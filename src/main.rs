@@ -7694,7 +7694,6 @@ impl FastTube {
         let mut reload_target = None;
         let mut force_refresh = false;
         let mut new_limit: Option<usize> = None;
-        let mut cancel_initial = false;
 
         ui.horizontal(|ui| {
             if ui
@@ -7740,60 +7739,16 @@ impl FastTube {
         });
         ui.add_space(6.0);
 
-        if loading {
-            egui::Frame::new()
-                .fill(palette.info_box_bg)
-                .stroke(egui::Stroke::new(1.0, palette.info_box_stroke))
-                .corner_radius(6)
-                .inner_margin(egui::Margin::symmetric(12, 8))
-                .show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.horizontal_wrapped(|ui| {
-                        let target_text = loading_target
-                            .as_ref()
-                            .map(channel_target_display_label)
-                            .unwrap_or_else(|| "canal".into());
-                        ui.label(
-                            RichText::new(format!("Carregando canal {target_text}..."))
-                                .color(palette.info_accent_fg),
-                        );
-                        if ui
-                            .button(RichText::new("Cancelar").small())
-                            .on_hover_text("Cancelar o carregamento em andamento do canal")
-                            .clicked()
-                        {
-                            cancel_initial = true;
-                        }
-                    });
-                });
-            ui.add_space(6.0);
-        }
-
-        if let Some(error_msg) = &error {
-            egui::Frame::new()
-                .fill(palette.error_bg)
-                .stroke(egui::Stroke::new(1.0, palette.error_stroke))
-                .corner_radius(6)
-                .inner_margin(egui::Margin::symmetric(12, 8))
-                .show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            RichText::new(format!("Erro ao carregar canal: {error_msg}"))
-                                .color(palette.error_banner_fg),
-                        );
-                        if let Some(target) = &retry_target {
-                            if ui
-                                .button(RichText::new("↻ Tentar novamente").small())
-                                .on_hover_text("Tentar buscar novamente os dados do canal")
-                                .clicked()
-                            {
-                                reload_target = Some(target.clone());
-                            }
-                        }
-                    });
-                });
-            ui.add_space(6.0);
+        let (cancel_initial, status_reload_target) = self.channel_load_status_ui(
+            ui,
+            loading,
+            loading_target.as_ref(),
+            error.as_deref(),
+            retry_target.as_ref(),
+            palette,
+        );
+        if status_reload_target.is_some() {
+            reload_target = status_reload_target;
         }
 
         let mut chosen = None;
@@ -8433,16 +8388,7 @@ impl FastTube {
         }
 
         if playlists_loaded && playlists.is_empty() && playlists_error.is_none() {
-            egui::Frame::new()
-                .fill(palette.card_alt_bg)
-                .corner_radius(6)
-                .inner_margin(egui::Margin::symmetric(12, 10))
-                .show(ui, |ui| {
-                    ui.set_min_width(card_max_w);
-                    ui.label(
-                        RichText::new("Nenhuma playlist pública listada para este canal.").weak(),
-                    );
-                });
+            Self::channel_playlists_empty_state_ui(ui, card_max_w, palette);
         } else if !playlists.is_empty() {
             self.thumbnails.begin_pass();
             egui::ScrollArea::vertical()
@@ -8765,27 +8711,7 @@ impl FastTube {
                             );
                         }
 
-                        ui.add_space(8.0);
-                        ui.separator();
-                        ui.add_space(6.0);
-                        ui.label(RichText::new("Descrição do canal").small().strong());
-                        let full_desc = about
-                            .as_ref()
-                            .and_then(|a| clean_description(a.description.as_deref()))
-                            .or_else(|| clean_description(page.description.as_deref()));
-                        if let Some(desc) = full_desc {
-                            ui.add_space(4.0);
-                            ui.label(RichText::new(desc).color(palette.description_fg));
-                        } else {
-                            ui.add_space(4.0);
-                            ui.label(
-                                RichText::new(
-                                    "Nenhuma descrição pública informada nos metadados do canal.",
-                                )
-                                .small()
-                                .weak(),
-                            );
-                        }
+                        Self::channel_about_description_ui(ui, page, about.as_ref(), palette);
                     });
             });
 
@@ -8793,6 +8719,113 @@ impl FastTube {
             self.cancel_channel_about();
         } else if reload_about {
             self.start_channel_about(ctx);
+        }
+    }
+
+    fn channel_load_status_ui(
+        &self,
+        ui: &mut egui::Ui,
+        loading: bool,
+        loading_target: Option<&ChannelTarget>,
+        error: Option<&str>,
+        retry_target: Option<&ChannelTarget>,
+        palette: ThemePalette,
+    ) -> (bool, Option<ChannelTarget>) {
+        let mut cancel_initial = false;
+        let mut reload_target = None;
+
+        if loading {
+            egui::Frame::new()
+                .fill(palette.info_box_bg)
+                .stroke(egui::Stroke::new(1.0, palette.info_box_stroke))
+                .corner_radius(6)
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal_wrapped(|ui| {
+                        let target_text = loading_target
+                            .map(channel_target_display_label)
+                            .unwrap_or_else(|| "canal".into());
+                        ui.label(
+                            RichText::new(format!("Carregando canal {target_text}..."))
+                                .color(palette.info_accent_fg),
+                        );
+                        if ui
+                            .button(RichText::new("Cancelar").small())
+                            .on_hover_text("Cancelar o carregamento em andamento do canal")
+                            .clicked()
+                        {
+                            cancel_initial = true;
+                        }
+                    });
+                });
+            ui.add_space(6.0);
+        }
+
+        if let Some(error_msg) = error {
+            egui::Frame::new()
+                .fill(palette.error_bg)
+                .stroke(egui::Stroke::new(1.0, palette.error_stroke))
+                .corner_radius(6)
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!("Erro ao carregar canal: {error_msg}"))
+                                .color(palette.error_banner_fg),
+                        );
+                        if let Some(target) = retry_target {
+                            if ui
+                                .button(RichText::new("↻ Tentar novamente").small())
+                                .on_hover_text("Tentar buscar novamente os dados do canal")
+                                .clicked()
+                            {
+                                reload_target = Some(target.clone());
+                            }
+                        }
+                    });
+                });
+            ui.add_space(6.0);
+        }
+
+        (cancel_initial, reload_target)
+    }
+
+    fn channel_playlists_empty_state_ui(ui: &mut egui::Ui, card_max_w: f32, palette: ThemePalette) {
+        egui::Frame::new()
+            .fill(palette.card_alt_bg)
+            .corner_radius(6)
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.set_min_width(card_max_w);
+                ui.label(RichText::new("Nenhuma playlist pública listada para este canal.").weak());
+            });
+    }
+
+    fn channel_about_description_ui(
+        ui: &mut egui::Ui,
+        page: &ChannelPage,
+        about: Option<&search::ChannelAboutInfo>,
+        palette: ThemePalette,
+    ) {
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.label(RichText::new("Descrição do canal").small().strong());
+        let full_desc = about
+            .and_then(|about| clean_description(about.description.as_deref()))
+            .or_else(|| clean_description(page.description.as_deref()));
+        if let Some(desc) = full_desc {
+            ui.add_space(4.0);
+            ui.label(RichText::new(desc).color(palette.description_fg));
+        } else {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Nenhuma descrição pública informada nos metadados do canal.")
+                    .small()
+                    .weak(),
+            );
         }
     }
 
