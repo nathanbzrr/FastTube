@@ -6,9 +6,9 @@ Consulta realizada no grafo estrutural do FastTube em 11/11/2026. O objetivo foi
 
 Após todas as refatorações de interface realizadas até 12/11/2026:
 
-- 1.297 nós, 3.679 relações e 68 comunidades.
-- `FastTube` possui 278 relações: 234 de métodos, 42 referências de tipos, 1 de conteúdo e 1 de implementação.
-- A estrutura `FastTube` declara 148 campos.
+- 1.327 nós, 3.775 relações e 71 comunidades.
+- `FastTube` possui 255 relações: 234 de métodos, 19 referências de tipos, 1 de conteúdo e 1 de implementação.
+- A estrutura `FastTube` declara 20 campos: 8 transversais e 12 raízes de domínio.
 - As duas implementações de `FastTube` contêm 231 métodos identificados antes da implementação de `eframe::App`.
 - A estrutura e as implementações ocupam aproximadamente 11 mil linhas de `src/main.rs`.
 
@@ -23,6 +23,7 @@ Evolução do grafo:
 | Após dividir `browse_ui` | 1.253 | 3.464 | 65 | 234 |
 | Após dividir a aba de playlists | 1.255 | 3.478 | 66 | 236 |
 | Rodada paralela completa | 1.297 | 3.679 | 68 | 278 |
+| Estado separado por domínio | 1.327 | 3.775 | 71 | 255 |
 
 Os métodos de interface ainda mais extensos são:
 
@@ -160,14 +161,12 @@ graphify explain "FeedFilter" --all
 graphify affected "RecommendationEngine" --depth 3
 ```
 
-## Rodada paralela
+## Estado separado por domínio
 
-Todos os candidatos selecionados receberam uma passagem de refatoração em seis frentes isoladas. O resumo detalhado, commits, modelos e a lista de métodos que ainda merecem uma segunda passagem estão em [`refatoracao-paralela-ui.md`](refatoracao-paralela-ui.md).
+A migração concluiu a divisão dos 140 campos não transversais em 12 subestados definidos em [`src/app_state.rs`](../src/app_state.rs). `FastTube` ficou reduzido a 8 campos compartilhados e 12 raízes de domínio, sem duplicação de estado.
 
-O próximo alvo é uma segunda passagem em `player_ui`, agora com 613 linhas, seguida por `watch_page_ui`, com 321.
+O Graphify registrou redução das referências diretas de tipos em `FastTube` de 42 para 19. O detalhamento e os critérios de aceite estão em [`state-migration-complete.md`](state-migration-complete.md).
 
-## Limitações
+## Próxima etapa possível
 
-- O grafo atual é estrutural (`--code-only`); a documentação não participa das relações.
-- As comunidades têm nomes genéricos ou derivados de hubs porque a rotulagem por LLM não foi executada.
-- Relações com confiança inferior a 1 orientam a investigação, mas não substituem a leitura do código-fonte.
+Os próximos ganhos virão de usar empréstimos específicos, como `&mut self.feed`, `&mut self.channels` e `&mut self.playback`, em vez de `&mut self` nos helpers. Isso reduzirá ainda mais o alcance das mudanças sem alterar o layout dos dados.

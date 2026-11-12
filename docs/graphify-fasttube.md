@@ -11,7 +11,7 @@ graphify extract . --code-only --cargo
 graphify cluster-only . --no-label
 ```
 
-Resultado atual: `1297` nós, `3679` relações e `68` comunidades. O build inicial possuía `1219` nós, `3436` relações e `52` comunidades. A execução estrutural usa AST e não consome tokens de LLM. A documentação não faz parte desse grafo porque foi usada a opção `--code-only`.
+Resultado atual: `1327` nós, `3775` relações e `71` comunidades. O build inicial possuía `1219` nós, `3436` relações e `52` comunidades. A execução estrutural usa AST e não consome tokens de LLM. A documentação não faz parte desse grafo porque foi usada a opção `--code-only`.
 
 Arquivos principais:
 
@@ -134,3 +134,4 @@ O diretório `target*` e `graphify-out/` estão excluídos por `.graphifyignore`
 
 - [`consulta-graphify-fasttube.md`](consulta-graphify-fasttube.md): diagnóstico do núcleo `FastTube`, acoplamentos, pontos de propagação e evolução estrutural.
 - [`refatoracao-paralela-ui.md`](refatoracao-paralela-ui.md): resultado da rodada paralela, commits, modelos e próximos alvos.
+- [`state-migration-complete.md`](state-migration-complete.md): migração de 148 campos para 12 estados de domínio e evidências de validação.
