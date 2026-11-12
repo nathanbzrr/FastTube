@@ -4,14 +4,16 @@ O Graphify mantém um mapa consultável do código em `graphify-out/`. Ele ajuda
 
 ## Estado atual
 
-O grafo estrutural foi gerado com:
+O grafo estrutural foi atualizado após a refatoração e limpeza de avisos com:
 
 ```powershell
-graphify extract . --code-only --cargo
+graphify update . --force
 graphify cluster-only . --no-label
+graphify tree --output graphify-out/GRAPH_TREE.html --root . --label FastTube
+graphify export callflow-html . --output graphify-out/callflow.html --lang auto
 ```
 
-Resultado atual: `1327` nós, `3775` relações e `71` comunidades. O build inicial possuía `1219` nós, `3436` relações e `52` comunidades. A execução estrutural usa AST e não consome tokens de LLM. A documentação não faz parte desse grafo porque foi usada a opção `--code-only`.
+Resultado atual: `1379` nós, `4048` relações (`94% EXTRACTED`, `6% INFERRED`, `0% AMBIGUOUS`) e `58` comunidades (após `1327` nós, `3775` relações e `71` comunidades na etapa anterior, e `1219` nós, `3436` relações e `52` comunidades no build inicial). A execução estrutural usa AST e não consome tokens de LLM (`0 input · 0 output`). Nenhum backend de LLM (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `GRAPHIFY_LLM_API_KEY`, `OLLAMA_HOST` ou configuração em `~/.graphify`) está configurado neste ambiente; portanto, a indexação semântica de documentação (`docs/`) não foi executada.
 
 Arquivos principais:
 
@@ -129,9 +131,10 @@ Durante uma sessão ativa de desenvolvimento:
 graphify watch .
 ```
 
-O diretório `target*` e `graphify-out/` estão excluídos por `.graphifyignore`. O checkout atual não é um repositório Git, então os hooks automáticos do Graphify não se aplicam. Em um checkout Git, eles podem ser instalados depois com `graphify hook install`.
+O diretório `target*` e `graphify-out/` estão excluídos por `.graphifyignore`, e `graphify-out/` também consta em `.gitignore`. Para instalar hooks do Graphify neste checkout Git, execute `graphify hook install`.
 ## Consultas registradas
 
 - [`consulta-graphify-fasttube.md`](consulta-graphify-fasttube.md): diagnóstico do núcleo `FastTube`, acoplamentos, pontos de propagação e evolução estrutural.
 - [`refatoracao-paralela-ui.md`](refatoracao-paralela-ui.md): resultado da rodada paralela, commits, modelos e próximos alvos.
 - [`state-migration-complete.md`](state-migration-complete.md): migração de 148 campos para 12 estados de domínio e evidências de validação.
+- [`medicoes-refatoracao-portatil.md`](medicoes-refatoracao-portatil.md): validações da distribuição portátil e medições finais de processo e rede pós-refatoração.
