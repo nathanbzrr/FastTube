@@ -67,7 +67,7 @@ A redução de 42 para 19 referências diretas de tipos mostra que as dependênc
 - 35 warnings preexistentes, nenhum novo.
 - Workspace limpo após o commit.
 
-A estabilização foi executada pelo GPT-6 Luna high no subagente de validação da migração.
+A estabilização foi executada pelo GPT-6 Luna high no subagente de validação da migração. Uma auditoria independente posterior confirmou cobertura dos 148 campos, ausência de estado duplicado, preservação dos defaults, request IDs, cancelamentos e asserts.
 
 ## Arquivos
 
