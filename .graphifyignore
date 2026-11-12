@@ -1,0 +1,8 @@
+﻿target/
+target-*/
+graphify-out/
+
+libmpv-2.dll
+mpv-2.dll
+oauth-client.json
+client_secret_*.json

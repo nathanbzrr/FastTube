@@ -1,0 +1,27 @@
+[package]
+name = 'fasttube'
+version = '0.1.0'
+edition = '2024'
+rust-version = '1.98'
+
+[dependencies]
+eframe = { version = '=0.36.2', default-features = false, features = ['default_fonts', 'glow'] }
+egui_extras = { version = '=0.36.2', features = ['http', 'image', 'svg'] }
+fastframe-fonts = { git = 'https://github.com/crmne/fastframe.git', tag = 'v0.17.0' }
+fastframe-graphics = { git = 'https://github.com/crmne/fastframe.git', tag = 'v0.17.0' }
+fastframe-icons = { git = 'https://github.com/crmne/fastframe.git', tag = 'v0.17.0' }
+fastframe-scroll = { git = 'https://github.com/crmne/fastframe.git', tag = 'v0.17.0' }
+fastframe-text = { git = 'https://github.com/crmne/fastframe.git', tag = 'v0.17.0' }
+image = { version = '0.25', default-features = false, features = ['jpeg', 'png', 'webp'] }
+libloading = '0.8'
+raw-window-handle = '0.6'
+serde_json = '1'
+serde = { version = '1', features = ['derive'] }
+zeroize = '1'
+base64 = '0.22'
+getrandom = '0.3'
+sha2 = '0.10'
+url = '2'
+reqwest = { version = '0.12', default-features = false, features = ['blocking', 'json', 'rustls-tls'] }
+tungstenite = '0.29'
+windows-sys = { version = '0.61', features = ['Win32_Foundation', 'Win32_Security_Cryptography', 'Win32_Storage_FileSystem', 'Win32_UI_WindowsAndMessaging'] }
