@@ -1130,7 +1130,7 @@ impl Default for FastTube {
                 search_results_mode: false,
                 settings_open: false,
                 shortcuts_open: false,
-                sidebar_subscriptions_expanded: false,
+                subscriptions_expanded: false,
                 browse_section: BrowseSection::Home,
             },
             watch: app_state::WatchState {
@@ -1609,7 +1609,9 @@ impl FastTube {
             active.position_ms.abs_diff(saved) >= HISTORY_MIN_POSITION_DELTA_MS
         });
         let dur_changed = self
-            .last_saved_duration_ms
+            .history
+            .save
+            .last_duration_ms
             .is_none_or(|saved| saved != active.duration_ms);
         pos_changed || dur_changed
     }
@@ -1705,12 +1707,14 @@ impl FastTube {
     ) -> (f64, Option<f64>, Option<f64>, bool) {
         self.ensure_history_synchronized();
         if self
-            .active_playback
+            .playback
+            .active
             .as_ref()
             .is_none_or(|active| active.url != video.url)
         {
             let prev_pos = self
-                .active_playback
+                .playback
+                .active
                 .as_ref()
                 .filter(|active| active.has_live_sample)
                 .map(|active| active.position_ms);
@@ -1951,7 +1955,9 @@ impl FastTube {
             return Some(channel_video);
         }
         if let Some(playlist_video) = self
-            .channel_playlist_videos
+            .channels
+            .playlist_detail
+            .items
             .iter()
             .find(|item| {
                 history::youtube_video_id(&item.video.url).as_deref()
@@ -2243,7 +2249,9 @@ impl FastTube {
                             .any(|item| &item.video.thumbnail == thumb)
                     })
                     && !self
-                        .channel_playlist_videos
+                        .channels
+                        .playlist_detail
+                        .items
                         .iter()
                         .any(|item| &item.video.thumbnail == thumb)
                 {
@@ -2252,7 +2260,8 @@ impl FastTube {
             }
         }
         let channel_videos_len = self
-            .channel_page
+            .channels
+            .page
             .as_ref()
             .map_or(0, |page| page.videos.len());
         let mut videos = Vec::with_capacity(results.len());
@@ -2362,7 +2371,8 @@ impl FastTube {
             }
         }
         let effective_limit = self
-            .channel_video_limit
+            .channels
+            .video_limit
             .clamp(1, search::MAX_CHANNEL_VIDEOS_LIMIT);
         let loaded_count = page.videos.len();
         self.channels.videos.reached_max = loaded_count >= search::MAX_CHANNEL_VIDEOS_LIMIT;
@@ -2535,7 +2545,8 @@ impl FastTube {
             return false;
         }
         if self
-            .channel_page
+            .channels
+            .page
             .as_ref()
             .is_none_or(|page| &page.target != target)
         {
@@ -2574,7 +2585,8 @@ impl FastTube {
                         self.channels.videos.has_more = false;
                     }
                     let effective_limit = self
-                        .channel_video_limit
+                        .channels
+                        .video_limit
                         .max(page.videos.len())
                         .clamp(1, search::MAX_CHANNEL_VIDEOS_LIMIT);
                     search::update_cached_channel_videos(
@@ -2601,7 +2613,8 @@ impl FastTube {
             return None;
         }
         let target = self
-            .channel_page
+            .channels
+            .page
             .as_ref()
             .map(|page| page.target.clone())
             .or_else(|| self.current_channel_target())?;
@@ -2701,7 +2714,8 @@ impl FastTube {
             return None;
         }
         let target = self
-            .channel_page
+            .channels
+            .page
             .as_ref()
             .map(|page| page.target.clone())
             .or_else(|| self.current_channel_target())?;
@@ -2796,7 +2810,9 @@ impl FastTube {
         }
         if self.current_channel_target().as_ref() != Some(target)
             || self
-                .channel_selected_playlist
+                .channels
+                .playlist_detail
+                .selected
                 .as_ref()
                 .is_none_or(|pl| pl.id != playlist_id)
         {
@@ -2835,7 +2851,8 @@ impl FastTube {
             return None;
         }
         let target = self
-            .channel_page
+            .channels
+            .page
             .as_ref()
             .map(|page| page.target.clone())
             .or_else(|| self.current_channel_target())?;
@@ -3224,6 +3241,7 @@ impl FastTube {
                         Some(entry_id) => self.queue.data.remove_entry(entry_id),
                         None => self
                             .queue
+                            .data
                             .videos()
                             .iter()
                             .position(|video| *video == candidate)
@@ -3259,7 +3277,8 @@ impl FastTube {
             && !self.queue.data.is_empty()
             && self.selected.is_some()
             && self
-                .active_playback
+                .playback
+                .active
                 .as_ref()
                 .is_some_and(|active| active.has_live_sample)
     }
@@ -3817,7 +3836,9 @@ impl FastTube {
     fn poll_channel(&mut self, ctx: &egui::Context) {
         loop {
             let outcome = self
-                .channel_search
+                .channels
+                .videos
+                .rx
                 .as_ref()
                 .map(|receiver| receiver.try_recv());
             match outcome {
@@ -3842,7 +3863,9 @@ impl FastTube {
     fn poll_channel_more_videos(&mut self) {
         loop {
             let outcome = self
-                .channel_more_videos_search
+                .channels
+                .videos
+                .more_rx
                 .as_ref()
                 .map(|receiver| receiver.try_recv());
             match outcome {
@@ -3868,7 +3891,9 @@ impl FastTube {
     fn poll_channel_playlists(&mut self, ctx: &egui::Context) {
         loop {
             let outcome = self
-                .channel_playlists_search
+                .channels
+                .playlists
+                .rx
                 .as_ref()
                 .map(|receiver| receiver.try_recv());
             match outcome {
@@ -3898,7 +3923,9 @@ impl FastTube {
     fn poll_channel_playlist_videos(&mut self) {
         loop {
             let outcome = self
-                .channel_playlist_videos_search
+                .channels
+                .playlist_detail
+                .rx
                 .as_ref()
                 .map(|receiver| receiver.try_recv());
             match outcome {
@@ -3928,7 +3955,9 @@ impl FastTube {
     fn poll_channel_about(&mut self) {
         loop {
             let outcome = self
-                .channel_about_search
+                .channels
+                .about
+                .rx
                 .as_ref()
                 .map(|receiver| receiver.try_recv());
             match outcome {
@@ -4670,7 +4699,7 @@ impl FastTube {
                 ui.label(RichText::new(text).small().weak());
             });
         } else {
-            let visible_limit = if self.ui.sidebar_subscriptions_expanded {
+            let visible_limit = if self.ui.subscriptions_expanded {
                 sidebar_channels.len()
             } else {
                 sidebar_channels.len().min(7)
@@ -4699,12 +4728,12 @@ impl FastTube {
             }
 
             if sidebar_channels.len() > 7 {
-                let toggle_label = if self.ui.sidebar_subscriptions_expanded {
+                let toggle_label = if self.ui.subscriptions_expanded {
                     "Mostrar menos"
                 } else {
                     "Mostrar mais"
                 };
-                let toggle_icon = if self.ui.sidebar_subscriptions_expanded {
+                let toggle_icon = if self.ui.subscriptions_expanded {
                     "\u{2302}"
                 } else {
                     "\u{2304}"
@@ -4712,8 +4741,7 @@ impl FastTube {
                 if sidebar_pill_item(ui, toggle_icon, toggle_label, false, false, &palette)
                     .clicked()
                 {
-                    self.ui.sidebar_subscriptions_expanded =
-                        !self.ui.sidebar_subscriptions_expanded;
+                    self.ui.subscriptions_expanded = !self.ui.subscriptions_expanded;
                 }
             }
         }
@@ -5554,7 +5582,8 @@ impl FastTube {
         let status_color = if !self.selected.is_some() {
             palette.diag_inactive_fg
         } else if self
-            .decoding_diagnostics
+            .playback
+            .diagnostics
             .effective_decoding
             .is_hardware_active()
         {
@@ -6040,7 +6069,9 @@ impl FastTube {
                             Some(height) => format!("Qualidade: {height}p"),
                             None => {
                                 let preferred = self
-                                    .playback_preferences
+                                    .settings
+                                    .playback
+                                    .value
                                     .max_height
                                     .map(|height| format!("até {height}p"))
                                     .unwrap_or_else(|| "automática".into());
@@ -6082,7 +6113,8 @@ impl FastTube {
                         });
                         if quality != self.playback.quality {
                             let ready = self
-                                .active_playback
+                                .playback
+                                .active
                                 .as_ref()
                                 .is_some_and(|active| active.has_live_sample)
                                 && raw_path.as_deref().is_some_and(|path| path == video.url)
@@ -6861,6 +6893,7 @@ impl FastTube {
         let content_width = width.min(ui.available_width()).max(1.0);
         let saved_for_later = self
             .library
+            .data
             .watch_later
             .iter()
             .any(|record| record.video.url == video.url);
@@ -6963,6 +6996,7 @@ impl FastTube {
                 .small_button(
                     if self
                         .library
+                        .data
                         .favorites
                         .iter()
                         .any(|v| v.video.url == video.url)
@@ -6981,6 +7015,7 @@ impl FastTube {
                 .small_button(
                     if self
                         .library
+                        .data
                         .watch_later
                         .iter()
                         .any(|v| v.video.url == video.url)
@@ -7189,7 +7224,8 @@ impl FastTube {
 
     fn save_library(&mut self) {
         let result = self
-            .library_path
+            .library
+            .path
             .as_deref()
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "local library path unavailable")
@@ -7451,6 +7487,7 @@ impl FastTube {
         let mut queue = Queue::new(DEFAULT_QUEUE_LIMIT);
         for video in self
             .queue
+            .data
             .videos()
             .iter()
             .chain(imported.queue.videos())
@@ -7572,6 +7609,7 @@ impl FastTube {
     fn continue_watching_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> Option<Video> {
         let entries: Vec<_> = self
             .history
+            .data
             .entries()
             .iter()
             .filter(|entry| entry.resume_position_ms().is_some())
@@ -8302,7 +8340,9 @@ impl FastTube {
         let mut chosen = None;
         let current_url = self.selected.as_ref().map(|video| video.url.clone());
         let playlist_videos: Vec<Video> = self
-            .channel_playlist_videos
+            .channels
+            .playlist_detail
+            .items
             .iter()
             .map(|item| item.video.clone())
             .collect();
@@ -9861,6 +9901,7 @@ impl FastTube {
                 )
                 .changed();
             let channels: Vec<String> = self
+                .feed
                 .videos
                 .iter()
                 .map(|video| video.channel.clone())
@@ -9995,7 +10036,9 @@ impl FastTube {
         self.ensure_feed_cache();
         let mut ranked = std::mem::take(&mut self.feed.cache.ranked);
         let is_subscription_feed = self
-            .home_title
+            .feed
+            .home
+            .title
             .as_deref()
             .is_some_and(|title| title.contains("envios recentes"));
         // Os filtros da página de inscrições alteram apenas a visualização. Preserva
@@ -10454,6 +10497,7 @@ impl FastTube {
         if let Some(id) = id {
             let marks: Vec<_> = self
                 .library
+                .data
                 .bookmarks
                 .iter()
                 .filter(|m| m.video_id == id)
@@ -10563,7 +10607,8 @@ impl FastTube {
 
     fn comments_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, scroll_id: &str) {
         let needs_reauth = self
-            .oauth_session
+            .auth
+            .session
             .as_ref()
             .is_some_and(|s| !s.has_comment_scope());
         ui.horizontal(|ui| {
@@ -10650,7 +10695,8 @@ impl FastTube {
                             }
                         }
                         let (loaded, loading, error, replies, has_next) = self
-                            .watch_extras
+                            .watch
+                            .extras
                             .comment_replies
                             .get(&comment.id)
                             .map(|state| {
@@ -10670,7 +10716,8 @@ impl FastTube {
                             ui.label(error);
                             if ui.button("Tentar novamente").clicked() {
                                 let retry_next = self
-                                    .watch_extras
+                                    .watch
+                                    .extras
                                     .comment_replies
                                     .get(&comment.id)
                                     .is_some_and(
@@ -11266,7 +11313,9 @@ impl FastTube {
     fn browse_alerts_ui(&mut self, ui: &mut egui::Ui, palette: ThemePalette) {
         ui.add_space(4.0);
         if let Some(error) = self
-            .settings_error
+            .settings
+            .buffer
+            .error
             .as_ref()
             .or(self.settings.playback.error.as_ref())
             .or(self.settings.theme.error.as_ref())
@@ -11397,6 +11446,7 @@ impl FastTube {
                             && name.len() <= 128
                             && !self
                                 .library
+                                .data
                                 .collections
                                 .iter()
                                 .any(|collection| collection.name == name)
@@ -11525,18 +11575,21 @@ impl FastTube {
         let mut bookmark_to_open = None;
         let watch_later: Vec<Video> = self
             .library
+            .data
             .watch_later
             .iter()
             .map(|record| record.video.clone())
             .collect();
         let favorites: Vec<Video> = self
             .library
+            .data
             .favorites
             .iter()
             .map(|record| record.video.clone())
             .collect();
         let collections: Vec<(String, Vec<Video>)> = self
             .library
+            .data
             .collections
             .iter()
             .map(|collection| {
@@ -11874,6 +11927,7 @@ impl FastTube {
         let mut open_channel_target = None;
         let saved_for_later = self
             .library
+            .data
             .watch_later
             .iter()
             .any(|record| record.video.url == video.url);

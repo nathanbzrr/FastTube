@@ -70,7 +70,8 @@ fn oauth_home_preserves_session_when_feed_fails() {
     app.poll_async_tasks(&egui::Context::default());
     assert!(app.auth.authenticated);
     assert_eq!(
-        app.auth.session
+        app.auth
+            .session
             .as_ref()
             .map(|session| session.access_token.as_str()),
         Some("test-token")
@@ -145,7 +146,8 @@ fn oauth_home_shows_partial_results_and_preserves_session_on_failure() {
     assert_eq!(app.feed.videos[0].title, "Lote mais recente");
     assert_eq!(app.message, "API unavailable");
     assert_eq!(
-        app.auth.session
+        app.auth
+            .session
             .as_ref()
             .map(|session| session.access_token.as_str()),
         Some("test-token")
@@ -276,7 +278,10 @@ fn sidebar_subscription_catalog_only_contains_oauth_subscriptions() {
     app.poll_async_tasks(&egui::Context::default());
 
     assert_eq!(app.feed.home.subscription_channels.len(), 1);
-    assert_eq!(app.feed.home.subscription_channels[0].title, "Canal inscrito");
+    assert_eq!(
+        app.feed.home.subscription_channels[0].title,
+        "Canal inscrito"
+    );
     assert!(app.feed.home.subscription_channels_loaded);
 
     app.apply_search_results(
@@ -295,8 +300,14 @@ fn sidebar_subscription_catalog_only_contains_oauth_subscriptions() {
     app.ensure_feed_cache();
 
     assert_eq!(app.feed.home.subscription_channels.len(), 1);
-    assert_eq!(app.feed.home.subscription_channels[0].title, "Canal inscrito");
-    assert_ne!(app.feed.home.subscription_channels[0].title, "Canal pesquisado");
+    assert_eq!(
+        app.feed.home.subscription_channels[0].title,
+        "Canal inscrito"
+    );
+    assert_ne!(
+        app.feed.home.subscription_channels[0].title,
+        "Canal pesquisado"
+    );
 }
 
 #[test]
@@ -455,7 +466,9 @@ fn buffer_settings_persistence_pending_restart_and_storage_errors_work() {
     assert!(app.has_pending_buffer_restart());
     assert!(app.settings.buffer.error.is_none());
     assert!(
-        app.settings.buffer.notice
+        app.settings
+            .buffer
+            .notice
             .as_deref()
             .unwrap_or("")
             .contains("reiniciar o player")
@@ -925,7 +938,8 @@ fn compact_history_queue_button_enqueues_the_matching_video_data() {
     app.feed.videos = videos.clone();
     app.queue.data = Queue::new(3);
     app.history.data = History::default();
-    app.history.data
+    app.history
+        .data
         .record(history::Entry {
             video_id: "dQw4w9WgXcQ".into(),
             title: videos[0].title.clone(),
@@ -957,7 +971,8 @@ fn compact_history_queue_button_preserves_full_queue_and_reports_rejected_video(
     app.queue.data = Queue::new(1);
     app.history.data = History::default();
     app.enqueue_video(videos[1].clone()).unwrap();
-    app.history.data
+    app.history
+        .data
         .record(history::Entry {
             video_id: "dQw4w9WgXcQ".into(),
             title: videos[0].title.clone(),
@@ -1003,9 +1018,15 @@ fn unconfirmed_playback_and_missing_path_do_not_replace_saved_position() {
         now,
     );
     app.flush_playback_history_at(now);
-    assert_eq!(app.history.data.get("dQw4w9WgXcQ").unwrap().position_ms, 197_000);
+    assert_eq!(
+        app.history.data.get("dQw4w9WgXcQ").unwrap().position_ms,
+        197_000
+    );
     app.close_video(&egui::Context::default());
-    assert_eq!(app.history.data.get("dQw4w9WgXcQ").unwrap().position_ms, 197_000);
+    assert_eq!(
+        app.history.data.get("dQw4w9WgXcQ").unwrap().position_ms,
+        197_000
+    );
 }
 
 #[test]
@@ -1074,7 +1095,10 @@ fn history_tracks_playback_throttles_disk_saves_and_prevents_old_position_leak_o
     assert_eq!(dur, Some(200.0));
     assert!(seek.is_none());
     assert!(!clear_start);
-    assert_eq!(app.history.data.get("dQw4w9WgXcQ").unwrap().position_ms, 12_400);
+    assert_eq!(
+        app.history.data.get("dQw4w9WgXcQ").unwrap().position_ms,
+        12_400
+    );
     // Disco ainda contém a gravação de t0 (não regravou após apenas 500ms).
     assert_eq!(
         history::load(&path)
@@ -1094,7 +1118,10 @@ fn history_tracks_playback_throttles_disk_saves_and_prevents_old_position_leak_o
         false,
         t2,
     );
-    assert_eq!(app.history.data.get("dQw4w9WgXcQ").unwrap().position_ms, 28_000);
+    assert_eq!(
+        app.history.data.get("dQw4w9WgXcQ").unwrap().position_ms,
+        28_000
+    );
     assert_eq!(
         history::load(&path)
             .unwrap()
@@ -1133,7 +1160,10 @@ fn history_tracks_playback_throttles_disk_saves_and_prevents_old_position_leak_o
         false,
         t4,
     );
-    assert_eq!(app.history.data.get("dQw4w9WgXcQ").unwrap().position_ms, 62_000);
+    assert_eq!(
+        app.history.data.get("dQw4w9WgXcQ").unwrap().position_ms,
+        62_000
+    );
 
     // Troca para o vídeo 2: deve persistir imediatamente 62s do vídeo 1 e proteger o vídeo 2
     // contra leituras atrasadas (stale) da posição 62s do vídeo 1.
@@ -1267,7 +1297,10 @@ fn resume_restores_saved_position_and_avoids_resuming_near_end_or_non_youtube_ur
     );
     assert!((pos_loading - 45.0).abs() < 0.01);
     assert!(seek_loading.is_none());
-    assert_eq!(app.history.data.get("dQw4w9WgXcQ").unwrap().position_ms, 45_000);
+    assert_eq!(
+        app.history.data.get("dQw4w9WgXcQ").unwrap().position_ms,
+        45_000
+    );
 
     // Se o player iniciar em 0.2s, emite seek explícito para 45.0s.
     let (pos_started, _, pending_seek, _) = app.process_player_telemetry(
@@ -1289,7 +1322,10 @@ fn resume_restores_saved_position_and_avoids_resuming_near_end_or_non_youtube_ur
         now + Duration::from_millis(600),
     );
     app.flush_playback_history_at(now + Duration::from_millis(700));
-    assert_eq!(app.history.data.get("dQw4w9WgXcQ").unwrap().position_ms, 45_000);
+    assert_eq!(
+        app.history.data.get("dQw4w9WgXcQ").unwrap().position_ms,
+        45_000
+    );
     app.process_player_telemetry(
         &videos[0],
         Some(&videos[0].url),
@@ -1298,7 +1334,10 @@ fn resume_restores_saved_position_and_avoids_resuming_near_end_or_non_youtube_ur
         false,
         now + Duration::from_millis(800),
     );
-    assert_eq!(app.history.data.get("dQw4w9WgXcQ").unwrap().position_ms, 45_200);
+    assert_eq!(
+        app.history.data.get("dQw4w9WgXcQ").unwrap().position_ms,
+        45_200
+    );
 
     // Vídeo perto do fim (197s de 200s) não retoma perto do fim; recomeça do início.
     app.record_video_in_history(&videos[0], 197_000, Some(200_000))
@@ -1679,7 +1718,10 @@ fn theater_mode_toggles_via_button_and_shortcut_respecting_focus_fullscreen_and_
     assert!(app.playback.window_visible);
     assert_eq!(app.settings.buffer.profile, BufferProfile::Large);
     assert_eq!(app.playback.active_buffer, Some(BufferProfile::Large));
-    assert_eq!(app.history.data.get("dQw4w9WgXcQ").unwrap().position_ms, 33_000);
+    assert_eq!(
+        app.history.data.get("dQw4w9WgXcQ").unwrap().position_ms,
+        33_000
+    );
 
     let base_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 760.0));
     let mut output = ctx.run_ui(
@@ -1705,7 +1747,8 @@ fn theater_mode_toggles_via_button_and_shortcut_respecting_focus_fullscreen_and_
                     });
             }
             egui::CentralPanel::default().show(ui, |ui| {
-                let cols = compute_watch_columns_for_mode(ui.available_width(), app.playback.theater);
+                let cols =
+                    compute_watch_columns_for_mode(ui.available_width(), app.playback.theater);
                 assert_eq!(cols.mode, WatchLayoutMode::Stacked);
                 assert!((cols.primary_width - ui.available_width()).abs() < 0.01);
                 app.watch_primary_ui(
@@ -1788,7 +1831,10 @@ fn theater_mode_toggles_via_button_and_shortcut_respecting_focus_fullscreen_and_
     app.sync_player_window_visibility();
     assert!(app.playback.window_visible);
     assert!(app.playback.theater);
-    assert_eq!(app.history.data.get("dQw4w9WgXcQ").unwrap().position_ms, 33_000);
+    assert_eq!(
+        app.history.data.get("dQw4w9WgXcQ").unwrap().position_ms,
+        33_000
+    );
 }
 
 #[test]
@@ -1821,7 +1867,10 @@ fn queue_integration_preserves_duplicates_rejected_videos_errors_and_reorders_sa
     assert_eq!(rejected.title, extra.title);
     assert_eq!(rejected.url, extra.url);
     assert_eq!(
-        app.queue.last_rejected_video.as_ref().map(|v| v.url.as_str()),
+        app.queue
+            .last_rejected_video
+            .as_ref()
+            .map(|v| v.url.as_str()),
         Some(extra.url.as_str())
     );
     assert!(app.queue.error.is_some());
@@ -1882,7 +1931,8 @@ fn queue_load_failure_keeps_pending_duplicate_and_persisted_item() {
     app.report_pending_queue_load_error();
 
     assert!(
-        app.queue.error
+        app.queue
+            .error
             .as_deref()
             .unwrap()
             .contains("permanece na fila")
@@ -1918,7 +1968,8 @@ fn delayed_signals_for_equal_urls_never_remove_queue_items() {
     assert_eq!(Queue::load(&path, 4).unwrap().len(), 2);
     assert_eq!(app.queue.pending_video, Some(videos[0].clone()));
     assert!(
-        app.queue.notice
+        app.queue
+            .notice
             .as_deref()
             .unwrap()
             .contains("aguardando confirma\u{00e7}\u{00e3}o")
@@ -1942,7 +1993,8 @@ fn sequential_attempts_with_equal_urls_remain_unresolved_until_manual_removal() 
     assert_eq!(app.queue.data.len(), 2);
     assert!(app.queue.pending_video.is_some());
     assert!(
-        app.queue.notice
+        app.queue
+            .notice
             .as_deref()
             .unwrap()
             .contains("aguardando confirma\u{00e7}\u{00e3}o")
@@ -1986,7 +2038,8 @@ fn normal_matching_playback_observation_warns_without_consuming_queue_item() {
     assert_eq!(app.queue.data.len(), 1);
     assert_eq!(app.queue.data.videos()[0], video);
     assert!(
-        app.queue.notice
+        app.queue
+            .notice
             .as_deref()
             .unwrap()
             .contains("aguardando confirma\u{00e7}\u{00e3}o")
@@ -2135,13 +2188,15 @@ fn queue_manual_advance_preserves_history_theater_mode_buffer_and_metadata_witho
     let saved_disk = history::load(&path).unwrap();
     assert_eq!(saved_disk.get("dQw4w9WgXcQ").unwrap().position_ms, 200_000);
     assert_eq!(
-        app.playback.active
+        app.playback
+            .active
             .as_ref()
             .and_then(|a| a.resume_target_ms),
         Some(42_000)
     );
     assert_eq!(
-        app.playback.active
+        app.playback
+            .active
             .as_ref()
             .and_then(|a| a.stale_guard_pos_ms),
         Some(200_000)
@@ -3279,7 +3334,8 @@ fn youtube_layout_and_custom_recommendation_engine_work_across_filters_and_shelv
         ],
     );
 
-    app.history.data
+    app.history
+        .data
         .record(history::Entry {
             video_id: "___________".into(),
             title: "Animação anterior de 5 Alguma Coisa #animação".into(),

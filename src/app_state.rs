@@ -262,7 +262,6 @@ pub(crate) struct HistorySaveState {
     pub(crate) last_duration_ms: Option<Option<u64>>,
 }
 
-#[derive(Default)]
 pub(crate) struct QueueState {
     pub(crate) data: Queue,
     pub(crate) path: Option<PathBuf>,
@@ -276,6 +275,25 @@ pub(crate) struct QueueState {
     pub(crate) pending_entry_id: Option<u64>,
     pub(crate) correlation: QueuePlaybackCorrelation,
     pub(crate) pending_advance: bool,
+}
+
+impl Default for QueueState {
+    fn default() -> Self {
+        Self {
+            data: Queue::new(crate::DEFAULT_QUEUE_LIMIT),
+            path: None,
+            read_failed: false,
+            persistence_error: None,
+            eof_handled: false,
+            error: None,
+            notice: None,
+            last_rejected_video: None,
+            pending_video: None,
+            pending_entry_id: None,
+            correlation: QueuePlaybackCorrelation::default(),
+            pending_advance: false,
+        }
+    }
 }
 
 #[derive(Default)]
