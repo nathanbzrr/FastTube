@@ -5858,33 +5858,7 @@ impl FastTube {
         // Na página normal, os controles ficam somente sobre o vídeo, como no YouTube.
         // A barra externa permanece disponível como fallback em tela cheia.
         if fullscreen {
-            let mut seek = self.seek_drag.unwrap_or(position);
-            let response = ui
-                .scope(|ui| {
-                    ui.spacing_mut().slider_width = width;
-                    ui.add_enabled(
-                        duration.is_some(),
-                        egui::Slider::new(&mut seek, 0.0..=duration.unwrap_or(1.0))
-                            .show_value(false)
-                            .trailing_fill(true),
-                    )
-                })
-                .inner;
-            if response.dragged() {
-                self.seek_drag = Some(seek);
-            }
-            if response.drag_stopped() || (response.changed() && !response.dragged()) {
-                let seek_res = self
-                    .player
-                    .as_ref()
-                    .map(|player| player.seek(seek, "absolute+exact"))
-                    .unwrap_or(Ok(()));
-                match seek_res {
-                    Ok(()) => self.record_manual_seek(seek, duration, now),
-                    Err(error) => self.message = error,
-                }
-                self.seek_drag = None;
-            }
+            self.fullscreen_seek_ui(ui, width, position, duration, now);
 
             let mut close_clicked = false;
             let mut fullscreen_toggled = false;
@@ -6313,132 +6287,13 @@ impl FastTube {
             self.save_library();
         }
 
-        let mut overlay_action = None;
-        if let Some((rect, response)) = video_area {
-            let hovered = response.hovered() || ui.rect_contains_pointer(rect);
-            if hovered {
-                self.overlay_last_activity = Instant::now();
-            }
-            let idle_secs = self.overlay_last_activity.elapsed().as_secs_f64();
-            let visible = overlay::overlay_visible(hovered, paused, ended, idle_secs);
-            let style = self.overlay_style();
-            let telemetry = overlay::OverlayTelemetry {
-                paused,
-                ended,
-                muted,
-                position_secs: position,
-                duration_secs: duration,
-                volume_percent: raw_volume as f32,
-                has_queued,
-            };
-            let (action, over_bar) = overlay::show(ui, rect, &telemetry, &style, visible);
-            if let Some(action) = action {
-                self.overlay_last_activity = Instant::now();
-                overlay_action = Some(action);
-            } else if response.clicked() && !over_bar {
-                // Clique no vídeo (fora da barra) alterna reprodução/pausa.
-                overlay_action = Some(overlay::OverlayAction::TogglePlay);
-            }
-        }
+        let overlay_action = self.player_overlay_ui(
+            ui, video_area, paused, ended, muted, position, duration, raw_volume, has_queued,
+        );
         if let Some(action) = overlay_action {
-            use overlay::OverlayAction;
-            match action {
-                OverlayAction::TogglePlay => {
-                    let result = if ended {
-                        self.player
-                            .as_ref()
-                            .map(|player| {
-                                player
-                                    .seek(0.0, "absolute+exact")
-                                    .and_then(|()| player.set("pause", "no"))
-                            })
-                            .unwrap_or(Ok(()))
-                    } else {
-                        self.player
-                            .as_ref()
-                            .map(|player| player.set("pause", if paused { "no" } else { "yes" }))
-                            .unwrap_or(Ok(()))
-                    };
-                    match result {
-                        Ok(()) => {
-                            if ended {
-                                self.record_manual_seek(0.0, duration, now);
-                            } else if !paused {
-                                self.flush_playback_history_at(now);
-                            }
-                        }
-                        Err(error) => self.message = error,
-                    }
-                }
-                OverlayAction::SeekBack10 => {
-                    let result = self
-                        .player
-                        .as_ref()
-                        .map(|player| player.seek(-10.0, "relative"))
-                        .unwrap_or(Ok(()));
-                    match result {
-                        Ok(()) => {
-                            self.record_manual_seek((position - 10.0).max(0.0), duration, now)
-                        }
-                        Err(error) => self.message = error,
-                    }
-                }
-                OverlayAction::SeekForward10 => {
-                    let result = self
-                        .player
-                        .as_ref()
-                        .map(|player| player.seek(10.0, "relative"))
-                        .unwrap_or(Ok(()));
-                    match result {
-                        Ok(()) => {
-                            let target = duration
-                                .map(|duration| (position + 10.0).min(duration))
-                                .unwrap_or(position + 10.0);
-                            self.record_manual_seek(target, duration, now);
-                        }
-                        Err(error) => self.message = error,
-                    }
-                }
-                OverlayAction::SeekTo(target) => {
-                    let result = self
-                        .player
-                        .as_ref()
-                        .map(|player| player.seek(target, "absolute+exact"))
-                        .unwrap_or(Ok(()));
-                    match result {
-                        Ok(()) => self.record_manual_seek(target, duration, now),
-                        Err(error) => self.message = error,
-                    }
-                }
-                OverlayAction::ToggleMute => {
-                    let result = self
-                        .player
-                        .as_ref()
-                        .map(|player| player.set("mute", if muted { "no" } else { "yes" }))
-                        .unwrap_or(Ok(()));
-                    if let Err(error) = result {
-                        self.message = error;
-                    }
-                }
-                OverlayAction::SetVolume(volume) => {
-                    let result = self
-                        .player
-                        .as_ref()
-                        .map(|player| player.set("volume", &format!("{volume:.0}")))
-                        .unwrap_or(Ok(()));
-                    if let Err(error) = result {
-                        self.message = error;
-                    }
-                }
-                OverlayAction::Next => self.request_queue_advance(),
-                OverlayAction::ToggleSettings => {
-                    self.settings_open = !self.settings_open;
-                    self.sync_player_window_visibility();
-                }
-                OverlayAction::ToggleTheater => self.toggle_theater_mode(),
-                OverlayAction::ToggleFullscreen => self.toggle_fullscreen(ctx),
-                OverlayAction::Close => self.close_video(ctx),
-            }
+            self.handle_player_overlay_action(
+                action, paused, ended, muted, position, duration, now, ctx,
+            );
         }
 
         if let Some(seek_pos) = manual_seek_recorded {
@@ -6475,6 +6330,193 @@ impl FastTube {
         }
         if close_clicked {
             self.close_video(ctx);
+        }
+    }
+
+    fn fullscreen_seek_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        width: f32,
+        position: f64,
+        duration: Option<f64>,
+        now: Instant,
+    ) {
+        let mut seek = self.seek_drag.unwrap_or(position);
+        let response = ui
+            .scope(|ui| {
+                ui.spacing_mut().slider_width = width;
+                ui.add_enabled(
+                    duration.is_some(),
+                    egui::Slider::new(&mut seek, 0.0..=duration.unwrap_or(1.0))
+                        .show_value(false)
+                        .trailing_fill(true),
+                )
+            })
+            .inner;
+        if response.dragged() {
+            self.seek_drag = Some(seek);
+        }
+        if response.drag_stopped() || (response.changed() && !response.dragged()) {
+            let seek_res = self
+                .player
+                .as_ref()
+                .map(|player| player.seek(seek, "absolute+exact"))
+                .unwrap_or(Ok(()));
+            match seek_res {
+                Ok(()) => self.record_manual_seek(seek, duration, now),
+                Err(error) => self.message = error,
+            }
+            self.seek_drag = None;
+        }
+    }
+
+    fn player_overlay_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        video_area: Option<(egui::Rect, egui::Response)>,
+        paused: bool,
+        ended: bool,
+        muted: bool,
+        position: f64,
+        duration: Option<f64>,
+        raw_volume: f64,
+        has_queued: bool,
+    ) -> Option<overlay::OverlayAction> {
+        let mut overlay_action = None;
+        if let Some((rect, response)) = video_area {
+            let hovered = response.hovered() || ui.rect_contains_pointer(rect);
+            if hovered {
+                self.overlay_last_activity = Instant::now();
+            }
+            let idle_secs = self.overlay_last_activity.elapsed().as_secs_f64();
+            let visible = overlay::overlay_visible(hovered, paused, ended, idle_secs);
+            let style = self.overlay_style();
+            let telemetry = overlay::OverlayTelemetry {
+                paused,
+                ended,
+                muted,
+                position_secs: position,
+                duration_secs: duration,
+                volume_percent: raw_volume as f32,
+                has_queued,
+            };
+            let (action, over_bar) = overlay::show(ui, rect, &telemetry, &style, visible);
+            if let Some(action) = action {
+                self.overlay_last_activity = Instant::now();
+                overlay_action = Some(action);
+            } else if response.clicked() && !over_bar {
+                overlay_action = Some(overlay::OverlayAction::TogglePlay);
+            }
+        }
+        overlay_action
+    }
+
+    fn handle_player_overlay_action(
+        &mut self,
+        action: overlay::OverlayAction,
+        paused: bool,
+        ended: bool,
+        muted: bool,
+        position: f64,
+        duration: Option<f64>,
+        now: Instant,
+        ctx: &egui::Context,
+    ) {
+        use overlay::OverlayAction;
+        match action {
+            OverlayAction::TogglePlay => {
+                let result = if ended {
+                    self.player
+                        .as_ref()
+                        .map(|player| {
+                            player
+                                .seek(0.0, "absolute+exact")
+                                .and_then(|()| player.set("pause", "no"))
+                        })
+                        .unwrap_or(Ok(()))
+                } else {
+                    self.player
+                        .as_ref()
+                        .map(|player| player.set("pause", if paused { "no" } else { "yes" }))
+                        .unwrap_or(Ok(()))
+                };
+                match result {
+                    Ok(()) => {
+                        if ended {
+                            self.record_manual_seek(0.0, duration, now);
+                        } else if !paused {
+                            self.flush_playback_history_at(now);
+                        }
+                    }
+                    Err(error) => self.message = error,
+                }
+            }
+            OverlayAction::SeekBack10 => {
+                let result = self
+                    .player
+                    .as_ref()
+                    .map(|player| player.seek(-10.0, "relative"))
+                    .unwrap_or(Ok(()));
+                match result {
+                    Ok(()) => self.record_manual_seek((position - 10.0).max(0.0), duration, now),
+                    Err(error) => self.message = error,
+                }
+            }
+            OverlayAction::SeekForward10 => {
+                let result = self
+                    .player
+                    .as_ref()
+                    .map(|player| player.seek(10.0, "relative"))
+                    .unwrap_or(Ok(()));
+                match result {
+                    Ok(()) => {
+                        let target = duration
+                            .map(|duration| (position + 10.0).min(duration))
+                            .unwrap_or(position + 10.0);
+                        self.record_manual_seek(target, duration, now);
+                    }
+                    Err(error) => self.message = error,
+                }
+            }
+            OverlayAction::SeekTo(target) => {
+                let result = self
+                    .player
+                    .as_ref()
+                    .map(|player| player.seek(target, "absolute+exact"))
+                    .unwrap_or(Ok(()));
+                match result {
+                    Ok(()) => self.record_manual_seek(target, duration, now),
+                    Err(error) => self.message = error,
+                }
+            }
+            OverlayAction::ToggleMute => {
+                let result = self
+                    .player
+                    .as_ref()
+                    .map(|player| player.set("mute", if muted { "no" } else { "yes" }))
+                    .unwrap_or(Ok(()));
+                if let Err(error) = result {
+                    self.message = error;
+                }
+            }
+            OverlayAction::SetVolume(volume) => {
+                let result = self
+                    .player
+                    .as_ref()
+                    .map(|player| player.set("volume", &format!("{volume:.0}")))
+                    .unwrap_or(Ok(()));
+                if let Err(error) = result {
+                    self.message = error;
+                }
+            }
+            OverlayAction::Next => self.request_queue_advance(),
+            OverlayAction::ToggleSettings => {
+                self.settings_open = !self.settings_open;
+                self.sync_player_window_visibility();
+            }
+            OverlayAction::ToggleTheater => self.toggle_theater_mode(),
+            OverlayAction::ToggleFullscreen => self.toggle_fullscreen(ctx),
+            OverlayAction::Close => self.close_video(ctx),
         }
     }
 
