@@ -3,11 +3,11 @@ use crate::process;
 use crate::search;
 use crate::{
     ActivePlayback, BackupImportMode, BackupPreview, BrowseSection, BufferProfile,
-    ChannelAboutFetchMessage, ChannelFetchMessage, ChannelMoreVideosFetchMessage,
-    ChannelPage, ChannelPlaylistVideosFetchMessage, ChannelPlaylistsFetchMessage, ChannelTab,
-    DecodingDiagnostics, FeedDerivedCache, FeedFilter, History, HomeFetchMessage,
-    ImportedUserData, PlaybackPreferences, Queue, QueuePlaybackCorrelation, SearchFetchMessage,
-    SearchResult, Theme, Video,
+    ChannelAboutFetchMessage, ChannelFetchMessage, ChannelMoreVideosFetchMessage, ChannelPage,
+    ChannelPlaylistVideosFetchMessage, ChannelPlaylistsFetchMessage, ChannelTab,
+    DecodingDiagnostics, FeedDerivedCache, FeedFilter, History, HomeFetchMessage, ImportedUserData,
+    PlaybackPreferences, Queue, QueuePlaybackCorrelation, SearchFetchMessage, SearchResult, Theme,
+    Video,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
