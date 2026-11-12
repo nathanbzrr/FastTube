@@ -11,7 +11,7 @@ graphify extract . --code-only --cargo
 graphify cluster-only . --no-label
 ```
 
-Resultado atual: `1255` nós, `3478` relações e `66` comunidades. O build inicial possuía `1219` nós, `3436` relações e `52` comunidades. A execução estrutural usa AST e não consome tokens de LLM. A documentação não faz parte desse grafo porque foi usada a opção `--code-only`.
+Resultado atual: `1297` nós, `3679` relações e `68` comunidades. O build inicial possuía `1219` nós, `3436` relações e `52` comunidades. A execução estrutural usa AST e não consome tokens de LLM. A documentação não faz parte desse grafo porque foi usada a opção `--code-only`.
 
 Arquivos principais:
 
@@ -132,4 +132,5 @@ graphify watch .
 O diretório `target*` e `graphify-out/` estão excluídos por `.graphifyignore`. O checkout atual não é um repositório Git, então os hooks automáticos do Graphify não se aplicam. Em um checkout Git, eles podem ser instalados depois com `graphify hook install`.
 ## Consultas registradas
 
-- [`consulta-graphify-fasttube.md`](consulta-graphify-fasttube.md): diagnóstico do núcleo `FastTube`, acoplamentos, pontos de propagação e próxima melhoria estrutural.
+- [`consulta-graphify-fasttube.md`](consulta-graphify-fasttube.md): diagnóstico do núcleo `FastTube`, acoplamentos, pontos de propagação e evolução estrutural.
+- [`refatoracao-paralela-ui.md`](refatoracao-paralela-ui.md): resultado da rodada paralela, commits, modelos e próximos alvos.

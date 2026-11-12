@@ -4,12 +4,12 @@ Consulta realizada no grafo estrutural do FastTube em 11/11/2026. O objetivo foi
 
 ## Estado atual do grafo
 
-Após as extrações de tarefas assíncronas, do painel de configurações, da navegação lateral, da descoberta e das playlists:
+Após todas as refatorações de interface realizadas até 12/11/2026:
 
-- 1.255 nós, 3.478 relações e 66 comunidades.
-- `FastTube` possui 236 relações: 192 de métodos, 42 referências de tipos, 1 de conteúdo e 1 de implementação.
+- 1.297 nós, 3.679 relações e 68 comunidades.
+- `FastTube` possui 278 relações: 234 de métodos, 42 referências de tipos, 1 de conteúdo e 1 de implementação.
 - A estrutura `FastTube` declara 148 campos.
-- As duas implementações de `FastTube` contêm 189 métodos identificados antes da implementação de `eframe::App`.
+- As duas implementações de `FastTube` contêm 231 métodos identificados antes da implementação de `eframe::App`.
 - A estrutura e as implementações ocupam aproximadamente 11 mil linhas de `src/main.rs`.
 
 Evolução do grafo:
@@ -22,6 +22,7 @@ Evolução do grafo:
 | Após dividir `navigation_ui` | 1.249 | 3.443 | 67 | 230 |
 | Após dividir `browse_ui` | 1.253 | 3.464 | 65 | 234 |
 | Após dividir a aba de playlists | 1.255 | 3.478 | 66 | 236 |
+| Rodada paralela completa | 1.297 | 3.679 | 68 | 278 |
 
 Os métodos de interface ainda mais extensos são:
 
@@ -159,13 +160,11 @@ graphify explain "FeedFilter" --all
 graphify affected "RecommendationEngine" --depth 3
 ```
 
-## Próximo candidato
+## Rodada paralela
 
-O próximo método com tamanho relevante e risco menor que o player é `channel_section_ui`, com aproximadamente 347 linhas. A extração deve começar pela composição das abas e pelos estados compartilhados do canal.
+Todos os candidatos selecionados receberam uma passagem de refatoração em seis frentes isoladas. O resumo detalhado, commits, modelos e a lista de métodos que ainda merecem uma segunda passagem estão em [`refatoracao-paralela-ui.md`](refatoracao-paralela-ui.md).
 
-`watch_page_ui` permanece como etapa posterior porque integra layout do player, metadados e eventos de alta frequência. `player_ui` continua reservado para o final dessa série.
-
-A divisão dos campos de `FastTube` em um registro de tarefas assíncronas também é posterior. Ela exigirá alterações em muitos pontos e deve ocorrer somente depois que as novas fronteiras estiverem estáveis.
+O próximo alvo é uma segunda passagem em `player_ui`, agora com 613 linhas, seguida por `watch_page_ui`, com 321.
 
 ## Limitações
 
