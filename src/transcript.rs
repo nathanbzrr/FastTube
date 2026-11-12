@@ -87,13 +87,11 @@ fn timestamp_ms(s: &str) -> Option<u64> {
         2 => fraction.parse::<u64>().ok()? * 10,
         _ => fraction.get(..3)?.parse::<u64>().ok()?,
     };
-    Some(
-        hours
-            .checked_mul(3_600_000)?
-            .checked_add(minutes.checked_mul(60_000)?)?
-            .checked_add(sec.checked_mul(1000)?)?
-            .checked_add(millis.min(999))?,
-    )
+    hours
+        .checked_mul(3_600_000)?
+        .checked_add(minutes.checked_mul(60_000)?)?
+        .checked_add(sec.checked_mul(1000)?)?
+        .checked_add(millis.min(999))
 }
 fn strip_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

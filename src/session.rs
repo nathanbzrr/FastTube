@@ -15,27 +15,6 @@ pub fn profile_dir() -> Result<PathBuf, String> {
         .join("browser-profile"))
 }
 
-pub fn clear_profile() -> Result<(), String> {
-    let profile = profile_dir()?;
-    if !profile.exists() {
-        return Ok(());
-    }
-    let parent = profile.parent().ok_or("Pasta do FastTube indisponível")?;
-    let actual_parent = parent
-        .canonicalize()
-        .map_err(|_| "Pasta do FastTube indisponível")?;
-    let actual_profile = profile
-        .canonicalize()
-        .map_err(|_| "Perfil do navegador indisponível")?;
-    if actual_profile.parent() != Some(actual_parent.as_path())
-        || actual_profile.file_name() != Some(std::ffi::OsStr::new("browser-profile"))
-    {
-        return Err("Caminho de sessão inválido; o perfil não foi removido.".into());
-    }
-    std::fs::remove_dir_all(actual_profile)
-        .map_err(|_| "Não foi possível remover a sessão local do FastTube.".into())
-}
-
 fn browser_executable() -> Result<PathBuf, String> {
     // The registered Vivaldi installation is used when available, followed by Edge.
     for key in [
@@ -118,10 +97,10 @@ fn debug_json(port: u16, path: &str) -> Result<Value, String> {
             return Err("Resposta inválida do navegador".into());
         }
         bytes.extend_from_slice(&buffer[..count]);
-        if let Some(start) = bytes.windows(4).position(|x| x == b"\r\n\r\n") {
-            if let Ok(pages) = serde_json::from_slice(&bytes[start + 4..]) {
-                break pages;
-            }
+        if let Some(start) = bytes.windows(4).position(|x| x == b"\r\n\r\n")
+            && let Ok(pages) = serde_json::from_slice(&bytes[start + 4..])
+        {
+            break pages;
         }
     };
     Ok(pages)
@@ -260,30 +239,28 @@ pub fn youtube_cookies(interactive: bool, cancel: &Cancellation) -> Result<Vec<V
             }
             .into());
         }
-        if let Ok(cookies) = cookies(port) {
-            if signed_in(&cookies) {
-                // Closing through DevTools flushes the dedicated browser profile.
-                if let Ok(data) = debug_json(port, "/json/version") {
-                    if let Some(url) = data
-                        .get("webSocketDebuggerUrl")
-                        .and_then(Value::as_str)
-                        .filter(|url| url.starts_with(&format!("ws://127.0.0.1:{port}/")))
-                    {
-                        if let Ok((mut socket, _)) = tungstenite::connect(url) {
-                            let _ = socket.send(tungstenite::Message::Text(
-                                json!({"id":2,"method":"Browser.close"}).to_string().into(),
-                            ));
-                        }
-                    }
-                }
-                for _ in 0..50 {
-                    if browser.0.try_wait().ok().flatten().is_some() {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                return Ok(cookies);
+        if let Ok(cookies) = cookies(port)
+            && signed_in(&cookies)
+        {
+            // Closing through DevTools flushes the dedicated browser profile.
+            if let Ok(data) = debug_json(port, "/json/version")
+                && let Some(url) = data
+                    .get("webSocketDebuggerUrl")
+                    .and_then(Value::as_str)
+                    .filter(|url| url.starts_with(&format!("ws://127.0.0.1:{port}/")))
+                && let Ok((mut socket, _)) = tungstenite::connect(url)
+            {
+                let _ = socket.send(tungstenite::Message::Text(
+                    json!({"id":2,"method":"Browser.close"}).to_string().into(),
+                ));
             }
+            for _ in 0..50 {
+                if browser.0.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            return Ok(cookies);
         }
         if !interactive && start.elapsed() > Duration::from_secs(8) {
             return Err("Entre na sua conta Google para continuar.".into());
@@ -393,14 +370,14 @@ mod tests {
             socket.send(tungstenite::Message::Text(json!({"id":id,"method":"Network.setCookie","params":{"url":"https://www.youtube.com/","name":name,"value":"test-only","secure":true}}).to_string().into())).unwrap();
             loop {
                 let msg = socket.read().unwrap();
-                if let Ok(value) = serde_json::from_str::<Value>(msg.to_text().unwrap_or("")) {
-                    if value.get("id").and_then(Value::as_i64) == Some(id) {
-                        assert_eq!(
-                            value.pointer("/result/success").and_then(Value::as_bool),
-                            Some(true)
-                        );
-                        break;
-                    }
+                if let Ok(value) = serde_json::from_str::<Value>(msg.to_text().unwrap_or(""))
+                    && value.get("id").and_then(Value::as_i64) == Some(id)
+                {
+                    assert_eq!(
+                        value.pointer("/result/success").and_then(Value::as_bool),
+                        Some(true)
+                    );
+                    break;
                 }
             }
         }

@@ -156,10 +156,10 @@ impl ThumbnailCache {
             .cloned()
             .collect();
         for uri in removed {
-            if let Some(entry) = self.entries.remove(&uri) {
-                if matches!(entry.state, EntryState::Loading { .. }) {
-                    self.push_retired_in_flight(&uri, now);
-                }
+            if let Some(entry) = self.entries.remove(&uri)
+                && matches!(entry.state, EntryState::Loading { .. })
+            {
+                self.push_retired_in_flight(&uri, now);
             }
             ctx.forget_image(&uri);
         }

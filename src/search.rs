@@ -408,12 +408,10 @@ fn parse_home_feed(output: &[u8]) -> Result<HomeFeed, String> {
             .get("ie_key")
             .and_then(Value::as_str)
             .is_some_and(|s| s.eq_ignore_ascii_case("Youtube"))
+            && let Some(entry) = parse_video_entry(&value, true, None, None, None)
+            && crate::history::youtube_video_id(&entry.video.url).is_some()
         {
-            if let Some(entry) = parse_video_entry(&value, true, None, None, None) {
-                if crate::history::youtube_video_id(&entry.video.url).is_some() {
-                    feed.items.push(entry);
-                }
-            }
+            feed.items.push(entry);
         }
     }
     Ok(feed)
@@ -567,6 +565,7 @@ impl ChannelPageCache {
         });
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
     }
@@ -636,10 +635,12 @@ pub fn parse_channel_target(input: &str) -> Option<ChannelTarget> {
     parse_youtube_channel_url(trimmed)
 }
 
+#[cfg(test)]
 pub fn youtube_channel_url(input: &str) -> Option<String> {
     parse_channel_target(input).map(|target| target.canonical_url())
 }
 
+#[cfg(test)]
 pub fn youtube_channel_videos_url(input: &str) -> Option<String> {
     parse_channel_target(input).map(|target| target.videos_tab_url())
 }
@@ -791,10 +792,6 @@ pub(crate) fn ytdl_hook_path_option(path: &std::path::Path) -> String {
     format!("ytdl_hook-ytdl_path={value}")
 }
 
-pub fn resolutions(url: &str) -> Result<Vec<u32>, String> {
-    resolutions_with_cancel(url, &Cancellation::default())
-}
-
 pub fn resolutions_with_cancel(url: &str, cancellation: &Cancellation) -> Result<Vec<u32>, String> {
     let fetch = || {
         cached_resolutions(
@@ -861,11 +858,13 @@ fn fetch_resolutions(url: &str, cancellation: &Cancellation) -> Result<Vec<u32>,
     }
 }
 
+#[cfg(test)]
 pub fn find(query: &str) -> Result<Vec<Video>, String> {
     find_with_metadata(query)
         .map(|results| results.into_iter().map(|result| result.video).collect())
 }
 
+#[cfg(test)]
 pub fn find_with_metadata(query: &str) -> Result<Vec<SearchResult>, String> {
     find_with_cancel(query, &Cancellation::default())
 }
@@ -899,15 +898,18 @@ pub fn find_with_cancel(
     parse_results(&output.stdout, target.starts_with("ytsearch20:"))
 }
 
+#[cfg(test)]
 pub fn fetch_channel_page(input: &str) -> Result<ChannelPage, String> {
     fetch_channel_page_with_limit(input, DEFAULT_CHANNEL_VIDEOS_LIMIT)
 }
 
+#[cfg(test)]
 pub fn fetch_channel_page_with_limit(input: &str, limit: usize) -> Result<ChannelPage, String> {
     let (target, effective_limit) = parse_and_clamp_channel_request(input, limit)?;
     fetch_channel_page_for_target(&target, effective_limit)
 }
 
+#[cfg(test)]
 pub fn fetch_channel_page_with_cache(
     input: &str,
     limit: usize,
@@ -953,6 +955,7 @@ fn fetch_channel_page_cached_with(
     })
 }
 
+#[cfg(test)]
 fn fetch_channel_page_for_target(
     target: &ChannelTarget,
     effective_limit: usize,
@@ -1628,8 +1631,8 @@ pub fn youtube_playlist_url(playlist_id: &str) -> Option<String> {
 }
 
 fn extract_playlist_id(value: &Value) -> Option<String> {
-    if let Some(id) = nonempty_str(value, "id").filter(|id| is_valid_playlist_id(id)) {
-        if !crate::history::is_valid_video_id(id)
+    if let Some(id) = nonempty_str(value, "id").filter(|id| is_valid_playlist_id(id))
+        && (!crate::history::is_valid_video_id(id)
             || value
                 .get("_type")
                 .and_then(Value::as_str)
@@ -1637,18 +1640,17 @@ fn extract_playlist_id(value: &Value) -> Option<String> {
             || value
                 .get("ie_key")
                 .and_then(Value::as_str)
-                .is_some_and(|k| k.eq_ignore_ascii_case("YoutubeTab"))
-        {
-            return Some(id.to_owned());
-        }
+                .is_some_and(|k| k.eq_ignore_ascii_case("YoutubeTab")))
+    {
+        return Some(id.to_owned());
     }
     for key in ["url", "webpage_url"] {
-        if let Some(raw_url) = nonempty_str(value, key) {
-            if let Some(id) = raw_url.strip_prefix("https://www.youtube.com/playlist?list=") {
-                let id = id.split(['&', '#', '/']).next().unwrap_or("");
-                if is_valid_playlist_id(id) {
-                    return Some(id.to_owned());
-                }
+        if let Some(raw_url) = nonempty_str(value, key)
+            && let Some(id) = raw_url.strip_prefix("https://www.youtube.com/playlist?list=")
+        {
+            let id = id.split(['&', '#', '/']).next().unwrap_or("");
+            if is_valid_playlist_id(id) {
+                return Some(id.to_owned());
             }
         }
     }
@@ -1750,10 +1752,10 @@ fn parse_channel_playlists(output: &[u8], limit: usize) -> Result<Vec<ChannelPla
                 if playlists.len() >= effective_limit {
                     break;
                 }
-                if let Some(playlist) = parse_channel_playlist_entry(entry) {
-                    if seen_ids.insert(playlist.id.clone()) {
-                        playlists.push(playlist);
-                    }
+                if let Some(playlist) = parse_channel_playlist_entry(entry)
+                    && seen_ids.insert(playlist.id.clone())
+                {
+                    playlists.push(playlist);
                 }
             }
             return Ok(playlists);
@@ -1773,10 +1775,10 @@ fn parse_channel_playlists(output: &[u8], limit: usize) -> Result<Vec<ChannelPla
         }
         let value: Value = serde_json::from_slice(line)
             .map_err(|error| format!("Resposta inválida do yt-dlp: {error}"))?;
-        if let Some(playlist) = parse_channel_playlist_entry(&value) {
-            if seen_ids.insert(playlist.id.clone()) {
-                playlists.push(playlist);
-            }
+        if let Some(playlist) = parse_channel_playlist_entry(&value)
+            && seen_ids.insert(playlist.id.clone())
+        {
+            playlists.push(playlist);
         }
     }
     Ok(playlists)
@@ -1822,40 +1824,39 @@ fn parse_public_playlist_videos(output: &[u8], limit: usize) -> Result<Vec<Searc
     if output.iter().all(u8::is_ascii_whitespace) {
         return Ok(Vec::new());
     }
-    if let Ok(single_value) = serde_json::from_slice::<Value>(output) {
-        if let Some(entries) = single_value.get("entries").and_then(Value::as_array) {
-            let fallback_channel = [
-                "channel",
-                "uploader",
-                "playlist_channel",
-                "playlist_uploader",
-            ]
+    if let Ok(single_value) = serde_json::from_slice::<Value>(output)
+        && let Some(entries) = single_value.get("entries").and_then(Value::as_array)
+    {
+        let fallback_channel = [
+            "channel",
+            "uploader",
+            "playlist_channel",
+            "playlist_uploader",
+        ]
+        .into_iter()
+        .filter_map(|key| nonempty_str(&single_value, key))
+        .next();
+        let fallback_id = ["channel_id", "playlist_channel_id"]
             .into_iter()
             .filter_map(|key| nonempty_str(&single_value, key))
-            .next();
-            let fallback_id = ["channel_id", "playlist_channel_id"]
-                .into_iter()
-                .filter_map(|key| nonempty_str(&single_value, key))
-                .find(|candidate| is_valid_channel_id(candidate));
-            let fallback_url = ["channel_url", "uploader_url"]
-                .into_iter()
-                .filter_map(|key| nonempty_str(&single_value, key))
-                .find(|u| parse_channel_target(u).is_some());
-            let mut results = Vec::new();
-            for entry in entries {
-                if results.len() >= effective_limit {
-                    break;
-                }
-                if let Some(video) =
-                    parse_video_entry(entry, true, fallback_channel, fallback_id, fallback_url)
-                {
-                    if crate::history::youtube_video_id(&video.video.url).is_some() {
-                        results.push(video);
-                    }
-                }
+            .find(|candidate| is_valid_channel_id(candidate));
+        let fallback_url = ["channel_url", "uploader_url"]
+            .into_iter()
+            .filter_map(|key| nonempty_str(&single_value, key))
+            .find(|u| parse_channel_target(u).is_some());
+        let mut results = Vec::new();
+        for entry in entries {
+            if results.len() >= effective_limit {
+                break;
             }
-            return Ok(results);
+            if let Some(video) =
+                parse_video_entry(entry, true, fallback_channel, fallback_id, fallback_url)
+                && crate::history::youtube_video_id(&video.video.url).is_some()
+            {
+                results.push(video);
+            }
         }
+        return Ok(results);
     }
     let mut videos = parse_results(output, true)?;
     videos.retain(|item| crate::history::youtube_video_id(&item.video.url).is_some());

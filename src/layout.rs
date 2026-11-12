@@ -85,6 +85,7 @@ pub(crate) struct WatchColumns {
     pub(crate) gap: f32,
 }
 
+#[cfg(test)]
 pub(crate) fn compute_watch_columns(available_width: f32) -> WatchColumns {
     compute_watch_columns_for_mode(available_width, false)
 }
@@ -139,6 +140,7 @@ pub(crate) const fn watch_page_margin() -> f32 {
     WATCH_PAGE_MARGIN
 }
 
+#[cfg(test)]
 pub(crate) fn compute_player_size(
     column_width: f32,
     available_height: f32,
@@ -205,6 +207,7 @@ pub(crate) fn compute_header_search_layout(available_width: f32, reserve_right: 
     (leading_space, input_width)
 }
 
+#[cfg(test)]
 pub(crate) fn compute_navigation_width(viewport_width: f32) -> f32 {
     if viewport_width < 760.0 { 132.0 } else { 160.0 }
 }

@@ -102,17 +102,15 @@ pub fn youtube_video_id(url: &str) -> Option<String> {
                     }
                 }
                 found?
-            } else if let Some(segment) = ["/shorts/", "/embed/", "/live/", "/v/"]
-                .into_iter()
-                .find_map(|prefix| path.strip_prefix(prefix))
-            {
+            } else {
+                let segment = ["/shorts/", "/embed/", "/live/", "/v/"]
+                    .into_iter()
+                    .find_map(|prefix| path.strip_prefix(prefix))?;
                 let segment = segment.strip_suffix('/').unwrap_or(segment);
                 if segment.is_empty() || segment.contains('/') {
                     return None;
                 }
                 segment
-            } else {
-                return None;
             }
         }
         "youtube-nocookie.com" | "www.youtube-nocookie.com" => {

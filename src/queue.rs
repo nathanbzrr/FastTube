@@ -228,6 +228,7 @@ impl Queue {
         true
     }
 
+    #[cfg(test)]
     pub fn next(&mut self) -> Option<Video> {
         self.remove(0)
     }

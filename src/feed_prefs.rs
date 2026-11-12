@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
+#[cfg(not(test))]
+use std::path::PathBuf;
 use std::{
     fs,
     io::{self, Read},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -24,6 +26,7 @@ impl FeedPreferences {
                 .is_none_or(|selected| selected == channel)
     }
 }
+#[cfg(not(test))]
 pub fn path() -> io::Result<PathBuf> {
     let root = crate::history::history_path()?;
     Ok(root.with_file_name("feed-preferences.json"))

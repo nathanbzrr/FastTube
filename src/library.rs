@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(test))]
+use std::path::PathBuf;
 
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ITEMS: usize = 500;
@@ -43,6 +45,7 @@ pub struct Bookmark {
     pub note: String,
 }
 
+#[cfg(not(test))]
 pub fn path() -> io::Result<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA")
         .filter(|value| !value.is_empty())
@@ -72,7 +75,7 @@ pub fn load(path: &Path) -> io::Result<Library> {
     if root.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
         return Err(invalid());
     }
-    let mut library: Library =
+    let library: Library =
         serde_json::from_value(root.get("library").cloned().ok_or_else(invalid)?)
             .map_err(|_| invalid())?;
     library.validate().map_err(|_| invalid())?;

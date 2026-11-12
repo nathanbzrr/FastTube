@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
+#[cfg(not(test))]
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
@@ -18,8 +19,11 @@ const MAX_UPLOADS_PER_CHANNEL: usize = 5;
 const MAX_PLAYLISTS: usize = 100;
 const MAX_PLAYLIST_VIDEOS: usize = 200;
 const PROGRESS_CHANNEL_BATCH: usize = 5;
+#[cfg(not(test))]
 const MAX_SESSION_BYTES: usize = 64 * 1024;
+#[cfg(not(test))]
 static SESSION_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(not(test))]
 static SESSION_TEMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -139,17 +143,19 @@ impl TokenSession {
     }
 }
 
+#[cfg(not(test))]
 fn session_path() -> Result<PathBuf, String> {
     Ok(crate::settings::settings_path()
         .map_err(|_| "Não foi possível localizar a pasta de configurações.")?
         .with_file_name("google-session.bin"))
 }
 
+#[cfg(not(test))]
 pub fn load_session() -> Result<Option<TokenSession>, String> {
     let _guard = SESSION_LOCK
         .lock()
         .map_err(|_| "Falha ao acessar a sessão local.")?;
-    let mut file = match std::fs::File::open(session_path()?) {
+    let file = match std::fs::File::open(session_path()?) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err("Não foi possível ler a sessão Google local.".into()),
@@ -169,6 +175,7 @@ pub fn load_session() -> Result<Option<TokenSession>, String> {
         .map_err(|_| "Sessão Google local inválida.".into())
 }
 
+#[cfg(not(test))]
 pub fn save_session(session: &TokenSession) -> Result<(), String> {
     let _guard = SESSION_LOCK
         .lock()
@@ -213,7 +220,7 @@ pub fn save_session(session: &TokenSession) -> Result<(), String> {
     result
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn atomic_replace(from: &std::path::Path, to: &std::path::Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -234,11 +241,12 @@ fn atomic_replace(from: &std::path::Path, to: &std::path::Path) -> Result<(), St
         Ok(())
     }
 }
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(test)))]
 fn atomic_replace(from: &std::path::Path, to: &std::path::Path) -> Result<(), String> {
     std::fs::rename(from, to).map_err(|_| "Não foi possível salvar a sessão Google.".into())
 }
 
+#[cfg(not(test))]
 pub fn delete_session() -> Result<(), String> {
     let _guard = SESSION_LOCK
         .lock()
@@ -1197,6 +1205,7 @@ pub fn subscriptions_feed(
     })
 }
 
+#[cfg(test)]
 fn subscriptions_feed_with<F>(
     cancel: &Cancellation,
     mut progress: impl FnMut(SubscriptionProgress),

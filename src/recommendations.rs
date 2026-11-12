@@ -1,4 +1,4 @@
-use crate::history::{self, Entry as HistoryEntry, History};
+use crate::history::{self, History};
 use crate::queue::Queue;
 use crate::search::{Video, VideoMetadata};
 use std::collections::{HashMap, HashSet};
@@ -64,7 +64,6 @@ pub struct ScoredVideo {
     pub video: Video,
     pub metadata: VideoMetadata,
     pub score: f64,
-    pub reason: Option<String>,
     pub is_short: bool,
 }
 
@@ -143,6 +142,7 @@ impl UserProfile {
         profile
     }
 
+    #[cfg(test)]
     pub fn has_personal_signals(&self) -> bool {
         !self.channel_weights.is_empty()
             || !self.token_weights.is_empty()
@@ -279,7 +279,6 @@ impl RecommendationEngine {
         filter: &FeedFilter,
     ) -> ScoredVideo {
         let mut score = 20.0;
-        let mut top_reason: Option<(&'static str, f64)> = None;
 
         let channel_key = normalize_channel_key(&video.channel);
         let video_tokens = extract_significant_tokens(&video.title);
@@ -298,7 +297,6 @@ impl RecommendationEngine {
         if channel_affinity > 0.0 {
             let boost = (channel_affinity * 7.5).min(34.0);
             score += boost;
-            update_reason(&mut top_reason, "Canal que você assiste", boost);
         }
 
         // 2. Afinidade por tópicos / palavras-chave / hashtags
@@ -318,15 +316,14 @@ impl RecommendationEngine {
         if token_match_sum > 0.0 {
             let boost = (token_match_sum * 5.2).min(28.0);
             score += boost;
-            update_reason(&mut top_reason, "Recomendado para você", boost);
         }
 
         // 3. Contexto do vídeo em reprodução (para barra lateral / próximos vídeos)
-        if let Some(active_ch) = &profile.active_channel {
-            if !channel_key.is_empty() && &channel_key == active_ch {
-                score += 15.0;
-                update_reason(&mut top_reason, "Do mesmo canal", 15.0);
-            }
+        if let Some(active_ch) = &profile.active_channel
+            && !channel_key.is_empty()
+            && &channel_key == active_ch
+        {
+            score += 15.0;
         }
         if !profile.active_tokens.is_empty() {
             let shared = video_tokens
@@ -336,31 +333,24 @@ impl RecommendationEngine {
             if shared > 0 {
                 let boost = (shared as f64 * 6.5).min(20.0);
                 score += boost;
-                update_reason(&mut top_reason, "Relacionado", boost);
             }
         }
 
         // 4. Frescor do envio (Recency boost)
-        if let Some(upload_raw) = metadata.and_then(|m| m.upload_date.as_deref()) {
-            if let Some(upload_epoch) = parse_upload_date_epoch(upload_raw) {
-                let age_hours = ((reference_epoch - upload_epoch).max(0) as f64) / 3600.0;
-                let freshness = 32.0 * (-age_hours / 84.0).exp();
-                score += freshness;
-                if age_hours <= 12.0 {
-                    update_reason(&mut top_reason, "Novo envio", freshness);
-                }
-            }
+        if let Some(upload_raw) = metadata.and_then(|m| m.upload_date.as_deref())
+            && let Some(upload_epoch) = parse_upload_date_epoch(upload_raw)
+        {
+            let age_hours = ((reference_epoch - upload_epoch).max(0) as f64) / 3600.0;
+            let freshness = 32.0 * (-age_hours / 84.0).exp();
+            score += freshness;
         }
 
         // 5. Sinal de popularidade / engajamento (logarítmico para não esmagar canais menores)
-        if let Some(views) = metadata.and_then(|m| m.view_count) {
-            if views > 0 {
-                let pop_boost = ((views as f64 + 1.0).log10() * 2.2).min(13.0);
-                score += pop_boost;
-                if views >= 100_000 && top_reason.is_none() {
-                    update_reason(&mut top_reason, "Em alta", pop_boost);
-                }
-            }
+        if let Some(views) = metadata.and_then(|m| m.view_count)
+            && views > 0
+        {
+            let pop_boost = ((views as f64 + 1.0).log10() * 2.2).min(13.0);
+            score += pop_boost;
         }
 
         // 6. Adequação à duração preferida do usuário
@@ -385,35 +375,24 @@ impl RecommendationEngine {
                 }
                 Some(WatchedState::InProgress(_)) => {
                     score += 14.0;
-                    top_reason = Some(("Continuar assistindo", 99.0));
                 }
                 None => {}
             }
         }
 
         // 8. Ajustes específicos por modo de filtro
-        match filter {
-            FeedFilter::NewToYou => {
-                if channel_affinity == 0.0 {
-                    score += 22.0;
-                    top_reason = Some(("Novidade para você", 30.0));
-                } else {
-                    score -= channel_affinity * 5.0;
-                }
+        if matches!(filter, FeedFilter::NewToYou) {
+            if channel_affinity == 0.0 {
+                score += 22.0;
+            } else {
+                score -= channel_affinity * 5.0;
             }
-            FeedFilter::Recommended => {
-                if top_reason.is_none() && profile.has_personal_signals() {
-                    top_reason = Some(("Para você", 10.0));
-                }
-            }
-            _ => {}
         }
 
         ScoredVideo {
             video: video.clone(),
             metadata: metadata.cloned().unwrap_or_default(),
             score,
-            reason: top_reason.map(|(label, _)| label.to_owned()),
             is_short,
         }
     }
@@ -493,12 +472,6 @@ impl RecommendationEngine {
     }
 }
 
-fn update_reason(current: &mut Option<(&'static str, f64)>, label: &'static str, weight: f64) {
-    if current.is_none_or(|(_, best)| weight > best) {
-        *current = Some((label, weight));
-    }
-}
-
 pub fn matches_filter(
     video: &Video,
     metadata: Option<&VideoMetadata>,
@@ -514,10 +487,10 @@ pub fn matches_filter(
         FeedFilter::Live => is_live_video(video, metadata),
         FeedFilter::Mixes => is_music_video(video, metadata) || is_podcast_video(video, metadata),
         FeedFilter::NewToYou => {
-            if let Some(id) = history::youtube_video_id(&video.url) {
-                if profile.watched_states.contains_key(&id) {
-                    return false;
-                }
+            if let Some(id) = history::youtube_video_id(&video.url)
+                && profile.watched_states.contains_key(&id)
+            {
+                return false;
             }
             let ch_key = normalize_channel_key(&video.channel);
             let ch_weight = profile.channel_weights.get(&ch_key).copied().unwrap_or(0.0);
@@ -559,10 +532,11 @@ pub fn is_short_video(video: &Video, metadata: Option<&VideoMetadata>) -> bool {
             return true;
         }
     }
-    if let Some(secs) = parse_duration_seconds(&video.duration) {
-        if secs > 0.0 && secs <= 62.0 {
-            return true;
-        }
+    if let Some(secs) = parse_duration_seconds(&video.duration)
+        && secs > 0.0
+        && secs <= 62.0
+    {
+        return true;
     }
     false
 }
@@ -616,10 +590,10 @@ pub fn is_podcast_video(video: &Video, metadata: Option<&VideoMetadata>) -> bool
     if KEYWORDS.iter().any(|kw| text.contains(kw)) {
         return true;
     }
-    if let Some(secs) = parse_duration_seconds(&video.duration) {
-        if secs >= 1500.0 {
-            return true;
-        }
+    if let Some(secs) = parse_duration_seconds(&video.duration)
+        && secs >= 1500.0
+    {
+        return true;
     }
     false
 }
@@ -942,6 +916,7 @@ pub fn channel_avatar_initials(channel_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::Entry as HistoryEntry;
 
     fn sample_video(id: &str, title: &str, channel: &str, duration: &str) -> Video {
         Video {

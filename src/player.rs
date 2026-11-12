@@ -1,4 +1,4 @@
-use crate::settings::{BufferProfile, BufferSettings};
+use crate::settings::BufferSettings;
 use eframe::egui::{self, Rect};
 use eframe::egui_glow;
 use eframe::glow;
@@ -135,6 +135,7 @@ impl VideoWindow {
         self.hwnd
     }
 
+    #[cfg(test)]
     pub(crate) fn is_visible(&self) -> bool {
         self.visible
     }
@@ -147,10 +148,8 @@ impl VideoWindow {
         unsafe {
             ShowWindow(self.hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
         }
-        if visible {
-            if let Some((rect, scale)) = self.last_rect {
-                self.apply_bounds(rect, scale);
-            }
+        if visible && let Some((rect, scale)) = self.last_rect {
+            self.apply_bounds(rect, scale);
         }
     }
 
@@ -320,16 +319,16 @@ unsafe extern "C" fn mpv_get_proc_address(_ctx: *mut c_void, name: *const c_char
             return *symbol as usize as *mut c_void;
         }
     }
-    if let Some(library) = egl() {
-        if let Ok(egl_get_proc_address) = unsafe {
+    if let Some(library) = egl()
+        && let Ok(egl_get_proc_address) = unsafe {
             library.get::<unsafe extern "system" fn(*const c_char) -> *mut c_void>(
                 b"eglGetProcAddress\0",
             )
-        } {
-            let address = unsafe { egl_get_proc_address(name) };
-            if !address.is_null() {
-                return address;
-            }
+        }
+    {
+        let address = unsafe { egl_get_proc_address(name) };
+        if !address.is_null() {
+            return address;
         }
     }
     ptr::null_mut()
@@ -594,10 +593,10 @@ impl Player {
     fn load_library() -> Result<Library, String> {
         for name in ["libmpv-2.dll", "mpv-2.dll"] {
             let mut candidates = Vec::new();
-            if let Ok(executable) = std::env::current_exe() {
-                if let Some(directory) = executable.parent() {
-                    candidates.push(directory.join(name));
-                }
+            if let Ok(executable) = std::env::current_exe()
+                && let Some(directory) = executable.parent()
+            {
+                candidates.push(directory.join(name));
             }
             if let Ok(directory) = std::env::current_dir() {
                 candidates.push(directory.join(name));
@@ -760,10 +759,10 @@ impl Player {
                 "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best".to_owned(),
             ),
         ]);
-        if let Ok(executable) = std::env::current_exe() {
-            if let Some(yt_dlp) = crate::search::bundled_yt_dlp(&executable) {
-                options.push(("script-opts", crate::search::ytdl_hook_path_option(&yt_dlp)));
-            }
+        if let Ok(executable) = std::env::current_exe()
+            && let Some(yt_dlp) = crate::search::bundled_yt_dlp(&executable)
+        {
+            options.push(("script-opts", crate::search::ytdl_hook_path_option(&yt_dlp)));
         }
         options
     }
@@ -869,10 +868,10 @@ impl Player {
         } else {
             self.run(&["loadfile", url, "replace"])
         };
-        if result.is_err() {
-            if let Some(previous) = previous {
-                let _ = self.set("options/ytdl-format", &previous);
-            }
+        if result.is_err()
+            && let Some(previous) = previous
+        {
+            let _ = self.set("options/ytdl-format", &previous);
         }
         result
     }
@@ -880,10 +879,7 @@ impl Player {
     pub fn poll_events(&self) -> (Vec<crate::queue::PlaybackEvent>, Option<String>) {
         let mut events = Vec::new();
         let mut error = None;
-        loop {
-            let Some(event) = (unsafe { (self.wait_event)(self.handle, 0.0).as_ref() }) else {
-                break;
-            };
+        while let Some(event) = unsafe { (self.wait_event)(self.handle, 0.0).as_ref() } {
             match event.event_id {
                 0 => break,
                 6 if !event.data.is_null() => {
@@ -920,12 +916,6 @@ impl Player {
         if let Some(window) = &mut self.window {
             window.resize(rect, scale);
         }
-    }
-
-    /// Indica se o vídeo é desenhado pelo egui (render API), permitindo
-    /// controles sobrepostos reais. O modo embutido antigo retorna `false`.
-    pub fn renders_overlay(&self) -> bool {
-        self.render.is_some()
     }
 
     /// Desenha o quadro atual do libmpv dentro de `rect`.
@@ -1012,6 +1002,7 @@ unsafe fn create_render_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BufferProfile;
     use eframe::egui::Pos2;
     use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::UI::WindowsAndMessaging::{GWL_STYLE, GetClientRect, GetWindowLongW};

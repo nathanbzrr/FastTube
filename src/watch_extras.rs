@@ -424,18 +424,20 @@ mod tests {
 
     #[test]
     fn reset_comments_clears_state_and_cancels_pending_requests() {
-        let mut state = WatchExtras::default();
-        state.comments = vec![oauth::Comment {
-            id: "comment-1".into(),
-            author: "Ana".into(),
-            text: "texto".into(),
-            published: String::new(),
-            likes: 0,
-            replies: 1,
-        }];
-        state.comments_next = Some("next".into());
-        state.comments_error = Some("erro".into());
-        state.comments_loaded = true;
+        let mut state = WatchExtras {
+            comments: vec![oauth::Comment {
+                id: "comment-1".into(),
+                author: "Ana".into(),
+                text: "texto".into(),
+                published: String::new(),
+                likes: 0,
+                replies: 1,
+            }],
+            comments_next: Some("next".into()),
+            comments_error: Some("erro".into()),
+            comments_loaded: true,
+            ..WatchExtras::default()
+        };
         let comments_cancel = process::Cancellation::default();
         state.comments_cancel = Some(comments_cancel.clone());
         let (sender, receiver) = mpsc::channel();

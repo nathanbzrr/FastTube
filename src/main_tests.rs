@@ -2648,7 +2648,6 @@ fn concurrent_searches_and_channel_fetches_ignore_stale_results_and_handle_error
                 view_count: Some(7_777),
                 upload_date: Some("20261106".into()),
                 description: Some("Vídeo do canal Rust.".into()),
-                ..Default::default()
             },
         }],
     };
@@ -2823,7 +2822,6 @@ fn channel_view_preserves_navigation_queue_player_themes_history_and_thumbnail_c
                     view_count: Some(10_000),
                     upload_date: Some("20261106".into()),
                     description: Some("Vídeo com canal válido.".into()),
-                    ..Default::default()
                 },
             },
             SearchResult {
@@ -2926,7 +2924,6 @@ fn channel_view_preserves_navigation_queue_player_themes_history_and_thumbnail_c
                 view_count: Some(88_888),
                 upload_date: Some("20261105".into()),
                 description: Some("Vídeo exclusivo da aba do canal.".into()),
-                ..Default::default()
             },
         }],
     };
