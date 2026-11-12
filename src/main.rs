@@ -8994,28 +8994,7 @@ impl FastTube {
         let len = self.queue.len();
         let limit = self.queue.limit();
         let palette = self.palette();
-        let mut advance_clicked = false;
-        ui.horizontal(|ui| {
-            let heading_size = if compact { 15.0 } else { 17.0 };
-            ui.label(
-                RichText::new("Fila de reprodução")
-                    .size(heading_size)
-                    .strong(),
-            );
-            ui.label(RichText::new(format!("({len}/{limit})")).small().weak());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(
-                        !queued.is_empty(),
-                        egui::Button::new(RichText::new("⏭ Próximo").small()),
-                    )
-                    .on_hover_text("Avançar manualmente para o próximo vídeo da fila")
-                    .clicked()
-                {
-                    advance_clicked = true;
-                }
-            });
-        });
+        let advance_clicked = Self::queue_heading_ui(ui, compact, len, limit, !queued.is_empty());
         if let Some(error) = &self.queue_persistence_error {
             ui.colored_label(Color32::RED, error);
         }
@@ -9159,6 +9138,38 @@ impl FastTube {
         if advance_clicked {
             self.request_queue_advance();
         }
+    }
+
+    fn queue_heading_ui(
+        ui: &mut egui::Ui,
+        compact: bool,
+        len: usize,
+        limit: usize,
+        has_queued: bool,
+    ) -> bool {
+        let mut advance_clicked = false;
+        ui.horizontal(|ui| {
+            let heading_size = if compact { 15.0 } else { 17.0 };
+            ui.label(
+                RichText::new("Fila de reprodução")
+                    .size(heading_size)
+                    .strong(),
+            );
+            ui.label(RichText::new(format!("({len}/{limit})")).small().weak());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        has_queued,
+                        egui::Button::new(RichText::new("⏭ Próximo").small()),
+                    )
+                    .on_hover_text("Avançar manualmente para o próximo vídeo da fila")
+                    .clicked()
+                {
+                    advance_clicked = true;
+                }
+            });
+        });
+        advance_clicked
     }
 
     fn history_entry_card_ui(
@@ -10135,16 +10146,7 @@ impl FastTube {
         let palette = self.palette();
         let metadata = self.metadata_for(&video.url).cloned();
         let channel_target = self.channel_target_for_video(video);
-        let history_entry =
-            history::youtube_video_id(&video.url).and_then(|id| self.history.get(&id).cloned());
-        let progress_ratio = history_entry.as_ref().and_then(|entry| {
-            let duration_ms = entry.duration_ms? as f32;
-            if duration_ms <= 0.0 || entry.position_ms == 0 {
-                None
-            } else {
-                Some((entry.position_ms as f32 / duration_ms).clamp(0.04, 1.0))
-            }
-        });
+        let progress_ratio = self.youtube_search_progress_ratio(&video.url);
         let description = description_snippet(
             metadata
                 .as_ref()
@@ -10293,6 +10295,19 @@ impl FastTube {
             open_channel,
             filter_channel,
         )
+    }
+
+    fn youtube_search_progress_ratio(&self, url: &str) -> Option<f32> {
+        let history_entry =
+            history::youtube_video_id(url).and_then(|id| self.history.get(&id).cloned());
+        history_entry.as_ref().and_then(|entry| {
+            let duration_ms = entry.duration_ms? as f32;
+            if duration_ms <= 0.0 || entry.position_ms == 0 {
+                None
+            } else {
+                Some((entry.position_ms as f32 / duration_ms).clamp(0.04, 1.0))
+            }
+        })
     }
 
     fn search_results_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> Option<Video> {
@@ -10829,24 +10844,7 @@ impl FastTube {
                 ui.spinner();
             }
         });
-        let mut follow = self.watch_extras.transcript_follow;
-        let mut font_size = self.watch_extras.transcript_font_size.clamp(13.0, 24.0);
-        if self.watch_extras.transcript_font_size <= 0.0 {
-            font_size = 16.0;
-        }
-        let mut high_contrast = self.watch_extras.transcript_high_contrast;
-        ui.horizontal_wrapped(|ui| {
-            ui.checkbox(&mut follow, "Acompanhar reprodução");
-            ui.checkbox(&mut high_contrast, "Alto contraste");
-            ui.add(
-                egui::Slider::new(&mut font_size, 13.0..=24.0)
-                    .integer()
-                    .text("Tamanho"),
-            );
-        });
-        self.watch_extras.transcript_follow = follow;
-        self.watch_extras.transcript_font_size = font_size;
-        self.watch_extras.transcript_high_contrast = high_contrast;
+        let (font_size, high_contrast) = self.transcript_settings_ui(ui);
         if let Some(error) = &self.watch_extras.transcript_error {
             ui.colored_label(self.palette().warning_fg, error);
         }
@@ -11031,6 +11029,28 @@ impl FastTube {
                 }
             }
         }
+    }
+
+    fn transcript_settings_ui(&mut self, ui: &mut egui::Ui) -> (f32, bool) {
+        let mut follow = self.watch_extras.transcript_follow;
+        let mut font_size = self.watch_extras.transcript_font_size.clamp(13.0, 24.0);
+        if self.watch_extras.transcript_font_size <= 0.0 {
+            font_size = 16.0;
+        }
+        let mut high_contrast = self.watch_extras.transcript_high_contrast;
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut follow, "Acompanhar reprodução");
+            ui.checkbox(&mut high_contrast, "Alto contraste");
+            ui.add(
+                egui::Slider::new(&mut font_size, 13.0..=24.0)
+                    .integer()
+                    .text("Tamanho"),
+            );
+        });
+        self.watch_extras.transcript_follow = follow;
+        self.watch_extras.transcript_font_size = font_size;
+        self.watch_extras.transcript_high_contrast = high_contrast;
+        (font_size, high_contrast)
     }
 
     fn library_video_section_ui(
