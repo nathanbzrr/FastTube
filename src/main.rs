@@ -8146,24 +8146,14 @@ impl FastTube {
         )
     }
 
-    fn channel_playlist_detail_ui(
-        &mut self,
+    fn channel_playlist_detail_header_ui(
+        &self,
         ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        scroll_id: &str,
-        compact: bool,
-        max_card_width: Option<f32>,
-        card_max_w: f32,
-        selected_playlist: search::ChannelPlaylist,
-        palette: ThemePalette,
-    ) -> Option<Video> {
-        let mut chosen = None;
+        selected_playlist: &search::ChannelPlaylist,
+        loading_videos: bool,
+    ) -> (bool, bool) {
         let mut back_to_playlists = false;
         let mut reload_playlist = false;
-        let mut cancel_playlist_videos = false;
-        let loading_videos = self.is_channel_playlist_videos_loading();
-        let videos_error = self.channel_playlist_videos_error.clone();
-        let videos_loaded = self.channel_playlist_videos_loaded;
 
         ui.horizontal_wrapped(|ui| {
             if ui
@@ -8192,104 +8182,180 @@ impl FastTube {
         });
         ui.add_space(6.0);
 
-        if loading_videos {
-            egui::Frame::new()
-                .fill(palette.info_box_bg)
-                .stroke(egui::Stroke::new(1.0, palette.info_box_stroke))
-                .corner_radius(6)
-                .inner_margin(egui::Margin::symmetric(12, 8))
-                .show(ui, |ui| {
-                    ui.set_min_width(card_max_w);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spinner();
-                        ui.label(
-                            RichText::new("Carregando vídeos da playlist pública...")
-                                .color(palette.info_accent_fg),
-                        );
-                        if ui.button(RichText::new("Cancelar").small()).clicked() {
-                            cancel_playlist_videos = true;
-                        }
-                    });
-                });
-            ui.add_space(6.0);
-        }
+        (back_to_playlists, reload_playlist)
+    }
 
-        if let Some(err) = &videos_error {
-            egui::Frame::new()
-                .fill(palette.error_bg)
-                .stroke(egui::Stroke::new(1.0, palette.error_stroke))
-                .corner_radius(6)
-                .inner_margin(egui::Margin::symmetric(12, 8))
-                .show(ui, |ui| {
-                    ui.set_min_width(card_max_w);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            RichText::new(format!("Erro ao carregar vídeos da playlist: {err}"))
-                                .color(palette.error_banner_fg),
-                        );
-                        if ui
-                            .button(RichText::new("↻ Tentar novamente").small())
-                            .clicked()
-                        {
-                            reload_playlist = true;
-                        }
-                    });
-                });
-            ui.add_space(6.0);
-        }
+    fn channel_playlist_detail_loading_ui(
+        &self,
+        ui: &mut egui::Ui,
+        card_max_w: f32,
+        palette: ThemePalette,
+    ) -> bool {
+        let mut cancel_playlist_videos = false;
 
-        if videos_loaded && self.channel_playlist_videos.is_empty() && videos_error.is_none() {
-            egui::Frame::new()
-                .fill(palette.card_alt_bg)
-                .corner_radius(6)
-                .inner_margin(egui::Margin::symmetric(12, 10))
-                .show(ui, |ui| {
-                    ui.set_min_width(card_max_w);
+        egui::Frame::new()
+            .fill(palette.info_box_bg)
+            .stroke(egui::Stroke::new(1.0, palette.info_box_stroke))
+            .corner_radius(6)
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_min_width(card_max_w);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spinner();
                     ui.label(
-                        RichText::new("Nenhum vídeo público disponível nesta playlist.").weak(),
+                        RichText::new("Carregando vídeos da playlist pública...")
+                            .color(palette.info_accent_fg),
                     );
-                });
-        } else if !self.channel_playlist_videos.is_empty() {
-            let current_url = self.selected.as_ref().map(|video| video.url.clone());
-            let playlist_videos: Vec<Video> = self
-                .channel_playlist_videos
-                .iter()
-                .map(|item| item.video.clone())
-                .collect();
-            self.thumbnails.begin_pass();
-            egui::ScrollArea::vertical()
-                .id_salt(format!("{scroll_id}_playlist_videos"))
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    let target_width = max_card_width
-                        .map(|limit| ui.available_width().min(limit))
-                        .unwrap_or_else(|| ui.available_width());
-                    for (index, video) in playlist_videos.iter().enumerate() {
-                        let is_playing = current_url.as_deref() == Some(video.url.as_str());
-                        ui.push_id(("chan_pl_vid", index), |ui| {
-                            ui.scope(|ui| {
-                                ui.set_max_width(target_width);
-                                if self.video_card_ui(ui, ctx, video, compact, is_playing) {
-                                    chosen = Some(video.clone());
-                                }
-                            });
-                        });
-                        ui.add_space(6.0);
-                    }
-                    if playlist_videos.len() >= search::MAX_CHANNEL_PLAYLIST_VIDEOS_LIMIT {
-                        ui.label(
-                            RichText::new(format!(
-                                "Exibindo até o limite de {} vídeos por playlist pública.",
-                                search::MAX_CHANNEL_PLAYLIST_VIDEOS_LIMIT
-                            ))
-                            .small()
-                            .weak(),
-                        );
+                    if ui.button(RichText::new("Cancelar").small()).clicked() {
+                        cancel_playlist_videos = true;
                     }
                 });
-            self.thumbnails.end_pass(ctx);
+            });
+        ui.add_space(6.0);
+
+        cancel_playlist_videos
+    }
+
+    fn channel_playlist_detail_error_ui(
+        &self,
+        ui: &mut egui::Ui,
+        card_max_w: f32,
+        palette: ThemePalette,
+        err: &str,
+    ) -> bool {
+        let mut reload_playlist = false;
+
+        egui::Frame::new()
+            .fill(palette.error_bg)
+            .stroke(egui::Stroke::new(1.0, palette.error_stroke))
+            .corner_radius(6)
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_min_width(card_max_w);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!("Erro ao carregar vídeos da playlist: {err}"))
+                            .color(palette.error_banner_fg),
+                    );
+                    if ui
+                        .button(RichText::new("↻ Tentar novamente").small())
+                        .clicked()
+                    {
+                        reload_playlist = true;
+                    }
+                });
+            });
+        ui.add_space(6.0);
+
+        reload_playlist
+    }
+
+    fn channel_playlist_detail_empty_ui(
+        &self,
+        ui: &mut egui::Ui,
+        card_max_w: f32,
+        palette: ThemePalette,
+    ) {
+        egui::Frame::new()
+            .fill(palette.card_alt_bg)
+            .corner_radius(6)
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.set_min_width(card_max_w);
+                ui.label(RichText::new("Nenhum vídeo público disponível nesta playlist.").weak());
+            });
+    }
+
+    fn channel_playlist_detail_status_ui(
+        &self,
+        ui: &mut egui::Ui,
+        card_max_w: f32,
+        palette: ThemePalette,
+        loading_videos: bool,
+        videos_error: Option<&str>,
+        videos_loaded: bool,
+        has_videos: bool,
+    ) -> (bool, bool) {
+        let mut cancel_playlist_videos = false;
+        let mut reload_playlist = false;
+
+        if loading_videos && self.channel_playlist_detail_loading_ui(ui, card_max_w, palette) {
+            cancel_playlist_videos = true;
         }
 
+        if let Some(err) = videos_error {
+            if self.channel_playlist_detail_error_ui(ui, card_max_w, palette, err) {
+                reload_playlist = true;
+            }
+        }
+
+        if videos_loaded && !has_videos && videos_error.is_none() {
+            self.channel_playlist_detail_empty_ui(ui, card_max_w, palette);
+        }
+
+        (cancel_playlist_videos, reload_playlist)
+    }
+
+    fn channel_playlist_detail_videos_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        scroll_id: &str,
+        compact: bool,
+        max_card_width: Option<f32>,
+    ) -> Option<Video> {
+        let mut chosen = None;
+        let current_url = self.selected.as_ref().map(|video| video.url.clone());
+        let playlist_videos: Vec<Video> = self
+            .channel_playlist_videos
+            .iter()
+            .map(|item| item.video.clone())
+            .collect();
+
+        self.thumbnails.begin_pass();
+        egui::ScrollArea::vertical()
+            .id_salt(format!("{scroll_id}_playlist_videos"))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let target_width = max_card_width
+                    .map(|limit| ui.available_width().min(limit))
+                    .unwrap_or_else(|| ui.available_width());
+                for (index, video) in playlist_videos.iter().enumerate() {
+                    let is_playing = current_url.as_deref() == Some(video.url.as_str());
+                    ui.push_id(("chan_pl_vid", index), |ui| {
+                        ui.scope(|ui| {
+                            ui.set_max_width(target_width);
+                            if self.video_card_ui(ui, ctx, video, compact, is_playing) {
+                                chosen = Some(video.clone());
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                }
+                if playlist_videos.len() >= search::MAX_CHANNEL_PLAYLIST_VIDEOS_LIMIT {
+                    ui.label(
+                        RichText::new(format!(
+                            "Exibindo até o limite de {} vídeos por playlist pública.",
+                            search::MAX_CHANNEL_PLAYLIST_VIDEOS_LIMIT
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                }
+            });
+        self.thumbnails.end_pass(ctx);
+
+        chosen
+    }
+
+    fn channel_playlist_detail_handle_actions(
+        &mut self,
+        ctx: &egui::Context,
+        selected_playlist: search::ChannelPlaylist,
+        back_to_playlists: bool,
+        cancel_playlist_videos: bool,
+        reload_playlist: bool,
+    ) {
         if back_to_playlists {
             self.close_channel_public_playlist(ctx);
         } else if cancel_playlist_videos {
@@ -8297,7 +8363,53 @@ impl FastTube {
         } else if reload_playlist {
             self.open_channel_public_playlist(selected_playlist, ctx);
         }
-        return chosen;
+    }
+
+    fn channel_playlist_detail_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        scroll_id: &str,
+        compact: bool,
+        max_card_width: Option<f32>,
+        card_max_w: f32,
+        selected_playlist: search::ChannelPlaylist,
+        palette: ThemePalette,
+    ) -> Option<Video> {
+        let loading_videos = self.is_channel_playlist_videos_loading();
+        let videos_error = self.channel_playlist_videos_error.clone();
+        let videos_loaded = self.channel_playlist_videos_loaded;
+
+        let (back_to_playlists, reload_header) =
+            self.channel_playlist_detail_header_ui(ui, &selected_playlist, loading_videos);
+
+        let (cancel_playlist_videos, reload_status) = self.channel_playlist_detail_status_ui(
+            ui,
+            card_max_w,
+            palette,
+            loading_videos,
+            videos_error.as_deref(),
+            videos_loaded,
+            !self.channel_playlist_videos.is_empty(),
+        );
+
+        let reload_playlist = reload_header || reload_status;
+
+        let mut chosen = None;
+        if !self.channel_playlist_videos.is_empty() {
+            chosen =
+                self.channel_playlist_detail_videos_ui(ui, ctx, scroll_id, compact, max_card_width);
+        }
+
+        self.channel_playlist_detail_handle_actions(
+            ctx,
+            selected_playlist,
+            back_to_playlists,
+            cancel_playlist_videos,
+            reload_playlist,
+        );
+
+        chosen
     }
 
     fn channel_playlists_list_ui(
