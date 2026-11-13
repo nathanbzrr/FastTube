@@ -24,4 +24,4 @@ sha2 = '0.10'
 url = '2'
 reqwest = { version = '0.12', default-features = false, features = ['blocking', 'json', 'rustls-tls'] }
 tungstenite = '0.29'
-windows-sys = { version = '0.61', features = ['Win32_Foundation', 'Win32_Security_Cryptography', 'Win32_Storage_FileSystem', 'Win32_UI_WindowsAndMessaging'] }
+windows-sys = { version = '0.61', features = ['Win32_Foundation', 'Win32_Security_Cryptography', 'Win32_Storage_FileSystem', 'Win32_System_DataExchange', 'Win32_System_Memory', 'Win32_System_Ole', 'Win32_UI_WindowsAndMessaging'] }

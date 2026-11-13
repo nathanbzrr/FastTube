@@ -445,8 +445,20 @@ impl RenderShared {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, painter.intermediate_fbo());
                 return;
             }
+            let clip = info.clip_rect_in_pixels();
+            if clip.width_px <= 0 || clip.height_px <= 0 {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, painter.intermediate_fbo());
+                return;
+            }
             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(surface.framebuffer));
             gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, painter.intermediate_fbo());
+            gl.enable(glow::SCISSOR_TEST);
+            gl.scissor(
+                clip.left_px,
+                clip.from_bottom_px,
+                clip.width_px,
+                clip.height_px,
+            );
             gl.blit_framebuffer(
                 0,
                 0,
@@ -459,6 +471,7 @@ impl RenderShared {
                 glow::COLOR_BUFFER_BIT,
                 glow::NEAREST,
             );
+            gl.disable(glow::SCISSOR_TEST);
             gl.bind_framebuffer(glow::FRAMEBUFFER, painter.intermediate_fbo());
         }
     }
@@ -509,6 +522,7 @@ fn create_surface(gl: &glow::Context, width: i32, height: i32) -> Option<GlSurfa
             glow::UNSIGNED_BYTE,
             glow::PixelUnpackData::Slice(None),
         );
+        gl.bind_texture(glow::TEXTURE_2D, None);
         let framebuffer = match gl.create_framebuffer() {
             Ok(framebuffer) => framebuffer,
             Err(_) => {
@@ -771,8 +785,44 @@ impl Player {
         self.run(&["loadfile", url, "replace"])
     }
 
-    pub fn add_subtitle(&self, url: &str, title: &str, language: &str) -> Result<(), String> {
-        self.run(&["sub-add", url, "select", title, language])
+    pub fn add_subtitle(
+        &self,
+        path_or_url: &str,
+        title: &str,
+        language: &str,
+    ) -> Result<(), String> {
+        if let Some(existing_id) = self.find_subtitle_track_by_path(path_or_url) {
+            self.set("sid", &existing_id)?;
+        } else {
+            self.run(&["sub-add", path_or_url, "select", title, language])?;
+        }
+        self.set("sub-visibility", "yes")
+    }
+
+    pub fn disable_subtitles(&self) -> Result<(), String> {
+        self.set("sid", "no")
+    }
+
+    fn find_subtitle_track_by_path(&self, path_or_url: &str) -> Option<String> {
+        let count = self.number("track-list/count")? as usize;
+        let target = std::path::Path::new(path_or_url);
+        for index in 0..count {
+            if self
+                .property(&format!("track-list/{index}/type"))
+                .as_deref()
+                != Some("sub")
+            {
+                continue;
+            }
+            let Some(external) = self.property(&format!("track-list/{index}/external-filename"))
+            else {
+                continue;
+            };
+            if external == path_or_url || std::path::Path::new(&external) == target {
+                return self.property(&format!("track-list/{index}/id"));
+            }
+        }
+        None
     }
 
     fn run(&self, args: &[&str]) -> Result<(), String> {
@@ -918,6 +968,12 @@ impl Player {
         }
     }
 
+    pub fn is_render_api(&self) -> bool {
+        self.render
+            .as_ref()
+            .is_some_and(|shared| !shared.failed.load(Ordering::Relaxed))
+    }
+
     /// Desenha o quadro atual do libmpv dentro de `rect`.
     ///
     /// Retorna `false` quando o player está no modo de janela nativa, onde o
@@ -926,6 +982,9 @@ impl Player {
         let Some(shared) = &self.render else {
             return false;
         };
+        if shared.failed.load(Ordering::Relaxed) {
+            return false;
+        }
         let shared = Arc::downgrade(shared);
         let callback = egui_glow::CallbackFn::new(move |info, painter| {
             if let Some(shared) = shared.upgrade() {

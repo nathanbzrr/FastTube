@@ -697,6 +697,86 @@ fn format_history_status(entry: &HistoryEntry) -> String {
     }
 }
 
+fn encode_utf16_clipboard_words(text: &str) -> Vec<u16> {
+    let mut words: Vec<u16> = text.encode_utf16().collect();
+    words.push(0);
+    words
+}
+
+#[cfg(windows)]
+fn copy_text_to_os_clipboard(text: &str) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::GlobalFree;
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows_sys::Win32::System::Memory::{
+        GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock,
+    };
+    use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
+
+    struct ClipboardGuard;
+    impl Drop for ClipboardGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseClipboard();
+            }
+        }
+    }
+
+    let words = encode_utf16_clipboard_words(text);
+    let byte_len = words
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| "Texto muito grande para a área de transferência.".to_owned())?;
+
+    let mut opened = false;
+    for attempt in 0..5 {
+        if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
+            opened = true;
+            break;
+        }
+        if attempt < 4 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    if !opened {
+        return Err("Não foi possível acessar a área de transferência do Windows.".into());
+    }
+    let _guard = ClipboardGuard;
+
+    unsafe {
+        if EmptyClipboard() == 0 {
+            return Err("Não foi possível limpar a área de transferência do Windows.".into());
+        }
+        let handle = GlobalAlloc(GMEM_MOVEABLE, byte_len);
+        if handle.is_null() {
+            return Err("Não foi possível alocar memória para a área de transferência.".into());
+        }
+        let locked = GlobalLock(handle);
+        if locked.is_null() {
+            let _ = GlobalFree(handle);
+            return Err("Não foi possível gravar na área de transferência.".into());
+        }
+        std::ptr::copy_nonoverlapping(words.as_ptr(), locked.cast::<u16>(), words.len());
+        let _ = GlobalUnlock(handle);
+        if SetClipboardData(u32::from(CF_UNICODETEXT), handle).is_null() {
+            let _ = GlobalFree(handle);
+            return Err("Falha ao enviar o texto para a área de transferência.".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn copy_text_to_os_clipboard(_text: &str) -> Result<(), String> {
+    Ok(())
+}
+
+fn copy_text_to_clipboard(ctx: &egui::Context, text: &str) -> Result<(), String> {
+    ctx.copy_text(text.to_owned());
+    copy_text_to_os_clipboard(text)
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ActivePlayback {
     video_id: Option<String>,
@@ -833,6 +913,8 @@ struct PlayerTelemetry {
     raw_position: Option<f64>,
     raw_duration: Option<f64>,
     raw_volume: f64,
+    speed: f64,
+    current_height: Option<u32>,
 }
 
 #[cfg(windows)]
@@ -861,13 +943,29 @@ struct FullscreenControlsActions {
 }
 
 struct OverlayPlaybackContext {
+    video: Video,
     paused: bool,
     ended: bool,
     muted: bool,
     position: f64,
     duration: Option<f64>,
     raw_volume: f64,
+    speed: f64,
+    current_height: Option<u32>,
+    selected_quality: Option<u32>,
+    qualities: Vec<u32>,
+    qualities_loading: bool,
     has_queued: bool,
+    has_active_subtitle: bool,
+    subtitles: Vec<overlay::OverlaySubtitleOption>,
+    subtitles_loading: bool,
+    chapters: Vec<overlay::OverlayChapter>,
+    theater: bool,
+    fullscreen: bool,
+    mini_player: bool,
+    can_bookmark: bool,
+    raw_path: Option<String>,
+    raw_position: Option<f64>,
     now: Instant,
 }
 
@@ -884,6 +982,7 @@ struct WatchMetadataActionState<'a> {
     current_rating: Option<oauth::VideoRating>,
     rating_pending: bool,
     saved_for_later: bool,
+    share_recently_copied: bool,
     palette: &'a ThemePalette,
 }
 
@@ -891,6 +990,7 @@ struct WatchMetadataActionState<'a> {
 struct WatchMetadataActionFlags {
     rating_to_apply: Option<Option<oauth::VideoRating>>,
     enqueue_video: bool,
+    share_video: bool,
     toggle_watch_later: bool,
 }
 
@@ -915,11 +1015,13 @@ struct ShortsWatchDetails<'a> {
     metadata: Option<&'a VideoMetadata>,
     channel_target: Option<&'a ChannelTarget>,
     saved_for_later: bool,
+    share_recently_copied: bool,
 }
 
 #[derive(Default)]
 struct ShortsWatchActions {
     enqueue_video: bool,
+    share_video: bool,
     toggle_watch_later: bool,
     open_channel_target: Option<ChannelTarget>,
 }
@@ -1161,6 +1263,8 @@ impl Default for FastTube {
                 quality_error: None,
                 seek_drag: None,
                 overlay_last_activity: Instant::now(),
+                player_menu: None,
+                last_subtitle_id: None,
                 diagnostics: DecodingDiagnostics::unknown(Some(DEFAULT_CONFIGURED_HWDEC)),
                 last_diagnostics_poll_at: None,
             },
@@ -1238,6 +1342,7 @@ impl Default for FastTube {
             },
             watch: app_state::WatchState {
                 extras: watch_extras::WatchExtras::default(),
+                share_copied_at: None,
             },
         }
     }
@@ -3204,17 +3309,22 @@ impl FastTube {
             self.start_reauth(ctx);
             return;
         };
-        let token = session.access_token.clone();
+        let mut session = session.clone();
         let cancel = process::Cancellation::default();
         self.auth.rating_cancel = Some(cancel.clone());
         let (sender, receiver) = mpsc::channel();
         self.auth.rating_rx = Some(receiver);
         let api_rating = rating.unwrap_or(oauth::VideoRating::None);
+        self.message = "Enviando avaliação...".into();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = oauth::rate_video(&token, &video_id, api_rating, &cancel)
+            let result = session
+                .refresh_if_needed(&cancel)
+                .and_then(|()| {
+                    oauth::rate_video(&session.access_token, &video_id, api_rating, &cancel)
+                })
                 .map(|()| (video_id, rating));
-            let _ = sender.send(result);
+            let _ = sender.send((Some(session), result));
             ctx.request_repaint();
         });
     }
@@ -3318,23 +3428,32 @@ impl FastTube {
     fn poll_rating(&mut self, ctx: &egui::Context) {
         let rating_result = self.auth.rating_rx.as_ref().map(Receiver::try_recv);
         match rating_result {
-            Some(Ok(Ok((video_id, rating)))) => {
-                if let Some(rating) = rating {
-                    self.auth.ratings.insert(video_id, rating);
-                    self.message = match rating {
-                        oauth::VideoRating::Like => "Você gostou deste vídeo.".into(),
-                        oauth::VideoRating::Dislike => "Você não gostou deste vídeo.".into(),
-                        oauth::VideoRating::None => "Avaliação removida.".into(),
-                    };
-                } else {
-                    self.auth.ratings.remove(&video_id);
-                    self.message = "Avaliação removida.".into();
+            Some(Ok((updated_session, result))) => {
+                if let Some(session) = updated_session
+                    && self.auth.session.is_some()
+                {
+                    let _ = self.set_oauth_session(Some(session));
                 }
-                self.auth.rating_rx = None;
-                self.auth.rating_cancel = None;
-            }
-            Some(Ok(Err(error))) => {
-                self.message = error;
+                match result {
+                    Ok((video_id, rating)) => {
+                        if let Some(rating) = rating {
+                            self.auth.ratings.insert(video_id, rating);
+                            self.message = match rating {
+                                oauth::VideoRating::Like => "Você gostou deste vídeo.".into(),
+                                oauth::VideoRating::Dislike => {
+                                    "Você não gostou deste vídeo.".into()
+                                }
+                                oauth::VideoRating::None => "Avaliação removida.".into(),
+                            };
+                        } else {
+                            self.auth.ratings.remove(&video_id);
+                            self.message = "Avaliação removida.".into();
+                        }
+                    }
+                    Err(error) => {
+                        self.message = error;
+                    }
+                }
                 self.auth.rating_rx = None;
                 self.auth.rating_cancel = None;
             }
@@ -3700,10 +3819,13 @@ impl FastTube {
                 }
             }
             self.message.clear();
+            self.watch.share_copied_at = None;
             self.playback.quality = None;
             self.playback.qualities.clear();
             self.playback.quality_error = None;
             self.playback.seek_drag = None;
+            self.playback.player_menu = None;
+            self.playback.last_subtitle_id = None;
             self.reset_decoding_diagnostics();
             let (sender, receiver) = mpsc::channel();
             if let Some(cancel) = self.playback.quality_cancel.take() {
@@ -3746,10 +3868,13 @@ impl FastTube {
         self.flush_playback_history_at(now);
         self.playback.active = None;
         self.selected = None;
+        self.watch.share_copied_at = None;
         self.ui.navigation_open = false;
         self.invalidate_feed_cache();
         self.selected_metadata = None;
         self.playback.seek_drag = None;
+        self.playback.player_menu = None;
+        self.playback.last_subtitle_id = None;
         self.playback.quality = None;
         self.playback.qualities.clear();
         self.playback.quality_rx = None;
@@ -3998,11 +4123,12 @@ impl FastTube {
                 ui.label(RichText::new("Reprodução").strong());
                 for (key, action) in [
                     ("Espaço ou K", "reproduzir/pausar"),
-                    ("← / →", "voltar ou avançar 10 segundos"),
+                    ("← / → ou J / L", "voltar ou avançar 10 segundos"),
                     ("M", "silenciar"),
+                    ("C", "ativar ou desativar legendas"),
                     ("T", "modo teatro"),
                     ("F", "tela cheia"),
-                    ("Esc", "fechar tela cheia ou painel"),
+                    ("Esc", "fechar tela cheia, ajustes ou painel"),
                 ] {
                     ui.horizontal(|ui| {
                         ui.monospace(key);
@@ -4791,11 +4917,17 @@ impl FastTube {
                     ui.label(RichText::new(format!("- {step}")).small());
                 }
                 if ui.button("Copiar relatório redigido").clicked() {
-                    ui.ctx().copy_text(diagnostics::safe_report(
+                    let report = diagnostics::safe_report(
                         kind,
                         self.auth.authenticated,
                         self.selected.is_some(),
-                    ));
+                    );
+                    self.message = match copy_text_to_clipboard(ui.ctx(), &report) {
+                        Ok(()) => {
+                            "Relatório de diagnóstico copiado para a área de transferência.".into()
+                        }
+                        Err(error) => error,
+                    };
                 }
             });
         }
@@ -5406,8 +5538,304 @@ impl FastTube {
             raw_position: player.number("time-pos").filter(|&pos| pos >= 0.0),
             raw_duration: player.number("duration").filter(|&dur| dur > 0.0),
             raw_volume: player.number("volume").unwrap_or(100.0).clamp(0.0, 100.0),
+            speed: player.number("speed").unwrap_or(1.0),
+            current_height: player.number("height").map(|height| height as u32),
         };
         Some((video_area, telemetry))
+    }
+
+    fn toggle_mini_player(&mut self, ctx: &egui::Context) {
+        if !self.playback.mini_player {
+            self.playback.mini_player_restore_size =
+                ctx.input(|input| input.viewport().inner_rect.map(|rect| rect.size()));
+            if self.playback.fullscreen {
+                self.toggle_fullscreen(ctx);
+            }
+        }
+        self.playback.mini_player = !self.playback.mini_player;
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            if self.playback.mini_player {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            },
+        ));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+            if self.playback.mini_player {
+                egui::vec2(720.0, 450.0)
+            } else {
+                self.playback
+                    .mini_player_restore_size
+                    .take()
+                    .unwrap_or_else(|| egui::vec2(1280.0, 800.0))
+            },
+        ));
+    }
+
+    fn add_current_bookmark(&mut self, video: &Video, position: f64) -> bool {
+        let Some(id) = history::youtube_video_id(&video.url) else {
+            return false;
+        };
+        let mark = library::Bookmark {
+            video_id: id,
+            title: video.title.clone(),
+            time_ms: (position.max(0.0) * 1000.0).round() as u64,
+            note: std::mem::take(&mut self.library.bookmark_note),
+        };
+        if let Err(error) = self.library.data.add_bookmark(mark) {
+            self.library.error = Some(format!("Marcador não salvo: {error}"));
+            false
+        } else {
+            true
+        }
+    }
+
+    #[cfg(windows)]
+    fn apply_player_quality(
+        &mut self,
+        video: &Video,
+        quality: Option<u32>,
+        position: f64,
+        raw_path: Option<&str>,
+        raw_position: Option<f64>,
+    ) {
+        let Some(player) = &self.player else {
+            return;
+        };
+        let ready = self
+            .playback
+            .active
+            .as_ref()
+            .is_some_and(|active| active.has_live_sample)
+            && raw_path.is_some_and(|path| path == video.url)
+            && raw_position.is_some();
+        let result = if ready {
+            player.set("options/start", "none").and_then(|()| {
+                player.quality(&video.url, quality, &self.settings.playback.value.format())
+            })
+        } else {
+            Err("Aguarde o vídeo carregar antes de alterar a qualidade.".into())
+        };
+        match result {
+            Ok(()) => {
+                self.playback.quality = quality;
+                self.message.clear();
+                if let Some(active) = &mut self.playback.active {
+                    let pos_ms = (position * 1000.0).round() as u64;
+                    if pos_ms > 0 {
+                        active.resume_target_ms = Some(pos_ms);
+                        active.resume_seek_pending = true;
+                        active.start_option_cleared = false;
+                    }
+                }
+            }
+            Err(error) => self.message = error,
+        }
+    }
+
+    #[cfg(windows)]
+    fn collect_player_chapters(&self) -> Vec<overlay::OverlayChapter> {
+        let Some(player) = &self.player else {
+            return Vec::new();
+        };
+        let chapter_count = player
+            .number("chapter-list/count")
+            .unwrap_or(0.0)
+            .clamp(0.0, 500.0) as usize;
+        let mut chapters = Vec::with_capacity(chapter_count);
+        for index in 0..chapter_count {
+            let Some(time_secs) = player.number(&format!("chapter-list/{index}/time")) else {
+                continue;
+            };
+            let title = player
+                .property(&format!("chapter-list/{index}/title"))
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| format!("Capítulo {}", index + 1));
+            chapters.push(overlay::OverlayChapter { title, time_secs });
+        }
+        chapters
+    }
+
+    fn collect_overlay_subtitles(&self) -> (bool, Vec<overlay::OverlaySubtitleOption>) {
+        let mut options = Vec::new();
+        #[cfg(windows)]
+        let (has_active_player_sub, active_sid) = {
+            let active_sid = self
+                .player
+                .as_ref()
+                .and_then(|player| player.property("sid"))
+                .filter(|sid| !sid.is_empty() && sid != "no");
+            let sub_visible = self
+                .player
+                .as_ref()
+                .is_some_and(|player| player.property("sub-visibility").as_deref() != Some("no"));
+            (active_sid.is_some() && sub_visible, active_sid)
+        };
+        #[cfg(not(windows))]
+        let (has_active_player_sub, _active_sid): (bool, Option<String>) = (false, None);
+
+        let active_yt_url = self.watch.extras.active_subtitle_url.as_deref();
+
+        #[cfg(windows)]
+        if let Some(player) = &self.player {
+            let count = player
+                .number("track-list/count")
+                .unwrap_or(0.0)
+                .clamp(0.0, 200.0) as usize;
+            for index in 0..count {
+                if player
+                    .property(&format!("track-list/{index}/type"))
+                    .as_deref()
+                    != Some("sub")
+                {
+                    continue;
+                }
+                let Some(id) = player.property(&format!("track-list/{index}/id")) else {
+                    continue;
+                };
+                let is_external = player
+                    .property(&format!("track-list/{index}/external"))
+                    .as_deref()
+                    == Some("yes");
+                if is_external && !self.watch.extras.subtitles.is_empty() {
+                    continue;
+                }
+                let label = player
+                    .property(&format!("track-list/{index}/title"))
+                    .filter(|title| !title.is_empty())
+                    .or_else(|| player.property(&format!("track-list/{index}/lang")))
+                    .unwrap_or_else(|| format!("Faixa {id}"));
+                let active = has_active_player_sub && active_sid.as_deref() == Some(id.as_str());
+                options.push(overlay::OverlaySubtitleOption {
+                    id: format!("mpv:{id}"),
+                    label,
+                    active,
+                });
+            }
+        }
+
+        for track in &self.watch.extras.subtitles {
+            let label = format!(
+                "{}{}",
+                track.language,
+                if track.automatic {
+                    " (automática)"
+                } else {
+                    ""
+                }
+            );
+            let active = has_active_player_sub && active_yt_url == Some(track.url.as_str());
+            options.push(overlay::OverlaySubtitleOption {
+                id: format!("yt:{}", track.url),
+                label,
+                active,
+            });
+        }
+
+        (has_active_player_sub, options)
+    }
+
+    fn select_overlay_subtitle(&mut self, id: Option<&str>, ctx: &egui::Context) {
+        let Some(raw) = id else {
+            let (_, options) = self.collect_overlay_subtitles();
+            if let Some(active) = options.into_iter().find(|opt| opt.active) {
+                self.playback.last_subtitle_id = Some(active.id);
+            }
+            self.watch.extras.active_subtitle_url = None;
+            #[cfg(windows)]
+            if let Some(player) = &self.player
+                && let Err(error) = player.disable_subtitles()
+            {
+                self.message = error;
+            }
+            return;
+        };
+
+        if let Some(sid) = raw.strip_prefix("mpv:") {
+            self.watch.extras.active_subtitle_url = None;
+            self.playback.last_subtitle_id = Some(raw.to_owned());
+            #[cfg(windows)]
+            if let Some(player) = &self.player {
+                let result = player
+                    .set("sid", sid)
+                    .and_then(|()| player.set("sub-visibility", "yes"));
+                if let Err(error) = result {
+                    self.message = error;
+                }
+            }
+            #[cfg(not(windows))]
+            let _ = sid;
+        } else if let Some(url) = raw.strip_prefix("yt:")
+            && let Some(track) = self
+                .watch
+                .extras
+                .subtitles
+                .iter()
+                .find(|t| t.url == url)
+                .cloned()
+        {
+            #[cfg(windows)]
+            {
+                let player_ready = self
+                    .playback
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.has_live_sample)
+                    || self.player.as_ref().is_some_and(|player| {
+                        player.number("track-list/count").unwrap_or(0.0) > 0.0
+                    });
+                if self.player.is_none() {
+                    self.message = "O player não está disponível.".to_owned();
+                } else if !player_ready {
+                    self.message = "Aguarde o vídeo carregar antes de ativar legendas.".to_owned();
+                } else {
+                    let label = format!(
+                        "{}{}",
+                        track.language,
+                        if track.automatic {
+                            " (automática)"
+                        } else {
+                            ""
+                        }
+                    );
+                    self.playback.last_subtitle_id = Some(raw.to_owned());
+                    self.watch.extras.start_apply_subtitle(&track, label, ctx);
+                    self.apply_ready_subtitle();
+                }
+            }
+            #[cfg(not(windows))]
+            let _ = (track, ctx);
+        }
+    }
+
+    fn toggle_player_captions(&mut self, ctx: &egui::Context) {
+        let (has_active, options) = self.collect_overlay_subtitles();
+        if has_active {
+            self.select_overlay_subtitle(None, ctx);
+            return;
+        }
+        let candidate = self
+            .playback
+            .last_subtitle_id
+            .as_ref()
+            .filter(|prev| options.iter().any(|opt| &opt.id == *prev))
+            .cloned()
+            .or_else(|| {
+                options
+                    .iter()
+                    .find(|opt| !opt.label.contains("(automática)"))
+                    .or_else(|| options.first())
+                    .map(|opt| opt.id.clone())
+            });
+        if let Some(target_id) = candidate {
+            self.select_overlay_subtitle(Some(&target_id), ctx);
+        } else {
+            if !self.watch.extras.subtitles_loaded && self.watch.extras.subtitles_loading.is_none()
+            {
+                self.watch.extras.start_subtitles(ctx);
+            }
+            self.playback.player_menu = Some(overlay::OverlayMenu::Subtitles);
+        }
     }
 
     #[cfg(windows)]
@@ -5515,20 +5943,8 @@ impl FastTube {
             egui::TextEdit::singleline(&mut self.library.bookmark_note)
                 .hint_text("Nota do marcador"),
         );
-        if ui.small_button("＋ Marcador").clicked()
-            && let Some(id) = history::youtube_video_id(&video.url)
-        {
-            let mark = library::Bookmark {
-                video_id: id,
-                title: video.title.clone(),
-                time_ms: (position.max(0.0) * 1000.0).round() as u64,
-                note: std::mem::take(&mut self.library.bookmark_note),
-            };
-            if let Err(error) = self.library.data.add_bookmark(mark) {
-                self.library.error = Some(format!("Marcador não salvo: {error}"));
-            } else {
-                *library_changed = true;
-            }
+        if ui.small_button("＋ Marcador").clicked() && self.add_current_bookmark(video, position) {
+            *library_changed = true;
         }
         if ui
             .small_button(if self.playback.mini_player {
@@ -5538,28 +5954,7 @@ impl FastTube {
             })
             .clicked()
         {
-            if !self.playback.mini_player {
-                self.playback.mini_player_restore_size =
-                    ctx.input(|input| input.viewport().inner_rect.map(|rect| rect.size()));
-            }
-            self.playback.mini_player = !self.playback.mini_player;
-            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                if self.playback.mini_player {
-                    egui::WindowLevel::AlwaysOnTop
-                } else {
-                    egui::WindowLevel::Normal
-                },
-            ));
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
-                if self.playback.mini_player {
-                    egui::vec2(720.0, 450.0)
-                } else {
-                    self.playback
-                        .mini_player_restore_size
-                        .take()
-                        .unwrap_or_else(|| egui::vec2(1280.0, 800.0))
-                },
-            ));
+            self.toggle_mini_player(ctx);
         }
     }
 
@@ -5695,38 +6090,13 @@ impl FastTube {
                 .on_hover_text(quality_tip);
         });
         if quality != self.playback.quality {
-            let ready = self
-                .playback
-                .active
-                .as_ref()
-                .is_some_and(|active| active.has_live_sample)
-                && telemetry
-                    .raw_path
-                    .as_deref()
-                    .is_some_and(|path| path == video.url)
-                && telemetry.raw_position.is_some();
-            let result = if ready {
-                player.set("options/start", "none").and_then(|()| {
-                    player.quality(&video.url, quality, &self.settings.playback.value.format())
-                })
-            } else {
-                Err("Aguarde o vídeo carregar antes de alterar a qualidade.".into())
-            };
-            match result {
-                Ok(()) => {
-                    self.playback.quality = quality;
-                    self.message.clear();
-                    if let Some(active) = &mut self.playback.active {
-                        let pos_ms = (bar.position * 1000.0).round() as u64;
-                        if pos_ms > 0 {
-                            active.resume_target_ms = Some(pos_ms);
-                            active.resume_seek_pending = true;
-                            active.start_option_cleared = false;
-                        }
-                    }
-                }
-                Err(error) => self.message = error,
-            }
+            self.apply_player_quality(
+                video,
+                quality,
+                bar.position,
+                telemetry.raw_path.as_deref(),
+                telemetry.raw_position,
+            );
         }
     }
 
@@ -5772,12 +6142,18 @@ impl FastTube {
                         ui.selectable_value(&mut selected, id.clone(), label);
                     }
                 });
-            if selected != current
-                && let Err(error) = player
-                    .set("sid", &selected)
-                    .and_then(|()| player.set("sub-visibility", "yes"))
-            {
-                self.message = error;
+            if selected != current {
+                let result = if selected == "no" {
+                    self.watch.extras.active_subtitle_url = None;
+                    player.disable_subtitles()
+                } else {
+                    player
+                        .set("sid", &selected)
+                        .and_then(|()| player.set("sub-visibility", "yes"))
+                };
+                if let Err(error) = result {
+                    self.message = error;
+                }
             }
         }
     }
@@ -5913,13 +6289,23 @@ impl FastTube {
         let fullscreen = self.playback.fullscreen;
         let theater_mode = self.playback.theater;
 
-        let player_size = compute_player_size_with_theater(
-            column_width,
-            available_height,
-            fullscreen,
-            theater_mode,
-            mode,
-        );
+        let player_size = if fullscreen
+            && !settings_open
+            && self
+                .player
+                .as_ref()
+                .is_some_and(player::Player::is_render_api)
+        {
+            egui::vec2(column_width.max(160.0), available_height.max(160.0))
+        } else {
+            compute_player_size_with_theater(
+                column_width,
+                available_height,
+                fullscreen,
+                theater_mode,
+                mode,
+            )
+        };
         let width = player_size.x;
         let compact_controls = watch_controls_are_compact(width);
 
@@ -5935,7 +6321,9 @@ impl FastTube {
             self.message = error;
             self.report_pending_queue_load_error();
         }
-        ui.add_space(6.0);
+        if !fullscreen || video_area.is_none() {
+            ui.add_space(6.0);
+        }
 
         let now = Instant::now();
         let (position, duration, pending_seek, clear_start_option) = self.process_player_telemetry(
@@ -5977,9 +6365,10 @@ impl FastTube {
         let has_queued = !self.queue.data.is_empty();
         let palette = self.palette();
         let mut actions = FullscreenControlsActions::default();
-        // Na página normal, os controles ficam somente sobre o vídeo, como no YouTube.
-        // A barra externa permanece disponível como fallback em tela cheia.
-        if fullscreen {
+        // Quando a render API do libmpv está ativa, todos os controles ficam integrados
+        // dentro do player (como no YouTube oficial). Se houver fallback para janela nativa
+        // (HWND), a barra externa aparece automaticamente em todos os modos.
+        if video_area.is_none() && !settings_open {
             self.fullscreen_seek_ui(ui, width, position, duration, now);
             let bar = FullscreenBarContext {
                 width,
@@ -5998,17 +6387,44 @@ impl FastTube {
             self.save_library();
         }
 
+        let chapters = if video_area.is_some() {
+            self.collect_player_chapters()
+        } else {
+            Vec::new()
+        };
+        let (has_active_subtitle, subtitles) = if video_area.is_some() {
+            self.collect_overlay_subtitles()
+        } else {
+            (false, Vec::new())
+        };
         let overlay_ctx = OverlayPlaybackContext {
+            video: video.clone(),
             paused: telemetry.paused,
             ended: telemetry.ended,
             muted: telemetry.muted,
             position,
             duration,
             raw_volume: telemetry.raw_volume,
+            speed: telemetry.speed,
+            current_height: telemetry.current_height,
+            selected_quality: self.playback.quality,
+            qualities: self.playback.qualities.clone(),
+            qualities_loading: self.playback.quality_rx.is_some(),
             has_queued,
+            has_active_subtitle,
+            subtitles,
+            subtitles_loading: self.watch.extras.subtitles_loading.is_some()
+                || self.watch.extras.is_subtitle_applying(),
+            chapters,
+            theater: theater_mode,
+            fullscreen,
+            mini_player: self.playback.mini_player,
+            can_bookmark: history::youtube_video_id(&video.url).is_some(),
+            raw_path: telemetry.raw_path.clone(),
+            raw_position: telemetry.raw_position,
             now,
         };
-        let overlay_action = self.player_overlay_ui(ui, video_area, &overlay_ctx);
+        let overlay_action = self.player_overlay_ui(ui, video_area, &overlay_ctx, ctx);
         if let Some(action) = overlay_action {
             self.handle_player_overlay_action(action, &overlay_ctx, ctx);
         }
@@ -6092,6 +6508,7 @@ impl FastTube {
         ui: &mut egui::Ui,
         video_area: Option<(egui::Rect, egui::Response)>,
         playback: &OverlayPlaybackContext,
+        ctx: &egui::Context,
     ) -> Option<overlay::OverlayAction> {
         let mut overlay_action = None;
         if let Some((rect, response)) = video_area {
@@ -6100,24 +6517,65 @@ impl FastTube {
                 self.playback.overlay_last_activity = Instant::now();
             }
             let idle_secs = self.playback.overlay_last_activity.elapsed().as_secs_f64();
-            let visible =
-                overlay::overlay_visible(hovered, playback.paused, playback.ended, idle_secs);
+            let menu_open = self.playback.player_menu.is_some();
+            let scrubbing = self.playback.seek_drag.is_some()
+                || ui.input(|i| {
+                    i.pointer.any_down() && i.pointer.hover_pos().is_some_and(|p| rect.contains(p))
+                });
+            let visible = overlay::overlay_visible_with_state(
+                hovered,
+                playback.paused,
+                playback.ended,
+                menu_open,
+                scrubbing,
+                idle_secs,
+            );
             let style = self.overlay_style();
             let telemetry = overlay::OverlayTelemetry {
+                title: playback.video.title.clone(),
                 paused: playback.paused,
                 ended: playback.ended,
                 muted: playback.muted,
                 position_secs: playback.position,
                 duration_secs: playback.duration,
                 volume_percent: playback.raw_volume as f32,
+                speed: playback.speed,
+                current_height: playback.current_height,
+                selected_quality: playback.selected_quality,
+                qualities: playback.qualities.clone(),
+                qualities_loading: playback.qualities_loading,
                 has_queued: playback.has_queued,
+                has_active_subtitle: playback.has_active_subtitle,
+                subtitles: playback.subtitles.clone(),
+                subtitles_loading: playback.subtitles_loading,
+                chapters: playback.chapters.clone(),
+                theater: playback.theater,
+                fullscreen: playback.fullscreen,
+                mini_player: playback.mini_player,
+                can_bookmark: playback.can_bookmark,
+                menu: self.playback.player_menu,
             };
             let (action, over_bar) = overlay::show(ui, rect, &telemetry, &style, visible);
             if let Some(action) = action {
                 self.playback.overlay_last_activity = Instant::now();
                 overlay_action = Some(action);
+            } else if response.double_clicked() && !over_bar {
+                self.playback.overlay_last_activity = Instant::now();
+                if !menu_open {
+                    self.handle_player_overlay_action(
+                        overlay::OverlayAction::TogglePlay,
+                        playback,
+                        ctx,
+                    );
+                }
+                overlay_action = Some(overlay::OverlayAction::ToggleFullscreen);
             } else if response.clicked() && !over_bar {
-                overlay_action = Some(overlay::OverlayAction::TogglePlay);
+                self.playback.overlay_last_activity = Instant::now();
+                overlay_action = if menu_open {
+                    Some(overlay::OverlayAction::SetMenu(None))
+                } else {
+                    Some(overlay::OverlayAction::TogglePlay)
+                };
             }
         }
         overlay_action
@@ -6132,102 +6590,184 @@ impl FastTube {
         use overlay::OverlayAction;
         match action {
             OverlayAction::TogglePlay => {
-                let result = if playback.ended {
-                    self.player
-                        .as_ref()
-                        .map(|player| {
-                            player
-                                .seek(0.0, "absolute+exact")
-                                .and_then(|()| player.set("pause", "no"))
-                        })
-                        .unwrap_or(Ok(()))
-                } else {
-                    self.player
-                        .as_ref()
-                        .map(|player| {
-                            player.set("pause", if playback.paused { "no" } else { "yes" })
-                        })
-                        .unwrap_or(Ok(()))
-                };
-                match result {
-                    Ok(()) => {
-                        if playback.ended {
-                            self.record_manual_seek(0.0, playback.duration, playback.now);
-                        } else if !playback.paused {
-                            self.flush_playback_history_at(playback.now);
+                #[cfg(windows)]
+                {
+                    let result = if playback.ended {
+                        self.player
+                            .as_ref()
+                            .map(|player| {
+                                player
+                                    .seek(0.0, "absolute+exact")
+                                    .and_then(|()| player.set("pause", "no"))
+                            })
+                            .unwrap_or(Ok(()))
+                    } else {
+                        self.player
+                            .as_ref()
+                            .map(|player| {
+                                player.set("pause", if playback.paused { "no" } else { "yes" })
+                            })
+                            .unwrap_or(Ok(()))
+                    };
+                    match result {
+                        Ok(()) => {
+                            if playback.ended {
+                                self.record_manual_seek(0.0, playback.duration, playback.now);
+                            } else if !playback.paused {
+                                self.flush_playback_history_at(playback.now);
+                            }
                         }
+                        Err(error) => self.message = error,
                     }
-                    Err(error) => self.message = error,
                 }
             }
             OverlayAction::SeekBack10 => {
-                let result = self
-                    .player
-                    .as_ref()
-                    .map(|player| player.seek(-10.0, "relative"))
-                    .unwrap_or(Ok(()));
-                match result {
-                    Ok(()) => self.record_manual_seek(
-                        (playback.position - 10.0).max(0.0),
-                        playback.duration,
-                        playback.now,
-                    ),
-                    Err(error) => self.message = error,
+                #[cfg(windows)]
+                {
+                    let result = self
+                        .player
+                        .as_ref()
+                        .map(|player| player.seek(-10.0, "relative"))
+                        .unwrap_or(Ok(()));
+                    match result {
+                        Ok(()) => self.record_manual_seek(
+                            (playback.position - 10.0).max(0.0),
+                            playback.duration,
+                            playback.now,
+                        ),
+                        Err(error) => self.message = error,
+                    }
                 }
             }
             OverlayAction::SeekForward10 => {
-                let result = self
-                    .player
-                    .as_ref()
-                    .map(|player| player.seek(10.0, "relative"))
-                    .unwrap_or(Ok(()));
-                match result {
-                    Ok(()) => {
-                        let target = playback
-                            .duration
-                            .map(|duration| (playback.position + 10.0).min(duration))
-                            .unwrap_or(playback.position + 10.0);
-                        self.record_manual_seek(target, playback.duration, playback.now);
+                #[cfg(windows)]
+                {
+                    let result = self
+                        .player
+                        .as_ref()
+                        .map(|player| player.seek(10.0, "relative"))
+                        .unwrap_or(Ok(()));
+                    match result {
+                        Ok(()) => {
+                            let target = playback
+                                .duration
+                                .map(|duration| (playback.position + 10.0).min(duration))
+                                .unwrap_or(playback.position + 10.0);
+                            self.record_manual_seek(target, playback.duration, playback.now);
+                        }
+                        Err(error) => self.message = error,
                     }
-                    Err(error) => self.message = error,
                 }
             }
             OverlayAction::SeekTo(target) => {
-                let result = self
-                    .player
-                    .as_ref()
-                    .map(|player| player.seek(target, "absolute+exact"))
-                    .unwrap_or(Ok(()));
-                match result {
-                    Ok(()) => self.record_manual_seek(target, playback.duration, playback.now),
-                    Err(error) => self.message = error,
+                #[cfg(windows)]
+                {
+                    let result = self
+                        .player
+                        .as_ref()
+                        .map(|player| player.seek(target, "absolute+exact"))
+                        .unwrap_or(Ok(()));
+                    match result {
+                        Ok(()) => self.record_manual_seek(target, playback.duration, playback.now),
+                        Err(error) => self.message = error,
+                    }
                 }
             }
             OverlayAction::ToggleMute => {
-                let result = self
-                    .player
-                    .as_ref()
-                    .map(|player| player.set("mute", if playback.muted { "no" } else { "yes" }))
-                    .unwrap_or(Ok(()));
-                if let Err(error) = result {
-                    self.message = error;
+                #[cfg(windows)]
+                {
+                    let result = self
+                        .player
+                        .as_ref()
+                        .map(|player| player.set("mute", if playback.muted { "no" } else { "yes" }))
+                        .unwrap_or(Ok(()));
+                    if let Err(error) = result {
+                        self.message = error;
+                    }
                 }
             }
             OverlayAction::SetVolume(volume) => {
-                let result = self
-                    .player
-                    .as_ref()
-                    .map(|player| player.set("volume", &format!("{volume:.0}")))
-                    .unwrap_or(Ok(()));
-                if let Err(error) = result {
-                    self.message = error;
+                #[cfg(windows)]
+                {
+                    let result = self
+                        .player
+                        .as_ref()
+                        .map(|player| player.set("volume", &format!("{volume:.0}")))
+                        .unwrap_or(Ok(()));
+                    if let Err(error) = result {
+                        self.message = error;
+                    }
                 }
             }
             OverlayAction::Next => self.request_queue_advance(),
-            OverlayAction::ToggleSettings => {
-                self.ui.settings_open = !self.ui.settings_open;
+            OverlayAction::ToggleCaptions => self.toggle_player_captions(ctx),
+            OverlayAction::SelectSubtitle(id) => {
+                self.select_overlay_subtitle(id.as_deref(), ctx);
+                self.playback.player_menu = None;
+            }
+            OverlayAction::SetSpeed(speed) => {
+                let clamped = speed.clamp(0.25, 2.0);
+                #[cfg(windows)]
+                if let Some(player) = &self.player
+                    && let Err(error) = player.set("speed", &format!("{clamped}"))
+                {
+                    self.message = error;
+                }
+                #[cfg(not(windows))]
+                let _ = clamped;
+                self.playback.player_menu = None;
+            }
+            OverlayAction::SelectQuality(quality) => {
+                #[cfg(windows)]
+                self.apply_player_quality(
+                    &playback.video,
+                    quality,
+                    playback.position,
+                    playback.raw_path.as_deref(),
+                    playback.raw_position,
+                );
+                #[cfg(not(windows))]
+                let _ = quality;
+                self.playback.player_menu = None;
+            }
+            OverlayAction::SeekChapter(target) => {
+                #[cfg(windows)]
+                {
+                    let result = self
+                        .player
+                        .as_ref()
+                        .map(|player| player.seek(target, "absolute"))
+                        .unwrap_or(Ok(()));
+                    match result {
+                        Ok(()) => self.record_manual_seek(target, playback.duration, playback.now),
+                        Err(error) => self.message = error,
+                    }
+                }
+                #[cfg(not(windows))]
+                let _ = target;
+                self.playback.player_menu = None;
+            }
+            OverlayAction::AddBookmark => {
+                if self.add_current_bookmark(&playback.video, playback.position) {
+                    self.save_library();
+                }
+                self.playback.player_menu = None;
+            }
+            OverlayAction::OpenAppSettings => {
+                self.playback.player_menu = None;
+                self.ui.settings_open = true;
                 self.sync_player_window_visibility();
             }
+            OverlayAction::SetMenu(menu) => {
+                if menu == Some(overlay::OverlayMenu::Subtitles)
+                    && !self.watch.extras.subtitles_loaded
+                    && self.watch.extras.subtitles_loading.is_none()
+                {
+                    self.watch.extras.start_subtitles(ctx);
+                }
+                self.playback.player_menu = menu;
+            }
+            OverlayAction::ToggleMiniPlayer => self.toggle_mini_player(ctx),
             OverlayAction::ToggleTheater => self.toggle_theater_mode(),
             OverlayAction::ToggleFullscreen => self.toggle_fullscreen(ctx),
             OverlayAction::Close => self.close_video(ctx),
@@ -6449,8 +6989,6 @@ impl FastTube {
     fn watch_metadata_actions_ui(
         &self,
         ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        video: &Video,
         state: &WatchMetadataActionState<'_>,
         flags: &mut WatchMetadataActionFlags,
     ) {
@@ -6532,12 +7070,23 @@ impl FastTube {
                 flags.enqueue_video = true;
             }
 
-            let share_button = egui::Button::new(
-                RichText::new("Compartilhar")
-                    .size(13.0)
-                    .color(palette.header_button_fg),
-            )
-            .fill(palette.header_button_bg)
+            let share_label = if state.share_recently_copied {
+                "✓ Copiado"
+            } else {
+                "Compartilhar"
+            };
+            let share_button = egui::Button::new(RichText::new(share_label).size(13.0).color(
+                if state.share_recently_copied {
+                    palette.active_button_fg
+                } else {
+                    palette.header_button_fg
+                },
+            ))
+            .fill(if state.share_recently_copied {
+                palette.active_button_bg
+            } else {
+                palette.header_button_bg
+            })
             .corner_radius(18);
             if ui
                 .add_sized([112.0, 36.0], share_button)
@@ -6545,7 +7094,7 @@ impl FastTube {
                 .on_hover_text("Copiar o endereço deste vídeo")
                 .clicked()
             {
-                ctx.copy_text(video.url.clone());
+                flags.share_video = true;
             }
 
             let save_label = if state.saved_for_later {
@@ -6642,6 +7191,10 @@ impl FastTube {
             current_rating,
             rating_pending,
             saved_for_later,
+            share_recently_copied: self
+                .watch
+                .share_copied_at
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(2)),
             palette: &palette,
         };
 
@@ -6665,7 +7218,7 @@ impl FastTube {
                     open_channel_target = Some(target);
                 }
 
-                self.watch_metadata_actions_ui(ui, &ctx, video, &action_state, &mut action_flags);
+                self.watch_metadata_actions_ui(ui, &action_state, &mut action_flags);
             });
 
             self.watch_metadata_description_ui(
@@ -6682,6 +7235,18 @@ impl FastTube {
 
         if let (Some(video_id), Some(rating)) = (video_id, action_flags.rating_to_apply) {
             self.start_video_rating(video_id, rating, &ctx);
+        }
+        if action_flags.share_video {
+            match copy_text_to_clipboard(&ctx, &video.url) {
+                Ok(()) => {
+                    self.watch.share_copied_at = Some(Instant::now());
+                    self.message = format!("Link do vídeo copiado: {}", video.url);
+                    ctx.request_repaint_after(Duration::from_secs(2));
+                }
+                Err(error) => {
+                    self.message = error;
+                }
+            }
         }
         if action_flags.toggle_watch_later {
             self.library.data.toggle_watch_later(video.clone());
@@ -8444,11 +9009,11 @@ impl FastTube {
 
     fn channel_about_card_ui(
         ui: &mut egui::Ui,
-        ctx: &egui::Context,
         page: &ChannelPage,
         about: Option<&search::ChannelAboutInfo>,
         layout: &ChannelTabLayout<'_>,
-    ) {
+    ) -> bool {
+        let mut copy_link = false;
         let palette = layout.palette;
         egui::ScrollArea::vertical()
             .id_salt(format!("{}_about", layout.scroll_id))
@@ -8506,7 +9071,7 @@ impl FastTube {
                                 )
                                 .clicked()
                             {
-                                ctx.copy_text(page.canonical_url.clone());
+                                copy_link = true;
                             }
                         });
                         if let Some(subs) = page
@@ -8568,6 +9133,7 @@ impl FastTube {
                         Self::channel_about_description_ui(ui, page, about, palette);
                     });
             });
+        copy_link
     }
 
     fn channel_about_tab_ui(
@@ -8580,7 +9146,12 @@ impl FastTube {
         let (cancel_about, reload_about) =
             self.channel_about_status_ui(ui, layout.card_max_w, layout.palette);
         let about = self.channels.about.info.clone();
-        Self::channel_about_card_ui(ui, ctx, page, about.as_ref(), layout);
+        if Self::channel_about_card_ui(ui, page, about.as_ref(), layout) {
+            self.message = match copy_text_to_clipboard(ctx, &page.canonical_url) {
+                Ok(()) => format!("Link do canal copiado: {}", page.canonical_url),
+                Err(error) => error,
+            };
+        }
 
         if cancel_about {
             self.cancel_channel_about();
@@ -10488,12 +11059,45 @@ impl FastTube {
             });
     }
 
+    fn apply_ready_subtitle(&mut self) {
+        #[cfg(windows)]
+        if let Some(sub) = self.watch.extras.take_ready_subtitle() {
+            let path = sub.path.to_string_lossy().into_owned();
+            let result = self
+                .player
+                .as_ref()
+                .ok_or("O player não está disponível.".to_owned())
+                .and_then(|player| player.add_subtitle(&path, &sub.label, &sub.language));
+            match result {
+                Ok(()) => {
+                    self.playback.last_subtitle_id = Some(format!("yt:{}", sub.url));
+                    self.watch.extras.active_subtitle_url = Some(sub.url);
+                    self.watch.extras.subtitles_error = None;
+                }
+                Err(error) => {
+                    self.watch.extras.subtitles_error = Some(error);
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = self.watch.extras.take_ready_subtitle();
+    }
+
     fn subtitles_tracks_list_ui(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         scroll_id: &str,
     ) {
+        #[cfg(windows)]
+        let has_active_player_subtitle = self
+            .player
+            .as_ref()
+            .and_then(|player| player.property("sid"))
+            .is_some_and(|sid| !sid.is_empty() && sid != "no");
+        #[cfg(not(windows))]
+        let has_active_player_subtitle = false;
+
         ui.horizontal(|ui| {
             ui.heading("Legendas");
             if ui
@@ -10505,13 +11109,29 @@ impl FastTube {
             {
                 self.watch.extras.start_subtitles(ctx);
             }
+            #[cfg(windows)]
+            if has_active_player_subtitle
+                && ui.button("Desativar").clicked()
+                && let Some(player) = &self.player
+            {
+                match player.disable_subtitles() {
+                    Ok(()) => {
+                        self.watch.extras.active_subtitle_url = None;
+                        self.watch.extras.subtitles_error = None;
+                    }
+                    Err(error) => {
+                        self.watch.extras.subtitles_error = Some(error);
+                    }
+                }
+            }
         });
         ui.label(
             RichText::new("Faixas do YouTube obtidas pelo yt-dlp; disponibilidade pode variar.")
                 .small()
                 .weak(),
         );
-        if self.watch.extras.subtitles_loading.is_some() {
+        if self.watch.extras.subtitles_loading.is_some() || self.watch.extras.is_subtitle_applying()
+        {
             ui.spinner();
         }
         if let Some(error) = &self.watch.extras.subtitles_error {
@@ -10525,11 +11145,14 @@ impl FastTube {
         }
         let mut chosen = None;
         let mut transcript_track = None;
+        let active_url = self.watch.extras.active_subtitle_url.as_deref();
         egui::ScrollArea::vertical()
             .id_salt(format!("{scroll_id}_subtitles"))
             .max_height(150.0)
             .show(ui, |ui| {
                 for track in &self.watch.extras.subtitles {
+                    let is_active =
+                        has_active_player_subtitle && active_url == Some(track.url.as_str());
                     let label = format!(
                         "{}{}",
                         track.language,
@@ -10539,8 +11162,13 @@ impl FastTube {
                             ""
                         }
                     );
+                    let button_text = if is_active {
+                        RichText::new(format!("{label} ✓")).strong()
+                    } else {
+                        RichText::new(&label)
+                    };
                     ui.horizontal(|ui| {
-                        if ui.button(&label).clicked() {
+                        if ui.button(button_text).clicked() {
                             chosen = Some((track.clone(), label.clone()));
                         }
                         if ui
@@ -10556,12 +11184,24 @@ impl FastTube {
         if let Some((track, label)) = chosen {
             #[cfg(windows)]
             {
-                let result = self
-                    .player
+                let player_ready = self
+                    .playback
+                    .active
                     .as_ref()
-                    .ok_or("O player não está disponível.".to_owned())
-                    .and_then(|player| player.add_subtitle(&track.url, &label, &track.language));
-                self.watch.extras.subtitles_error = result.err();
+                    .is_some_and(|active| active.has_live_sample)
+                    || self.player.as_ref().is_some_and(|player| {
+                        player.number("track-list/count").unwrap_or(0.0) > 0.0
+                    });
+                if self.player.is_none() {
+                    self.watch.extras.subtitles_error =
+                        Some("O player não está disponível.".to_owned());
+                } else if !player_ready {
+                    self.watch.extras.subtitles_error =
+                        Some("Aguarde o vídeo carregar antes de ativar legendas.".to_owned());
+                } else {
+                    self.watch.extras.start_apply_subtitle(&track, label, ctx);
+                    self.apply_ready_subtitle();
+                }
             }
             #[cfg(not(windows))]
             let _ = (track, label);
@@ -11537,9 +12177,8 @@ impl FastTube {
     fn shorts_watch_actions_ui(
         &self,
         ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        video_url: &str,
         saved_for_later: bool,
+        share_recently_copied: bool,
         palette: &ThemePalette,
         actions: &mut ShortsWatchActions,
     ) {
@@ -11555,16 +12194,26 @@ impl FastTube {
             if ui.add_sized([70.0, 36.0], queue).clicked() {
                 actions.enqueue_video = true;
             }
-            let share = egui::Button::new(
-                RichText::new("Compartilhar")
-                    .size(13.0)
-                    .strong()
-                    .color(palette.header_button_fg),
-            )
-            .fill(palette.header_button_bg)
+            let share_label = if share_recently_copied {
+                "✓ Copiado"
+            } else {
+                "Compartilhar"
+            };
+            let share = egui::Button::new(RichText::new(share_label).size(13.0).strong().color(
+                if share_recently_copied {
+                    palette.active_button_fg
+                } else {
+                    palette.header_button_fg
+                },
+            ))
+            .fill(if share_recently_copied {
+                palette.active_button_bg
+            } else {
+                palette.header_button_bg
+            })
             .corner_radius(18);
             if ui.add_sized([116.0, 36.0], share).clicked() {
-                ctx.copy_text(video_url.to_owned());
+                actions.share_video = true;
             }
             let save = egui::Button::new(
                 RichText::new(if saved_for_later { "Salvo" } else { "Salvar" })
@@ -11583,7 +12232,6 @@ impl FastTube {
     fn shorts_watch_details_ui(
         &self,
         ui: &mut egui::Ui,
-        ctx: &egui::Context,
         details: &ShortsWatchDetails<'_>,
         palette: &ThemePalette,
         actions: &mut ShortsWatchActions,
@@ -11625,9 +12273,8 @@ impl FastTube {
         ui.add_space(14.0);
         self.shorts_watch_actions_ui(
             ui,
-            ctx,
-            &video.url,
             details.saved_for_later,
+            details.share_recently_copied,
             palette,
             actions,
         );
@@ -11685,6 +12332,10 @@ impl FastTube {
             metadata: metadata.as_ref(),
             channel_target: channel_target.as_ref(),
             saved_for_later,
+            share_recently_copied: self
+                .watch
+                .share_copied_at
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(2)),
         };
         let mut actions = ShortsWatchActions::default();
 
@@ -11714,7 +12365,7 @@ impl FastTube {
                         ui.vertical(|ui| {
                             ui.set_width(details_width);
                             ui.set_max_width(details_width);
-                            self.shorts_watch_details_ui(ui, ctx, &details, &palette, &mut actions);
+                            self.shorts_watch_details_ui(ui, &details, &palette, &mut actions);
                         });
                     });
                 } else {
@@ -11729,13 +12380,25 @@ impl FastTube {
                     });
                     ui.add_space(12.0);
                     ui.vertical(|ui| {
-                        self.shorts_watch_details_ui(ui, ctx, &details, &palette, &mut actions);
+                        self.shorts_watch_details_ui(ui, &details, &palette, &mut actions);
                     });
                 }
             });
 
         if actions.enqueue_video {
             let _ = self.enqueue_video(video.clone());
+        }
+        if actions.share_video {
+            match copy_text_to_clipboard(ctx, &video.url) {
+                Ok(()) => {
+                    self.watch.share_copied_at = Some(Instant::now());
+                    self.message = format!("Link do vídeo copiado: {}", video.url);
+                    ctx.request_repaint_after(Duration::from_secs(2));
+                }
+                Err(error) => {
+                    self.message = error;
+                }
+            }
         }
         if actions.toggle_watch_later {
             self.library.data.toggle_watch_later(video);
@@ -12239,6 +12902,7 @@ impl eframe::App for FastTube {
             .extras
             .sync_video(self.selected.as_ref().map(|video| video.url.as_str()));
         self.watch.extras.poll();
+        self.apply_ready_subtitle();
         self.poll_async_tasks(&ctx);
         if self.auth.authenticated && !self.auth.restore_attempted {
             self.auth.restore_attempted = true;
@@ -12272,6 +12936,11 @@ impl eframe::App for FastTube {
             self.ui.settings_open = false;
             self.sync_player_window_visibility();
         }
+        let closed_player_menu =
+            escape_pressed && !closed_settings && self.playback.player_menu.is_some();
+        if closed_player_menu {
+            self.playback.player_menu = None;
+        }
         self.handle_help_shortcuts(&ctx);
         if !ctx.egui_wants_keyboard_input() {
             let (home, explore, history, queue, library) = ctx.input(|input| {
@@ -12297,16 +12966,20 @@ impl eframe::App for FastTube {
             }
         }
         if self.selected.is_some() && !ctx.egui_wants_keyboard_input() {
-            let (toggle, back, forward, mute, theater, fullscreen) = ctx.input(|input| {
+            let (toggle, back, forward, mute, captions, theater, fullscreen) = ctx.input(|input| {
                 (
                     input.key_pressed(egui::Key::Space) || input.key_pressed(egui::Key::K),
-                    input.key_pressed(egui::Key::ArrowLeft),
-                    input.key_pressed(egui::Key::ArrowRight),
+                    input.key_pressed(egui::Key::ArrowLeft) || input.key_pressed(egui::Key::J),
+                    input.key_pressed(egui::Key::ArrowRight) || input.key_pressed(egui::Key::L),
                     input.key_pressed(egui::Key::M),
+                    input.key_pressed(egui::Key::C),
                     input.key_pressed(egui::Key::T),
                     input.key_pressed(egui::Key::F),
                 )
             });
+            if toggle || back || forward || mute || captions || theater || fullscreen {
+                self.playback.overlay_last_activity = Instant::now();
+            }
             #[cfg(windows)]
             {
                 let mut key_seek_pos: Option<f64> = None;
@@ -12373,10 +13046,18 @@ impl eframe::App for FastTube {
             }
             #[cfg(not(windows))]
             let _ = (toggle, back, forward, mute);
+            if captions {
+                self.toggle_player_captions(&ctx);
+            }
             if theater && !self.playback.fullscreen {
                 self.toggle_theater_mode();
             }
-            if fullscreen || (escape_pressed && !closed_settings && self.playback.fullscreen) {
+            if fullscreen
+                || (escape_pressed
+                    && !closed_settings
+                    && !closed_player_menu
+                    && self.playback.fullscreen)
+            {
                 self.toggle_fullscreen(&ctx);
             }
         }

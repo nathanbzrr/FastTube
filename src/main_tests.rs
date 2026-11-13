@@ -3527,3 +3527,226 @@ fn transcript_controls_render_headlessly_without_panicking() {
     output.textures_delta.clear();
     assert!(rendered_shapes > 0);
 }
+
+#[test]
+fn encode_utf16_clipboard_words_appends_null_terminator_for_ascii_and_unicode() {
+    let ascii = encode_utf16_clipboard_words("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+    assert_eq!(ascii.last(), Some(&0));
+    assert_eq!(
+        String::from_utf16(&ascii[..ascii.len() - 1]).unwrap(),
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    );
+
+    let unicode = encode_utf16_clipboard_words("Vídeo com ação 👍");
+    assert_eq!(unicode.last(), Some(&0));
+    assert_eq!(
+        String::from_utf16(&unicode[..unicode.len() - 1]).unwrap(),
+        "Vídeo com ação 👍"
+    );
+}
+
+#[test]
+fn poll_rating_updates_ratings_refreshed_session_and_status_messages() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    app.auth.authenticated = true;
+    app.auth.session = Some(oauth::TokenSession::test_session("old-token"));
+
+    let (tx, rx) = mpsc::channel();
+    app.auth.rating_rx = Some(rx);
+    tx.send((
+        Some(oauth::TokenSession::test_session("refreshed-token")),
+        Ok(("dQw4w9WgXcQ".into(), Some(oauth::VideoRating::Like))),
+    ))
+    .unwrap();
+    app.poll_rating(&ctx);
+    assert_eq!(
+        app.auth
+            .session
+            .as_ref()
+            .map(|session| session.access_token.as_str()),
+        Some("refreshed-token")
+    );
+    assert_eq!(
+        app.auth.ratings.get("dQw4w9WgXcQ").copied(),
+        Some(oauth::VideoRating::Like)
+    );
+    assert_eq!(app.message, "Você gostou deste vídeo.");
+    assert!(app.auth.rating_rx.is_none());
+
+    let (tx, rx) = mpsc::channel();
+    app.auth.rating_rx = Some(rx);
+    tx.send((
+        None,
+        Ok(("dQw4w9WgXcQ".into(), Some(oauth::VideoRating::Dislike))),
+    ))
+    .unwrap();
+    app.poll_rating(&ctx);
+    assert_eq!(
+        app.auth.ratings.get("dQw4w9WgXcQ").copied(),
+        Some(oauth::VideoRating::Dislike)
+    );
+    assert_eq!(app.message, "Você não gostou deste vídeo.");
+
+    let (tx, rx) = mpsc::channel();
+    app.auth.rating_rx = Some(rx);
+    tx.send((None, Ok(("dQw4w9WgXcQ".into(), None)))).unwrap();
+    app.poll_rating(&ctx);
+    assert!(!app.auth.ratings.contains_key("dQw4w9WgXcQ"));
+    assert_eq!(app.message, "Avaliação removida.");
+
+    let (tx, rx) = mpsc::channel();
+    app.auth.rating_rx = Some(rx);
+    tx.send((
+        None,
+        Err("Sua sessão Google expirou ou foi revogada. Entre novamente.".into()),
+    ))
+    .unwrap();
+    app.poll_rating(&ctx);
+    assert!(app.auth.session.is_some());
+    assert!(app.message.contains("sessão Google expirou"));
+}
+
+#[test]
+fn watch_share_copied_state_renders_headlessly_and_clears_on_close() {
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+    let video = sample_videos().remove(0);
+    app.selected = Some(video.clone());
+    app.watch.share_copied_at = Some(Instant::now());
+
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(960.0, 720.0),
+            )),
+            ..Default::default()
+        },
+        |ui| {
+            app.watch_metadata_card_ui(ui, &video, 680.0, None);
+        },
+    );
+    let rendered_shapes = output.shapes.len();
+    output.textures_delta.clear();
+    assert!(rendered_shapes > 0);
+    assert!(app.watch.share_copied_at.is_some());
+
+    app.close_video(&ctx);
+    assert!(app.watch.share_copied_at.is_none());
+}
+
+#[test]
+fn integrated_overlay_actions_update_menu_theater_fullscreen_miniplayer_and_app_settings() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "fasttube-overlay-actions-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let lib_path = temp_dir.join("library.json");
+
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    app.library.path = Some(lib_path.clone());
+
+    let mut video = sample_videos().remove(0);
+    video.url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into();
+    app.selected = Some(video.clone());
+    app.playback.last_subtitle_id = Some("mpv:1".into());
+
+    let overlay_ctx = OverlayPlaybackContext {
+        video: video.clone(),
+        paused: false,
+        ended: false,
+        muted: false,
+        position: 42.0,
+        duration: Some(180.0),
+        raw_volume: 85.0,
+        speed: 1.0,
+        current_height: Some(1080),
+        selected_quality: None,
+        qualities: vec![1080, 720, 480],
+        qualities_loading: false,
+        has_queued: false,
+        has_active_subtitle: false,
+        subtitles: Vec::new(),
+        subtitles_loading: false,
+        chapters: vec![overlay::OverlayChapter {
+            title: "Intro".into(),
+            time_secs: 0.0,
+        }],
+        theater: false,
+        fullscreen: false,
+        mini_player: false,
+        can_bookmark: true,
+        raw_path: Some(video.url.clone()),
+        raw_position: Some(42.0),
+        now: Instant::now(),
+    };
+
+    app.handle_player_overlay_action(
+        overlay::OverlayAction::SetMenu(Some(overlay::OverlayMenu::Root)),
+        &overlay_ctx,
+        &ctx,
+    );
+    assert_eq!(app.playback.player_menu, Some(overlay::OverlayMenu::Root));
+
+    app.handle_player_overlay_action(
+        overlay::OverlayAction::SetMenu(Some(overlay::OverlayMenu::Speed)),
+        &overlay_ctx,
+        &ctx,
+    );
+    assert_eq!(app.playback.player_menu, Some(overlay::OverlayMenu::Speed));
+
+    app.handle_player_overlay_action(overlay::OverlayAction::SetSpeed(1.5), &overlay_ctx, &ctx);
+    assert_eq!(app.playback.player_menu, None);
+
+    app.handle_player_overlay_action(overlay::OverlayAction::AddBookmark, &overlay_ctx, &ctx);
+    assert_eq!(app.library.data.bookmarks.len(), 1);
+    assert_eq!(app.library.data.bookmarks[0].time_ms, 42_000);
+    assert!(app.library.error.is_none());
+
+    app.handle_player_overlay_action(
+        overlay::OverlayAction::SetMenu(Some(overlay::OverlayMenu::Root)),
+        &overlay_ctx,
+        &ctx,
+    );
+    app.handle_player_overlay_action(overlay::OverlayAction::OpenAppSettings, &overlay_ctx, &ctx);
+    assert_eq!(app.playback.player_menu, None);
+    assert!(app.ui.settings_open);
+    assert!(!app.playback.window_visible);
+
+    app.ui.settings_open = false;
+    app.handle_player_overlay_action(overlay::OverlayAction::ToggleTheater, &overlay_ctx, &ctx);
+    assert!(app.playback.theater);
+
+    app.handle_player_overlay_action(overlay::OverlayAction::ToggleFullscreen, &overlay_ctx, &ctx);
+    assert!(app.playback.fullscreen);
+
+    // Ativar miniplayer enquanto em tela cheia deve sair da tela cheia automaticamente.
+    app.handle_player_overlay_action(overlay::OverlayAction::ToggleMiniPlayer, &overlay_ctx, &ctx);
+    assert!(app.playback.mini_player);
+    assert!(!app.playback.fullscreen);
+
+    app.playback.player_menu = Some(overlay::OverlayMenu::Quality);
+    app.close_video(&ctx);
+    assert_eq!(app.playback.player_menu, None);
+    assert_eq!(app.playback.last_subtitle_id, None);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn overlay_style_maintains_high_contrast_in_both_themes() {
+    let mut settings = app_state::SettingsState::default();
+    for theme in [Theme::Dark, Theme::Light] {
+        settings.theme.value = theme;
+        let style = settings.overlay_style();
+        assert!(style.panel.a() >= 220);
+        assert!(style.icon.r() >= 240 && style.icon.g() >= 240 && style.icon.b() >= 240);
+        assert!(style.text.r() >= 240 && style.text.g() >= 240 && style.text.b() >= 240);
+        assert_eq!(style.accent, Color32::from_rgb(255, 0, 51));
+    }
+}

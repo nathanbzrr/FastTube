@@ -152,8 +152,41 @@ pub struct SubtitleTrack {
     pub url: String,
 }
 
+const SUBTITLE_MAX_BYTES: usize = 2 * 1024 * 1024;
+const SUBTITLE_MAX_HLS_SEGMENTS: usize = 64;
+const SUBTITLE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+fn validate_subtitle_url(value: &str) -> Result<url::Url, String> {
+    let parsed = url::Url::parse(value).map_err(|_| "URL de legenda inválida.".to_owned())?;
+    let host = parsed.host_str().unwrap_or("");
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || !(host == "youtube.com"
+            || host.ends_with(".youtube.com")
+            || host == "googlevideo.com"
+            || host.ends_with(".googlevideo.com")
+            || host == "ytimg.com"
+            || host.ends_with(".ytimg.com"))
+    {
+        return Err("Origem da legenda não permitida.".into());
+    }
+    Ok(parsed)
+}
+
+fn is_auto_translated_url(parsed: &url::Url) -> bool {
+    parsed.query_pairs().any(|(key, _)| key == "tlang")
+}
+
+fn is_hls_playlist_format(format: &Value, parsed: &url::Url) -> bool {
+    format["protocol"]
+        .as_str()
+        .is_some_and(|protocol| protocol.starts_with("m3u8"))
+        || parsed.path().ends_with(".m3u8")
+}
+
 fn parse_subtitles(value: &Value) -> Vec<SubtitleTrack> {
-    let mut tracks = Vec::new();
+    let mut candidates = Vec::new();
     for (field, automatic) in [("subtitles", false), ("automatic_captions", true)] {
         let Some(languages) = value[field].as_object() else {
             continue;
@@ -167,35 +200,48 @@ fn parse_subtitles(value: &Value) -> Vec<SubtitleTrack> {
             {
                 continue;
             }
-            let Some(url) = formats.as_array().and_then(|formats| {
-                formats.iter().find_map(|format| {
+            let Some((url, parsed)) = formats.as_array().and_then(|formats| {
+                let mut direct = None;
+                let mut hls = None;
+                for format in formats {
                     if format["ext"].as_str() != Some("vtt") {
-                        return None;
+                        continue;
                     }
-                    let value = format["url"].as_str()?;
-                    let parsed = url::Url::parse(value).ok()?;
-                    let host = parsed.host_str()?;
-                    (parsed.scheme() == "https"
-                        && parsed.username().is_empty()
-                        && parsed.password().is_none()
-                        && (host == "youtube.com"
-                            || host.ends_with(".youtube.com")
-                            || host == "googlevideo.com"
-                            || host.ends_with(".googlevideo.com")
-                            || host == "ytimg.com"
-                            || host.ends_with(".ytimg.com")))
-                    .then_some(value)
-                })
+                    let Some(value) = format["url"].as_str() else {
+                        continue;
+                    };
+                    let Ok(parsed) = validate_subtitle_url(value) else {
+                        continue;
+                    };
+                    if is_hls_playlist_format(format, &parsed) {
+                        if hls.is_none() {
+                            hls = Some((value, parsed));
+                        }
+                    } else {
+                        direct = Some((value, parsed));
+                        break;
+                    }
+                }
+                direct.or(hls)
             }) else {
                 continue;
             };
-            tracks.push(SubtitleTrack {
-                language: language.clone(),
-                automatic,
-                url: url.to_owned(),
-            });
+            let translated = is_auto_translated_url(&parsed);
+            candidates.push((
+                SubtitleTrack {
+                    language: language.clone(),
+                    automatic,
+                    url: url.to_owned(),
+                },
+                translated,
+            ));
         }
     }
+    let has_native_tracks = candidates.iter().any(|(_, translated)| !translated);
+    let mut tracks: Vec<SubtitleTrack> = candidates
+        .into_iter()
+        .filter_map(|(track, translated)| (!has_native_tracks || !translated).then_some(track))
+        .collect();
     tracks.sort_by(|left, right| {
         (left.automatic, &left.language).cmp(&(right.automatic, &right.language))
     });
@@ -215,6 +261,33 @@ fn subtitle_parser_selects_vtt_and_rejects_untrusted_hosts() {
     assert_eq!(tracks[0].language, "pt-BR");
     assert!(!tracks[0].automatic);
     assert!(tracks[1].automatic);
+}
+
+#[cfg(test)]
+#[test]
+fn subtitle_parser_prefers_direct_vtt_and_filters_tlang_when_native_exists() {
+    let value = serde_json::json!({
+        "subtitles": {},
+        "automatic_captions": {
+            "en": [
+                {"ext": "vtt", "protocol": "m3u8_native", "url": "https://manifest.googlevideo.com/api/manifest/hls_timedtext_playlist/index.m3u8"},
+                {"ext": "vtt", "url": "https://www.youtube.com/api/timedtext?v=123&lang=en&fmt=vtt"}
+            ],
+            "pt": [
+                {"ext": "vtt", "url": "https://www.youtube.com/api/timedtext?v=123&lang=en&tlang=pt&fmt=vtt"}
+            ],
+            "it": [
+                {"ext": "vtt", "url": "https://www.youtube.com/api/timedtext?v=123&lang=en&tlang=it&fmt=vtt"}
+            ]
+        }
+    });
+    let tracks = parse_subtitles(&value);
+    assert_eq!(tracks.len(), 1);
+    assert_eq!(tracks[0].language, "en");
+    assert_eq!(
+        tracks[0].url,
+        "https://www.youtube.com/api/timedtext?v=123&lang=en&fmt=vtt"
+    );
 }
 
 pub fn youtube_subtitles(
@@ -245,39 +318,133 @@ pub fn youtube_subtitles(
     Ok(parse_subtitles(&json))
 }
 
-pub fn download_vtt(url: &str) -> Result<String, String> {
-    let parsed = url::Url::parse(url).map_err(|_| "URL de legenda inválida.")?;
-    let host = parsed.host_str().unwrap_or("");
-    if parsed.scheme() != "https"
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || !(host == "youtube.com"
-            || host.ends_with(".youtube.com")
-            || host == "googlevideo.com"
-            || host.ends_with(".googlevideo.com")
-            || host == "ytimg.com"
-            || host.ends_with(".ytimg.com"))
-    {
-        return Err("Origem da legenda não permitida.".into());
+fn fetch_subtitle_text(
+    client: &reqwest::blocking::Client,
+    parsed: url::Url,
+    remaining_bytes: usize,
+) -> Result<String, String> {
+    let response = client
+        .get(parsed)
+        .header(reqwest::header::USER_AGENT, SUBTITLE_USER_AGENT)
+        .send()
+        .map_err(|_| "Não foi possível baixar a legenda.".to_owned())?;
+    let status = response.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(
+            "O YouTube limitou temporariamente o acesso às legendas (HTTP 429). Aguarde alguns instantes e tente novamente."
+                .into(),
+        );
     }
-    let response = reqwest::blocking::Client::builder()
-        .timeout(QUERY_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .and_then(|client| client.get(parsed).send())
-        .map_err(|_| "Não foi possível baixar a legenda.")?;
-    if !response.status().is_success() {
-        return Err("A legenda expirou ou não está disponível.".into());
+    if matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED
+            | reqwest::StatusCode::FORBIDDEN
+            | reqwest::StatusCode::NOT_FOUND
+            | reqwest::StatusCode::GONE
+    ) {
+        return Err("A legenda expirou ou não está disponível. Clique em Buscar novamente.".into());
+    }
+    if !status.is_success() {
+        return Err(format!(
+            "Não foi possível baixar a legenda (HTTP {}).",
+            status.as_u16()
+        ));
     }
     let mut bytes = Vec::new();
     response
-        .take(2 * 1024 * 1024 + 1)
+        .take(remaining_bytes.saturating_add(1) as u64)
         .read_to_end(&mut bytes)
-        .map_err(|_| "Resposta de legenda inválida.")?;
-    if bytes.len() > 2 * 1024 * 1024 {
+        .map_err(|_| "Resposta de legenda inválida.".to_owned())?;
+    if bytes.len() > remaining_bytes {
         return Err("Legenda acima do limite de 2 MiB.".into());
     }
-    String::from_utf8(bytes).map_err(|_| "A legenda não está em UTF-8.".into())
+    String::from_utf8(bytes).map_err(|_| "A legenda não está em UTF-8.".to_owned())
+}
+
+fn strip_vtt_header(segment: &str) -> &str {
+    let trimmed = segment.trim_start_matches('\u{feff}');
+    if !trimmed.starts_with("WEBVTT") {
+        return trimmed;
+    }
+    let mut offset = 0;
+    let mut seen_blank = false;
+    for line in trimmed.split_inclusive('\n') {
+        offset += line.len();
+        if line.trim().is_empty() {
+            seen_blank = true;
+            break;
+        }
+    }
+    if seen_blank { &trimmed[offset..] } else { "" }
+}
+
+fn merge_vtt_segments<'a>(segments: impl IntoIterator<Item = &'a str>) -> String {
+    let mut merged = String::new();
+    for (index, segment) in segments.into_iter().enumerate() {
+        if index == 0 {
+            merged.push_str(segment.trim_start_matches('\u{feff}'));
+            continue;
+        }
+        let body = strip_vtt_header(segment).trim_start_matches(['\r', '\n']);
+        if !body.is_empty() {
+            if !merged.ends_with('\n') {
+                merged.push('\n');
+            }
+            merged.push('\n');
+            merged.push_str(body);
+        }
+    }
+    merged
+}
+
+#[cfg(test)]
+#[test]
+fn hls_vtt_segment_merger_strips_duplicate_headers() {
+    let seg1 = "WEBVTT\nKind: captions\nLanguage: pt-BR\n\n00:00:01.000 --> 00:00:02.000\nOi\n";
+    let seg2 =
+        "\u{feff}WEBVTT\nKind: captions\nLanguage: pt-BR\n\n00:00:02.000 --> 00:00:03.000\nMundo\n";
+    let merged = merge_vtt_segments([seg1, seg2]);
+    assert_eq!(merged.matches("WEBVTT").count(), 1);
+    assert!(merged.contains("Oi"));
+    assert!(merged.contains("Mundo"));
+}
+
+pub fn download_vtt(url: &str) -> Result<String, String> {
+    let parsed = validate_subtitle_url(url)?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(QUERY_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "Não foi possível preparar o download da legenda.".to_owned())?;
+    let body = fetch_subtitle_text(&client, parsed.clone(), SUBTITLE_MAX_BYTES)?;
+    if !body.trim_start_matches('\u{feff}').starts_with("#EXTM3U") {
+        return Ok(body);
+    }
+    let mut segment_urls = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if segment_urls.len() >= SUBTITLE_MAX_HLS_SEGMENTS {
+            return Err("A legenda excede o limite de segmentos suportado.".into());
+        }
+        let joined = parsed
+            .join(trimmed)
+            .map_err(|_| "URL de segmento de legenda inválida.".to_owned())?;
+        segment_urls.push(validate_subtitle_url(joined.as_str())?);
+    }
+    if segment_urls.is_empty() {
+        return Err("A playlist da legenda não contém faixas disponíveis.".into());
+    }
+    let mut remaining = SUBTITLE_MAX_BYTES;
+    let mut segments = Vec::with_capacity(segment_urls.len());
+    for segment_url in segment_urls {
+        let segment_text = fetch_subtitle_text(&client, segment_url, remaining)?;
+        remaining = remaining.saturating_sub(segment_text.len());
+        segments.push(segment_text);
+    }
+    Ok(merge_vtt_segments(segments.iter().map(String::as_str)))
 }
 
 fn is_playlist_url(url: &str) -> bool {

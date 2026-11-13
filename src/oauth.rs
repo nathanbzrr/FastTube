@@ -545,9 +545,11 @@ fn api_failure_message(status: u16, body: &Value) -> String {
     match reason {
         Some("commentsDisabled") => "Os coment\u{00e1}rios est\u{00e3}o desativados neste v\u{00ed}deo.".into(),
         Some("quotaExceeded" | "dailyLimitExceeded" | "rateLimitExceeded") => "Cota da API do YouTube esgotada. Tente novamente mais tarde.".into(),
+        Some("authError") => "Sua sess\u{00e3}o Google expirou ou foi revogada. Entre novamente.".into(),
         Some("forbidden" | "insufficientPermissions") => "A conta conectada n\u{00e3}o tem permiss\u{00e3}o para esta consulta. Se o problema continuar, reconecte a conta.".into(),
         Some("videoNotFound" | "commentThreadNotFound" | "playlistNotFound" | "channelNotFound") => "O recurso solicitado n\u{00e3}o foi encontrado no YouTube.".into(),
         Some(reason) => format!("A API do YouTube recusou a consulta (HTTP {status}, motivo: {reason}). Confira permiss\u{00f5}es e cota."),
+        None if status == 401 => "Sua sess\u{00e3}o Google expirou ou foi revogada. Entre novamente.".into(),
         None => format!("A API do YouTube recusou a consulta (HTTP {status}). Confira API, permiss\u{00f5}es e cota."),
     }
 }
@@ -757,6 +759,22 @@ pub fn rate_video(
     rating: VideoRating,
     cancel: &Cancellation,
 ) -> Result<(), String> {
+    rate_video_at(
+        "https://www.googleapis.com/youtube/v3/videos/rate",
+        token,
+        video_id,
+        rating,
+        cancel,
+    )
+}
+
+fn rate_video_at(
+    endpoint: &str,
+    token: &str,
+    video_id: &str,
+    rating: VideoRating,
+    cancel: &Cancellation,
+) -> Result<(), String> {
     if cancel.cancelled() {
         return Err("Avaliação cancelada.".into());
     }
@@ -764,9 +782,11 @@ pub fn rate_video(
         return Err("Este vídeo não possui um ID válido do YouTube.".into());
     }
     let response = http_client()?
-        .post("https://www.googleapis.com/youtube/v3/videos/rate")
+        .post(endpoint)
         .bearer_auth(token)
         .query(&[("id", video_id), ("rating", rating.api_value())])
+        .header(reqwest::header::CONTENT_LENGTH, 0)
+        .body(Vec::new())
         .send()
         .map_err(|_| "Falha de conexão ao avaliar o vídeo.".to_owned())?;
     if cancel.cancelled() {
@@ -1344,6 +1364,63 @@ mod tests {
         }
         assert!(!valid_id(&"a".repeat(129)));
         assert!(valid_id("a".repeat(128).as_str()));
+    }
+
+    #[test]
+    fn video_rating_sends_zero_content_length_post_and_handles_auth_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut captured = Vec::new();
+            for status_line in ["HTTP/1.1 204 No Content", "HTTP/1.1 401 Unauthorized"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0u8; 4096];
+                let count = stream.read(&mut buf).unwrap_or(0);
+                captured.push(String::from_utf8_lossy(&buf[..count]).into_owned());
+                let response =
+                    format!("{status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            captured
+        });
+
+        let endpoint = format!("http://{addr}/youtube/v3/videos/rate");
+        let cancel = Cancellation::default();
+        rate_video_at(
+            &endpoint,
+            "tok-123",
+            "dQw4w9WgXcQ",
+            VideoRating::Like,
+            &cancel,
+        )
+        .unwrap();
+        let err = rate_video_at(
+            &endpoint,
+            "tok-123",
+            "dQw4w9WgXcQ",
+            VideoRating::Dislike,
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(err.contains("sess\u{00e3}o Google expirou"));
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        let first_lower = requests[0].to_ascii_lowercase();
+        assert!(
+            requests[0].starts_with("POST /youtube/v3/videos/rate?id=dQw4w9WgXcQ&rating=like ")
+        );
+        assert!(first_lower.contains("authorization: bearer tok-123\r\n"));
+        assert!(first_lower.contains("content-length: 0\r\n"));
+        assert!(
+            requests[1].starts_with("POST /youtube/v3/videos/rate?id=dQw4w9WgXcQ&rating=dislike ")
+        );
+        assert!(
+            requests[1]
+                .to_ascii_lowercase()
+                .contains("content-length: 0\r\n")
+        );
     }
 
     #[test]

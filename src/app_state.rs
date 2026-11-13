@@ -159,8 +159,10 @@ pub(crate) struct ChannelAboutState {
     pub(crate) error: Option<String>,
 }
 
-pub(crate) type RatingResultReceiver =
-    Receiver<Result<(String, Option<crate::oauth::VideoRating>), String>>;
+pub(crate) type RatingResultReceiver = Receiver<(
+    Option<crate::oauth::TokenSession>,
+    Result<(String, Option<crate::oauth::VideoRating>), String>,
+)>;
 
 #[derive(Default)]
 pub(crate) struct AuthState {
@@ -189,6 +191,8 @@ pub(crate) struct PlaybackState {
     pub(crate) quality_error: Option<String>,
     pub(crate) seek_drag: Option<f64>,
     pub(crate) overlay_last_activity: Instant,
+    pub(crate) player_menu: Option<overlay::OverlayMenu>,
+    pub(crate) last_subtitle_id: Option<String>,
     pub(crate) diagnostics: DecodingDiagnostics,
     pub(crate) last_diagnostics_poll_at: Option<Instant>,
 }
@@ -210,6 +214,8 @@ impl Default for PlaybackState {
             quality_error: None,
             seek_drag: None,
             overlay_last_activity: Instant::now(),
+            player_menu: None,
+            last_subtitle_id: None,
             diagnostics: DecodingDiagnostics::unknown(Some(crate::DEFAULT_CONFIGURED_HWDEC)),
             last_diagnostics_poll_at: None,
         }
@@ -335,6 +341,7 @@ pub(crate) struct NavigationUiState {
 #[derive(Default)]
 pub(crate) struct WatchState {
     pub(crate) extras: crate::watch_extras::WatchExtras,
+    pub(crate) share_copied_at: Option<Instant>,
 }
 
 pub(crate) fn load_playback_settings_from_path(path: &Path) -> Result<PlaybackPreferences, String> {
@@ -502,22 +509,12 @@ impl SettingsState {
     }
 
     pub(crate) fn overlay_style(&self) -> overlay::OverlayStyle {
-        let palette = self.palette();
-        let (panel, accent) = match self.theme.value {
-            Theme::Dark => (
-                Color32::from_rgba_unmultiplied(16, 16, 20, 232),
-                Color32::from_rgb(255, 70, 70),
-            ),
-            Theme::Light => (
-                Color32::from_rgba_unmultiplied(250, 250, 252, 238),
-                Color32::from_rgb(176, 24, 34),
-            ),
-        };
+        let _ = self.theme.value;
         overlay::OverlayStyle {
-            panel,
-            icon: palette.icon_fg,
-            text: palette.description_fg,
-            accent,
+            panel: Color32::from_rgba_unmultiplied(20, 20, 22, 238),
+            icon: Color32::from_rgb(248, 248, 250),
+            text: Color32::from_rgb(244, 244, 246),
+            accent: Color32::from_rgb(255, 0, 51),
         }
     }
 
