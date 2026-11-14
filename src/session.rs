@@ -15,6 +15,10 @@ pub fn profile_dir() -> Result<PathBuf, String> {
         .join("browser-profile"))
 }
 
+pub fn has_saved_profile() -> bool {
+    profile_dir().is_ok_and(|p| p.join("Default").exists())
+}
+
 fn browser_executable() -> Result<PathBuf, String> {
     // The registered Vivaldi installation is used when available, followed by Edge.
     for key in [

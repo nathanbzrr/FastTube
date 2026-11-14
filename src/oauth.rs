@@ -510,14 +510,15 @@ fn http_client() -> Result<reqwest::blocking::Client, String> {
         .map_err(|_| "Não foi possível iniciar a conexão segura.".into())
 }
 
-fn api(
+fn api_at(
     client: &reqwest::blocking::Client,
+    base_url: &str,
     token: &str,
     resource: &str,
     params: &[(&str, &str)],
 ) -> Result<Value, String> {
     let response = client
-        .get(format!("https://www.googleapis.com/youtube/v3/{resource}"))
+        .get(format!("{base_url}/{resource}"))
         .bearer_auth(token)
         .query(params)
         .send()
@@ -529,12 +530,82 @@ fn api(
     let body: Value = match response.json() {
         Ok(body) => body,
         Err(_) if !status.is_success() => Value::Null,
-        Err(_) => return Err("Resposta inv\u{e1}lida da API do YouTube.".into()),
+        Err(_) => return Err("Resposta inv\u{00e1}lida da API do YouTube.".into()),
     };
     if !status.is_success() {
         return Err(api_failure_message(status.as_u16(), &body));
     }
     Ok(body)
+}
+
+fn api(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    resource: &str,
+    params: &[(&str, &str)],
+) -> Result<Value, String> {
+    api_at(
+        client,
+        "https://www.googleapis.com/youtube/v3",
+        token,
+        resource,
+        params,
+    )
+}
+
+fn api_post_json_at(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    token: &str,
+    resource: &str,
+    params: &[(&str, &str)],
+    payload: &Value,
+) -> Result<Value, String> {
+    let response = client
+        .post(format!("{base_url}/{resource}"))
+        .bearer_auth(token)
+        .query(params)
+        .json(payload)
+        .send()
+        .map_err(|_| "Falha de conexão com a API do YouTube.")?;
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("Sess\u{00e3}o expirada. Saia da conta e entre novamente.".into());
+    }
+    let body: Value = match response.json() {
+        Ok(body) => body,
+        Err(_) if !status.is_success() => Value::Null,
+        Err(_) if status.is_success() => Value::Null,
+        Err(_) => return Err("Resposta inv\u{00e1}lida da API do YouTube.".into()),
+    };
+    if !status.is_success() {
+        return Err(api_failure_message(status.as_u16(), &body));
+    }
+    Ok(body)
+}
+
+fn api_delete_at(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    token: &str,
+    resource: &str,
+    params: &[(&str, &str)],
+) -> Result<(), String> {
+    let response = client
+        .delete(format!("{base_url}/{resource}"))
+        .bearer_auth(token)
+        .query(params)
+        .send()
+        .map_err(|_| "Falha de conexão com a API do YouTube.")?;
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("Sess\u{00e3}o expirada. Saia da conta e entre novamente.".into());
+    }
+    if status.is_success() {
+        return Ok(());
+    }
+    let body: Value = response.json().unwrap_or(Value::Null);
+    Err(api_failure_message(status.as_u16(), &body))
 }
 
 fn api_failure_message(status: u16, body: &Value) -> String {
@@ -547,7 +618,9 @@ fn api_failure_message(status: u16, body: &Value) -> String {
         Some("quotaExceeded" | "dailyLimitExceeded" | "rateLimitExceeded") => "Cota da API do YouTube esgotada. Tente novamente mais tarde.".into(),
         Some("authError") => "Sua sess\u{00e3}o Google expirou ou foi revogada. Entre novamente.".into(),
         Some("forbidden" | "insufficientPermissions") => "A conta conectada n\u{00e3}o tem permiss\u{00e3}o para esta consulta. Se o problema continuar, reconecte a conta.".into(),
-        Some("videoNotFound" | "commentThreadNotFound" | "playlistNotFound" | "channelNotFound") => "O recurso solicitado n\u{00e3}o foi encontrado no YouTube.".into(),
+        Some("subscriptionDuplicate") => "Você já está inscrito neste canal.".into(),
+        Some("subscriptionForbidden") => "Não foi possível alterar a inscrição deste canal.".into(),
+        Some("videoNotFound" | "commentThreadNotFound" | "playlistNotFound" | "channelNotFound" | "subscriptionNotFound") => "O recurso solicitado n\u{00e3}o foi encontrado no YouTube.".into(),
         Some(reason) => format!("A API do YouTube recusou a consulta (HTTP {status}, motivo: {reason}). Confira permiss\u{00f5}es e cota."),
         None if status == 401 => "Sua sess\u{00e3}o Google expirou ou foi revogada. Entre novamente.".into(),
         None => format!("A API do YouTube recusou a consulta (HTTP {status}). Confira API, permiss\u{00f5}es e cota."),
@@ -562,10 +635,43 @@ fn valid_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CommentOrder {
+    #[default]
+    Relevance,
+    Time,
+}
+
+impl CommentOrder {
+    pub fn api_value(self) -> &'static str {
+        match self {
+            Self::Relevance => "relevance",
+            Self::Time => "time",
+        }
+    }
+}
+
+fn sanitize_avatar_url(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() || trimmed.len() > 2048 {
+        return None;
+    }
+    let normalized = if let Some(rest) = trimmed.strip_prefix("//") {
+        format!("https://{rest}")
+    } else if let Some(rest) = trimmed.strip_prefix("http://") {
+        format!("https://{rest}")
+    } else {
+        trimmed.to_owned()
+    };
+    let parsed = url::Url::parse(&normalized).ok()?;
+    (parsed.scheme() == "https" && parsed.host_str().is_some()).then_some(normalized)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Comment {
     pub id: String,
     pub author: String,
+    pub author_avatar: Option<String>,
     pub text: String,
     pub published: String,
     pub likes: u64,
@@ -575,6 +681,69 @@ pub struct Comment {
 pub struct CommentsPage {
     pub comments: Vec<Comment>,
     pub next_page: Option<String>,
+    pub total_results: Option<u64>,
+}
+
+fn parse_top_level_comment(item: &Value) -> Option<Comment> {
+    let snippet = item.pointer("/snippet/topLevelComment/snippet")?;
+    Some(Comment {
+        id: item
+            .pointer("/snippet/topLevelComment/id")?
+            .as_str()?
+            .to_owned(),
+        author: snippet["authorDisplayName"]
+            .as_str()
+            .unwrap_or("Usuário")
+            .chars()
+            .take(256)
+            .collect(),
+        author_avatar: sanitize_avatar_url(snippet["authorProfileImageUrl"].as_str()),
+        text: snippet["textDisplay"]
+            .as_str()
+            .or_else(|| snippet["textOriginal"].as_str())?
+            .chars()
+            .take(8192)
+            .collect(),
+        published: snippet["publishedAt"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(40)
+            .collect(),
+        likes: snippet["likeCount"].as_u64().unwrap_or(0),
+        replies: item
+            .pointer("/snippet/totalReplyCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    })
+}
+
+fn parse_reply_comment(item: &Value) -> Option<Comment> {
+    let snippet = item.get("snippet")?;
+    Some(Comment {
+        id: item["id"].as_str()?.to_owned(),
+        author: snippet["authorDisplayName"]
+            .as_str()
+            .unwrap_or("Usu\u{00e1}rio")
+            .chars()
+            .take(256)
+            .collect(),
+        author_avatar: sanitize_avatar_url(snippet["authorProfileImageUrl"].as_str()),
+        text: snippet["textDisplay"]
+            .as_str()
+            .or_else(|| snippet["textOriginal"].as_str())?
+            .chars()
+            .take(8192)
+            .collect(),
+        published: snippet["publishedAt"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(40)
+            .collect(),
+        likes: snippet["likeCount"].as_u64().unwrap_or(0),
+        replies: 0,
+    })
 }
 
 fn parse_comments(json: &Value) -> Result<CommentsPage, String> {
@@ -583,52 +752,36 @@ fn parse_comments(json: &Value) -> Result<CommentsPage, String> {
         .ok_or("Resposta de comentários inválida.")?;
     let comments = items
         .iter()
-        .take(25)
-        .filter_map(|item| {
-            let snippet = item.pointer("/snippet/topLevelComment/snippet")?;
-            Some(Comment {
-                id: item
-                    .pointer("/snippet/topLevelComment/id")?
-                    .as_str()?
-                    .to_owned(),
-                author: snippet["authorDisplayName"]
-                    .as_str()
-                    .unwrap_or("Usuário")
-                    .chars()
-                    .take(256)
-                    .collect(),
-                text: snippet["textDisplay"]
-                    .as_str()?
-                    .chars()
-                    .take(8192)
-                    .collect(),
-                published: snippet["publishedAt"]
-                    .as_str()
-                    .unwrap_or("")
-                    .chars()
-                    .take(40)
-                    .collect(),
-                likes: snippet["likeCount"].as_u64().unwrap_or(0),
-                replies: item
-                    .pointer("/snippet/totalReplyCount")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-            })
-        })
+        .take(50)
+        .filter_map(parse_top_level_comment)
         .collect();
     let next_page = json["nextPageToken"]
         .as_str()
         .filter(|value| !value.is_empty() && value.len() <= 1024)
         .map(str::to_owned);
+    let total_results = json
+        .pointer("/pageInfo/totalResults")
+        .and_then(Value::as_u64);
     Ok(CommentsPage {
         comments,
         next_page,
+        total_results,
     })
 }
 
 pub fn comments_page(
     token: &str,
     video_id: &str,
+    page: Option<&str>,
+    cancel: &Cancellation,
+) -> Result<CommentsPage, String> {
+    comments_page_ordered(token, video_id, CommentOrder::Relevance, page, cancel)
+}
+
+pub fn comments_page_ordered(
+    token: &str,
+    video_id: &str,
+    order: CommentOrder,
     page: Option<&str>,
     cancel: &Cancellation,
 ) -> Result<CommentsPage, String> {
@@ -641,8 +794,8 @@ pub fn comments_page(
     let mut params = vec![
         ("part", "snippet"),
         ("videoId", video_id),
-        ("maxResults", "25"),
-        ("order", "relevance"),
+        ("maxResults", "50"),
+        ("order", order.api_value()),
         ("textFormat", "plainText"),
     ];
     if let Some(page) = page {
@@ -660,6 +813,118 @@ pub fn comments_page(
     parse_comments(&json)
 }
 
+pub fn post_comment(
+    token: &str,
+    video_id: &str,
+    text: &str,
+    cancel: &Cancellation,
+) -> Result<Comment, String> {
+    post_comment_at(
+        "https://www.googleapis.com/youtube/v3",
+        token,
+        video_id,
+        text,
+        cancel,
+    )
+}
+
+fn post_comment_at(
+    base_url: &str,
+    token: &str,
+    video_id: &str,
+    text: &str,
+    cancel: &Cancellation,
+) -> Result<Comment, String> {
+    if cancel.cancelled() {
+        return Err("Envio de comentário cancelado.".into());
+    }
+    if !valid_id(video_id) {
+        return Err("Este vídeo não possui um ID válido do YouTube.".into());
+    }
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("Escreva um comentário antes de enviar.".into());
+    }
+    let safe_text: String = trimmed.chars().take(10_000).collect();
+    let payload = serde_json::json!({
+        "snippet": {
+            "videoId": video_id,
+            "topLevelComment": {
+                "snippet": {
+                    "textOriginal": safe_text
+                }
+            }
+        }
+    });
+    let json = api_post_json_at(
+        &http_client()?,
+        base_url,
+        token,
+        "commentThreads",
+        &[("part", "snippet")],
+        &payload,
+    )
+    .map_err(|error| format!("Não foi possível publicar o comentário. {error}"))?;
+    if cancel.cancelled() {
+        return Err("Envio de comentário cancelado.".into());
+    }
+    parse_top_level_comment(&json).ok_or_else(|| "Resposta de comentário inválida.".to_owned())
+}
+
+pub fn post_comment_reply(
+    token: &str,
+    parent_id: &str,
+    text: &str,
+    cancel: &Cancellation,
+) -> Result<Comment, String> {
+    post_comment_reply_at(
+        "https://www.googleapis.com/youtube/v3",
+        token,
+        parent_id,
+        text,
+        cancel,
+    )
+}
+
+fn post_comment_reply_at(
+    base_url: &str,
+    token: &str,
+    parent_id: &str,
+    text: &str,
+    cancel: &Cancellation,
+) -> Result<Comment, String> {
+    if cancel.cancelled() {
+        return Err("Envio de resposta cancelado.".into());
+    }
+    if !valid_id(parent_id) {
+        return Err("Este comentário não possui um ID válido.".into());
+    }
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("Escreva uma resposta antes de enviar.".into());
+    }
+    let safe_text: String = trimmed.chars().take(10_000).collect();
+    let payload = serde_json::json!({
+        "snippet": {
+            "parentId": parent_id,
+            "textOriginal": safe_text
+        }
+    });
+    let json = api_post_json_at(
+        &http_client()?,
+        base_url,
+        token,
+        "comments",
+        &[("part", "snippet")],
+        &payload,
+    )
+    .map_err(|error| format!("Não foi possível publicar a resposta. {error}"))?;
+    if cancel.cancelled() {
+        return Err("Envio de resposta cancelado.".into());
+    }
+    parse_reply_comment(&json).ok_or_else(|| "Resposta de comentário inválida.".to_owned())
+}
+
 fn parse_comment_replies(json: &Value) -> Result<CommentsPage, String> {
     let items = json["items"]
         .as_array()
@@ -667,31 +932,7 @@ fn parse_comment_replies(json: &Value) -> Result<CommentsPage, String> {
     let comments = items
         .iter()
         .take(100)
-        .filter_map(|item| {
-            let snippet = item.get("snippet")?;
-            Some(Comment {
-                id: item["id"].as_str()?.to_owned(),
-                author: snippet["authorDisplayName"]
-                    .as_str()
-                    .unwrap_or("Usu\u{00e1}rio")
-                    .chars()
-                    .take(256)
-                    .collect(),
-                text: snippet["textDisplay"]
-                    .as_str()?
-                    .chars()
-                    .take(8192)
-                    .collect(),
-                published: snippet["publishedAt"]
-                    .as_str()
-                    .unwrap_or("")
-                    .chars()
-                    .take(40)
-                    .collect(),
-                likes: snippet["likeCount"].as_u64().unwrap_or(0),
-                replies: 0,
-            })
-        })
+        .filter_map(parse_reply_comment)
         .collect();
     let next_page = json["nextPageToken"]
         .as_str()
@@ -700,6 +941,7 @@ fn parse_comment_replies(json: &Value) -> Result<CommentsPage, String> {
     Ok(CommentsPage {
         comments,
         next_page,
+        total_results: None,
     })
 }
 
@@ -734,6 +976,537 @@ pub fn comment_replies_page(
         return Err("Consulta de respostas cancelada.".into());
     }
     parse_comment_replies(&json)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscriptionStatus {
+    pub channel_id: String,
+    pub channel_title: Option<String>,
+    pub subscription_id: Option<String>,
+}
+
+pub fn resolve_channel_id(
+    token: &str,
+    target: &crate::search::ChannelTarget,
+    cancel: &Cancellation,
+) -> Result<String, String> {
+    resolve_channel_id_at(
+        "https://www.googleapis.com/youtube/v3",
+        token,
+        target,
+        cancel,
+    )
+}
+
+fn resolve_channel_id_at(
+    base_url: &str,
+    token: &str,
+    target: &crate::search::ChannelTarget,
+    cancel: &Cancellation,
+) -> Result<String, String> {
+    if cancel.cancelled() {
+        return Err("Consulta cancelada.".into());
+    }
+    match target {
+        crate::search::ChannelTarget::ChannelId(id) => {
+            if !valid_id(id) {
+                return Err("ID de canal inválido.".into());
+            }
+            Ok(id.clone())
+        }
+        crate::search::ChannelTarget::Handle(handle) => {
+            let clean = handle.trim().trim_start_matches('@');
+            if clean.is_empty() || clean.len() > 128 {
+                return Err("Identificador de canal inválido.".into());
+            }
+            let json = api_at(
+                &http_client()?,
+                base_url,
+                token,
+                "channels",
+                &[("part", "id"), ("forHandle", clean), ("maxResults", "1")],
+            )?;
+            if cancel.cancelled() {
+                return Err("Consulta cancelada.".into());
+            }
+            json.pointer("/items/0/id")
+                .and_then(Value::as_str)
+                .filter(|id| valid_id(id))
+                .map(str::to_owned)
+                .ok_or_else(|| "Não foi possível identificar o canal no YouTube.".to_owned())
+        }
+    }
+}
+
+pub fn check_subscription(
+    token: &str,
+    channel_id: &str,
+    cancel: &Cancellation,
+) -> Result<SubscriptionStatus, String> {
+    check_subscription_at(
+        "https://www.googleapis.com/youtube/v3",
+        token,
+        channel_id,
+        cancel,
+    )
+}
+
+fn check_subscription_at(
+    base_url: &str,
+    token: &str,
+    channel_id: &str,
+    cancel: &Cancellation,
+) -> Result<SubscriptionStatus, String> {
+    if cancel.cancelled() {
+        return Err("Consulta cancelada.".into());
+    }
+    if !valid_id(channel_id) {
+        return Err("ID de canal inválido.".into());
+    }
+    let json = api_at(
+        &http_client()?,
+        base_url,
+        token,
+        "subscriptions",
+        &[
+            ("part", "id,snippet"),
+            ("mine", "true"),
+            ("forChannelId", channel_id),
+            ("maxResults", "1"),
+        ],
+    )?;
+    if cancel.cancelled() {
+        return Err("Consulta cancelada.".into());
+    }
+    let subscription_id = json
+        .pointer("/items/0/id")
+        .and_then(Value::as_str)
+        .filter(|id| valid_id(id))
+        .map(str::to_owned);
+    let channel_title = json
+        .pointer("/items/0/snippet/title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_owned);
+    Ok(SubscriptionStatus {
+        channel_id: channel_id.to_owned(),
+        channel_title,
+        subscription_id,
+    })
+}
+
+pub fn subscribe_channel(
+    token: &str,
+    channel_id: &str,
+    cancel: &Cancellation,
+) -> Result<SubscriptionStatus, String> {
+    subscribe_channel_at(
+        "https://www.googleapis.com/youtube/v3",
+        token,
+        channel_id,
+        cancel,
+    )
+}
+
+fn subscribe_channel_at(
+    base_url: &str,
+    token: &str,
+    channel_id: &str,
+    cancel: &Cancellation,
+) -> Result<SubscriptionStatus, String> {
+    if cancel.cancelled() {
+        return Err("Inscrição cancelada.".into());
+    }
+    if !valid_id(channel_id) {
+        return Err("ID de canal inválido.".into());
+    }
+    let payload = serde_json::json!({
+        "snippet": {
+            "resourceId": {
+                "kind": "youtube#channel",
+                "channelId": channel_id
+            }
+        }
+    });
+    let json = api_post_json_at(
+        &http_client()?,
+        base_url,
+        token,
+        "subscriptions",
+        &[("part", "snippet")],
+        &payload,
+    )?;
+    if cancel.cancelled() {
+        return Err("Inscrição cancelada.".into());
+    }
+    let subscription_id = json
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| valid_id(id))
+        .map(str::to_owned)
+        .ok_or_else(|| "Resposta de inscrição inválida.".to_owned())?;
+    let channel_title = json
+        .pointer("/snippet/title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_owned);
+    Ok(SubscriptionStatus {
+        channel_id: channel_id.to_owned(),
+        channel_title,
+        subscription_id: Some(subscription_id),
+    })
+}
+
+pub fn unsubscribe_channel(
+    token: &str,
+    subscription_id: &str,
+    channel_id: &str,
+    cancel: &Cancellation,
+) -> Result<SubscriptionStatus, String> {
+    unsubscribe_channel_at(
+        "https://www.googleapis.com/youtube/v3",
+        token,
+        subscription_id,
+        channel_id,
+        cancel,
+    )
+}
+
+fn unsubscribe_channel_at(
+    base_url: &str,
+    token: &str,
+    subscription_id: &str,
+    channel_id: &str,
+    cancel: &Cancellation,
+) -> Result<SubscriptionStatus, String> {
+    if cancel.cancelled() {
+        return Err("Cancelamento de inscrição cancelado.".into());
+    }
+    if !valid_id(subscription_id) || !valid_id(channel_id) {
+        return Err("Identificador de inscrição inválido.".into());
+    }
+    api_delete_at(
+        &http_client()?,
+        base_url,
+        token,
+        "subscriptions",
+        &[("id", subscription_id)],
+    )?;
+    if cancel.cancelled() {
+        return Err("Cancelamento de inscrição cancelado.".into());
+    }
+    Ok(SubscriptionStatus {
+        channel_id: channel_id.to_owned(),
+        channel_title: None,
+        subscription_id: None,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MyChannelProfile {
+    pub target: crate::search::ChannelTarget,
+    pub title: Option<String>,
+    pub avatar_url: Option<String>,
+}
+
+fn parse_my_channel_profile(json: &Value) -> Result<MyChannelProfile, String> {
+    let item = json
+        .pointer("/items/0")
+        .ok_or_else(|| "Esta conta Google ainda não possui um canal do YouTube.".to_owned())?;
+    let id = item["id"]
+        .as_str()
+        .filter(|id| valid_id(id))
+        .ok_or_else(|| "Esta conta Google ainda não possui um canal do YouTube.".to_owned())?;
+    let title = item
+        .pointer("/snippet/title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(256).collect());
+    let avatar_url = sanitize_avatar_url(
+        item.pointer("/snippet/thumbnails/default/url")
+            .or_else(|| item.pointer("/snippet/thumbnails/medium/url"))
+            .and_then(Value::as_str),
+    );
+    Ok(MyChannelProfile {
+        target: crate::search::ChannelTarget::ChannelId(id.to_owned()),
+        title,
+        avatar_url,
+    })
+}
+
+pub fn my_channel_profile(token: &str, cancel: &Cancellation) -> Result<MyChannelProfile, String> {
+    if cancel.cancelled() {
+        return Err("Consulta cancelada.".into());
+    }
+    let json = api(
+        &http_client()?,
+        token,
+        "channels",
+        &[
+            ("part", "id,snippet"),
+            ("mine", "true"),
+            ("maxResults", "1"),
+        ],
+    )?;
+    if cancel.cancelled() {
+        return Err("Consulta cancelada.".into());
+    }
+    parse_my_channel_profile(&json)
+}
+
+pub fn create_playlist(
+    token: &str,
+    title: &str,
+    privacy_status: &str,
+    cancel: &Cancellation,
+) -> Result<(String, String), String> {
+    create_playlist_at(
+        "https://www.googleapis.com/youtube/v3",
+        token,
+        title,
+        privacy_status,
+        cancel,
+    )
+}
+
+fn create_playlist_at(
+    base_url: &str,
+    token: &str,
+    title: &str,
+    privacy_status: &str,
+    cancel: &Cancellation,
+) -> Result<(String, String), String> {
+    if cancel.cancelled() {
+        return Err("Criação de playlist cancelada.".into());
+    }
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err("Informe um nome para a playlist.".into());
+    }
+    let safe_title: String = trimmed.chars().take(150).collect();
+    let privacy = match privacy_status {
+        "public" | "unlisted" | "private" => privacy_status,
+        _ => "private",
+    };
+    let payload = serde_json::json!({
+        "snippet": { "title": safe_title },
+        "status": { "privacyStatus": privacy }
+    });
+    let json = api_post_json_at(
+        &http_client()?,
+        base_url,
+        token,
+        "playlists",
+        &[("part", "snippet,status")],
+        &payload,
+    )?;
+    if cancel.cancelled() {
+        return Err("Criação de playlist cancelada.".into());
+    }
+    let id = json
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| valid_id(id))
+        .ok_or("Resposta de playlist inválida.")?
+        .to_owned();
+    let saved_title = json
+        .pointer("/snippet/title")
+        .and_then(Value::as_str)
+        .unwrap_or(&safe_title)
+        .to_owned();
+    Ok((id, saved_title))
+}
+
+pub fn add_video_to_playlist(
+    token: &str,
+    playlist_id: &str,
+    video_id: &str,
+    cancel: &Cancellation,
+) -> Result<String, String> {
+    add_video_to_playlist_at(
+        "https://www.googleapis.com/youtube/v3",
+        token,
+        playlist_id,
+        video_id,
+        cancel,
+    )
+}
+
+fn add_video_to_playlist_at(
+    base_url: &str,
+    token: &str,
+    playlist_id: &str,
+    video_id: &str,
+    cancel: &Cancellation,
+) -> Result<String, String> {
+    if cancel.cancelled() {
+        return Err("Adição à playlist cancelada.".into());
+    }
+    if !valid_id(playlist_id) || !valid_id(video_id) {
+        return Err("Playlist ou vídeo inválido.".into());
+    }
+    let payload = serde_json::json!({
+        "snippet": {
+            "playlistId": playlist_id,
+            "resourceId": {
+                "kind": "youtube#video",
+                "videoId": video_id
+            }
+        }
+    });
+    let json = api_post_json_at(
+        &http_client()?,
+        base_url,
+        token,
+        "playlistItems",
+        &[("part", "snippet")],
+        &payload,
+    )?;
+    if cancel.cancelled() {
+        return Err("Adição à playlist cancelada.".into());
+    }
+    json.get("id")
+        .and_then(Value::as_str)
+        .filter(|id| valid_id(id))
+        .map(str::to_owned)
+        .ok_or_else(|| "Resposta ao adicionar item na playlist inválida.".to_owned())
+}
+
+fn parse_iso8601_duration(raw: &str) -> String {
+    let Some(rest) = raw.strip_prefix("PT") else {
+        return String::new();
+    };
+    let mut hours = 0u64;
+    let mut minutes = 0u64;
+    let mut seconds = 0u64;
+    let mut current = 0u64;
+    for ch in rest.chars() {
+        if let Some(digit) = ch.to_digit(10) {
+            current = current.saturating_mul(10).saturating_add(u64::from(digit));
+        } else {
+            match ch {
+                'H' => hours = current,
+                'M' => minutes = current,
+                'S' => seconds = current,
+                _ => return String::new(),
+            }
+            current = 0;
+        }
+    }
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else if minutes > 0 || seconds > 0 {
+        format!("{minutes}:{seconds:02}")
+    } else {
+        String::new()
+    }
+}
+
+fn parse_liked_video_item(item: &Value) -> Option<SearchResult> {
+    let id = item.get("id")?.as_str()?;
+    if !valid_id(id) {
+        return None;
+    }
+    let snippet = item.get("snippet")?;
+    let title = snippet["title"].as_str()?;
+    let date = snippet["publishedAt"].as_str().unwrap_or("").to_owned();
+    let thumbnail = snippet
+        .pointer("/thumbnails/medium/url")
+        .or_else(|| snippet.pointer("/thumbnails/default/url"))
+        .and_then(Value::as_str)
+        .filter(|url| url.starts_with("https://i.ytimg.com/"))
+        .unwrap_or("")
+        .to_owned();
+    let channel_id = snippet["channelId"]
+        .as_str()
+        .filter(|id| valid_id(id))
+        .map(str::to_owned);
+    let duration = item
+        .pointer("/contentDetails/duration")
+        .and_then(Value::as_str)
+        .map(parse_iso8601_duration)
+        .unwrap_or_default();
+    let view_count = item
+        .pointer("/statistics/viewCount")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<u64>().ok());
+    Some(SearchResult {
+        video: Video {
+            title: title.chars().take(512).collect(),
+            channel: snippet["channelTitle"]
+                .as_str()
+                .unwrap_or("")
+                .chars()
+                .take(256)
+                .collect(),
+            url: format!("https://www.youtube.com/watch?v={id}"),
+            thumbnail,
+            duration,
+        },
+        metadata: VideoMetadata {
+            view_count,
+            upload_date: (!date.is_empty()).then_some(date),
+            description: snippet["description"]
+                .as_str()
+                .map(|d| d.chars().take(2048).collect()),
+            channel_id,
+            ..Default::default()
+        },
+    })
+}
+
+pub fn liked_videos_feed(token: &str, cancel: &Cancellation) -> Result<HomeFeed, String> {
+    let client = http_client()?;
+    liked_videos_feed_with(cancel, |params| api(&client, token, "videos", params))
+}
+
+fn liked_videos_feed_with<F>(cancel: &Cancellation, mut fetch: F) -> Result<HomeFeed, String>
+where
+    F: FnMut(&[(&str, &str)]) -> Result<Value, String>,
+{
+    let mut items = Vec::new();
+    let mut page = None;
+    loop {
+        if cancel.cancelled() {
+            return Err("Consulta cancelada.".into());
+        }
+        let mut params = vec![
+            ("part", "snippet,contentDetails,statistics"),
+            ("myRating", "like"),
+            ("maxResults", "50"),
+        ];
+        if let Some(token) = page.as_deref() {
+            params.push(("pageToken", token));
+        }
+        let response = fetch(&params)?;
+        if cancel.cancelled() {
+            return Err("Consulta cancelada.".into());
+        }
+        let rows = response["items"]
+            .as_array()
+            .ok_or("Lista de vídeos com Gostei inválida.")?;
+        items.extend(
+            rows.iter()
+                .take(MAX_PLAYLIST_VIDEOS - items.len())
+                .filter_map(parse_liked_video_item),
+        );
+        let next = response["nextPageToken"]
+            .as_str()
+            .filter(|v| !v.is_empty() && v.len() <= 1024)
+            .map(str::to_owned);
+        if items.len() >= MAX_PLAYLIST_VIDEOS || next.is_none() {
+            break;
+        }
+        page = next;
+    }
+    Ok(HomeFeed {
+        items,
+        playlists: Vec::new(),
+        channels: Vec::new(),
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1885,5 +2658,297 @@ mod tests {
         assert!(video.video.thumbnail.is_empty());
         item["snippet"]["resourceId"]["videoId"] = "x&other".into();
         assert!(parse_upload(&item).is_none());
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 2048];
+        let mut header_end = None;
+        let mut content_length = 0usize;
+        while let Ok(read) = stream.read(&mut buf) {
+            if read == 0 {
+                break;
+            }
+            raw.extend_from_slice(&buf[..read]);
+            if header_end.is_none()
+                && let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n")
+            {
+                let end = pos + 4;
+                header_end = Some(end);
+                let headers = String::from_utf8_lossy(&raw[..end]);
+                for line in headers.lines() {
+                    if let Some((name, val)) = line.split_once(':')
+                        && name.trim().eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = val.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            if let Some(end) = header_end
+                && raw.len() >= end + content_length
+            {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&raw).into_owned()
+    }
+
+    fn spawn_mock_json_server(
+        responses: Vec<(&'static str, String)>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::Write;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::with_capacity(responses.len());
+            for (status_line, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                requests.push(read_http_request(&mut stream));
+                let resp = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+            }
+            requests
+        });
+        (base_url, handle)
+    }
+
+    #[test]
+    fn comment_order_values_match_youtube_api() {
+        assert_eq!(CommentOrder::Relevance.api_value(), "relevance");
+        assert_eq!(CommentOrder::Time.api_value(), "time");
+    }
+
+    #[test]
+    fn parses_iso8601_durations_into_player_labels() {
+        assert_eq!(parse_iso8601_duration("PT45S"), "0:45");
+        assert_eq!(parse_iso8601_duration("PT3M5S"), "3:05");
+        assert_eq!(parse_iso8601_duration("PT1H2M3S"), "1:02:03");
+        assert_eq!(parse_iso8601_duration("PT0S"), "");
+        assert_eq!(parse_iso8601_duration("invalid"), "");
+    }
+
+    #[test]
+    fn liked_videos_feed_paginates_and_filters_invalid_items() {
+        let cancel = Cancellation::default();
+        let mut calls = 0;
+        let feed = liked_videos_feed_with(&cancel, |params| {
+            calls += 1;
+            assert!(params.contains(&("myRating", "like")));
+            if calls == 1 {
+                Ok(serde_json::json!({
+                    "nextPageToken": "p2",
+                    "items": [
+                        {
+                            "id": "dQw4w9WgXcQ",
+                            "snippet": {
+                                "title": "Rust Demo",
+                                "channelTitle": "Canal Rust",
+                                "channelId": "UC0000000000000000000001",
+                                "publishedAt": "2026-02-01T10:00:00Z",
+                                "thumbnails": {"medium": {"url": "https://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg"}}
+                            },
+                            "contentDetails": {"duration": "PT4M12S"},
+                            "statistics": {"viewCount": "12345"}
+                        },
+                        {"id": "bad id!", "snippet": {"title": "Invalid"}}
+                    ]
+                }))
+            } else {
+                assert!(params.contains(&("pageToken", "p2")));
+                Ok(serde_json::json!({"items": []}))
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(feed.items.len(), 1);
+        assert_eq!(feed.items[0].video.title, "Rust Demo");
+        assert_eq!(feed.items[0].video.duration, "4:12");
+        assert_eq!(feed.items[0].metadata.view_count, Some(12345));
+    }
+
+    #[test]
+    fn post_comment_and_reply_send_payloads_and_validate_inputs() {
+        let cancel = Cancellation::default();
+        assert!(post_comment("tok", "dQw4w9WgXcQ", "   ", &cancel).is_err());
+        assert!(post_comment("tok", "bad id", "Olá", &cancel).is_err());
+        assert!(post_comment_reply("tok", "parent1", "   ", &cancel).is_err());
+
+        let comment_resp = serde_json::json!({
+            "snippet": {
+                "totalReplyCount": 0,
+                "topLevelComment": {
+                    "id": "UgxNewComment1",
+                    "snippet": {
+                        "authorDisplayName": "Dev",
+                        "textDisplay": "Ótimo vídeo!",
+                        "likeCount": 0,
+                        "publishedAt": "2026-11-12T00:00:00Z"
+                    }
+                }
+            }
+        })
+        .to_string();
+        let reply_resp = serde_json::json!({
+            "id": "UgxNewReply1",
+            "snippet": {
+                "authorDisplayName": "Dev",
+                "textDisplay": "Concordo!",
+                "likeCount": 0,
+                "publishedAt": "2026-11-12T00:01:00Z"
+            }
+        })
+        .to_string();
+
+        let (base, server) = spawn_mock_json_server(vec![
+            ("HTTP/1.1 200 OK", comment_resp),
+            ("HTTP/1.1 200 OK", reply_resp),
+        ]);
+        let posted =
+            post_comment_at(&base, "tok-abc", "dQw4w9WgXcQ", "  Ótimo vídeo! ", &cancel).unwrap();
+        assert_eq!(posted.id, "UgxNewComment1");
+        assert_eq!(posted.text, "Ótimo vídeo!");
+
+        let reply = post_comment_reply_at(&base, "tok-abc", "UgxNewComment1", "Concordo!", &cancel)
+            .unwrap();
+        assert_eq!(reply.id, "UgxNewReply1");
+        assert_eq!(reply.text, "Concordo!");
+
+        let reqs = server.join().unwrap();
+        assert!(reqs[0].starts_with("POST /commentThreads?part=snippet "));
+        assert!(reqs[0].contains("\"videoId\":\"dQw4w9WgXcQ\""));
+        assert!(reqs[1].starts_with("POST /comments?part=snippet "));
+        assert!(reqs[1].contains("\"parentId\":\"UgxNewComment1\""));
+    }
+
+    #[test]
+    fn subscriptions_and_playlists_mutations_work_against_mock_api() {
+        let cancel = Cancellation::default();
+        let ch_id = "UC0000000000000000000001";
+        let (base, server) = spawn_mock_json_server(vec![
+            (
+                "HTTP/1.1 200 OK",
+                serde_json::json!({"items": [{"id": ch_id}]}).to_string(),
+            ),
+            (
+                "HTTP/1.1 200 OK",
+                serde_json::json!({"items": []}).to_string(),
+            ),
+            (
+                "HTTP/1.1 200 OK",
+                serde_json::json!({"id": "SUB_123", "snippet": {"title": "Canal Rust"}})
+                    .to_string(),
+            ),
+            ("HTTP/1.1 204 No Content", String::new()),
+            (
+                "HTTP/1.1 200 OK",
+                serde_json::json!({"id": "PL_999", "snippet": {"title": "Estudos Rust"}})
+                    .to_string(),
+            ),
+            (
+                "HTTP/1.1 200 OK",
+                serde_json::json!({"id": "PLI_111"}).to_string(),
+            ),
+        ]);
+
+        let resolved = resolve_channel_id_at(
+            &base,
+            "tok",
+            &crate::search::ChannelTarget::Handle("@rustlang".into()),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(resolved, ch_id);
+
+        let status = check_subscription_at(&base, "tok", ch_id, &cancel).unwrap();
+        assert!(status.subscription_id.is_none());
+
+        let sub = subscribe_channel_at(&base, "tok", ch_id, &cancel).unwrap();
+        assert_eq!(sub.subscription_id.as_deref(), Some("SUB_123"));
+
+        let unsub = unsubscribe_channel_at(&base, "tok", "SUB_123", ch_id, &cancel).unwrap();
+        assert!(unsub.subscription_id.is_none());
+
+        let (pl_id, pl_title) =
+            create_playlist_at(&base, "tok", "Estudos Rust", "private", &cancel).unwrap();
+        assert_eq!(pl_id, "PL_999");
+        assert_eq!(pl_title, "Estudos Rust");
+
+        let item_id =
+            add_video_to_playlist_at(&base, "tok", "PL_999", "dQw4w9WgXcQ", &cancel).unwrap();
+        assert_eq!(item_id, "PLI_111");
+
+        let reqs = server.join().unwrap();
+        assert!(reqs[0].contains("GET /channels?part=id&forHandle=rustlang"));
+        assert!(reqs[1].contains("GET /subscriptions?part=id%2Csnippet&mine=true"));
+        assert!(reqs[2].starts_with("POST /subscriptions?part=snippet "));
+        assert!(reqs[3].starts_with("DELETE /subscriptions?id=SUB_123 "));
+        assert!(reqs[4].starts_with("POST /playlists?part=snippet%2Cstatus "));
+        assert!(reqs[5].starts_with("POST /playlistItems?part=snippet "));
+    }
+
+    #[test]
+    fn comment_and_channel_profile_parsers_extract_valid_https_avatar_urls() {
+        let top_level = serde_json::json!({
+            "snippet": {
+                "totalReplyCount": 2,
+                "topLevelComment": {
+                    "id": "UgxAvatar1",
+                    "snippet": {
+                        "authorDisplayName": "@Carlos-be6gp",
+                        "authorProfileImageUrl": "//yt3.ggpht.com/avatar48=s48-c-k-c0x00ffffff-no-rj",
+                        "textDisplay": "teste",
+                        "publishedAt": "2026-11-13T10:00:00Z",
+                        "likeCount": 66
+                    }
+                }
+            }
+        });
+        let parsed = parse_top_level_comment(&top_level).unwrap();
+        assert_eq!(
+            parsed.author_avatar.as_deref(),
+            Some("https://yt3.ggpht.com/avatar48=s48-c-k-c0x00ffffff-no-rj")
+        );
+
+        let reply = serde_json::json!({
+            "id": "UgxReply1",
+            "snippet": {
+                "authorDisplayName": "@Pedro",
+                "authorProfileImageUrl": "javascript:alert(1)",
+                "textOriginal": "oi",
+                "publishedAt": "2026-11-13T10:05:00Z",
+                "likeCount": 1
+            }
+        });
+        let parsed_reply = parse_reply_comment(&reply).unwrap();
+        assert!(parsed_reply.author_avatar.is_none());
+
+        let profile_json = serde_json::json!({
+            "items": [{
+                "id": "UC0000000000000000000001",
+                "snippet": {
+                    "title": "Meu Canal",
+                    "thumbnails": {
+                        "default": {
+                            "url": "https://yt3.googleusercontent.com/me=s88-c-k-c0x00ffffff-no-rj"
+                        }
+                    }
+                }
+            }]
+        });
+        let profile = parse_my_channel_profile(&profile_json).unwrap();
+        assert_eq!(
+            profile.target,
+            crate::search::ChannelTarget::ChannelId("UC0000000000000000000001".into())
+        );
+        assert_eq!(profile.title.as_deref(), Some("Meu Canal"));
+        assert_eq!(
+            profile.avatar_url.as_deref(),
+            Some("https://yt3.googleusercontent.com/me=s88-c-k-c0x00ffffff-no-rj")
+        );
     }
 }

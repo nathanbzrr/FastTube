@@ -4,7 +4,6 @@ use crate::search::{Video, VideoMetadata};
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Filtros estilo chips do YouTube para a página inicial e barra lateral.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum FeedFilter {
     #[default]
@@ -47,7 +46,6 @@ enum WatchedState {
     Completed,
 }
 
-/// Perfil comportamental aprendido localmente a partir do histórico, fila e sessão atual.
 #[derive(Clone, Debug, Default)]
 pub struct UserProfile {
     pub channel_weights: HashMap<String, f64>,
@@ -58,7 +56,6 @@ pub struct UserProfile {
     pub active_tokens: HashSet<String>,
 }
 
-/// Resultado de pontuação de um vídeo pelo motor de recomendações.
 #[derive(Clone, Debug)]
 pub struct ScoredVideo {
     pub video: Video,
@@ -74,7 +71,6 @@ impl UserProfile {
         let mut duration_weight_sum = 0.0;
 
         for (index, entry) in history.entries().iter().enumerate() {
-            // Peso decai suavemente para itens mais antigos do histórico.
             let recency_weight = 1.0 / (1.0 + (index as f64) * 0.14);
             let completion_ratio = match entry.duration_ms {
                 Some(dur) if dur > 0 => (entry.position_ms as f64 / dur as f64).clamp(0.05, 1.0),
@@ -113,7 +109,6 @@ impl UserProfile {
             }
         }
 
-        // Itens na fila demonstram intenção explícita imediata do usuário.
         for (index, queued) in queue.videos().iter().enumerate() {
             let queue_weight = 1.6 / (1.0 + (index as f64) * 0.2);
             let channel_key = normalize_channel_key(&queued.channel);
@@ -164,10 +159,6 @@ impl UserProfile {
     }
 }
 
-/// Motor de recomendação próprio do FastTube.
-/// Combina afinidade de canal, relevância semântica de tópicos/hashtags,
-/// frescor do envio (decay temporal), engajamento (views), adequação de duração,
-/// penalidade de vídeos já concluídos e diversificação de canais.
 pub struct RecommendationEngine;
 
 impl RecommendationEngine {
@@ -213,13 +204,11 @@ impl RecommendationEngine {
             .map(|(idx, video)| {
                 let meta = metadata_map.get(&video.url);
                 let mut scored = Self::score_single(video, meta, profile, reference_epoch, filter);
-                // Preserva leve estabilidade de ordem original como desempate suave.
                 scored.score -= (idx as f64) * 0.04;
                 (idx, scored)
             })
             .collect();
 
-        // Ordena inicialmente pelo score bruto.
         candidates.sort_by(|a, b| {
             b.1.score
                 .partial_cmp(&a.1.score)
@@ -227,8 +216,7 @@ impl RecommendationEngine {
                 .then_with(|| a.0.cmp(&b.0))
         });
 
-        // Passagem de diversificação estilo YouTube: evita que um único canal monopolize
-        // diversas posições consecutivas no topo do feed.
+        // Diversify top slots so a single channel does not dominate consecutive entries.
         let mut ranked = Vec::with_capacity(candidates.len());
         let mut channel_appearances: HashMap<String, usize> = HashMap::new();
         let mut last_channel = String::new();
@@ -284,7 +272,6 @@ impl RecommendationEngine {
         let video_tokens = extract_significant_tokens(&video.title);
         let is_short = is_short_video(video, metadata);
 
-        // 1. Afinidade com o canal
         let channel_affinity = if !channel_key.is_empty() {
             profile
                 .channel_weights
@@ -299,7 +286,6 @@ impl RecommendationEngine {
             score += boost;
         }
 
-        // 2. Afinidade por tópicos / palavras-chave / hashtags
         let mut token_match_sum = 0.0;
         for token in &video_tokens {
             if let Some(&w) = profile.token_weights.get(token) {
@@ -318,7 +304,6 @@ impl RecommendationEngine {
             score += boost;
         }
 
-        // 3. Contexto do vídeo em reprodução (para barra lateral / próximos vídeos)
         if let Some(active_ch) = &profile.active_channel
             && !channel_key.is_empty()
             && &channel_key == active_ch
@@ -336,7 +321,6 @@ impl RecommendationEngine {
             }
         }
 
-        // 4. Frescor do envio (Recency boost)
         if let Some(upload_raw) = metadata.and_then(|m| m.upload_date.as_deref())
             && let Some(upload_epoch) = parse_upload_date_epoch(upload_raw)
         {
@@ -345,7 +329,6 @@ impl RecommendationEngine {
             score += freshness;
         }
 
-        // 5. Sinal de popularidade / engajamento (logarítmico para não esmagar canais menores)
         if let Some(views) = metadata.and_then(|m| m.view_count)
             && views > 0
         {
@@ -353,7 +336,6 @@ impl RecommendationEngine {
             score += pop_boost;
         }
 
-        // 6. Adequação à duração preferida do usuário
         if let (Some(pref_secs), Some(video_secs)) = (
             profile.preferred_duration_secs,
             parse_duration_seconds(&video.duration),
@@ -366,11 +348,9 @@ impl RecommendationEngine {
             score += ratio * 5.0;
         }
 
-        // 7. Estado de visualização no histórico local
         if let Some(video_id) = history::youtube_video_id(&video.url) {
             match profile.watched_states.get(&video_id) {
                 Some(WatchedState::Completed) => {
-                    // Demove vídeos já concluídos para priorizar conteúdo inédito.
                     score -= 48.0;
                 }
                 Some(WatchedState::InProgress(_)) => {
@@ -380,7 +360,6 @@ impl RecommendationEngine {
             }
         }
 
-        // 8. Ajustes específicos por modo de filtro
         if matches!(filter, FeedFilter::NewToYou) {
             if channel_affinity == 0.0 {
                 score += 22.0;
@@ -397,7 +376,6 @@ impl RecommendationEngine {
         }
     }
 
-    /// Constrói a lista dinâmica de chips de filtro estilo YouTube para os vídeos carregados.
     pub fn available_chips(
         videos: &[Video],
         metadata_map: &HashMap<String, VideoMetadata>,
@@ -411,7 +389,6 @@ impl RecommendationEngine {
             FeedFilter::Gaming,
         ];
 
-        // Tópicos personalizados extraídos do perfil ou dos títulos atuais
         let mut dynamic_topics = profile.top_topics(2);
         if dynamic_topics.is_empty() {
             for topic in extract_trending_feed_topics(videos, 2) {
@@ -446,7 +423,6 @@ impl RecommendationEngine {
         chips
     }
 
-    /// Gera uma consulta de descoberta personalizada baseada no histórico e fila do usuário.
     pub fn build_discovery_query(profile: &UserProfile, filter: &FeedFilter) -> String {
         match filter {
             FeedFilter::Music => "música clipe ao vivo oficial".into(),
@@ -470,6 +446,233 @@ impl RecommendationEngine {
             }
         }
     }
+
+    pub fn rank_sidebar_videos(
+        videos: &[Video],
+        metadata_map: &HashMap<String, VideoMetadata>,
+        profile: &UserProfile,
+        current_video: Option<&Video>,
+        current_metadata: Option<&VideoMetadata>,
+        tab: crate::watch_extras::SidebarTab,
+    ) -> Vec<ScoredVideo> {
+        if videos.is_empty() {
+            return Vec::new();
+        }
+
+        let reference_epoch = latest_dataset_epoch(videos, metadata_map)
+            .or_else(current_unix_epoch)
+            .unwrap_or(1_762_728_000);
+
+        let current_url = current_video.map(|v| v.url.as_str()).unwrap_or("");
+        let current_id = current_video.and_then(|v| history::youtube_video_id(&v.url));
+        let current_ch_key = current_video
+            .map(|v| normalize_channel_key(&v.channel))
+            .unwrap_or_default();
+        let current_tokens = current_video
+            .map(|v| {
+                let mut toks = extract_significant_tokens(&v.title);
+                if let Some(desc) = current_metadata.and_then(|m| m.description.as_deref()) {
+                    for tok in extract_significant_tokens(desc).into_iter().take(16) {
+                        if !toks.contains(&tok) {
+                            toks.push(tok);
+                        }
+                    }
+                }
+                toks
+            })
+            .unwrap_or_default();
+        let current_is_music = current_video.is_some_and(|v| is_music_video(v, current_metadata));
+        let current_is_gaming = current_video.is_some_and(|v| is_gaming_video(v, current_metadata));
+        let current_is_podcast =
+            current_video.is_some_and(|v| is_podcast_video(v, current_metadata));
+
+        let non_self: Vec<&Video> = videos
+            .iter()
+            .filter(|v| {
+                if !current_url.is_empty() && v.url == current_url {
+                    return false;
+                }
+                if let (Some(cid), Some(vid)) = (&current_id, history::youtube_video_id(&v.url))
+                    && cid == &vid
+                {
+                    return false;
+                }
+                true
+            })
+            .collect();
+
+        if matches!(tab, crate::watch_extras::SidebarTab::FromChannel) {
+            let same_channel: Vec<&Video> = non_self
+                .iter()
+                .copied()
+                .filter(|v| {
+                    !current_ch_key.is_empty()
+                        && normalize_channel_key(&v.channel) == current_ch_key
+                })
+                .collect();
+            let pool = if !same_channel.is_empty() {
+                same_channel
+            } else {
+                non_self
+            };
+            let mut scored_list: Vec<(usize, ScoredVideo)> = pool
+                .into_iter()
+                .enumerate()
+                .map(|(idx, video)| {
+                    let meta = metadata_map.get(&video.url);
+                    let mut scored =
+                        Self::score_single(video, meta, profile, reference_epoch, &FeedFilter::All);
+                    if !current_ch_key.is_empty()
+                        && normalize_channel_key(&video.channel) == current_ch_key
+                    {
+                        scored.score += 100.0;
+                    }
+                    scored.score -= (idx as f64) * 0.05;
+                    (idx, scored)
+                })
+                .collect();
+            scored_list.sort_by(|a, b| {
+                b.1.score
+                    .partial_cmp(&a.1.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            return scored_list.into_iter().map(|(_, s)| s).collect();
+        }
+
+        let mut candidates: Vec<(usize, ScoredVideo)> = non_self
+            .into_iter()
+            .enumerate()
+            .map(|(idx, video)| {
+                let meta = metadata_map.get(&video.url);
+                let mut scored = Self::score_single(
+                    video,
+                    meta,
+                    profile,
+                    reference_epoch,
+                    &FeedFilter::Recommended,
+                );
+                let ch_key = normalize_channel_key(&video.channel);
+                let v_tokens = extract_significant_tokens(&video.title);
+                let shared_with_current = v_tokens
+                    .iter()
+                    .filter(|t| current_tokens.contains(*t))
+                    .count();
+                let same_category = (current_is_music && is_music_video(video, meta))
+                    || (current_is_gaming && is_gaming_video(video, meta))
+                    || (current_is_podcast && is_podcast_video(video, meta));
+
+                match tab {
+                    crate::watch_extras::SidebarTab::All => {
+                        scored.score -= (idx as f64) * 0.04;
+                    }
+                    crate::watch_extras::SidebarTab::FromChannel => {}
+                    crate::watch_extras::SidebarTab::Related => {
+                        scored.score += (shared_with_current as f64) * 16.0;
+                        if same_category {
+                            scored.score += 18.0;
+                        }
+                        if !current_ch_key.is_empty() && ch_key == current_ch_key {
+                            scored.score += 10.0;
+                        }
+                        scored.score -= (idx as f64) * 0.03;
+                    }
+                    crate::watch_extras::SidebarTab::ForYou => {
+                        let ch_affinity =
+                            profile.channel_weights.get(&ch_key).copied().unwrap_or(0.0);
+                        let mut personal_topic_score = 0.0;
+                        for tok in &v_tokens {
+                            if let Some(&w) = profile.token_weights.get(tok) {
+                                personal_topic_score += w;
+                            }
+                        }
+                        scored.score += (ch_affinity * 9.0).min(42.0);
+                        scored.score += (personal_topic_score * 7.5).min(38.0);
+
+                        let is_unwatched = history::youtube_video_id(&video.url)
+                            .is_none_or(|id| !profile.watched_states.contains_key(&id));
+                        if is_unwatched {
+                            scored.score += 16.0;
+                        }
+                        if !current_ch_key.is_empty() && ch_key != current_ch_key {
+                            scored.score += 9.0;
+                        }
+                        if is_recent_upload(meta, Some(reference_epoch)) {
+                            scored.score += 8.0;
+                        }
+                    }
+                }
+                (idx, scored)
+            })
+            .collect();
+
+        candidates.sort_by(|a, b| {
+            b.1.score
+                .partial_cmp(&a.1.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        let mut ranked = Vec::with_capacity(candidates.len());
+        let mut channel_appearances: HashMap<String, usize> = HashMap::new();
+        let mut last_channel = String::new();
+        let repeat_weight = match tab {
+            crate::watch_extras::SidebarTab::ForYou => 9.5,
+            crate::watch_extras::SidebarTab::Related => 5.0,
+            _ => 6.5,
+        };
+
+        while !candidates.is_empty() {
+            let mut best_pos = 0;
+            let mut best_effective_score = f64::NEG_INFINITY;
+
+            let search_window = candidates.len().min(24);
+            for (pos, (_, candidate)) in candidates.iter().enumerate().take(search_window) {
+                let ch_key = normalize_channel_key(&candidate.video.channel);
+                let count = if ch_key.is_empty() {
+                    0
+                } else {
+                    *channel_appearances.get(&ch_key).unwrap_or(&0)
+                };
+                let repeat_penalty = (count as f64) * repeat_weight;
+                let consecutive_penalty = if !ch_key.is_empty() && ch_key == last_channel {
+                    14.0
+                } else {
+                    0.0
+                };
+                let effective = candidate.score - repeat_penalty - consecutive_penalty;
+                if effective > best_effective_score {
+                    best_effective_score = effective;
+                    best_pos = pos;
+                }
+            }
+
+            let (_, mut chosen) = candidates.remove(best_pos);
+            chosen.score = best_effective_score;
+            let ch_key = normalize_channel_key(&chosen.video.channel);
+            if !ch_key.is_empty() {
+                *channel_appearances.entry(ch_key.clone()).or_insert(0) += 1;
+                last_channel = ch_key;
+            }
+            ranked.push(chosen);
+        }
+
+        ranked
+    }
+}
+
+pub fn is_recent_upload(metadata: Option<&VideoMetadata>, reference_epoch: Option<i64>) -> bool {
+    let Some(upload_raw) = metadata.and_then(|m| m.upload_date.as_deref()) else {
+        return false;
+    };
+    let Some(upload_epoch) = parse_upload_date_epoch(upload_raw) else {
+        return false;
+    };
+    let now_epoch = reference_epoch
+        .or_else(current_unix_epoch)
+        .unwrap_or(upload_epoch);
+    let diff_secs = (now_epoch - upload_epoch).max(0);
+    diff_secs <= 86_400 * 7
 }
 
 pub fn matches_filter(
@@ -510,7 +713,6 @@ pub fn matches_filter(
     }
 }
 
-/// Detecta se um vídeo deve ser tratado como YouTube Short (formato vertical / curta duração).
 pub fn is_short_video(video: &Video, metadata: Option<&VideoMetadata>) -> bool {
     let url_lower = video.url.to_lowercase();
     if url_lower.contains("/shorts/") {
@@ -735,7 +937,6 @@ pub fn parse_duration_seconds(raw: &str) -> Option<f64> {
     }
 }
 
-/// Converte datas `YYYY-MM-DDTHH:MM:SSZ`, `YYYY-MM-DD` ou `YYYYMMDD` para Unix timestamp (segundos).
 pub fn parse_upload_date_epoch(raw: &str) -> Option<i64> {
     let trimmed = raw.trim();
     if trimmed.len() == 8 && trimmed.bytes().all(|b| b.is_ascii_digit()) {
@@ -773,7 +974,7 @@ fn ymd_hms_to_epoch(year: i32, month: u32, day: u32, hour: u32, min: u32, sec: u
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 59 {
         return None;
     }
-    // Algoritmo civil_from_days (Howard Hinnant)
+    // Howard Hinnant's civil_from_days
     let y = year as i64 - if month <= 2 { 1 } else { 0 };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u32;
@@ -804,7 +1005,6 @@ pub fn latest_dataset_epoch(
         .max()
 }
 
-/// Formata data de publicação no estilo compacto do YouTube Brasil (`há 4 h`, `há 4 dias`, etc.).
 pub fn format_youtube_relative_time(raw: &str, reference_epoch: Option<i64>) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -850,7 +1050,6 @@ pub fn format_youtube_relative_time(raw: &str, reference_epoch: Option<i64>) -> 
     }
 }
 
-/// Formata visualizações no estilo compacto do YouTube Brasil (`32 mil`, `1,4 mi`).
 pub fn format_youtube_compact_views(count: u64) -> String {
     if count >= 1_000_000 {
         let millions = count as f64 / 1_000_000.0;
@@ -868,7 +1067,6 @@ pub fn format_youtube_compact_views(count: u64) -> String {
     }
 }
 
-/// Gera uma cor determinística vibrante para o avatar circular de um canal.
 pub fn channel_avatar_rgb(channel_name: &str) -> [u8; 3] {
     const PALETTE: &[[u8; 3]] = &[
         [211, 47, 47],
@@ -891,7 +1089,6 @@ pub fn channel_avatar_rgb(channel_name: &str) -> [u8; 3] {
     PALETTE[hash % PALETTE.len()]
 }
 
-/// Extrai 1 ou 2 iniciais maiúsculas para o avatar circular do canal.
 pub fn channel_avatar_initials(channel_name: &str) -> String {
     let words: Vec<&str> = channel_name
         .trim()
@@ -1089,5 +1286,82 @@ mod tests {
         );
         assert!(is_short_video(&short_by_tag, None));
         assert!(!is_short_video(&regular, None));
+    }
+
+    #[test]
+    fn sidebar_tabs_filter_and_rank_videos_for_channel_related_and_for_you() {
+        let mut history = History::default();
+        history
+            .record(HistoryEntry {
+                video_id: "hist_rust01".into(),
+                title: "Rust Async Tokio Masterclass".into(),
+                channel: "RustLab".into(),
+                position_ms: 400_000,
+                duration_ms: Some(500_000),
+            })
+            .unwrap();
+        let queue = Queue::new(10);
+        let current = sample_video("curr_klara1", "Chatting and tapping ASMR", "klara", "18:04");
+        let profile = UserProfile::build(&history, &queue, Some(&current));
+
+        let v_same_ch = sample_video(
+            "klara_vid02",
+            "Designing you a custom outfit asmr",
+            "klara",
+            "24:09",
+        );
+        let v_related_asmr = sample_video(
+            "asmr_rel003",
+            "ASMR tapping e massagenzinha relax",
+            "brellyna asmr",
+            "1:19:19",
+        );
+        let v_for_you_rust = sample_video(
+            "rust_fy_004",
+            "Tokio Async Runtime Internals em Rust",
+            "RustLab",
+            "22:00",
+        );
+
+        let videos = vec![
+            current.clone(),
+            v_same_ch.clone(),
+            v_related_asmr.clone(),
+            v_for_you_rust.clone(),
+        ];
+        let meta = HashMap::new();
+
+        let from_channel = RecommendationEngine::rank_sidebar_videos(
+            &videos,
+            &meta,
+            &profile,
+            Some(&current),
+            None,
+            crate::watch_extras::SidebarTab::FromChannel,
+        );
+        assert_eq!(from_channel.len(), 1);
+        assert_eq!(from_channel[0].video.channel, "klara");
+        assert_eq!(from_channel[0].video.url, v_same_ch.url);
+
+        let related = RecommendationEngine::rank_sidebar_videos(
+            &videos,
+            &meta,
+            &profile,
+            Some(&current),
+            None,
+            crate::watch_extras::SidebarTab::Related,
+        );
+        assert!(!related.is_empty());
+        assert!(related.iter().all(|v| v.video.url != current.url));
+
+        let for_you = RecommendationEngine::rank_sidebar_videos(
+            &videos,
+            &meta,
+            &profile,
+            Some(&current),
+            None,
+            crate::watch_extras::SidebarTab::ForYou,
+        );
+        assert_eq!(for_you[0].video.url, v_for_you_rust.url);
     }
 }

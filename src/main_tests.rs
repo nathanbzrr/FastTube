@@ -459,7 +459,6 @@ fn buffer_settings_persistence_pending_restart_and_storage_errors_work() {
     assert_eq!(app.settings.buffer.profile, BufferProfile::Default);
     assert!(!app.has_pending_buffer_restart());
 
-    // Simula player ativo com perfil padrão e troca para Grande: exige reiniciar o player.
     app.playback.active_buffer = Some(BufferProfile::Default);
     app.apply_buffer_profile(BufferProfile::Large);
     assert_eq!(app.settings.buffer.profile, BufferProfile::Large);
@@ -475,7 +474,6 @@ fn buffer_settings_persistence_pending_restart_and_storage_errors_work() {
     );
     assert_eq!(settings::load(&path).unwrap(), BufferProfile::Large);
 
-    // Simula erro de armazenamento (caminho sem diretório pai).
     app.settings.buffer.path = Some(PathBuf::from(""));
     app.apply_buffer_profile(BufferProfile::Small);
     assert_eq!(app.settings.buffer.profile, BufferProfile::Small);
@@ -495,8 +493,7 @@ fn playback_preferences_isolated_path_injection_persistence_and_real_path_protec
     let history_file = temp_dir.join("history.json");
     let _ = std::fs::remove_dir_all(&temp_dir);
 
-    // 1. Sem caminho configurado em teste (default), aplicar preferências atualiza a sessão,
-    // registra erro de armazenamento e protege contra escrita no playback_path() real.
+    // Unconfigured path updates session and surfaces an error without writing to real playback_path().
     let mut unconfigured_app = FastTube::default();
     assert!(unconfigured_app.settings.playback.path.is_none());
     assert_eq!(
@@ -512,7 +509,6 @@ fn playback_preferences_isolated_path_injection_persistence_and_real_path_protec
     assert!(unconfigured_app.settings.playback.error.is_some());
     assert!(unconfigured_app.settings.playback.path.is_none());
 
-    // 2. Com caminho isolado injetado: persiste e recarrega sem interferir em buffer ou histórico.
     let mut app = FastTube::default();
     app.settings.playback.path = Some(playback_file.clone());
     app.settings.buffer.path = Some(buffer_file.clone());
@@ -528,14 +524,12 @@ fn playback_preferences_isolated_path_injection_persistence_and_real_path_protec
     assert!(!buffer_file.exists());
     assert!(!history_file.exists());
 
-    // 3. Nova instância sincroniza automaticamente a partir do caminho isolado injetado.
     let mut reloaded_app = FastTube::default();
     reloaded_app.settings.playback.path = Some(playback_file.clone());
     reloaded_app.ensure_playback_settings_synchronized();
     assert_eq!(reloaded_app.settings.playback.value, custom_prefs);
     assert!(reloaded_app.settings.playback.error.is_none());
 
-    // 4. Arquivo corrompido no caminho injetado cai para padrão (1x / auto) e reporta erro na UI.
     let corrupt_file = temp_dir.join("corrupt-playback.txt");
     std::fs::write(&corrupt_file, b"invalid-playback-data").unwrap();
     let mut corrupt_app = FastTube::default();
@@ -570,7 +564,6 @@ fn playback_preferences_isolated_path_injection_persistence_and_real_path_protec
         b"invalid-playback-data"
     );
 
-    // 5. Erro de escrita (caminho inválido) preserva preferência na sessão e expõe playback_settings_error.
     corrupt_app.settings.playback.path = Some(PathBuf::from(""));
     corrupt_app.settings.playback.loaded_path = Some(PathBuf::from(""));
     let next_prefs = PlaybackPreferences {
@@ -695,7 +688,6 @@ fn settings_window_hides_and_restores_video_window_across_watch_fullscreen_and_c
         ..Default::default()
     };
 
-    // Abre configurações com vídeo ativo: HWND nativo é ocultado, sem pausar/destruir o estado do player.
     app.ui.settings_open = true;
     let mut output = ctx.run_ui(raw_input.clone(), |ui| {
         let ctx = ui.ctx().clone();
@@ -710,7 +702,6 @@ fn settings_window_hides_and_restores_video_window_across_watch_fullscreen_and_c
     assert!(app.selected.is_some());
     assert_eq!(app.playback.active_buffer, Some(BufferProfile::Default));
 
-    // Alterna para tela cheia com configurações abertas: menu continua acessível e HWND permanece oculto.
     app.toggle_fullscreen(&ctx);
     assert!(app.playback.fullscreen);
     assert!(!app.playback.window_visible);
@@ -725,7 +716,6 @@ fn settings_window_hides_and_restores_video_window_across_watch_fullscreen_and_c
     assert!(app.ui.settings_open);
     assert!(!app.playback.window_visible);
 
-    // Fecha a janela de configurações em tela cheia: HWND do vídeo é restaurado imediatamente.
     app.ui.settings_open = false;
     let mut output = ctx.run_ui(raw_input, |ui| {
         let ctx = ui.ctx().clone();
@@ -739,7 +729,6 @@ fn settings_window_hides_and_restores_video_window_across_watch_fullscreen_and_c
     assert!(app.playback.window_visible);
     assert!(app.selected.is_some());
 
-    // Fechar o vídeo limpa a seleção, sai da tela cheia e garante que o HWND não fique visível.
     app.close_video(&ctx);
     assert!(app.selected.is_none());
     assert!(!app.playback.fullscreen);
@@ -1066,7 +1055,6 @@ fn history_tracks_playback_throttles_disk_saves_and_prevents_old_position_leak_o
     app.history.read_failed = false;
     app.history.error = None;
 
-    // Abre o primeiro vídeo: grava entrada inicial em disco na posição 0.
     app.selected = Some(videos[0].clone());
     app.activate_video_playback(&videos[0], None, None, t0);
     app.process_player_telemetry(
@@ -1081,7 +1069,6 @@ fn history_tracks_playback_throttles_disk_saves_and_prevents_old_position_leak_o
     let initial_disk = history::load(&path).unwrap();
     assert_eq!(initial_disk.get("dQw4w9WgXcQ").unwrap().position_ms, 0);
 
-    // Quadros durante os primeiros segundos (< 5s): atualiza em memória sem regravar em disco a cada quadro.
     let t1 = t0 + Duration::from_millis(500);
     let (pos, dur, seek, clear_start) = app.process_player_telemetry(
         &videos[0],
@@ -1099,7 +1086,6 @@ fn history_tracks_playback_throttles_disk_saves_and_prevents_old_position_leak_o
         app.history.data.get("dQw4w9WgXcQ").unwrap().position_ms,
         12_400
     );
-    // Disco ainda contém a gravação de t0 (não regravou após apenas 500ms).
     assert_eq!(
         history::load(&path)
             .unwrap()
@@ -1131,7 +1117,6 @@ fn history_tracks_playback_throttles_disk_saves_and_prevents_old_position_leak_o
         0
     );
 
-    // Após >= 5s com avanço >= 1s, grava automaticamente em disco.
     let t3 = t0 + Duration::from_secs(6);
     let _ = app.process_player_telemetry(
         &videos[0],
@@ -1150,7 +1135,6 @@ fn history_tracks_playback_throttles_disk_saves_and_prevents_old_position_leak_o
         45_000
     );
 
-    // Avança mais um pouco até 62s antes de trocar de vídeo.
     let t4 = t3 + Duration::from_secs(1);
     let _ = app.process_player_telemetry(
         &videos[0],
@@ -1165,8 +1149,6 @@ fn history_tracks_playback_throttles_disk_saves_and_prevents_old_position_leak_o
         62_000
     );
 
-    // Troca para o vídeo 2: deve persistir imediatamente 62s do vídeo 1 e proteger o vídeo 2
-    // contra leituras atrasadas (stale) da posição 62s do vídeo 1.
     let prev_live_pos = app.current_player_live_pos_ms();
     assert_eq!(prev_live_pos, Some(62_000));
     let t_switch = t4 + Duration::from_millis(200);
@@ -1184,8 +1166,7 @@ fn history_tracks_playback_throttles_disk_saves_and_prevents_old_position_leak_o
     );
     assert!(disk_after_switch.get("0123456789A").is_none());
 
-    // Simula o player ainda reportando o path antigo ou o time-pos antigo (62.1s) logo após o loadfile:
-    // nenhuma dessas amostras velhas deve contaminar o vídeo 2!
+    // Ignore stale path/time-pos samples emitted right after `loadfile` for the previous video.
     let _ = app.process_player_telemetry(
         &videos[1],
         Some(&videos[0].url),
@@ -1206,7 +1187,6 @@ fn history_tracks_playback_throttles_disk_saves_and_prevents_old_position_leak_o
     );
     assert!(app.history.data.get("0123456789A").is_none());
 
-    // Agora o vídeo 2 realmente começa em 1.5s e depois fecha em 18.0s.
     let _ = app.process_player_telemetry(
         &videos[1],
         Some(&videos[1].url),
@@ -1253,7 +1233,6 @@ fn resume_restores_saved_position_and_avoids_resuming_near_end_or_non_youtube_ur
     app.history.read_failed = false;
     app.history.error = None;
 
-    // Fonte não-YouTube ou ID inválido falha com segurança sem entrar no histórico.
     let external_video = Video {
         title: "Vídeo Externo".into(),
         channel: "Outro Site".into(),
@@ -1278,7 +1257,6 @@ fn resume_restores_saved_position_and_avoids_resuming_near_end_or_non_youtube_ur
     );
     assert!(app.history.data.entries().is_empty());
 
-    // Vídeo YouTube com posição intermediária (45s de 200s) retoma em 45s.
     app.record_video_in_history(&videos[0], 45_000, Some(200_000))
         .unwrap();
     let resume_ms = app.planned_resume_ms(&videos[0]);
@@ -1286,7 +1264,7 @@ fn resume_restores_saved_position_and_avoids_resuming_near_end_or_non_youtube_ur
     app.selected = Some(videos[0].clone());
     app.activate_video_playback(&videos[0], resume_ms, None, now);
 
-    // Enquanto o player carrega (time-pos == None), a posição de retomada 45s não é zerada.
+    // Keep the 45s resume position intact while the player is still loading (`time-pos == None`).
     let (pos_loading, _, seek_loading, _) = app.process_player_telemetry(
         &videos[0],
         Some(&videos[0].url),
@@ -1302,7 +1280,6 @@ fn resume_restores_saved_position_and_avoids_resuming_near_end_or_non_youtube_ur
         45_000
     );
 
-    // Se o player iniciar em 0.2s, emite seek explícito para 45.0s.
     let (pos_started, _, pending_seek, _) = app.process_player_telemetry(
         &videos[0],
         Some(&videos[0].url),
@@ -1339,7 +1316,6 @@ fn resume_restores_saved_position_and_avoids_resuming_near_end_or_non_youtube_ur
         45_200
     );
 
-    // Vídeo perto do fim (197s de 200s) não retoma perto do fim; recomeça do início.
     app.record_video_in_history(&videos[0], 197_000, Some(200_000))
         .unwrap();
     assert_eq!(app.planned_resume_ms(&videos[0]), None);
@@ -1369,7 +1345,6 @@ fn corrupt_history_file_reports_error_and_is_never_overwritten_and_clear_works()
     assert!(app.history.read_failed);
     assert!(app.history.error.is_some());
 
-    // Mesmo abrindo, reproduzindo, limpando ou fechando vídeo, o arquivo corrompido é preservado intacto.
     let now = Instant::now();
     app.selected = Some(videos[0].clone());
     app.activate_video_playback(&videos[0], None, None, now);
@@ -1385,7 +1360,6 @@ fn corrupt_history_file_reports_error_and_is_never_overwritten_and_clear_works()
     app.clear_history();
     assert_eq!(std::fs::read(&corrupt_path).unwrap(), corrupt_bytes);
 
-    // Agora em um caminho válido, verifica limpeza de histórico e renderização na UI.
     let valid_path = temp_dir.join("valid-history.json");
     let mut valid_app = FastTube::default();
     valid_app.feed.videos = videos.clone();
@@ -1439,7 +1413,6 @@ fn decoding_diagnostics_polls_only_when_settings_visible_and_throttles_to_one_se
 
     let mut ffi_calls = 0usize;
 
-    // 1. Sem vídeo ativo e painel fechado: nenhuma consulta FFI e diagnóstico permanece desconhecido/inativo.
     assert!(!app.refresh_decoding_diagnostics_with(t0, false, |_| {
         ffi_calls += 1;
         Some("d3d11va".into())
@@ -1447,7 +1420,6 @@ fn decoding_diagnostics_polls_only_when_settings_visible_and_throttles_to_one_se
     assert_eq!(ffi_calls, 0);
     assert!(app.playback.diagnostics.effective_decoding.is_unknown());
 
-    // 2. Com vídeo ativo, mas painel de configurações oculto: nenhuma consulta FFI.
     app.selected = Some(videos[0].clone());
     assert!(!app.refresh_decoding_diagnostics_with(t0, true, |_| {
         ffi_calls += 1;
@@ -1455,7 +1427,6 @@ fn decoding_diagnostics_polls_only_when_settings_visible_and_throttles_to_one_se
     }));
     assert_eq!(ffi_calls, 0);
 
-    // 3. Sem vídeo ativo, mesmo com painel aberto: nenhuma consulta FFI.
     app.ui.settings_open = true;
     assert!(!app.refresh_decoding_diagnostics_with(t0, false, |_| {
         ffi_calls += 1;
@@ -1463,7 +1434,6 @@ fn decoding_diagnostics_polls_only_when_settings_visible_and_throttles_to_one_se
     }));
     assert_eq!(ffi_calls, 0);
 
-    // 4. Painel visível + vídeo ativo: coleta imediatamente na primeira verificação.
     let polled = app.refresh_decoding_diagnostics_with(t0, true, |name| {
         ffi_calls += 1;
         match name {
@@ -1490,7 +1460,6 @@ fn decoding_diagnostics_polls_only_when_settings_visible_and_throttles_to_one_se
         })
     );
 
-    // 5. Quadros subsequentes antes de 1s (~250ms, ~900ms): suprime consultas FFI.
     assert!(
         !app.refresh_decoding_diagnostics_with(t0 + Duration::from_millis(250), true, |_| {
             ffi_calls += 1;
@@ -1505,7 +1474,6 @@ fn decoding_diagnostics_polls_only_when_settings_visible_and_throttles_to_one_se
     );
     assert_eq!(ffi_calls, 5);
 
-    // 6. Após >= 1s com painel visível: realiza nova coleta (ex.: mudou para software / AV1).
     let polled_after_1s =
         app.refresh_decoding_diagnostics_with(t0 + Duration::from_secs(1), true, |name| {
             ffi_calls += 1;
@@ -1526,7 +1494,6 @@ fn decoding_diagnostics_polls_only_when_settings_visible_and_throttles_to_one_se
     );
     assert_eq!(app.playback.diagnostics.codec.as_deref(), Some("av1"));
 
-    // 7. Ao fechar o vídeo, o diagnóstico volta imediatamente para desconhecido/inativo.
     let ctx = egui::Context::default();
     app.close_video(&ctx);
     assert!(app.selected.is_none());
@@ -1542,7 +1509,6 @@ fn settings_diagnostics_display_distinguishes_requested_from_effective_and_rende
     fastframe_icons::install::<Icon>(&ctx);
     let videos = valid_youtube_videos();
 
-    // Caso 1: Sem vídeo em reprodução -> inativo/desconhecido, sem alegar GPU ativa apesar de hwdec=auto-safe.
     let inactive_diag = DecodingDiagnostics::unknown(Some("auto-safe"));
     let inactive_display = format_diagnostics_display(&inactive_diag, false);
     assert!(inactive_display.status_line.contains("inativo"));
@@ -1559,7 +1525,6 @@ fn settings_diagnostics_display_distinguishes_requested_from_effective_and_rende
     );
     assert!(inactive_display.metadata_line.is_none());
 
-    // Caso 2: Vídeo ativo, mas hwdec-current ainda ausente/política -> desconhecido, não alega hardware ativo.
     let unconfirmed_diag =
         DecodingDiagnostics::from_raw(Some("auto-safe"), Some("auto-safe"), None, None, None);
     let unconfirmed_display = format_diagnostics_display(&unconfirmed_diag, true);
@@ -1567,7 +1532,6 @@ fn settings_diagnostics_display_distinguishes_requested_from_effective_and_rende
     assert!(unconfirmed_display.effective_line.contains("desconhecido"));
     assert!(unconfirmed_display.metadata_line.is_none());
 
-    // Caso 3: Vídeo ativo com hardware confirmado (d3d11va) + codec e tamanho.
     let hw_diag = DecodingDiagnostics::from_raw(
         Some("auto-safe"),
         Some("d3d11va"),
@@ -1586,7 +1550,6 @@ fn settings_diagnostics_display_distinguishes_requested_from_effective_and_rende
         Some("Codec: vp9 • Tamanho: 1920 × 1080")
     );
 
-    // Caso 4: Vídeo ativo em software (hwdec-current = no).
     let sw_diag = DecodingDiagnostics::from_raw(
         Some("auto-safe"),
         Some("no"),
@@ -1602,7 +1565,6 @@ fn settings_diagnostics_display_distinguishes_requested_from_effective_and_rende
     );
     assert!(sw_display.effective_line.contains("software (no)"));
 
-    // Exercita renderização headless da janela de configurações nos estados ativo e inativo.
     let mut app = FastTube::default();
     app.feed.videos = videos.clone();
     app.selected = Some(videos[0].clone());
@@ -2237,8 +2199,7 @@ fn theme_selection_persists_isolated_and_preserves_buffer_playback_queue_and_his
     let ctx = egui::Context::default();
     fastframe_icons::install::<Icon>(&ctx);
 
-    // 1. Sem caminho configurado em teste (default), aplicar tema atualiza a sessão,
-    // registra erro de armazenamento e protege contra escrita no theme_path() real.
+    // Unconfigured path updates session and surfaces an error without writing to real theme_path().
     let mut unconfigured_app = FastTube::default();
     assert_eq!(unconfigured_app.settings.theme.value, Theme::Dark);
     assert!(unconfigured_app.settings.theme.path.is_none());
@@ -3058,7 +3019,7 @@ fn channel_progressive_videos_pagination_playlists_and_about_tabs_work_and_prese
     assert!(app.channels.videos.has_more);
     assert!(!app.channels.videos.reached_max);
 
-    // 1. Progressive video pagination ("Carregar mais vídeos") with deduplication & error handling.
+    // 1. Progressive video pagination with deduplication & error handling.
     let (more_req_1, more_target, start, count) = app
         .begin_channel_more_videos_request()
         .expect("should start progressive video batch");
@@ -3181,7 +3142,7 @@ fn channel_progressive_videos_pagination_playlists_and_about_tabs_work_and_prese
         vec!["fasttube-google-playlist:PL_OAUTH_USER_123".to_owned()]
     );
 
-    // 3. Channel About ("Informações") tab on-demand load and metadata enrichment.
+    // 3. Channel About tab on-demand load and metadata enrichment.
     app.channels.tab = ChannelTab::About;
     let (about_req_id, about_target) = app
         .begin_channel_about_request()
@@ -3387,6 +3348,7 @@ fn comments_reauthorization_replaces_session_and_resets_comment_state() {
     app.watch.extras.comments = vec![oauth::Comment {
         id: "comment-old".into(),
         author: "Ana".into(),
+        author_avatar: None,
         text: "antigo".into(),
         published: String::new(),
         likes: 0,
@@ -3680,6 +3642,8 @@ fn integrated_overlay_actions_update_menu_theater_fullscreen_miniplayer_and_app_
         theater: false,
         fullscreen: false,
         mini_player: false,
+        autoplay: true,
+        loop_video: false,
         can_bookmark: true,
         raw_path: Some(video.url.clone()),
         raw_position: Some(42.0),
@@ -3725,10 +3689,15 @@ fn integrated_overlay_actions_update_menu_theater_fullscreen_miniplayer_and_app_
     app.handle_player_overlay_action(overlay::OverlayAction::ToggleFullscreen, &overlay_ctx, &ctx);
     assert!(app.playback.fullscreen);
 
-    // Ativar miniplayer enquanto em tela cheia deve sair da tela cheia automaticamente.
     app.handle_player_overlay_action(overlay::OverlayAction::ToggleMiniPlayer, &overlay_ctx, &ctx);
     assert!(app.playback.mini_player);
     assert!(!app.playback.fullscreen);
+
+    app.handle_player_overlay_action(overlay::OverlayAction::ToggleAutoplay, &overlay_ctx, &ctx);
+    assert!(!app.playback.autoplay);
+
+    app.handle_player_overlay_action(overlay::OverlayAction::ToggleLoop, &overlay_ctx, &ctx);
+    assert!(app.playback.loop_video);
 
     app.playback.player_menu = Some(overlay::OverlayMenu::Quality);
     app.close_video(&ctx);
@@ -3750,3 +3719,350 @@ fn overlay_style_maintains_high_contrast_in_both_themes() {
         assert_eq!(style.accent, Color32::from_rgb(255, 0, 51));
     }
 }
+
+#[test]
+fn recent_searches_deduplicates_and_ignores_internal_queries() {
+    let mut app = FastTube::default();
+    app.record_recent_search("rust egui");
+    app.record_recent_search("  Rust Egui  ");
+    app.record_recent_search(":ytrec");
+    app.record_recent_search("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+    app.record_recent_search("mpv player");
+
+    assert_eq!(
+        app.feed.recent_searches,
+        vec!["mpv player".to_owned(), "Rust Egui".to_owned()]
+    );
+}
+
+#[test]
+fn collection_toggle_and_saved_status_round_trip() {
+    let mut app = FastTube::default();
+    let mut video = sample_videos().remove(0);
+    video.url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into();
+
+    assert!(!app.video_saved_in_library(&video));
+    app.toggle_collection_video("Estudos Rust", &video);
+    assert!(app.video_saved_in_library(&video));
+    assert_eq!(app.library.data.collections.len(), 1);
+    assert_eq!(app.library.data.collections[0].videos.len(), 1);
+
+    app.toggle_collection_video("estudos rust", &video);
+    assert!(!app.video_saved_in_library(&video));
+    assert!(app.library.data.collections[0].videos.is_empty());
+}
+
+#[test]
+fn next_recommended_and_shorts_navigation_resolve_expected_videos() {
+    let mut app = FastTube::default();
+    let videos = vec![
+        Video {
+            title: "Short 1".into(),
+            channel: "Canal A".into(),
+            duration: "0:30".into(),
+            url: "https://www.youtube.com/shorts/short000001".into(),
+            thumbnail: String::new(),
+        },
+        Video {
+            title: "Short 2".into(),
+            channel: "Canal B".into(),
+            duration: "0:45".into(),
+            url: "https://www.youtube.com/shorts/short000002".into(),
+            thumbnail: String::new(),
+        },
+    ];
+    app.feed.videos = videos.clone();
+    app.feed.cache_dirty = true;
+    app.selected = Some(videos[0].clone());
+
+    let next_rec = app.next_recommended_video().expect("next recommended");
+    assert_eq!(next_rec.url, videos[1].url);
+
+    let next_short = app.next_or_prev_short(true).expect("next short");
+    assert_eq!(next_short.url, videos[1].url);
+
+    app.selected = Some(videos[1].clone());
+    let prev_short = app.next_or_prev_short(false).expect("prev short");
+    assert_eq!(prev_short.url, videos[0].url);
+}
+
+#[test]
+fn channel_tab_videos_completion_populates_shorts_and_streams() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    let target = ChannelTarget::Handle("rustlang".into());
+    app.channels.view_open = true;
+    app.channels.last_target = Some(target.clone());
+
+    let (req_shorts, _) = app.channels.begin_shorts_request().expect("shorts req");
+    let item = SearchResult {
+        video: Video {
+            title: "Rust Short".into(),
+            channel: "Rust".into(),
+            duration: "0:40".into(),
+            url: "https://www.youtube.com/shorts/abc12345678".into(),
+            thumbnail: String::new(),
+        },
+        metadata: VideoMetadata::default(),
+    };
+    assert!(app.complete_channel_tab_videos(
+        req_shorts,
+        &target,
+        search::ChannelFeedTab::Shorts,
+        Ok(vec![item]),
+    ));
+    assert!(app.channels.shorts.loaded);
+    assert_eq!(app.channels.shorts.items.len(), 1);
+
+    app.reset_channel_tabs_state(&ctx);
+    assert!(!app.channels.shorts.loaded);
+    assert!(app.channels.shorts.items.is_empty());
+}
+
+fn collect_rendered_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+    let mut texts = Vec::new();
+    fn visit(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text) => out.push(text.galley.job.text.clone()),
+            egui::Shape::Vec(items) => {
+                for item in items {
+                    visit(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    for clipped in shapes {
+        visit(&clipped.shape, &mut texts);
+    }
+    texts
+}
+
+#[test]
+fn watch_metadata_card_omits_transcript_and_markers_section() {
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+    let video = Video {
+        title: "Video de Teste".into(),
+        channel: "Canal Teste".into(),
+        duration: "3:00".into(),
+        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+        thumbnail: String::new(),
+    };
+    app.selected = Some(video.clone());
+    app.watch.extras.comments_loaded = true;
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1024.0, 900.0),
+            )),
+            ..Default::default()
+        },
+        |ui| {
+            app.watch_metadata_card_ui(ui, &video, 820.0, None);
+        },
+    );
+    let rendered = collect_rendered_text(&output.shapes).join("\n");
+    output.textures_delta.clear();
+    assert!(!rendered.contains("Transcri\u{00e7}\u{00e3}o / Legendas"));
+    assert!(!rendered.contains("Ocultar transcri\u{00e7}\u{00e3}o"));
+    assert!(!rendered.contains("Marcadores"));
+}
+
+#[test]
+fn comments_ui_renders_composer_emoji_picker_avatars_and_actions_headlessly() {
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+    app.auth.authenticated = true;
+    app.auth.session = Some(oauth::TokenSession::test_session("token-comments"));
+    app.auth.my_channel = Some(ChannelTarget::ChannelId("UC1234567890".into()));
+    app.auth.my_channel_title = Some("Meu Canal".into());
+    app.auth.my_channel_fetch_attempted = true;
+    app.watch.extras.comments_loaded = true;
+    app.watch.extras.comments_total = Some(1);
+    app.watch.extras.comment_composer_active = true;
+    app.watch.extras.comment_emoji_picker_open = true;
+    app.watch.extras.comments = vec![oauth::Comment {
+        id: "c-1".into(),
+        author: "@usuario".into(),
+        author_avatar: None,
+        text: "Hello world".into(),
+        published: "2026-11-13T10:00:00Z".into(),
+        likes: 66,
+        replies: 1,
+    }];
+    app.watch
+        .extras
+        .comment_ratings
+        .insert("c-1".into(), watch_extras::CommentRating::Like);
+    app.watch
+        .extras
+        .comment_rating_errors
+        .insert("c-1".into(), "Falha remota simulada".into());
+    assert_eq!(app.watch.extras.comment_displayed_likes("c-1", 66), 67);
+
+    let input_id = egui::Id::new("test_emoji_insert");
+    let mut draft = "Oi".to_owned();
+    FastTube::insert_emoji_into_draft(&ctx, input_id, &mut draft, "\u{1f525}");
+    assert_eq!(draft, "Oi\u{1f525}");
+
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(960.0, 900.0),
+            )),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.comments_ui(ui, &c, "test_watch_comments");
+        },
+    );
+    let rendered = collect_rendered_text(&output.shapes).join("\n");
+    output.textures_delta.clear();
+    assert!(rendered.contains("1 coment\u{00e1}rio"));
+    assert!(rendered.contains("Cancelar"));
+    assert!(rendered.contains("Comentar"));
+    assert!(rendered.contains("Traduzir para o portugu\u{00ea}s"));
+    assert!(rendered.contains("67"));
+    assert!(rendered.contains("Falha remota simulada"));
+}
+
+#[test]
+fn poll_my_channel_stores_avatar_and_only_navigates_when_requested() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    app.auth.authenticated = true;
+    app.auth.session = Some(oauth::TokenSession::test_session("token"));
+    app.auth.my_channel_open_when_ready = false;
+    let (tx, rx) = mpsc::channel();
+    app.auth.my_channel_rx = Some(rx);
+    tx.send((
+        Some(oauth::TokenSession::test_session("token-2")),
+        Ok(oauth::MyChannelProfile {
+            target: ChannelTarget::ChannelId("UCabc123".into()),
+            title: Some("Canal Teste".into()),
+            avatar_url: Some("https://yt3.ggpht.com/avatar=s88".into()),
+        }),
+    ))
+    .unwrap();
+
+    app.poll_my_channel(&ctx);
+
+    assert_eq!(
+        app.auth.my_channel,
+        Some(ChannelTarget::ChannelId("UCabc123".into()))
+    );
+    assert_eq!(app.auth.my_channel_title.as_deref(), Some("Canal Teste"));
+    assert_eq!(
+        app.auth.my_channel_avatar_url.as_deref(),
+        Some("https://yt3.ggpht.com/avatar=s88")
+    );
+    assert!(!app.channels.view_open);
+}
+
+#[test]
+fn youtube_sidebar_and_responsive_watch_resize_adapt_across_viewports() {
+    // 1. Browse page: persistent sidebar at >= 1312px, compact rail + overlay drawer at 760..1312px, overlay drawer only at < 760px.
+    assert!(should_show_persistent_navigation_panel(
+        1440.0, true, false, false, false
+    ));
+    assert!(!should_show_compact_navigation_for_page(
+        1440.0, true, false, false, false
+    ));
+    assert!(!should_show_navigation_drawer(1440.0, true, false, false));
+
+    assert!(!should_show_persistent_navigation_panel(
+        1440.0, false, false, false, false
+    ));
+    assert!(should_show_compact_navigation_for_page(
+        1440.0, false, false, false, false
+    ));
+
+    assert!(!should_show_persistent_navigation_panel(
+        1100.0, true, false, false, false
+    ));
+    assert!(should_show_compact_navigation_for_page(
+        1100.0, true, false, false, false
+    ));
+    assert!(should_show_navigation_drawer(1100.0, true, false, false));
+
+    assert!(!should_show_compact_navigation_for_page(
+        640.0, false, false, false, false
+    ));
+    assert!(should_show_navigation_drawer(640.0, true, false, false));
+
+    // 2. Watch page (video open): never shows persistent panel or compact rail; shows overlay drawer when navigation_open (including in theater mode).
+    assert!(!should_show_persistent_navigation_panel(
+        1600.0, true, false, true, false
+    ));
+    assert!(!should_show_compact_navigation_for_page(
+        1600.0, false, false, true, false
+    ));
+    assert!(should_show_navigation_drawer(1600.0, true, false, true));
+    assert!(!should_show_navigation_drawer(1600.0, false, false, true));
+
+    // Watch pagecolumns adapt between wide side-by-side and narrow stacked on window resize.
+    let wide_watch = compute_watch_page_columns(1440.0, 900.0, false);
+    assert_eq!(wide_watch.mode, WatchLayoutMode::SideBySide);
+    let wide_margin = watch_page_side_margin(1440.0, &wide_watch);
+    assert!(wide_margin >= 24.0);
+
+    let narrow_watch = compute_watch_page_columns(820.0, 700.0, false);
+    assert_eq!(narrow_watch.mode, WatchLayoutMode::Stacked);
+    assert!(narrow_watch.primary_width <= 820.0 - 24.0);
+
+    let theater_watch = compute_watch_page_columns(1440.0, 900.0, true);
+    assert_eq!(theater_watch.mode, WatchLayoutMode::Stacked);
+    assert_eq!(theater_watch.primary_width, 1440.0);
+
+    // 3. Headless UI pass verifying YouTube sidebar sections and overlay drawer in both default and theater watch modes.
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+    app.feed.videos = sample_videos();
+    app.selected = Some(app.feed.videos[0].clone());
+    app.ui.navigation_open = true;
+    app.playback.theater = true;
+
+    for size in [
+        egui::vec2(1600.0, 900.0),
+        egui::vec2(1100.0, 760.0),
+        egui::vec2(720.0, 640.0),
+    ] {
+        let mut rendered = String::new();
+        for _pass in 0..2 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    ..Default::default()
+                },
+                |ui| {
+                    let c = ui.ctx().clone();
+                    egui::Panel::top("header").show(ui, |ui| {
+                        app.header_ui(ui, &c);
+                    });
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let _ = app.watch_page_ui(ui, &c);
+                    });
+                    app.watch_navigation_drawer_ui(&c);
+                },
+            );
+            rendered = collect_rendered_text(&output.shapes).join("\n");
+            output.textures_delta.clear();
+        }
+        assert!(rendered.contains("In\u{00ed}cio"), "rendered was:\n{rendered}");
+        assert!(rendered.contains("Shorts"));
+        assert!(rendered.contains("Inscri\u{00e7}\u{00f5}es"));
+        assert!(rendered.contains("Voc\u{00ea}"));
+        assert!(rendered.contains("Explorar"));
+        assert!(rendered.contains("M\u{00fa}sica"));
+        assert!(rendered.contains("Jogos"));
+        assert!(rendered.contains("Configura\u{00e7}\u{00f5}es"));
+    }
+}
+

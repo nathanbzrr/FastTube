@@ -1,31 +1,14 @@
-//! Controles sobrepostos ao vídeo no estilo do player oficial do YouTube.
-//!
-//! Este módulo é independente do restante da interface: recebe a geometria do
-//! vídeo e a telemetria atual do player e devolve a ação escolhida pelo
-//! usuário. A integração com o `FastTube` e com o libmpv fica em `main.rs`.
-
 use eframe::egui::{
     self, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, RichText, Sense, Shape, Stroke,
     Vec2, epaint::Vertex,
 };
 
-/// Altura visual da faixa de controles na base do player, em pontos.
 pub const OVERLAY_HEIGHT: f32 = 64.0;
-
-/// Tempo sem atividade de ponteiro após o qual a barra se esconde durante a
-/// reprodução.
 pub const OVERLAY_HIDE_DELAY_SECS: f64 = 2.5;
-
-/// Padding horizontal interno dos controles em relação às bordas do vídeo.
 const BAR_SIDE_PADDING: f32 = 12.0;
-
-/// Altura da faixa interativa da barra de progresso.
 const PROGRESS_HIT_HEIGHT: f32 = 16.0;
-
-/// Altura da faixa inferior de botões.
 const BUTTON_ROW_HEIGHT: f32 = 38.0;
 
-/// Submenus disponíveis no painel de ajustes integrado ao player.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OverlayMenu {
     Root,
@@ -35,14 +18,12 @@ pub enum OverlayMenu {
     Chapters,
 }
 
-/// Capítulo do vídeo exibido na barra de progresso e no menu do player.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OverlayChapter {
     pub title: String,
     pub time_secs: f64,
 }
 
-/// Faixa de legenda selecionável dentro do player.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OverlaySubtitleOption {
     pub id: String,
@@ -50,7 +31,6 @@ pub struct OverlaySubtitleOption {
     pub active: bool,
 }
 
-/// Estado do player necessário para desenhar os controles integrados.
 #[derive(Clone, Debug)]
 pub struct OverlayTelemetry {
     pub title: String,
@@ -67,12 +47,15 @@ pub struct OverlayTelemetry {
     pub qualities_loading: bool,
     pub has_queued: bool,
     pub has_active_subtitle: bool,
+    pub active_subtitle_text: Option<String>,
     pub subtitles: Vec<OverlaySubtitleOption>,
     pub subtitles_loading: bool,
     pub chapters: Vec<OverlayChapter>,
     pub theater: bool,
     pub fullscreen: bool,
     pub mini_player: bool,
+    pub autoplay: bool,
+    pub loop_video: bool,
     pub can_bookmark: bool,
     pub menu: Option<OverlayMenu>,
 }
@@ -94,19 +77,21 @@ impl Default for OverlayTelemetry {
             qualities_loading: false,
             has_queued: false,
             has_active_subtitle: false,
+            active_subtitle_text: None,
             subtitles: Vec::new(),
             subtitles_loading: false,
             chapters: Vec::new(),
             theater: false,
             fullscreen: false,
             mini_player: false,
+            autoplay: false,
+            loop_video: false,
             can_bookmark: false,
             menu: None,
         }
     }
 }
 
-/// Cores fornecidas pelo tema atual.
 #[derive(Clone, Copy, Debug)]
 pub struct OverlayStyle {
     pub panel: Color32,
@@ -115,7 +100,6 @@ pub struct OverlayStyle {
     pub accent: Color32,
 }
 
-/// Ação pedida por um controle integrado ao player.
 #[derive(Clone, Debug, PartialEq)]
 pub enum OverlayAction {
     TogglePlay,
@@ -125,6 +109,8 @@ pub enum OverlayAction {
     ToggleMute,
     SetVolume(f32),
     Next,
+    ToggleAutoplay,
+    ToggleLoop,
     ToggleCaptions,
     SelectSubtitle(Option<String>),
     SetSpeed(f64),
@@ -139,7 +125,6 @@ pub enum OverlayAction {
     Close,
 }
 
-/// Decide se a barra sobreposta deve aparecer neste quadro.
 pub fn overlay_visible(
     pointer_over_video: bool,
     paused: bool,
@@ -149,7 +134,6 @@ pub fn overlay_visible(
     pointer_over_video || paused || ended || seconds_since_activity < OVERLAY_HIDE_DELAY_SECS
 }
 
-/// Variante completa considerando menu aberto ou arraste ativo na barra.
 pub fn overlay_visible_with_state(
     pointer_over_video: bool,
     paused: bool,
@@ -163,7 +147,6 @@ pub fn overlay_visible_with_state(
         || overlay_visible(pointer_over_video, paused, ended, seconds_since_activity)
 }
 
-/// Formata segundos em `M:SS` ou `H:MM:SS`.
 pub fn format_time(seconds: f64) -> String {
     let clamped = if seconds.is_finite() && seconds > 0.0 {
         seconds.floor() as u64
@@ -180,7 +163,6 @@ pub fn format_time(seconds: f64) -> String {
     }
 }
 
-/// Formata o par `decorrido / total` exibido na barra (`--:--` quando sem duração).
 fn format_elapsed_total(position_secs: f64, duration_secs: Option<f64>) -> String {
     let elapsed = format_time(position_secs);
     let total = match duration_secs {
@@ -190,7 +172,6 @@ fn format_elapsed_total(position_secs: f64, duration_secs: Option<f64>) -> Strin
     format!("{elapsed} / {total}")
 }
 
-/// Calcula o retângulo da faixa inferior de controles dentro de `video_rect`.
 fn compute_bar_rect(video_rect: Rect) -> Option<Rect> {
     let vw = video_rect.width();
     let vh = video_rect.height();
@@ -210,7 +191,6 @@ fn compute_bar_rect(video_rect: Rect) -> Option<Rect> {
     }
 }
 
-/// Converte uma fração `[0, 1]` e a duração opcional em uma ação `SeekTo`.
 fn action_for_progress_click(fraction: f64, duration_secs: Option<f64>) -> Option<OverlayAction> {
     let duration = duration_secs?;
     if !duration.is_finite() || duration <= 0.0 || !fraction.is_finite() {
@@ -262,6 +242,7 @@ enum VectorGlyph {
     SkipBack10,
     SkipForward10,
     Volume(bool, f32),
+    Autoplay(bool),
     Captions(bool),
     Settings(bool),
     MiniPlayer(bool),
@@ -427,6 +408,49 @@ fn icon_button(
                     }
                 }
             }
+            VectorGlyph::Autoplay(is_on) => {
+                let pill = Rect::from_center_size(c, Vec2::new(20.0, 9.0));
+                let track_bg = if is_on {
+                    style.accent.gamma_multiply(0.85)
+                } else {
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 70)
+                };
+                painter.rect_filled(pill, CornerRadius::same(5), track_bg);
+                let knob_x = if is_on {
+                    pill.right() - 5.0
+                } else {
+                    pill.left() + 5.0
+                };
+                let knob_center = Pos2::new(knob_x, c.y);
+                painter.circle_filled(knob_center, 5.8, Color32::WHITE);
+                if is_on {
+                    let tri = vec![
+                        Pos2::new(knob_center.x - 1.5, knob_center.y - 2.6),
+                        Pos2::new(knob_center.x - 1.5, knob_center.y + 2.6),
+                        Pos2::new(knob_center.x + 2.5, knob_center.y),
+                    ];
+                    painter.add(Shape::convex_polygon(
+                        tri,
+                        Color32::from_rgb(24, 24, 28),
+                        Stroke::NONE,
+                    ));
+                } else {
+                    painter.line_segment(
+                        [
+                            Pos2::new(knob_center.x - 1.5, knob_center.y - 2.4),
+                            Pos2::new(knob_center.x - 1.5, knob_center.y + 2.4),
+                        ],
+                        Stroke::new(1.3, Color32::from_rgb(24, 24, 28)),
+                    );
+                    painter.line_segment(
+                        [
+                            Pos2::new(knob_center.x + 1.5, knob_center.y - 2.4),
+                            Pos2::new(knob_center.x + 1.5, knob_center.y + 2.4),
+                        ],
+                        Stroke::new(1.3, Color32::from_rgb(24, 24, 28)),
+                    );
+                }
+            }
             VectorGlyph::Captions(is_on) => {
                 let box_rect = Rect::from_center_size(c, Vec2::new(18.0, 13.0));
                 painter.rect_stroke(
@@ -499,7 +523,6 @@ fn icon_button(
                 let arm = 4.2_f32;
                 let s = Stroke::new(1.8, fg);
                 if is_fs {
-                    // Cantos apontando para dentro
                     let corners = [
                         (Pos2::new(c.x - d + arm, c.y - d + arm), -1.0_f32, -1.0_f32),
                         (Pos2::new(c.x + d - arm, c.y - d + arm), 1.0, -1.0),
@@ -511,7 +534,6 @@ fn icon_button(
                         painter.line_segment([p, Pos2::new(p.x, p.y + sy * arm)], s);
                     }
                 } else {
-                    // Cantos apontando para fora
                     let corners = [
                         (Pos2::new(c.x - d, c.y - d), 1.0_f32, 1.0_f32),
                         (Pos2::new(c.x + d, c.y - d), -1.0, 1.0),
@@ -721,10 +743,10 @@ fn show_settings_popup(
     style: &OverlayStyle,
 ) -> (Option<OverlayAction>, bool) {
     let popup_w = (video_rect.width() - 16.0).clamp(180.0, 276.0);
-    let max_h = (bar_rect.min.y - video_rect.min.y - 12.0).clamp(110.0, 290.0);
+    let max_h = (bar_rect.min.y - video_rect.min.y - 12.0).clamp(110.0, 330.0);
     let est_h = match menu {
         OverlayMenu::Root => {
-            let rows = 4
+            let rows = 6
                 + usize::from(!telemetry.chapters.is_empty())
                 + usize::from(telemetry.can_bookmark);
             (rows as f32 * 34.0 + 18.0).min(max_h)
@@ -758,7 +780,7 @@ fn show_settings_popup(
 
     ui.scope_builder(egui::UiBuilder::new().max_rect(popup_rect), |ui| {
         ui.set_clip_rect(popup_rect.intersect(video_rect));
-        // Absorbe cliques no fundo do menu para não pausar/reproduzir o vídeo atrás.
+        // Absorb clicks on the popup backdrop so they do not toggle playback behind it.
         let bg_id = ui.make_persistent_id("fasttube_overlay_popup_bg");
         let _ = ui.interact(popup_rect, bg_id, Sense::click());
 
@@ -779,6 +801,38 @@ fn show_settings_popup(
             ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
             match menu {
                 OverlayMenu::Root => {
+                    if menu_row(
+                        ui,
+                        "Reprodu\u{00e7}\u{00e3}o autom\u{00e1}tica",
+                        Some(if telemetry.autoplay {
+                            "Ativada"
+                        } else {
+                            "Desativada"
+                        }),
+                        telemetry.autoplay,
+                        false,
+                        style,
+                    )
+                    .clicked()
+                    {
+                        action = Some(OverlayAction::ToggleAutoplay);
+                    }
+                    if menu_row(
+                        ui,
+                        "Repetir v\u{00ed}deo",
+                        Some(if telemetry.loop_video {
+                            "Ativado"
+                        } else {
+                            "Desativado"
+                        }),
+                        telemetry.loop_video,
+                        false,
+                        style,
+                    )
+                    .clicked()
+                    {
+                        action = Some(OverlayAction::ToggleLoop);
+                    }
                     if menu_row(
                         ui,
                         "Velocidade",
@@ -978,10 +1032,6 @@ fn show_settings_popup(
     (action, pointer_inside)
 }
 
-/// Desenha os controles sobrepostos do player dentro de `video_rect`.
-///
-/// Retorna a ação acionada (se houver) e se o ponteiro está sobre qualquer
-/// controle/menu sobreposto.
 pub fn show(
     ui: &mut egui::Ui,
     video_rect: Rect,
@@ -989,22 +1039,67 @@ pub fn show(
     style: &OverlayStyle,
     visible: bool,
 ) -> (Option<OverlayAction>, bool) {
+    let prev_clip = ui.clip_rect();
+    let clipped_video = video_rect.intersect(prev_clip);
+    if clipped_video.width() <= 0.0 || clipped_video.height() <= 0.0 {
+        return (None, false);
+    }
+
+    let bar_rect = compute_bar_rect(video_rect);
+
+    if let Some(sub_text) = telemetry
+        .active_subtitle_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        let font_px = (video_rect.height() * 0.042).clamp(14.0, 26.0);
+        let max_sub_width = (video_rect.width() * 0.84).max(120.0);
+        let painter = ui.painter().with_clip_rect(clipped_video);
+        let galley = painter.layout(
+            sub_text.to_owned(),
+            FontId::proportional(font_px),
+            Color32::WHITE,
+            max_sub_width,
+        );
+        let text_size = galley.size();
+        let pad_x = 12.0;
+        let pad_y = 6.0;
+        let bottom_y = if visible {
+            bar_rect
+                .map(|b| b.min.y - 10.0)
+                .unwrap_or(video_rect.max.y - 20.0)
+        } else {
+            video_rect.max.y - 22.0
+        };
+        let box_w = (text_size.x + pad_x * 2.0).min(video_rect.width() - 16.0);
+        let box_h = text_size.y + pad_y * 2.0;
+        let box_rect = Rect::from_min_size(
+            Pos2::new(video_rect.center().x - box_w * 0.5, bottom_y - box_h),
+            Vec2::new(box_w, box_h),
+        );
+        painter.rect_filled(
+            box_rect,
+            CornerRadius::same(6),
+            Color32::from_rgba_unmultiplied(8, 8, 10, 210),
+        );
+        let text_pos = Pos2::new(
+            box_rect.center().x - text_size.x * 0.5,
+            box_rect.min.y + pad_y,
+        );
+        painter.galley(text_pos, galley, Color32::WHITE);
+    }
+
     if !visible {
         return (None, false);
     }
 
-    let Some(bar_rect) = compute_bar_rect(video_rect) else {
+    let Some(bar_rect) = bar_rect else {
         return (None, false);
     };
 
     let pointer_pos = ui.input(|i| i.pointer.hover_pos());
     let mut over_controls = pointer_pos.is_some_and(|pos| bar_rect.contains(pos));
-
-    let prev_clip = ui.clip_rect();
-    let clipped_video = video_rect.intersect(prev_clip);
-    if clipped_video.width() <= 0.0 || clipped_video.height() <= 0.0 {
-        return (None, over_controls);
-    }
 
     let mut action_top: Option<OverlayAction> = None;
     let mut action_center: Option<OverlayAction> = None;
@@ -1016,13 +1111,13 @@ pub fn show(
     let mut action_mute: Option<OverlayAction> = None;
     let mut action_volume: Option<OverlayAction> = None;
     let mut action_chapter_pill: Option<OverlayAction> = None;
+    let mut action_autoplay: Option<OverlayAction> = None;
     let mut action_captions: Option<OverlayAction> = None;
     let mut action_settings: Option<OverlayAction> = None;
     let mut action_mini: Option<OverlayAction> = None;
     let mut action_theater: Option<OverlayAction> = None;
     let mut action_fullscreen: Option<OverlayAction> = None;
 
-    // 1) Faixa superior (título em tela cheia e botão discreto de fechar vídeo).
     if video_rect.height() >= 180.0 {
         let top_h = 46.0_f32.min(video_rect.height() * 0.25);
         let top_rect = Rect::from_min_max(
@@ -1079,7 +1174,6 @@ pub fn show(
         });
     }
 
-    // 2) Botão central de replay quando o vídeo termina.
     if telemetry.ended && telemetry.menu.is_none() && video_rect.height() >= 140.0 {
         let center_rect = Rect::from_center_size(video_rect.center(), Vec2::new(56.0, 56.0));
         if pointer_pos.is_some_and(|pos| center_rect.contains(pos)) {
@@ -1116,7 +1210,6 @@ pub fn show(
         });
     }
 
-    // 3) Menu popup de ajustes dentro do player (Velocidade, Qualidade, Legendas, Capítulos).
     if let Some(menu) = telemetry.menu {
         let (popup_act, over_popup) =
             show_settings_popup(ui, video_rect, bar_rect, menu, telemetry, style);
@@ -1126,7 +1219,6 @@ pub fn show(
         }
     }
 
-    // 4) Gradiente inferior + barra de progresso estilo YouTube + fileira de controles.
     let scrim_h = (bar_rect.height() + 26.0).min(video_rect.height());
     let scrim_rect = Rect::from_min_max(
         Pos2::new(
@@ -1264,7 +1356,6 @@ pub fn show(
                         .circle_filled(Pos2::new(knob_x, track_cy), 6.5, style.accent);
                 }
 
-                // Tooltip flutuante com tempo e capítulo sob o cursor.
                 if let Some(hf) = hover_fraction
                     && let Some(p) = pointer_pos
                 {
@@ -1307,7 +1398,6 @@ pub fn show(
                 }
             }
 
-            // Fileira de controles inferiores (esquerda: navegação/tempo; direita: CC/ajustes/telas).
             let row_top = (strip_rect.max.y + 2.0).min(bar_rect.max.y);
             let row_bottom = (row_top + BUTTON_ROW_HEIGHT).min(bar_rect.max.y);
             let row_rect = Rect::from_min_max(
@@ -1320,6 +1410,7 @@ pub fn show(
 
             let vw = bar_rect.width();
             let show_seek_10 = vw >= 440.0;
+            let show_autoplay = vw >= 420.0;
             let show_mini = vw >= 360.0;
             let show_theater = vw >= 320.0 && !telemetry.fullscreen;
             let slider_w = if vw >= 400.0 {
@@ -1330,7 +1421,8 @@ pub fn show(
                 0.0
             };
 
-            let right_slots = 3 + usize::from(show_mini) + usize::from(show_theater);
+            let right_slots =
+                3 + usize::from(show_autoplay) + usize::from(show_mini) + usize::from(show_theater);
             let right_w = (right_slots as f32 * 34.0).min(row_rect.width() * 0.55);
             let left_rect = Rect::from_min_max(
                 row_rect.min,
@@ -1616,6 +1708,25 @@ pub fn show(
                     {
                         action_captions = Some(OverlayAction::ToggleCaptions);
                     }
+
+                    if show_autoplay
+                        && icon_button(
+                            ui,
+                            Vec2::new(32.0, 30.0),
+                            VectorGlyph::Autoplay(telemetry.autoplay),
+                            style,
+                            true,
+                            telemetry.autoplay,
+                            if telemetry.autoplay {
+                                "Reprodu\u{00e7}\u{00e3}o autom\u{00e1}tica ativada"
+                            } else {
+                                "Reprodu\u{00e7}\u{00e3}o autom\u{00e1}tica desativada"
+                            },
+                        )
+                        .clicked()
+                    {
+                        action_autoplay = Some(OverlayAction::ToggleAutoplay);
+                    }
                 });
             });
         });
@@ -1631,6 +1742,7 @@ pub fn show(
         .or(action_mute)
         .or(action_volume)
         .or(action_chapter_pill)
+        .or(action_autoplay)
         .or(action_captions)
         .or(action_settings)
         .or(action_mini)
@@ -1780,7 +1892,6 @@ mod tests {
         let style = sample_style();
         let bar_rect = compute_bar_rect(rect).expect("bar_rect válido");
 
-        // Clique no botão Play (canto inferior esquerdo da barra).
         let play_click_pos = Pos2::new(bar_rect.min.x + 26.0, bar_rect.min.y + 36.0);
         let ctx = egui::Context::default();
         assert_eq!(
@@ -1788,7 +1899,6 @@ mod tests {
             (Some(OverlayAction::TogglePlay), true)
         );
 
-        // Clique no botão de ajustes (4º botão da direita: Fullscreen, Theater, Miniplayer, Settings).
         let settings_click_pos = Pos2::new(bar_rect.max.x - 120.0, bar_rect.min.y + 36.0);
         assert_eq!(
             click_at(&ctx, rect, &telemetry, &style, settings_click_pos),
@@ -1813,6 +1923,8 @@ mod tests {
                 title: "Introdução".into(),
                 time_secs: 0.0,
             }],
+            autoplay: true,
+            loop_video: true,
             can_bookmark: true,
             menu: Some(OverlayMenu::Root),
             ..OverlayTelemetry::default()
@@ -1832,5 +1944,22 @@ mod tests {
             });
             out.textures_delta.clear();
         }
+    }
+
+    #[test]
+    fn autoplay_button_emits_toggle_autoplay() {
+        let rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(640.0, 360.0));
+        let telemetry = OverlayTelemetry {
+            autoplay: true,
+            ..OverlayTelemetry::default()
+        };
+        let style = sample_style();
+        let bar_rect = compute_bar_rect(rect).expect("bar_rect válido");
+        let autoplay_click_pos = Pos2::new(bar_rect.max.x - 196.0, bar_rect.min.y + 36.0);
+        let ctx = egui::Context::default();
+        assert_eq!(
+            click_at(&ctx, rect, &telemetry, &style, autoplay_click_pos),
+            (Some(OverlayAction::ToggleAutoplay), true)
+        );
     }
 }

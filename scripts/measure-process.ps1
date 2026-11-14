@@ -193,7 +193,6 @@ $effectiveScenario = if (-not [string]::IsNullOrWhiteSpace($CustomScenarioLabel)
     $Scenario
 }
 
-# Resolver processos-alvo sem interrompe-los
 $targetProcesses = @()
 if ($null -ne $ProcessId -and $ProcessId.Count -gt 0) {
     foreach ($id in $ProcessId) {
@@ -232,7 +231,6 @@ try {
     $startTimeIso = $null
 }
 
-# Metadados de ambiente
 $logicalProcessors = [Environment]::ProcessorCount
 $osInfo = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
 $cpuInfo = @(Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue)
@@ -261,7 +259,7 @@ if (-not $Quiet -and -not $AsJson) {
     Write-Host ("  Amostras   : {0} (intervalo: {1}s)" -f $SampleCount, $IntervalSeconds)
 }
 
-# Leitura inicial de tempo de CPU para calcular delta preciso ja na 1a amostra
+# Baseline CPU times for first-sample delta
 $prevCpuMap = @{}
 foreach ($p in $targetProcesses) {
     $p.Refresh()
@@ -351,7 +349,7 @@ for ($i = 1; $i -le $SampleCount; $i++) {
     $cpuUserPercent = [math]::Round((($deltaUserCpuSec / $deltaWallSec) / $logicalProcessors) * 100.0, 2)
     $cpuKernelPercent = [math]::Round((($deltaKernelCpuSec / $deltaWallSec) / $logicalProcessors) * 100.0, 2)
 
-    # Memoria Privada Residente (WorkingSetPrivate) via Win32_PerfFormattedData_PerfProc_Process
+    # Resident private memory (WorkingSetPrivate) via PerfProc
     $pidFilter = ($aliveTargets | ForEach-Object { "IDProcess = $($_.Id)" }) -join ' OR '
     $perfProcItems = @(Get-CimInstance Win32_PerfFormattedData_PerfProc_Process -Filter $pidFilter -ErrorAction SilentlyContinue)
     $workingSetPrivateBytes = $null
@@ -365,7 +363,6 @@ for ($i = 1; $i -le $SampleCount; $i++) {
         $workingSetPrivateBytes = $sumWsp
     }
 
-    # Processos filhos (ex.: yt-dlp.exe)
     $childCount = 0
     $childNames = @()
     $childWorkingSetBytes = [int64]0
@@ -397,7 +394,6 @@ for ($i = 1; $i -le $SampleCount; $i++) {
         }
     }
 
-    # GPU (WDDM GPUPerformanceCounters) para o(s) PID(s) monitorado(s)
     $gpuFilter = ($aliveTargets | ForEach-Object { "Name LIKE 'pid_$($_.Id)_%'" }) -join ' OR '
     $gpuPidPattern = '^pid_(' + (($aliveTargets | ForEach-Object { [string]$_.Id }) -join '|') + ')_'
     $gpuEngines = @(Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine -Filter $gpuFilter -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $gpuPidPattern })

@@ -6,22 +6,11 @@ pub const THUMBNAIL_WIDTH: f32 = 160.0;
 pub const THUMBNAIL_HEIGHT: f32 = 90.0;
 pub const THUMBNAIL_SIZE: Vec2 = egui::vec2(THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT);
 
-/// Limite de entradas de miniaturas acompanhadas pelo cache da aplicação.
 pub const MAX_RETAINED_THUMBNAILS: usize = 48;
-
-/// Limite de vagas lógicas para carregamentos de miniaturas.
 pub const MAX_CONCURRENT_LOADS: usize = 6;
-
-/// Máximo de novos carregamentos iniciados por passagem de interface.
 pub const MAX_NEW_LOADS_PER_PASS: usize = 3;
-
-/// Intervalo mínimo entre o início de novos carregamentos para suavizar picos.
 pub const LOAD_START_INTERVAL: Duration = Duration::from_millis(20);
-
-/// Margem vertical além da janela de recorte visível considerada próxima à rolagem.
 pub const VIEWPORT_OVERSCAN_PX: f32 = 110.0;
-
-/// Tempo limite para considerar um carregamento pendente como expirado e liberar a vaga.
 pub const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,8 +109,6 @@ impl ThumbnailCache {
         self.access_counter
     }
 
-    /// Limpa todas as miniaturas retidas (ex.: ao trocar os resultados de uma pesquisa)
-    /// e acompanha temporariamente as requisições que ainda estavam em voo.
     pub fn reset(&mut self, ctx: &egui::Context, previous_videos: &[crate::search::Video]) {
         let now = Instant::now();
         let forgotten = self.drain_all_for_reset(now);
@@ -200,7 +187,6 @@ impl ThumbnailCache {
         });
     }
 
-    /// Executa manutenção periódica mesmo quando a lista não está visível (ex.: em tela cheia).
     pub fn maintain(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         for uri in self.sweep_expired(now) {
@@ -254,8 +240,6 @@ impl ThumbnailCache {
         self.candidates.clear();
     }
 
-    /// Renderiza o espaço fixo `160x90` da miniatura, garantindo estabilidade geométrica
-    /// de rolagem antes, durante e após o carregamento ou descarte.
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, uri: &str) -> egui::Response {
         self.show_sized(ui, ctx, uri, THUMBNAIL_SIZE)
     }
@@ -512,7 +496,6 @@ impl ThumbnailCache {
     fn evict_one(&mut self) -> Option<String> {
         let current_pass = self.pass_index;
 
-        // Prioridade 1: entradas prontas ou com falha que estão fora da região visível atual (LRU).
         let offscreen_finished = self
             .entries
             .iter()
@@ -592,15 +575,168 @@ pub fn fit_aspect_rect(bounds: Rect, intrinsic_size: [u32; 2]) -> Rect {
 }
 
 fn paint_fitted_texture_rounded(
-    ui: &egui::Ui,
+    ui: &mut egui::Ui,
     bounds: Rect,
     texture_id: egui::TextureId,
     intrinsic_size: [u32; 2],
-    _corner_radius: f32,
+    corner_radius: f32,
 ) {
     let target = fit_aspect_rect(bounds, intrinsic_size);
-    let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
-    ui.painter().image(texture_id, target, uv, Color32::WHITE);
+    if corner_radius > 0.0 {
+        egui::Image::from_texture((texture_id, target.size()))
+            .corner_radius(corner_radius)
+            .paint_at(ui, target);
+    } else {
+        let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+        ui.painter().image(texture_id, target, uv, Color32::WHITE);
+    }
+}
+
+pub const MAX_RETAINED_AVATARS: usize = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AvatarEntryState {
+    Loading { started_at: Instant },
+    Ready { size: [u32; 2] },
+    Failed,
+}
+
+#[derive(Clone, Debug)]
+struct AvatarEntry {
+    state: AvatarEntryState,
+    last_access_tick: u64,
+}
+
+pub struct AvatarCache {
+    entries: HashMap<String, AvatarEntry>,
+    access_counter: u64,
+    max_retained: usize,
+}
+
+impl Default for AvatarCache {
+    fn default() -> Self {
+        Self::with_limit(MAX_RETAINED_AVATARS)
+    }
+}
+
+impl AvatarCache {
+    pub fn with_limit(max_retained: usize) -> Self {
+        let max_retained = max_retained.max(1);
+        Self {
+            entries: HashMap::with_capacity(max_retained),
+            access_counter: 0,
+            max_retained,
+        }
+    }
+
+    fn bump_tick(&mut self) -> u64 {
+        self.access_counter = self.access_counter.wrapping_add(1);
+        self.access_counter
+    }
+
+    fn touch_or_insert(&mut self, uri: &str, now: Instant) -> Option<String> {
+        let tick = self.bump_tick();
+        if let Some(entry) = self.entries.get_mut(uri) {
+            entry.last_access_tick = tick;
+            return None;
+        }
+        let evicted = if self.entries.len() >= self.max_retained {
+            self.entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_access_tick)
+                .map(|(key, _)| key.clone())
+                .inspect(|victim| {
+                    self.entries.remove(victim);
+                })
+        } else {
+            None
+        };
+        self.entries.insert(
+            uri.to_owned(),
+            AvatarEntry {
+                state: AvatarEntryState::Loading { started_at: now },
+                last_access_tick: tick,
+            },
+        );
+        evicted
+    }
+
+    pub fn try_paint_circle(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        rect: Rect,
+        uri: &str,
+    ) -> bool {
+        let trimmed = uri.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let viewport = ui.clip_rect();
+        let is_near_viewport = viewport_intersects(viewport, rect, VIEWPORT_OVERSCAN_PX);
+        let is_visible = viewport_intersects(viewport, rect, 0.0);
+        let already_tracked = self.entries.contains_key(trimmed);
+        if !is_near_viewport && !already_tracked {
+            return false;
+        }
+
+        let now = Instant::now();
+        if let Some(entry) = self.entries.get_mut(trimmed) {
+            match entry.state {
+                AvatarEntryState::Failed => return false,
+                AvatarEntryState::Loading { started_at }
+                    if now.saturating_duration_since(started_at) >= IN_FLIGHT_TIMEOUT =>
+                {
+                    entry.state = AvatarEntryState::Failed;
+                    ctx.forget_image(trimmed);
+                    return false;
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(evicted) = self.touch_or_insert(trimmed, now) {
+            ctx.forget_image(&evicted);
+        }
+
+        let size_hint = egui::SizeHint::Size {
+            width: 96,
+            height: 96,
+            maintain_aspect_ratio: true,
+        };
+        match ctx.try_load_texture(trimmed, egui::TextureOptions::LINEAR, size_hint) {
+            Ok(egui::load::TexturePoll::Ready { texture }) => {
+                let size = [
+                    texture.size.x.max(1.0).round() as u32,
+                    texture.size.y.max(1.0).round() as u32,
+                ];
+                if let Some(entry) = self.entries.get_mut(trimmed) {
+                    entry.state = AvatarEntryState::Ready { size };
+                }
+                if is_visible {
+                    paint_fitted_texture_rounded(
+                        ui,
+                        rect,
+                        texture.id,
+                        size,
+                        rect.width().min(rect.height()) * 0.5,
+                    );
+                }
+                true
+            }
+            Ok(egui::load::TexturePoll::Pending { .. }) => {
+                ctx.request_repaint_after(Duration::from_millis(80));
+                false
+            }
+            Err(_) => {
+                if let Some(entry) = self.entries.get_mut(trimmed) {
+                    entry.state = AvatarEntryState::Failed;
+                }
+                ctx.forget_image(trimmed);
+                false
+            }
+        }
+    }
 }
 
 fn paint_placeholder(ui: &egui::Ui, rect: Rect, kind: PlaceholderKind) {
@@ -718,22 +854,18 @@ mod tests {
         assert_eq!(cache.in_flight_count(), 1);
         assert_eq!(cache.retained_count(), 1);
 
-        // Antes do intervalo mínimo (45-50ms), nenhuma nova miniatura deve iniciar.
         let (admitted_early, _) = cache.schedule_pass(t0 + Duration::from_millis(10));
         assert!(admitted_early.is_empty());
 
-        // Após o intervalo, a segunda miniatura inicia, atingindo MAX_CONCURRENT_LOADS = 2.
         let t1 = t0 + Duration::from_millis(60);
         let (admitted_2, _) = cache.schedule_pass(t1);
         assert_eq!(admitted_2, vec!["https://img/2.jpg"]);
         assert_eq!(cache.in_flight_count(), 2);
 
-        // Com 2 carregamentos em andamento, o terceiro aguarda até um terminar.
         let t2 = t1 + Duration::from_millis(60);
         let (admitted_blocked, _) = cache.schedule_pass(t2);
         assert!(admitted_blocked.is_empty());
 
-        // Quando o primeiro conclui, o terceiro é admitido.
         mark_ready(&mut cache, "https://img/1.jpg");
         let (admitted_3, _) = cache.schedule_pass(t2);
         assert_eq!(admitted_3, vec!["https://img/3.jpg"]);
@@ -745,7 +877,6 @@ mod tests {
         let mut cache = ThumbnailCache::with_limits(3, 2, 2, Duration::ZERO);
         let now = Instant::now();
 
-        // Passo 1: carrega 3 miniaturas visíveis (atinge o limite de 3).
         cache.begin_pass();
         cache.record_candidate("https://img/1.jpg", true, 0.0);
         cache.record_candidate("https://img/2.jpg", true, 100.0);
@@ -761,7 +892,6 @@ mod tests {
         mark_ready(&mut cache, "https://img/3.jpg");
         assert_eq!(cache.retained_count(), 3);
 
-        // Passo 2: usuário rola para baixo; 2 e 3 continuam visíveis, 1 saiu da tela e 4 entra.
         cache.begin_pass();
         for uri in ["https://img/2.jpg", "https://img/3.jpg"] {
             let tick = cache.bump_tick();
@@ -797,7 +927,6 @@ mod tests {
         assert_eq!(forgotten, vec!["https://img/inflight.jpg"]);
         assert_eq!(cache.retained_count(), 0);
 
-        // Varreduras subsequentes continuam esquecendo a URI em voo até expirar o janela segura.
         let swept = cache.sweep_expired(t0 + Duration::from_secs(1));
         assert_eq!(swept, vec!["https://img/inflight.jpg"]);
     }
@@ -908,5 +1037,22 @@ mod tests {
         let fitted = fit_aspect_rect(visible_card, [320, 180]);
         assert!((fitted.width() - THUMBNAIL_WIDTH).abs() < 0.01);
         assert!((fitted.height() - THUMBNAIL_HEIGHT).abs() < 0.01);
+    }
+
+    #[test]
+    fn avatar_cache_evicts_least_recently_used_entries() {
+        let mut cache = AvatarCache::with_limit(2);
+        let now = Instant::now();
+        assert!(cache.touch_or_insert("https://a/1.jpg", now).is_none());
+        assert!(cache.touch_or_insert("https://a/2.jpg", now).is_none());
+        // Touch 1.jpg so 2.jpg becomes least recently used.
+        assert!(cache.touch_or_insert("https://a/1.jpg", now).is_none());
+        assert_eq!(
+            cache.touch_or_insert("https://a/3.jpg", now).as_deref(),
+            Some("https://a/2.jpg")
+        );
+        assert!(cache.entries.contains_key("https://a/1.jpg"));
+        assert!(!cache.entries.contains_key("https://a/2.jpg"));
+        assert!(cache.entries.contains_key("https://a/3.jpg"));
     }
 }

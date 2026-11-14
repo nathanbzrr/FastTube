@@ -2,6 +2,7 @@
 
 mod app_state;
 mod backup;
+mod comment_actions;
 mod diagnostics;
 mod feed_prefs;
 mod history;
@@ -49,25 +50,17 @@ fastframe_icons::icons! {
         Maximize => lucide "maximize-2",
         Minimize => lucide "minimize-2",
         Close => lucide "x",
+        ThumbsUp => "thumbs-up",
+        ThumbsDown => "thumbs-down",
+        Smile => "smile",
     }
 }
 
-/// Largura máxima confortável para os cartões na visualização inicial de resultados.
 const BROWSE_MAX_CONTENT_WIDTH: f32 = 1600.0;
-
-/// Intervalo mínimo entre gravações periódicas do histórico em disco durante a reprodução.
 pub(crate) const HISTORY_SAVE_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Variação mínima de posição (em ms) para justificar gravação periódica em disco.
 pub(crate) const HISTORY_MIN_POSITION_DELTA_MS: u64 = 1_000;
-
-/// Limite máximo de bytes para campos textuais do histórico local.
 const HISTORY_MAX_TEXT_BYTES: usize = 4096;
-
-/// Intervalo mínimo entre coletas de diagnóstico do player enquanto o painel de configurações está visível.
 const DIAGNOSTICS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Política `hwdec` padrão configurada ao inicializar o `libmpv`.
 const DEFAULT_CONFIGURED_HWDEC: &str = "auto-safe";
 
 const DEFAULT_QUEUE_LIMIT: usize = 50;
@@ -796,6 +789,8 @@ pub(crate) struct ActivePlayback {
 pub(crate) enum ChannelTab {
     #[default]
     Videos,
+    Shorts,
+    Streams,
     Playlists,
     About,
 }
@@ -846,6 +841,13 @@ pub(crate) struct ChannelAboutFetchMessage {
     request_id: u64,
     target: ChannelTarget,
     result: Result<search::ChannelAboutInfo, String>,
+}
+
+pub(crate) struct ChannelTabVideosFetchMessage {
+    request_id: u64,
+    target: ChannelTarget,
+    tab: search::ChannelFeedTab,
+    result: Result<Vec<SearchResult>, String>,
 }
 
 pub(crate) enum HomeFetchMessage {
@@ -963,6 +965,8 @@ struct OverlayPlaybackContext {
     theater: bool,
     fullscreen: bool,
     mini_player: bool,
+    autoplay: bool,
+    loop_video: bool,
     can_bookmark: bool,
     raw_path: Option<String>,
     raw_position: Option<f64>,
@@ -975,13 +979,16 @@ struct WatchChannelDisplay<'a> {
     stats: &'a [String],
     technical_resolution: Option<&'a str>,
     palette: &'a ThemePalette,
+    subscribed: Option<bool>,
+    sub_pending: bool,
 }
 
 struct WatchMetadataActionState<'a> {
     video_id: Option<&'a str>,
     current_rating: Option<oauth::VideoRating>,
     rating_pending: bool,
-    saved_for_later: bool,
+    saved_in_library: bool,
+    save_menu_open: bool,
     share_recently_copied: bool,
     palette: &'a ThemePalette,
 }
@@ -991,7 +998,7 @@ struct WatchMetadataActionFlags {
     rating_to_apply: Option<Option<oauth::VideoRating>>,
     enqueue_video: bool,
     share_video: bool,
-    toggle_watch_later: bool,
+    toggle_save_menu: bool,
 }
 
 #[derive(Default)]
@@ -1014,15 +1021,29 @@ struct ShortsWatchDetails<'a> {
     video: &'a Video,
     metadata: Option<&'a VideoMetadata>,
     channel_target: Option<&'a ChannelTarget>,
-    saved_for_later: bool,
+    video_id: Option<&'a str>,
+    current_rating: Option<oauth::VideoRating>,
+    rating_pending: bool,
+    subscribed: Option<bool>,
+    sub_pending: bool,
+    saved_in_library: bool,
+    save_menu_open: bool,
+    comments_open: bool,
+    has_prev_short: bool,
+    has_next_short: bool,
     share_recently_copied: bool,
 }
 
 #[derive(Default)]
 struct ShortsWatchActions {
+    rating_to_apply: Option<Option<oauth::VideoRating>>,
+    toggle_subscribe: bool,
     enqueue_video: bool,
     share_video: bool,
-    toggle_watch_later: bool,
+    toggle_save_menu: bool,
+    toggle_comments: bool,
+    prev_short: bool,
+    next_short: bool,
     open_channel_target: Option<ChannelTarget>,
 }
 
@@ -1030,6 +1051,7 @@ struct FastTube {
     video_metadata: HashMap<String, VideoMetadata>,
     selected_metadata: Option<VideoMetadata>,
     thumbnails: ThumbnailCache,
+    avatars: thumbnails::AvatarCache,
     message: String,
     selected: Option<Video>,
     scrolling: fastframe_scroll::Scrolling,
@@ -1153,6 +1175,7 @@ impl Default for FastTube {
             video_metadata: HashMap::new(),
             selected_metadata: None,
             thumbnails: ThumbnailCache::default(),
+            avatars: thumbnails::AvatarCache::default(),
             message: oauth_restore_error
                 .unwrap_or_else(|| "Pesquise um video ou cole um link do YouTube.".into()),
             selected: None,
@@ -1163,6 +1186,9 @@ impl Default for FastTube {
 
             feed: app_state::BrowseFeedState {
                 query: String::new(),
+                search_filters: search::SearchFilters::default(),
+                search_filters_open: false,
+                recent_searches: Vec::new(),
                 videos: Vec::new(),
                 generation: 0,
                 filter: FeedFilter::All,
@@ -1212,6 +1238,8 @@ impl Default for FastTube {
                     has_more: false,
                     reached_max: false,
                 },
+                shorts: app_state::ChannelTabFeedState::default(),
+                streams: app_state::ChannelTabFeedState::default(),
                 playlists: app_state::ChannelPlaylistsState {
                     items: Vec::new(),
                     loaded: false,
@@ -1246,6 +1274,25 @@ impl Default for FastTube {
                 ratings: HashMap::new(),
                 rating_rx: None,
                 rating_cancel: None,
+                subscriptions: HashMap::new(),
+                sub_check_rx: None,
+                sub_check_cancel: None,
+                sub_toggle_rx: None,
+                sub_toggle_cancel: None,
+                my_channel: None,
+                my_channel_title: None,
+                my_channel_avatar_url: None,
+                my_channel_open_when_ready: false,
+                my_channel_fetch_attempted: false,
+                my_channel_rx: None,
+                my_channel_cancel: None,
+                remote_playlists: Vec::new(),
+                remote_playlists_rx: None,
+                remote_playlists_cancel: None,
+                playlist_action_rx: None,
+                playlist_action_cancel: None,
+                youtube_web_session: None,
+                youtube_web_session_checked: false,
                 restore_attempted: false,
             },
             playback: app_state::PlaybackState {
@@ -1255,6 +1302,12 @@ impl Default for FastTube {
                 active_buffer: None,
                 mini_player: false,
                 mini_player_restore_size: None,
+                autoplay: true,
+                loop_video: false,
+                autoplay_eof_handled: false,
+                save_menu_open: false,
+                new_remote_playlist_title: String::new(),
+                pending_open_video: None,
                 active: None,
                 quality: None,
                 qualities: Vec::new(),
@@ -1338,6 +1391,7 @@ impl Default for FastTube {
                 settings_open: false,
                 shortcuts_open: false,
                 subscriptions_expanded: false,
+                explore_expanded: false,
                 browse_section: BrowseSection::Home,
             },
             watch: app_state::WatchState {
@@ -2040,6 +2094,18 @@ impl FastTube {
 
     fn reset_channel_tabs_state(&mut self, ctx: &egui::Context) {
         self.cancel_channel_subrequests();
+        for item in &self.channels.shorts.items {
+            let thumb = &item.video.thumbnail;
+            if !thumb.is_empty() && !self.feed.videos.iter().any(|v| &v.thumbnail == thumb) {
+                ctx.forget_image(thumb);
+            }
+        }
+        for item in &self.channels.streams.items {
+            let thumb = &item.video.thumbnail;
+            if !thumb.is_empty() && !self.feed.videos.iter().any(|v| &v.thumbnail == thumb) {
+                ctx.forget_image(thumb);
+            }
+        }
         for pl in &self.channels.playlists.items {
             let thumb = &pl.thumbnail;
             if !thumb.is_empty() && !self.feed.videos.iter().any(|v| &v.thumbnail == thumb) {
@@ -2056,6 +2122,12 @@ impl FastTube {
         self.channels.videos.more_error = None;
         self.channels.videos.has_more = false;
         self.channels.videos.reached_max = false;
+        self.channels.shorts.items.clear();
+        self.channels.shorts.loaded = false;
+        self.channels.shorts.error = None;
+        self.channels.streams.items.clear();
+        self.channels.streams.loaded = false;
+        self.channels.streams.error = None;
         self.channels.playlists.items.clear();
         self.channels.playlists.loaded = false;
         self.channels.playlists.error = None;
@@ -2223,9 +2295,14 @@ impl FastTube {
         self.channels.videos.has_more =
             !self.channels.videos.reached_max && loaded_count >= effective_limit;
         self.channels.videos.more_error = None;
-        self.channels.last_target = Some(page.target.clone());
+        let target = page.target.clone();
+        let channel_id = page.channel_id.clone();
+        self.channels.last_target = Some(target.clone());
         self.channels.error = None;
         self.channels.page = Some(page);
+        if self.auth.authenticated {
+            self.start_check_subscription(target, channel_id, ctx);
+        }
     }
 
     fn begin_channel_request(
@@ -2741,6 +2818,1016 @@ impl FastTube {
         true
     }
 
+    fn start_channel_shorts(&mut self, ctx: &egui::Context) -> bool {
+        let Some((request_id, target)) = self.channels.begin_shorts_request() else {
+            return false;
+        };
+        if let Some(cancel) = self.channels.shorts.cancel.take() {
+            cancel.cancel();
+        }
+        let cancel = process::Cancellation::default();
+        self.channels.shorts.cancel = Some(cancel.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.channels.shorts.rx = Some(receiver);
+        let input = target.canonical_url();
+        let limit = self
+            .channels
+            .video_limit
+            .clamp(1, search::MAX_CHANNEL_VIDEOS_LIMIT);
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let result = search::fetch_channel_tab_videos_with_cancel(
+                &input,
+                search::ChannelFeedTab::Shorts,
+                limit,
+                &cancel,
+            );
+            let _ = sender.send(ChannelTabVideosFetchMessage {
+                request_id,
+                target,
+                tab: search::ChannelFeedTab::Shorts,
+                result,
+            });
+            ctx_clone.request_repaint();
+        });
+        true
+    }
+
+    fn cancel_channel_shorts(&mut self) {
+        self.channels.cancel_shorts();
+    }
+
+    fn start_channel_streams(&mut self, ctx: &egui::Context) -> bool {
+        let Some((request_id, target)) = self.channels.begin_streams_request() else {
+            return false;
+        };
+        if let Some(cancel) = self.channels.streams.cancel.take() {
+            cancel.cancel();
+        }
+        let cancel = process::Cancellation::default();
+        self.channels.streams.cancel = Some(cancel.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.channels.streams.rx = Some(receiver);
+        let input = target.canonical_url();
+        let limit = self
+            .channels
+            .video_limit
+            .clamp(1, search::MAX_CHANNEL_VIDEOS_LIMIT);
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let result = search::fetch_channel_tab_videos_with_cancel(
+                &input,
+                search::ChannelFeedTab::Streams,
+                limit,
+                &cancel,
+            );
+            let _ = sender.send(ChannelTabVideosFetchMessage {
+                request_id,
+                target,
+                tab: search::ChannelFeedTab::Streams,
+                result,
+            });
+            ctx_clone.request_repaint();
+        });
+        true
+    }
+
+    fn cancel_channel_streams(&mut self) {
+        self.channels.cancel_streams();
+    }
+
+    fn complete_channel_tab_videos(
+        &mut self,
+        request_id: u64,
+        target: &ChannelTarget,
+        tab: search::ChannelFeedTab,
+        result: Result<Vec<SearchResult>, String>,
+    ) -> bool {
+        let state = match tab {
+            search::ChannelFeedTab::Shorts => &mut self.channels.shorts,
+            search::ChannelFeedTab::Streams => &mut self.channels.streams,
+            search::ChannelFeedTab::Videos => return false,
+        };
+        if state.active_request_id != Some(request_id) {
+            return false;
+        }
+        let current_target = self.channels.current_target();
+        let state = match tab {
+            search::ChannelFeedTab::Shorts => &mut self.channels.shorts,
+            search::ChannelFeedTab::Streams => &mut self.channels.streams,
+            search::ChannelFeedTab::Videos => return false,
+        };
+        if current_target.as_ref() != Some(target) {
+            state.active_request_id = None;
+            state.rx = None;
+            state.cancel = None;
+            return false;
+        }
+        state.active_request_id = None;
+        state.rx = None;
+        state.cancel = None;
+        match result {
+            Ok(videos) => {
+                for item in &videos {
+                    self.video_metadata
+                        .insert(item.video.url.clone(), item.metadata.clone());
+                }
+                if let Some(selected) = &self.selected
+                    && let Some(found) = self.video_metadata.get(&selected.url)
+                {
+                    self.selected_metadata = Some(found.clone());
+                }
+                let state = match tab {
+                    search::ChannelFeedTab::Shorts => &mut self.channels.shorts,
+                    search::ChannelFeedTab::Streams => &mut self.channels.streams,
+                    search::ChannelFeedTab::Videos => return false,
+                };
+                state.items = videos;
+                state.loaded = true;
+                state.error = None;
+            }
+            Err(error) => {
+                let state = match tab {
+                    search::ChannelFeedTab::Shorts => &mut self.channels.shorts,
+                    search::ChannelFeedTab::Streams => &mut self.channels.streams,
+                    search::ChannelFeedTab::Videos => return false,
+                };
+                state.error = Some(error);
+            }
+        }
+        true
+    }
+
+    fn poll_channel_tab_feeds(&mut self) {
+        let shorts_msg = self.channels.shorts.rx.as_ref().map(|rx| rx.try_recv());
+        match shorts_msg {
+            Some(Ok(msg)) => {
+                self.complete_channel_tab_videos(msg.request_id, &msg.target, msg.tab, msg.result);
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.channels.shorts.rx = None;
+                self.channels.shorts.cancel = None;
+                self.channels.shorts.active_request_id = None;
+                self.channels.shorts.error =
+                    Some("A consulta de Shorts do canal foi encerrada inesperadamente.".into());
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) | None => {}
+        }
+
+        let streams_msg = self.channels.streams.rx.as_ref().map(|rx| rx.try_recv());
+        match streams_msg {
+            Some(Ok(msg)) => {
+                self.complete_channel_tab_videos(msg.request_id, &msg.target, msg.tab, msg.result);
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.channels.streams.rx = None;
+                self.channels.streams.cancel = None;
+                self.channels.streams.active_request_id = None;
+                self.channels.streams.error = Some(
+                    "A consulta de transmissões ao vivo do canal foi encerrada inesperadamente."
+                        .into(),
+                );
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) | None => {}
+        }
+    }
+
+    fn record_recent_search(&mut self, query: &str) {
+        let trimmed = query.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with("http://")
+            || trimmed.starts_with("https://")
+            || trimmed.starts_with(':')
+        {
+            return;
+        }
+        let lower = trimmed.to_lowercase();
+        self.feed
+            .recent_searches
+            .retain(|existing| existing.to_lowercase() != lower);
+        self.feed.recent_searches.insert(0, trimmed.to_owned());
+        self.feed.recent_searches.truncate(12);
+    }
+
+    fn subscription_status_for(
+        &self,
+        target: Option<&ChannelTarget>,
+        channel_id: Option<&str>,
+    ) -> Option<&oauth::SubscriptionStatus> {
+        if let Some(cid) = channel_id.map(str::trim).filter(|s| !s.is_empty())
+            && let Some(status) = self.auth.subscriptions.get(cid)
+        {
+            return Some(status);
+        }
+        if let Some(t) = target {
+            if let Some(status) = self.auth.subscriptions.get(&t.canonical_url()) {
+                return Some(status);
+            }
+            if let ChannelTarget::ChannelId(cid) = t
+                && let Some(status) = self.auth.subscriptions.get(cid)
+            {
+                return Some(status);
+            }
+        }
+        None
+    }
+
+    fn start_check_subscription(
+        &mut self,
+        target: ChannelTarget,
+        channel_id_hint: Option<String>,
+        ctx: &egui::Context,
+    ) {
+        let Some(mut session) = self.auth.session.clone() else {
+            return;
+        };
+        if let Some(cancel) = self.auth.sub_check_cancel.take() {
+            cancel.cancel();
+        }
+        let cancel = process::Cancellation::default();
+        self.auth.sub_check_cancel = Some(cancel.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.auth.sub_check_rx = Some(receiver);
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let result = session
+                .refresh_if_needed(&cancel)
+                .and_then(|()| {
+                    if let Some(cid) = channel_id_hint
+                        .map(|s| s.trim().to_owned())
+                        .filter(|s| !s.is_empty())
+                    {
+                        Ok(cid)
+                    } else {
+                        oauth::resolve_channel_id(&session.access_token, &target, &cancel)
+                    }
+                })
+                .and_then(|cid| oauth::check_subscription(&session.access_token, &cid, &cancel))
+                .map(|status| (target.canonical_url(), status));
+            let _ = sender.send((Some(session), result));
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn start_toggle_subscription(
+        &mut self,
+        target: ChannelTarget,
+        channel_id_hint: Option<String>,
+        ctx: &egui::Context,
+    ) {
+        if self.auth.sub_toggle_rx.is_some() {
+            return;
+        }
+        let Some(mut session) = self.auth.session.clone() else {
+            self.start_reauth(ctx);
+            return;
+        };
+        let existing = self
+            .subscription_status_for(Some(&target), channel_id_hint.as_deref())
+            .cloned();
+        if let Some(cancel) = self.auth.sub_toggle_cancel.take() {
+            cancel.cancel();
+        }
+        let cancel = process::Cancellation::default();
+        self.auth.sub_toggle_cancel = Some(cancel.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.auth.sub_toggle_rx = Some(receiver);
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let result = session
+                .refresh_if_needed(&cancel)
+                .and_then(|()| {
+                    if let Some(cid) = existing
+                        .as_ref()
+                        .map(|s| s.channel_id.trim().to_owned())
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| {
+                            channel_id_hint
+                                .map(|s| s.trim().to_owned())
+                                .filter(|s| !s.is_empty())
+                        })
+                    {
+                        Ok(cid)
+                    } else {
+                        oauth::resolve_channel_id(&session.access_token, &target, &cancel)
+                    }
+                })
+                .and_then(|cid| {
+                    if let Some(sub_id) = existing.and_then(|s| s.subscription_id) {
+                        oauth::unsubscribe_channel(&session.access_token, &sub_id, &cid, &cancel)
+                    } else {
+                        oauth::subscribe_channel(&session.access_token, &cid, &cancel)
+                    }
+                })
+                .map(|status| (target.canonical_url(), status));
+            let _ = sender.send((Some(session), result));
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn poll_subscriptions(&mut self, _ctx: &egui::Context) {
+        let check_msg = self.auth.sub_check_rx.as_ref().map(|rx| rx.try_recv());
+        match check_msg {
+            Some(Ok((session, result))) => {
+                self.auth.sub_check_rx = None;
+                self.auth.sub_check_cancel = None;
+                let _ = self.set_oauth_session(session);
+                if let Ok((key, status)) = result {
+                    self.auth
+                        .subscriptions
+                        .insert(status.channel_id.clone(), status.clone());
+                    self.auth.subscriptions.insert(key, status);
+                }
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.auth.sub_check_rx = None;
+                self.auth.sub_check_cancel = None;
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) | None => {}
+        }
+
+        let toggle_msg = self.auth.sub_toggle_rx.as_ref().map(|rx| rx.try_recv());
+        match toggle_msg {
+            Some(Ok((session, result))) => {
+                self.auth.sub_toggle_rx = None;
+                self.auth.sub_toggle_cancel = None;
+                let _ = self.set_oauth_session(session);
+                match result {
+                    Ok((key, status)) => {
+                        let subscribed = status.subscription_id.is_some();
+                        self.auth
+                            .subscriptions
+                            .insert(status.channel_id.clone(), status.clone());
+                        self.auth.subscriptions.insert(key, status);
+                        self.message = if subscribed {
+                            "Inscrição realizada com sucesso.".into()
+                        } else {
+                            "Inscrição cancelada.".into()
+                        };
+                    }
+                    Err(error) => {
+                        self.message = error;
+                    }
+                }
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.auth.sub_toggle_rx = None;
+                self.auth.sub_toggle_cancel = None;
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) | None => {}
+        }
+    }
+
+    fn start_fetch_my_channel(&mut self, open_when_ready: bool, ctx: &egui::Context) {
+        if self.auth.my_channel_rx.is_some() {
+            if open_when_ready {
+                self.auth.my_channel_open_when_ready = true;
+            }
+            return;
+        }
+        let Some(mut session) = self.auth.session.clone() else {
+            return;
+        };
+        if let Some(cancel) = self.auth.my_channel_cancel.take() {
+            cancel.cancel();
+        }
+        self.auth.my_channel_open_when_ready = open_when_ready;
+        self.auth.my_channel_fetch_attempted = true;
+        let cancel = process::Cancellation::default();
+        self.auth.my_channel_cancel = Some(cancel.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.auth.my_channel_rx = Some(receiver);
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let result = session
+                .refresh_if_needed(&cancel)
+                .and_then(|()| oauth::my_channel_profile(&session.access_token, &cancel));
+            let _ = sender.send((Some(session), result));
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn poll_my_channel(&mut self, ctx: &egui::Context) {
+        let msg = self.auth.my_channel_rx.as_ref().map(|rx| rx.try_recv());
+        match msg {
+            Some(Ok((session, result))) => {
+                self.auth.my_channel_rx = None;
+                self.auth.my_channel_cancel = None;
+                let open_when_ready = std::mem::take(&mut self.auth.my_channel_open_when_ready);
+                let _ = self.set_oauth_session(session);
+                match result {
+                    Ok(profile) => {
+                        self.auth.my_channel = Some(profile.target.clone());
+                        self.auth.my_channel_title = profile.title;
+                        self.auth.my_channel_avatar_url = profile.avatar_url;
+                        if open_when_ready {
+                            self.open_channel(profile.target, ctx);
+                        }
+                    }
+                    Err(error) => {
+                        if open_when_ready {
+                            self.message = error;
+                        }
+                    }
+                }
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.auth.my_channel_rx = None;
+                self.auth.my_channel_cancel = None;
+                self.auth.my_channel_open_when_ready = false;
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) | None => {}
+        }
+    }
+
+    fn start_fetch_remote_playlists(&mut self, ctx: &egui::Context) {
+        if self.auth.remote_playlists_rx.is_some() {
+            return;
+        }
+        let Some(mut session) = self.auth.session.clone() else {
+            return;
+        };
+        if let Some(cancel) = self.auth.remote_playlists_cancel.take() {
+            cancel.cancel();
+        }
+        let cancel = process::Cancellation::default();
+        self.auth.remote_playlists_cancel = Some(cancel.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.auth.remote_playlists_rx = Some(receiver);
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let result = session
+                .refresh_if_needed(&cancel)
+                .and_then(|()| oauth::playlists_feed(&session.access_token, &cancel))
+                .map(|feed| {
+                    feed.items
+                        .into_iter()
+                        .filter_map(|item| {
+                            let id = item
+                                .video
+                                .url
+                                .strip_prefix("fasttube-google-playlist:")?
+                                .to_owned();
+                            Some((id, item.video.title))
+                        })
+                        .collect::<Vec<_>>()
+                });
+            let _ = sender.send((Some(session), result));
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn poll_remote_playlists(&mut self, _ctx: &egui::Context) {
+        let msg = self
+            .auth
+            .remote_playlists_rx
+            .as_ref()
+            .map(|rx| rx.try_recv());
+        match msg {
+            Some(Ok((session, result))) => {
+                self.auth.remote_playlists_rx = None;
+                self.auth.remote_playlists_cancel = None;
+                let _ = self.set_oauth_session(session);
+                match result {
+                    Ok(playlists) => {
+                        self.auth.remote_playlists = playlists;
+                    }
+                    Err(error) => {
+                        self.message = error;
+                    }
+                }
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.auth.remote_playlists_rx = None;
+                self.auth.remote_playlists_cancel = None;
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) | None => {}
+        }
+    }
+
+    fn start_create_remote_playlist(
+        &mut self,
+        title: String,
+        video_id: Option<String>,
+        ctx: &egui::Context,
+    ) {
+        if self.auth.playlist_action_rx.is_some() {
+            return;
+        }
+        let Some(mut session) = self.auth.session.clone() else {
+            self.start_reauth(ctx);
+            return;
+        };
+        if let Some(cancel) = self.auth.playlist_action_cancel.take() {
+            cancel.cancel();
+        }
+        let cancel = process::Cancellation::default();
+        self.auth.playlist_action_cancel = Some(cancel.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.auth.playlist_action_rx = Some(receiver);
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let result = session
+                .refresh_if_needed(&cancel)
+                .and_then(|()| {
+                    oauth::create_playlist(&session.access_token, &title, "private", &cancel)
+                })
+                .and_then(|(pl_id, pl_title)| {
+                    if let Some(vid) = video_id.as_deref() {
+                        oauth::add_video_to_playlist(&session.access_token, &pl_id, vid, &cancel)?;
+                        Ok((
+                            Some((pl_id, pl_title.clone())),
+                            format!("Playlist '{pl_title}' criada e vídeo salvo."),
+                        ))
+                    } else {
+                        Ok((
+                            Some((pl_id, pl_title.clone())),
+                            format!("Playlist '{pl_title}' criada."),
+                        ))
+                    }
+                });
+            let _ = sender.send((Some(session), result));
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn start_add_to_remote_playlist(
+        &mut self,
+        playlist_id: String,
+        playlist_title: String,
+        video_id: String,
+        ctx: &egui::Context,
+    ) {
+        if self.auth.playlist_action_rx.is_some() {
+            return;
+        }
+        let Some(mut session) = self.auth.session.clone() else {
+            self.start_reauth(ctx);
+            return;
+        };
+        if let Some(cancel) = self.auth.playlist_action_cancel.take() {
+            cancel.cancel();
+        }
+        let cancel = process::Cancellation::default();
+        self.auth.playlist_action_cancel = Some(cancel.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.auth.playlist_action_rx = Some(receiver);
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let result = session
+                .refresh_if_needed(&cancel)
+                .and_then(|()| {
+                    oauth::add_video_to_playlist(
+                        &session.access_token,
+                        &playlist_id,
+                        &video_id,
+                        &cancel,
+                    )
+                })
+                .map(|_| (None, format!("Vídeo salvo na playlist '{playlist_title}'.")));
+            let _ = sender.send((Some(session), result));
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn poll_playlist_action(&mut self, _ctx: &egui::Context) {
+        let msg = self
+            .auth
+            .playlist_action_rx
+            .as_ref()
+            .map(|rx| rx.try_recv());
+        match msg {
+            Some(Ok((session, result))) => {
+                self.auth.playlist_action_rx = None;
+                self.auth.playlist_action_cancel = None;
+                let _ = self.set_oauth_session(session);
+                match result {
+                    Ok((created, notice)) => {
+                        if let Some((pl_id, pl_title)) = created
+                            && !self
+                                .auth
+                                .remote_playlists
+                                .iter()
+                                .any(|(id, _)| id == &pl_id)
+                        {
+                            self.auth.remote_playlists.push((pl_id, pl_title));
+                        }
+                        self.message = notice;
+                    }
+                    Err(error) => {
+                        self.message = error;
+                    }
+                }
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.auth.playlist_action_rx = None;
+                self.auth.playlist_action_cancel = None;
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) | None => {}
+        }
+    }
+
+    fn seek_to_seconds(&mut self, secs: f64) {
+        let target = secs.max(0.0);
+        #[cfg(windows)]
+        if let Some(player) = self.player.as_ref() {
+            let duration = player.number("duration");
+            let _ = player.seek(target, "absolute+exact");
+            self.record_manual_seek(target, duration, Instant::now());
+        }
+        #[cfg(not(windows))]
+        {
+            self.record_manual_seek(target, None, Instant::now());
+        }
+    }
+
+    fn next_recommended_video(&mut self) -> Option<Video> {
+        self.ensure_feed_cache();
+        let selected_url = self.selected.as_ref().map(|v| v.url.as_str());
+        for ranked in &self.feed.cache.ranked {
+            let v = &ranked.video;
+            if Some(v.url.as_str()) != selected_url
+                && !v.url.starts_with("fasttube-google-playlist:")
+                && !self.feed.home.playlist_urls.contains(&v.url)
+            {
+                return Some(v.clone());
+            }
+        }
+        for v in &self.feed.videos {
+            if Some(v.url.as_str()) != selected_url
+                && !v.url.starts_with("fasttube-google-playlist:")
+                && !self.feed.home.playlist_urls.contains(&v.url)
+            {
+                return Some(v.clone());
+            }
+        }
+        None
+    }
+
+    fn next_or_prev_short(&self, forward: bool) -> Option<Video> {
+        let shorts: Vec<&Video> = self
+            .feed
+            .videos
+            .iter()
+            .filter(|v| {
+                self.ui.browse_section == BrowseSection::Shorts
+                    || recommendations::is_short_video(v, self.metadata_for(&v.url))
+                    || v.url.contains("/shorts/")
+            })
+            .collect();
+        if shorts.is_empty() {
+            return None;
+        }
+        let selected_url = self.selected.as_ref().map(|v| v.url.as_str());
+        if let Some(idx) = shorts
+            .iter()
+            .position(|v| Some(v.url.as_str()) == selected_url)
+        {
+            let next_idx = if forward {
+                idx.checked_add(1)?
+            } else {
+                idx.checked_sub(1)?
+            };
+            shorts.get(next_idx).map(|v| (*v).clone())
+        } else if forward {
+            shorts.first().map(|v| (*v).clone())
+        } else {
+            None
+        }
+    }
+
+    fn toggle_collection_video(&mut self, name: &str, video: &Video) {
+        let trimmed = name.trim();
+        if trimmed.is_empty() || trimmed.len() > 128 {
+            return;
+        }
+        let Some(vid) = history::youtube_video_id(&video.url) else {
+            return;
+        };
+        let total_items = self.library.data.item_count();
+        if let Some(collection) = self
+            .library
+            .data
+            .collections
+            .iter_mut()
+            .find(|c| c.name.eq_ignore_ascii_case(trimmed))
+        {
+            if let Some(pos) = collection
+                .videos
+                .iter()
+                .position(|v| history::youtube_video_id(&v.video.url).as_deref() == Some(&vid))
+            {
+                collection.videos.remove(pos);
+            } else if total_items < 500 {
+                collection.videos.insert(
+                    0,
+                    library::VideoRecord {
+                        video: video.clone(),
+                    },
+                );
+            }
+        } else if self.library.data.collections.len() < 100 && total_items < 500 {
+            self.library.data.collections.push(library::Collection {
+                name: trimmed.to_owned(),
+                videos: vec![library::VideoRecord {
+                    video: video.clone(),
+                }],
+            });
+        }
+        self.save_library();
+    }
+
+    fn video_saved_in_library(&self, video: &Video) -> bool {
+        let vid = history::youtube_video_id(&video.url);
+        let matches = |record: &library::VideoRecord| {
+            if let Some(target_id) = vid.as_deref() {
+                history::youtube_video_id(&record.video.url).as_deref() == Some(target_id)
+            } else {
+                record.video.url == video.url
+            }
+        };
+        self.library.data.watch_later.iter().any(matches)
+            || self.library.data.favorites.iter().any(matches)
+            || self
+                .library
+                .data
+                .collections
+                .iter()
+                .any(|c| c.videos.iter().any(matches))
+    }
+
+    fn save_menu_ui(&mut self, ui: &mut egui::Ui, video: &Video, ctx: &egui::Context) {
+        let palette = self.palette();
+        let border = palette.card_alt_stroke;
+        let panel_alt = palette.card_alt_bg;
+        let text = palette.header_button_fg;
+        let muted = palette.neutral_status_fg;
+        let vid = history::youtube_video_id(&video.url);
+
+        egui::Frame::NONE
+            .fill(panel_alt)
+            .stroke(egui::Stroke::new(1.0, border))
+            .corner_radius(egui::CornerRadius::same(12))
+            .inner_margin(egui::Margin::same(12))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Salvar vídeo em...")
+                            .color(text)
+                            .size(13.0)
+                            .strong(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("✕").color(muted).size(12.0))
+                                    .fill(Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::NONE),
+                            )
+                            .clicked()
+                        {
+                            self.playback.save_menu_open = false;
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+
+                let in_watch_later = self.library.data.watch_later.iter().any(|v| {
+                    vid.as_deref().is_some_and(|id| {
+                        history::youtube_video_id(&v.video.url).as_deref() == Some(id)
+                    }) || v.video.url == video.url
+                });
+                let mut wl_checked = in_watch_later;
+                if ui
+                    .checkbox(
+                        &mut wl_checked,
+                        RichText::new("⏱ Assistir mais tarde")
+                            .color(text)
+                            .size(12.5),
+                    )
+                    .changed()
+                {
+                    if let Some(id) = vid.as_deref() {
+                        if in_watch_later {
+                            self.library.data.watch_later.retain(|v| {
+                                history::youtube_video_id(&v.video.url).as_deref() != Some(id)
+                            });
+                        } else if self.library.data.item_count() < 500 {
+                            self.library.data.watch_later.insert(
+                                0,
+                                library::VideoRecord {
+                                    video: video.clone(),
+                                },
+                            );
+                        }
+                        self.save_library();
+                    }
+                }
+
+                let in_favorites = self.library.data.favorites.iter().any(|v| {
+                    vid.as_deref().is_some_and(|id| {
+                        history::youtube_video_id(&v.video.url).as_deref() == Some(id)
+                    }) || v.video.url == video.url
+                });
+                let mut fav_checked = in_favorites;
+                if ui
+                    .checkbox(
+                        &mut fav_checked,
+                        RichText::new("★ Favoritos").color(text).size(12.5),
+                    )
+                    .changed()
+                {
+                    if let Some(id) = vid.as_deref() {
+                        if in_favorites {
+                            self.library.data.favorites.retain(|v| {
+                                history::youtube_video_id(&v.video.url).as_deref() != Some(id)
+                            });
+                        } else if self.library.data.item_count() < 500 {
+                            self.library.data.favorites.insert(
+                                0,
+                                library::VideoRecord {
+                                    video: video.clone(),
+                                },
+                            );
+                        }
+                        self.save_library();
+                    }
+                }
+
+                let collection_names: Vec<(String, bool)> = self
+                    .library
+                    .data
+                    .collections
+                    .iter()
+                    .map(|c| {
+                        let present = c.videos.iter().any(|v| {
+                            vid.as_deref().is_some_and(|id| {
+                                history::youtube_video_id(&v.video.url).as_deref() == Some(id)
+                            }) || v.video.url == video.url
+                        });
+                        (c.name.clone(), present)
+                    })
+                    .collect();
+                for (col_name, present) in collection_names {
+                    let mut checked = present;
+                    if ui
+                        .checkbox(
+                            &mut checked,
+                            RichText::new(format!("📁 {col_name}"))
+                                .color(text)
+                                .size(12.5),
+                        )
+                        .changed()
+                    {
+                        self.toggle_collection_video(&col_name, video);
+                    }
+                }
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.library.collection_name)
+                            .hint_text("Nova coleção local...")
+                            .desired_width(180.0),
+                    );
+                    let can_create = !self.library.collection_name.trim().is_empty();
+                    let create_btn = egui::Button::new(
+                        RichText::new("+ Criar coleção")
+                            .color(palette.header_button_fg)
+                            .size(12.0),
+                    )
+                    .fill(palette.header_button_bg)
+                    .corner_radius(egui::CornerRadius::same(14));
+                    if ui.add_enabled(can_create, create_btn).clicked() {
+                        let name = std::mem::take(&mut self.library.collection_name);
+                        self.toggle_collection_video(&name, video);
+                    }
+                });
+
+                if self.auth.authenticated {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Playlists da conta Google")
+                            .color(muted)
+                            .size(11.5)
+                            .strong(),
+                    );
+                    let remote_list = self.auth.remote_playlists.clone();
+                    if remote_list.is_empty() && self.auth.remote_playlists_rx.is_some() {
+                        ui.label(
+                            RichText::new("Carregando playlists...")
+                                .color(muted)
+                                .size(11.5),
+                        );
+                    } else {
+                        for (pl_id, pl_title) in remote_list {
+                            let btn = egui::Button::new(
+                                RichText::new(format!("+ Salvar em {pl_title}"))
+                                    .color(palette.header_button_fg)
+                                    .size(12.0),
+                            )
+                            .fill(palette.header_button_bg)
+                            .corner_radius(egui::CornerRadius::same(14));
+                            if ui.add(btn).clicked()
+                                && let Some(id) = vid.clone()
+                            {
+                                self.start_add_to_remote_playlist(pl_id, pl_title, id, ctx);
+                            }
+                        }
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(
+                                &mut self.playback.new_remote_playlist_title,
+                            )
+                            .hint_text("Nova playlist no YouTube...")
+                            .desired_width(180.0),
+                        );
+                        let can_create_remote =
+                            !self.playback.new_remote_playlist_title.trim().is_empty()
+                                && self.auth.playlist_action_rx.is_none();
+                        let create_remote_btn = egui::Button::new(
+                            RichText::new("+ Criar no YouTube")
+                                .color(palette.header_button_fg)
+                                .size(12.0),
+                        )
+                        .fill(palette.header_button_bg)
+                        .corner_radius(egui::CornerRadius::same(14));
+                        if ui
+                            .add_enabled(can_create_remote, create_remote_btn)
+                            .clicked()
+                        {
+                            let title =
+                                std::mem::take(&mut self.playback.new_remote_playlist_title);
+                            self.start_create_remote_playlist(title, vid.clone(), ctx);
+                        }
+                    });
+                }
+            });
+    }
+
+    fn render_text_with_timestamps_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        text: &str,
+        color: Color32,
+        font_size: f32,
+    ) {
+        let link_color = if self.settings.theme.value == Theme::Dark {
+            Color32::from_rgb(62, 166, 255)
+        } else {
+            Color32::from_rgb(6, 95, 212)
+        };
+        let mut clicked_secs = None;
+        for line in text.lines() {
+            let timestamps = watch_extras::extract_timestamps(line);
+            if timestamps.is_empty() {
+                ui.label(RichText::new(line).color(color).size(font_size));
+                continue;
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let mut cursor = 0;
+                for ts in timestamps {
+                    if ts.byte_start > cursor
+                        && let Some(prefix) = line.get(cursor..ts.byte_start)
+                    {
+                        ui.label(RichText::new(prefix).color(color).size(font_size));
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(&ts.label)
+                                    .color(link_color)
+                                    .size(font_size)
+                                    .strong(),
+                            )
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(egui::Stroke::NONE)
+                            .corner_radius(egui::CornerRadius::same(4)),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        clicked_secs = Some(ts.seconds as f64);
+                    }
+                    cursor = ts.byte_end;
+                }
+                if cursor < line.len()
+                    && let Some(suffix) = line.get(cursor..)
+                {
+                    ui.label(RichText::new(suffix).color(color).size(font_size));
+                }
+            });
+        }
+        if let Some(secs) = clicked_secs {
+            self.seek_to_seconds(secs);
+        }
+    }
+
     #[cfg(test)]
     fn open_channel_for_metadata(&mut self, metadata: &VideoMetadata, ctx: &egui::Context) -> bool {
         let Some(target) = search::channel_target_for_metadata(metadata) else {
@@ -3079,9 +4166,7 @@ impl FastTube {
         self.feed.search.active_request_id = Some(request_id);
         self.channels.view_open = false;
         self.cancel_channel_subrequests();
-        // A nova pesquisa substitui a navegação atual: descarta o pedido de canal
-        // em andamento para não manter o cabeçalho em "Carregando canal..." nem
-        // aplicar uma página antiga depois que o usuário já mudou de contexto.
+        // Cancel any in-flight channel fetch when a new search replaces navigation.
         if self.channels.videos.active_request_id.is_some() {
             if let Some(cancel) = self.channels.videos.cancel.take() {
                 cancel.cancel();
@@ -3148,9 +4233,10 @@ impl FastTube {
         let cancel = process::Cancellation::default();
         self.feed.search.cancel = Some(cancel.clone());
         self.feed.search.rx = Some(receiver);
+        let filters = self.feed.search_filters;
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = search::find_with_cancel(&query, &cancel);
+            let result = search::find_filtered_with_cancel(&query, filters, &cancel);
             let _ = sender.send(SearchFetchMessage { request_id, result });
             ctx.request_repaint();
         });
@@ -3181,6 +4267,8 @@ impl FastTube {
             "Inscrições: envios recentes"
         } else if target == ":google-playlists" {
             "Playlists da conta Google"
+        } else if target == ":google-liked" {
+            "Vídeos com Gostei"
         } else if target.starts_with("fasttube-google-playlist:") {
             "Vídeos da playlist"
         } else {
@@ -3191,6 +4279,8 @@ impl FastTube {
             "Consultando suas inscrições..."
         } else if target == ":google-playlists" || target.starts_with("fasttube-google-playlist:") {
             "Consultando suas playlists Google..."
+        } else if target == ":google-liked" {
+            "Consultando vídeos com Gostei..."
         } else {
             "Consultando a playlist..."
         }
@@ -3204,6 +4294,7 @@ impl FastTube {
         std::thread::spawn(move || {
             let result = if target == ":ytrec"
                 || target == ":google-playlists"
+                || target == ":google-liked"
                 || target.starts_with("fasttube-google-playlist:")
             {
                 match saved_session {
@@ -3213,6 +4304,8 @@ impl FastTube {
                         } else {
                             let feed = if target == ":google-playlists" {
                                 oauth::playlists_feed(&session.access_token, &cancel)
+                            } else if target == ":google-liked" {
+                                oauth::liked_videos_feed(&session.access_token, &cancel)
                             } else if let Some(id) =
                                 target.strip_prefix("fasttube-google-playlist:")
                             {
@@ -3237,6 +4330,8 @@ impl FastTube {
                         Ok(session) => {
                             let feed = if target == ":google-playlists" {
                                 oauth::playlists_feed(&session.access_token, &cancel)
+                            } else if target == ":google-liked" {
+                                oauth::liked_videos_feed(&session.access_token, &cancel)
                             } else if let Some(id) =
                                 target.strip_prefix("fasttube-google-playlist:")
                             {
@@ -3332,6 +4427,15 @@ impl FastTube {
     fn set_oauth_session(&mut self, session: Option<oauth::TokenSession>) -> Option<String> {
         if session.is_none() {
             self.auth.ratings.clear();
+            self.auth.subscriptions.clear();
+            self.auth.my_channel = None;
+            self.auth.my_channel_title = None;
+            self.auth.my_channel_avatar_url = None;
+            self.auth.my_channel_open_when_ready = false;
+            self.auth.my_channel_fetch_attempted = false;
+            self.auth.remote_playlists.clear();
+            self.auth.youtube_web_session = None;
+            self.auth.youtube_web_session_checked = false;
         }
         self.auth.session = session;
         #[cfg(test)]
@@ -3371,11 +4475,16 @@ impl FastTube {
     fn poll_async_tasks(&mut self, ctx: &egui::Context) {
         self.poll_reauth(ctx);
         self.poll_rating(ctx);
+        self.poll_subscriptions(ctx);
+        self.poll_my_channel(ctx);
+        self.poll_remote_playlists(ctx);
+        self.poll_playlist_action(ctx);
         self.poll_home(ctx);
         self.poll_quality();
         self.poll_search(ctx);
         self.poll_channel(ctx);
         self.poll_channel_more_videos();
+        self.poll_channel_tab_feeds();
         self.poll_channel_playlists(ctx);
         self.poll_channel_playlist_videos();
         self.poll_channel_about();
@@ -3403,6 +4512,10 @@ impl FastTube {
                 Ok(session) => {
                     self.auth.authenticated = true;
                     let persistence_error = self.set_oauth_session(Some(session));
+                    self.auth.my_channel_fetch_attempted = false;
+                    if self.auth.my_channel_avatar_url.is_none() {
+                        self.start_fetch_my_channel(false, ctx);
+                    }
                     self.watch.extras.reset_comments();
                     self.message = persistence_error
                         .map(|error| format!("Autorização concluída, mas não foi possível salvar a sessão: {error}"))
@@ -3514,12 +4627,26 @@ impl FastTube {
                     let persistence_error = self.set_oauth_session(token);
                     let is_subscription_feed = self.feed.home.title.as_deref()
                         == Some("Inscri\u{00e7}\u{00f5}es: envios recentes");
+                    let is_playlists_feed =
+                        self.feed.home.title.as_deref() == Some("Playlists da conta Google");
                     self.feed.home.rx = None;
                     self.feed.home.cancel = None;
                     if is_subscription_feed {
                         self.feed.home.subscription_channels = feed.channels.clone();
                         self.feed.home.subscription_channels_loaded = true;
                         self.feed.home.subscription_channels_error = None;
+                    }
+                    if is_playlists_feed {
+                        self.auth.remote_playlists = feed
+                            .items
+                            .iter()
+                            .filter_map(|item| {
+                                item.video
+                                    .url
+                                    .strip_prefix("fasttube-google-playlist:")
+                                    .map(|id| (id.to_owned(), item.video.title.clone()))
+                            })
+                            .collect();
                     }
                     self.feed.home.playlist_urls = feed.playlists;
                     self.apply_search_results(ctx, feed.items);
@@ -3532,6 +4659,8 @@ impl FastTube {
                             "Nenhuma playlist encontrada nesta conta.".into()
                         } else if self.feed.home.title.as_deref() == Some("Vídeos da playlist") {
                             "Nenhum vídeo encontrado nesta playlist.".into()
+                        } else if self.feed.home.title.as_deref() == Some("Vídeos com Gostei") {
+                            "Nenhum vídeo com Gostei encontrado.".into()
                         } else {
                             "Nenhum envio encontrado nas inscri\u{e7}\u{f5}es consultadas.".into()
                         };
@@ -3767,6 +4896,9 @@ impl FastTube {
     }
     fn open_video(&mut self, video: Video, frame: &eframe::Frame, ctx: &egui::Context) -> bool {
         self.cancel_pending_queue_video();
+        self.playback.autoplay_eof_handled = false;
+        self.playback.save_menu_open = false;
+        self.playback.pending_open_video = None;
         #[cfg(windows)]
         {
             let now = Instant::now();
@@ -3776,6 +4908,7 @@ impl FastTube {
             self.ensure_playback_settings_synchronized();
             let resume_target_ms = self.planned_resume_ms(&video);
 
+            let mut player_error: Option<String> = None;
             if self.player.is_none() {
                 let profile = self.settings.buffer.profile;
                 match player::Player::new(frame, profile.values(), ctx) {
@@ -3784,41 +4917,42 @@ impl FastTube {
                         self.playback.active_buffer = Some(profile);
                     }
                     Err(error) => {
-                        self.message = error;
-                        return false;
+                        player_error = Some(error);
                     }
                 }
             }
             if let Some(player) = &mut self.player {
-                if let Err(error) = player.set(
+                let _ = player.set(
                     "options/ytdl-format",
                     &self.settings.playback.value.format(),
-                ) {
-                    self.message = error;
-                    return false;
-                }
-                if let Err(error) = player.set(
+                );
+                let _ = player.set(
                     "speed",
                     &format!(
                         "{}",
                         f64::from(self.settings.playback.value.speed_quarters) / 4.0
                     ),
-                ) {
-                    self.message = error;
-                    return false;
-                }
-                if let Err(error) = player.set("options/start", "none") {
-                    self.message = error;
-                    return false;
-                }
+                );
+                let _ = player.set("options/start", "none");
+                let _ = player.set(
+                    "loop-file",
+                    if self.playback.loop_video {
+                        "inf"
+                    } else {
+                        "no"
+                    },
+                );
                 let _ = player.set("pause", "no");
                 if let Err(error) = player.play(&video.url) {
                     let _ = player.set("options/start", "none");
-                    self.message = error;
-                    return false;
+                    player_error = Some(error);
                 }
             }
-            self.message.clear();
+            if let Some(error) = &player_error {
+                self.message = error.clone();
+            } else {
+                self.message.clear();
+            }
             self.watch.share_copied_at = None;
             self.playback.quality = None;
             self.playback.qualities.clear();
@@ -3841,12 +4975,22 @@ impl FastTube {
                 ctx_clone.request_repaint();
             });
             self.selected_metadata = self.metadata_for(&video.url).cloned();
+            let sub_target = self.channel_target_for_video(&video);
+            let sub_channel_id = self
+                .selected_metadata
+                .as_ref()
+                .and_then(|meta| meta.channel_id.clone());
             self.activate_video_playback(&video, resume_target_ms, previous_player_pos_ms, now);
             self.selected = Some(video);
+            if self.auth.authenticated
+                && let Some(target) = sub_target
+            {
+                self.start_check_subscription(target, sub_channel_id, ctx);
+            }
             self.ui.navigation_open = false;
             self.invalidate_feed_cache();
             self.sync_player_window_visibility();
-            true
+            player_error.is_none()
         }
         #[cfg(not(windows))]
         {
@@ -3858,6 +5002,9 @@ impl FastTube {
 
     fn close_video(&mut self, ctx: &egui::Context) {
         self.cancel_pending_queue_video();
+        self.playback.autoplay_eof_handled = false;
+        self.playback.save_menu_open = false;
+        self.playback.pending_open_video = None;
         self.watch.extras.sync_video(None);
         if let Some(cancel) = self.playback.quality_cancel.take() {
             cancel.cancel();
@@ -3906,12 +5053,8 @@ impl FastTube {
     }
 
     fn header_menu_button_ui(&mut self, ui: &mut egui::Ui) {
-        let nav_visible = self.ui.navigation_open
-            && !self.playback.fullscreen
-            && !(self.selected.is_some() && self.playback.theater);
-        let nav_tip = if self.selected.is_some() && self.playback.theater {
-            "Mostrar navega\u{00e7}\u{00e3}o lateral e sair do modo teatro (T)"
-        } else if nav_visible {
+        let nav_visible = self.ui.navigation_open && !self.playback.fullscreen;
+        let nav_tip = if nav_visible {
             "Ocultar navega\u{00e7}\u{00e3}o"
         } else {
             "Mostrar navega\u{00e7}\u{00e3}o"
@@ -3925,13 +5068,7 @@ impl FastTube {
             .on_hover_text(nav_tip)
             .clicked()
         {
-            if self.selected.is_some() && self.playback.theater {
-                self.playback.theater = false;
-                self.ui.navigation_open = true;
-                self.sync_player_window_visibility();
-            } else {
-                self.ui.navigation_open = !self.ui.navigation_open;
-            }
+            self.ui.navigation_open = !self.ui.navigation_open;
         }
     }
 
@@ -4053,6 +5190,8 @@ impl FastTube {
             if self.selected.is_some() {
                 self.close_video(ctx);
             }
+            let query = self.feed.query.clone();
+            self.record_recent_search(&query);
             self.start_search(ctx);
         }
     }
@@ -4128,6 +5267,10 @@ impl FastTube {
                     ("C", "ativar ou desativar legendas"),
                     ("T", "modo teatro"),
                     ("F", "tela cheia"),
+                    ("I", "alternar miniplayer"),
+                    ("Shift+N", "próximo vídeo"),
+                    ("0 – 9", "ir para 0% – 90% do vídeo"),
+                    ("↑ / ↓", "Short anterior / próximo (no modo Shorts)"),
                     ("Esc", "fechar tela cheia, ajustes ou painel"),
                 ] {
                     ui.horizontal(|ui| {
@@ -4189,7 +5332,20 @@ impl FastTube {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(4.0);
             if self.auth.authenticated {
-                let _ = paint_channel_avatar(ui, "Voc\u{00ea}", 30.0);
+                let avatar_url = self.auth.my_channel_avatar_url.clone();
+                let label = self
+                    .auth
+                    .my_channel_title
+                    .clone()
+                    .unwrap_or_else(|| "Voc\u{00ea}".to_owned());
+                let _ = self.paint_avatar_or_initials(
+                    ui,
+                    ctx,
+                    avatar_url.as_deref(),
+                    &label,
+                    30.0,
+                    false,
+                );
             } else {
                 let button = egui::Button::new(
                     RichText::new("Entrar")
@@ -4338,6 +5494,15 @@ impl FastTube {
         ui.add_space(4.0);
     }
 
+    fn close_navigation_drawer_if_overlay(&mut self, ctx: &egui::Context) {
+        let viewport_width = ctx.input(|i| i.content_rect().width());
+        if self.selected.is_some()
+            || viewport_width < layout::PERSISTENT_SIDEBAR_MIN_VIEWPORT_WIDTH
+        {
+            self.ui.navigation_open = false;
+        }
+    }
+
     fn navigation_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.sync_theme_visuals(ctx);
         self.ensure_playback_settings_synchronized();
@@ -4348,12 +5513,15 @@ impl FastTube {
             .id_salt("youtube_left_sidebar_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 self.navigation_primary_ui(ui, ctx, palette);
                 self.navigation_subscriptions_ui(ui, ctx, palette);
                 self.navigation_shortcuts_ui(ui, ctx, palette);
+                self.navigation_explore_ui(ui, ctx, palette);
                 self.navigation_utilities_ui(ui, ctx, palette);
                 self.navigation_now_playing_ui(ui, ctx, palette);
+                self.navigation_footer_ui(ui, palette);
+                ui.add_space(8.0);
             });
     }
 
@@ -4389,6 +5557,7 @@ impl FastTube {
                     self.start_public_home(ctx);
                 }
             }
+            self.close_navigation_drawer_if_overlay(ctx);
         }
 
         ui.add_space(2.0);
@@ -4407,6 +5576,7 @@ impl FastTube {
             if self.selected.is_some() {
                 self.close_video(ctx);
             }
+            self.close_navigation_drawer_if_overlay(ctx);
         }
 
         ui.add_space(2.0);
@@ -4424,21 +5594,7 @@ impl FastTube {
                 self.close_video(ctx);
             }
             self.start_browser_feed(":ytrec".into(), !self.auth.authenticated, ctx);
-        }
-
-        ui.add_space(2.0);
-        let in_explore = self.selected.is_none()
-            && !self.ui.settings_open
-            && !self.channels.view_open
-            && self.ui.browse_section == BrowseSection::Explore;
-        if sidebar_pill_item(ui, "⌕", "Explorar", in_explore, false, &palette).clicked() {
-            self.ui.settings_open = false;
-            self.ui.search_results_mode = false;
-            self.ui.browse_section = BrowseSection::Explore;
-            self.close_channel_view();
-            if self.selected.is_some() {
-                self.close_video(ctx);
-            }
+            self.close_navigation_drawer_if_overlay(ctx);
         }
     }
 
@@ -4452,17 +5608,28 @@ impl FastTube {
         ui.separator();
         ui.add_space(6.0);
 
-        // Seção "Inscrições >" igual ao YouTube
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            ui.label(RichText::new("Inscrições  ›").size(15.0).strong());
-        });
-        ui.add_space(4.0);
+        let in_subscriptions = self.selected.is_none()
+            && !self.ui.settings_open
+            && !self.channels.view_open
+            && self.ui.browse_section == BrowseSection::Subscriptions;
+        if sidebar_section_header_item(ui, "Inscrições", true, in_subscriptions, &palette).clicked()
+        {
+            self.ui.settings_open = false;
+            self.ui.search_results_mode = false;
+            self.ui.browse_section = BrowseSection::Subscriptions;
+            self.close_channel_view();
+            if self.selected.is_some() {
+                self.close_video(ctx);
+            }
+            self.start_browser_feed(":ytrec".into(), !self.auth.authenticated, ctx);
+            self.close_navigation_drawer_if_overlay(ctx);
+        }
+        ui.add_space(2.0);
 
         let sidebar_channels = self.feed.home.subscription_channels.clone();
         if !self.auth.authenticated {
             ui.horizontal(|ui| {
-                ui.add_space(10.0);
+                ui.add_space(12.0);
                 ui.label(
                     RichText::new("Entre para ver os canais que voc\u{00ea} segue")
                         .small()
@@ -4474,7 +5641,7 @@ impl FastTube {
             && self.feed.home.rx.is_some()
         {
             ui.horizontal(|ui| {
-                ui.add_space(10.0);
+                ui.add_space(12.0);
                 ui.spinner();
                 ui.label(
                     RichText::new("Carregando inscri\u{00e7}\u{00f5}es...")
@@ -4484,7 +5651,7 @@ impl FastTube {
             });
         } else if sidebar_channels.is_empty() {
             ui.horizontal(|ui| {
-                ui.add_space(10.0);
+                ui.add_space(12.0);
                 let text = if self.feed.home.subscription_channels_error.is_some() {
                     "N\u{00e3}o foi poss\u{00ed}vel carregar as inscri\u{00e7}\u{00f5}es."
                 } else {
@@ -4519,6 +5686,7 @@ impl FastTube {
                     self.close_video(ctx);
                 }
                 self.open_channel(ChannelTarget::ChannelId(channel.channel_id), ctx);
+                self.close_navigation_drawer_if_overlay(ctx);
             }
 
             if sidebar_channels.len() > 7 {
@@ -4528,9 +5696,9 @@ impl FastTube {
                     "Mostrar mais"
                 };
                 let toggle_icon = if self.ui.subscriptions_expanded {
-                    "\u{2302}"
+                    "⌃"
                 } else {
-                    "\u{2304}"
+                    "⌄"
                 };
                 if sidebar_pill_item(ui, toggle_icon, toggle_label, false, false, &palette)
                     .clicked()
@@ -4551,19 +5719,35 @@ impl FastTube {
         ui.separator();
         ui.add_space(6.0);
 
-        // Seção "Você >" igual ao YouTube
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            ui.label(RichText::new("Você  ›").size(15.0).strong());
-        });
-        ui.add_space(4.0);
+        let you_section_active = self.selected.is_none()
+            && !self.ui.settings_open
+            && !self.channels.view_open
+            && matches!(
+                self.ui.browse_section,
+                BrowseSection::History | BrowseSection::Library | BrowseSection::Queue
+            );
+        if sidebar_section_header_item(ui, "Você", true, you_section_active, &palette).clicked() {
+            self.ui.settings_open = false;
+            self.ui.search_results_mode = false;
+            self.close_channel_view();
+            if self.selected.is_some() {
+                self.close_video(ctx);
+            }
+            self.ui.browse_section = BrowseSection::Library;
+            self.close_navigation_drawer_if_overlay(ctx);
+        }
+        ui.add_space(2.0);
 
         let channel_target = self.current_channel_target();
         let channel_active = self.channels.view_open && !self.ui.settings_open;
         if sidebar_pill_item(ui, "👤", "Seu canal", channel_active, false, &palette).clicked() {
             self.ui.settings_open = false;
             self.ui.search_results_mode = false;
-            if channel_target.is_some() {
+            if let Some(target) = self.auth.my_channel.clone() {
+                self.open_channel(target, ctx);
+            } else if self.auth.authenticated {
+                self.start_fetch_my_channel(true, ctx);
+            } else if channel_target.is_some() {
                 self.channels.view_open = true;
                 self.sync_player_window_visibility();
             } else {
@@ -4571,6 +5755,7 @@ impl FastTube {
                 self.feed.filter = FeedFilter::Recommended;
                 self.invalidate_feed_cache();
             }
+            self.close_navigation_drawer_if_overlay(ctx);
         }
 
         ui.add_space(2.0);
@@ -4595,6 +5780,7 @@ impl FastTube {
             } else {
                 BrowseSection::History
             };
+            self.close_navigation_drawer_if_overlay(ctx);
         }
 
         ui.add_space(2.0);
@@ -4610,6 +5796,62 @@ impl FastTube {
             }
             let interactive = !self.auth.authenticated;
             self.start_browser_feed(":google-playlists".into(), interactive, ctx);
+            self.close_navigation_drawer_if_overlay(ctx);
+        }
+
+        ui.add_space(2.0);
+        let watch_later_active = self.ui.browse_section == BrowseSection::Library
+            && !self.channels.view_open
+            && self.selected.is_none();
+        let watch_later_label = if self.library.data.watch_later.is_empty() {
+            "Assistir mais tarde".to_owned()
+        } else {
+            format!(
+                "Assistir mais tarde ({})",
+                self.library.data.watch_later.len()
+            )
+        };
+        if sidebar_pill_item(
+            ui,
+            "🕒",
+            &watch_later_label,
+            watch_later_active,
+            false,
+            &palette,
+        )
+        .clicked()
+        {
+            self.ui.settings_open = false;
+            self.ui.search_results_mode = false;
+            self.close_channel_view();
+            if self.selected.is_some() {
+                self.close_video(ctx);
+            }
+            self.ui.browse_section = if self.ui.browse_section == BrowseSection::Library {
+                BrowseSection::Home
+            } else {
+                BrowseSection::Library
+            };
+            self.close_navigation_drawer_if_overlay(ctx);
+        }
+
+        ui.add_space(2.0);
+        let liked_active = self.feed.home.title.as_deref() == Some("Vídeos com Gostei")
+            && !self.channels.view_open
+            && self.selected.is_none();
+        if sidebar_pill_item(ui, "👍", "Vídeos com \"Gostei\"", liked_active, false, &palette)
+            .clicked()
+        {
+            self.ui.settings_open = false;
+            self.ui.search_results_mode = false;
+            self.ui.browse_section = BrowseSection::Home;
+            self.close_channel_view();
+            if self.selected.is_some() {
+                self.close_video(ctx);
+            }
+            let interactive = !self.auth.authenticated;
+            self.start_browser_feed(":google-liked".into(), interactive, ctx);
+            self.close_navigation_drawer_if_overlay(ctx);
         }
 
         ui.add_space(2.0);
@@ -4637,6 +5879,125 @@ impl FastTube {
             } else {
                 BrowseSection::Queue
             };
+            self.close_navigation_drawer_if_overlay(ctx);
+        }
+    }
+
+    fn navigation_explore_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        palette: ThemePalette,
+    ) {
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        let in_explore = self.selected.is_none()
+            && !self.ui.settings_open
+            && !self.channels.view_open
+            && self.ui.browse_section == BrowseSection::Explore;
+        if sidebar_section_header_item(ui, "Explorar", true, in_explore, &palette).clicked() {
+            self.ui.settings_open = false;
+            self.ui.search_results_mode = false;
+            self.ui.browse_section = BrowseSection::Explore;
+            self.close_channel_view();
+            if self.selected.is_some() {
+                self.close_video(ctx);
+            }
+            self.close_navigation_drawer_if_overlay(ctx);
+        }
+        ui.add_space(2.0);
+
+        let explore_items = [
+            (
+                "♫",
+                "Música",
+                FeedFilter::Music,
+                "música clipe oficial",
+            ),
+            (
+                "📡",
+                "Ao vivo",
+                FeedFilter::Live,
+                "ao vivo transmissão",
+            ),
+            (
+                "🎮",
+                "Jogos",
+                FeedFilter::Gaming,
+                "gameplay jogos brasil",
+            ),
+            (
+                "🎙",
+                "Podcasts",
+                FeedFilter::Podcasts,
+                "podcast entrevista completa",
+            ),
+            (
+                "🔥",
+                "Em alta",
+                FeedFilter::RecentlyUploaded,
+                "tendências brasil hoje",
+            ),
+            (
+                "📻",
+                "Mixes",
+                FeedFilter::Mixes,
+                "mix música playlist",
+            ),
+            (
+                "✨",
+                "Novidades",
+                FeedFilter::NewToYou,
+                "novidades cultura tecnologia brasil",
+            ),
+        ];
+
+        let visible_count = if self.ui.explore_expanded {
+            explore_items.len()
+        } else {
+            4
+        };
+
+        for (icon, label, filter, query) in explore_items.into_iter().take(visible_count) {
+            let active = self.selected.is_none()
+                && !self.ui.settings_open
+                && !self.channels.view_open
+                && self.ui.browse_section == BrowseSection::Home
+                && self.feed.filter == filter;
+            if sidebar_pill_item(ui, icon, label, active, false, &palette).clicked() {
+                self.ui.settings_open = false;
+                self.ui.search_results_mode = false;
+                self.ui.browse_section = BrowseSection::Home;
+                self.close_channel_view();
+                if self.selected.is_some() {
+                    self.close_video(ctx);
+                }
+                self.feed.filter = filter;
+                if self.feed.videos.is_empty() {
+                    self.feed.query = query.to_owned();
+                    self.start_search(ctx);
+                } else {
+                    self.invalidate_feed_cache();
+                }
+                self.close_navigation_drawer_if_overlay(ctx);
+            }
+            ui.add_space(2.0);
+        }
+
+        let toggle_label = if self.ui.explore_expanded {
+            "Mostrar menos"
+        } else {
+            "Mostrar mais"
+        };
+        let toggle_icon = if self.ui.explore_expanded {
+            "⌃"
+        } else {
+            "⌄"
+        };
+        if sidebar_pill_item(ui, toggle_icon, toggle_label, false, false, &palette).clicked() {
+            self.ui.explore_expanded = !self.ui.explore_expanded;
         }
     }
 
@@ -4646,7 +6007,10 @@ impl FastTube {
         ctx: &egui::Context,
         palette: ThemePalette,
     ) {
-        ui.add_space(2.0);
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
+
         if sidebar_pill_item(
             ui,
             "▣",
@@ -4664,6 +6028,7 @@ impl FastTube {
                 self.close_video(ctx);
             }
             self.ui.browse_section = BrowseSection::Library;
+            self.close_navigation_drawer_if_overlay(ctx);
         }
 
         ui.add_space(2.0);
@@ -4679,30 +6044,64 @@ impl FastTube {
         {
             self.ui.settings_open = !self.ui.settings_open;
             self.sync_player_window_visibility();
+            self.close_navigation_drawer_if_overlay(ctx);
         }
 
         ui.add_space(2.0);
-        if self.feed.home.rx.is_none()
-            && sidebar_pill_item(ui, "🚪", "Sair da conta", false, false, &palette).clicked()
+        if sidebar_pill_item(
+            ui,
+            "⌨",
+            "Atalhos do teclado",
+            self.ui.shortcuts_open,
+            false,
+            &palette,
+        )
+        .clicked()
         {
-            self.close_video(ctx);
-            let persistence_error = self.set_oauth_session(None);
-            self.auth.authenticated = false;
-            self.feed.home.title = None;
-            self.feed.home.playlist_urls.clear();
-            self.feed.home.pending_items.clear();
-            self.feed.home.subscription_channels.clear();
-            self.feed.home.subscription_channels_loaded = false;
-            self.feed.home.subscription_channels_error = None;
-            self.apply_search_results(ctx, Vec::new());
-            self.ui.browse_section = BrowseSection::Home;
-            self.feed.filter = FeedFilter::Recommended;
-            let logout_error = persistence_error.unwrap_or_default();
-            self.start_public_home(ctx);
-            if !logout_error.is_empty() {
-                self.message = logout_error;
+            self.ui.shortcuts_open = !self.ui.shortcuts_open;
+            self.close_navigation_drawer_if_overlay(ctx);
+        }
+
+        if self.auth.authenticated && self.feed.home.rx.is_none() {
+            ui.add_space(2.0);
+            if sidebar_pill_item(ui, "🚪", "Sair da conta", false, false, &palette).clicked() {
+                self.close_video(ctx);
+                let persistence_error = self.set_oauth_session(None);
+                self.auth.authenticated = false;
+                self.feed.home.title = None;
+                self.feed.home.playlist_urls.clear();
+                self.feed.home.pending_items.clear();
+                self.feed.home.subscription_channels.clear();
+                self.feed.home.subscription_channels_loaded = false;
+                self.feed.home.subscription_channels_error = None;
+                self.apply_search_results(ctx, Vec::new());
+                self.ui.browse_section = BrowseSection::Home;
+                self.feed.filter = FeedFilter::Recommended;
+                let logout_error = persistence_error.unwrap_or_default();
+                self.start_public_home(ctx);
+                if !logout_error.is_empty() {
+                    self.message = logout_error;
+                }
+                self.close_navigation_drawer_if_overlay(ctx);
             }
         }
+    }
+
+    fn navigation_footer_ui(&self, ui: &mut egui::Ui, palette: ThemePalette) {
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(10.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new(
+                    "Sobre  Imprensa  Direitos autorais\nTermos  Privacidade  Segurança\n© 2026 FastTube",
+                )
+                .size(11.5)
+                .color(palette.neutral_status_fg),
+            );
+        });
+        ui.add_space(12.0);
     }
 
     fn navigation_now_playing_ui(
@@ -4730,6 +6129,7 @@ impl FastTube {
                 self.ui.settings_open = false;
                 self.ui.search_results_mode = false;
                 self.sync_player_window_visibility();
+                self.close_navigation_drawer_if_overlay(ctx);
             }
 
             ui.add_space(4.0);
@@ -4759,6 +6159,7 @@ impl FastTube {
                 .clicked()
             {
                 self.close_video(ctx);
+                self.ui.navigation_open = false;
             }
         }
     }
@@ -4848,10 +6249,31 @@ impl FastTube {
     }
 
     fn watch_navigation_drawer_ui(&mut self, ctx: &egui::Context) {
-        let content = ctx.content_rect();
+        let content = ctx.input(|i| i.content_rect());
         let width = layout::compute_youtube_sidebar_width(content.width());
         let top = content.top() + compute_header_height(content.width(), false);
         let height = (content.bottom() - top).max(120.0);
+        let scrim_left = (content.left() + width).min(content.right());
+        let scrim_width = (content.right() - scrim_left).max(0.0);
+        if scrim_width > 0.0 {
+            egui::Area::new(egui::Id::new("watch_navigation_drawer_scrim"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(scrim_left, top))
+                .show(ctx, |ui| {
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(scrim_width, height),
+                        egui::Sense::click(),
+                    );
+                    ui.painter().rect_filled(
+                        rect,
+                        0.0,
+                        Color32::from_rgba_unmultiplied(0, 0, 0, 132),
+                    );
+                    if response.clicked() {
+                        self.ui.navigation_open = false;
+                    }
+                });
+        }
         let fill = if self.settings.theme.value == Theme::Dark {
             Color32::from_rgb(15, 15, 15)
         } else {
@@ -4871,14 +6293,10 @@ impl FastTube {
                     .stroke(egui::Stroke::new(1.0, stroke))
                     .show(ui, |ui| {
                         ui.set_min_size(egui::vec2(width, height));
-                        ui.set_max_width(width);
-                        ui.set_height(height);
+                        ui.set_max_size(egui::vec2(width, height));
                         self.navigation_ui(ui, ctx);
                     });
             });
-        if self.selected.is_none() {
-            self.ui.navigation_open = false;
-        }
     }
 
     fn settings_panel_ui(&mut self, ui: &mut egui::Ui) {
@@ -5512,7 +6930,15 @@ impl FastTube {
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
 
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-        ui.painter().rect_filled(rect, 4.0, Color32::BLACK);
+        response.surrender_focus();
+        let corner_radius =
+            if self.playback.fullscreen || self.playback.theater || self.playback.mini_player {
+                0.0
+            } else {
+                4.0
+            };
+        ui.painter()
+            .rect_filled(rect, corner_radius, Color32::BLACK);
         if settings_open {
             ui.painter().text(
                 rect.center(),
@@ -5522,8 +6948,7 @@ impl FastTube {
                 Color32::from_rgb(165, 165, 175),
             );
         } else if player.paint_into(ui.painter(), rect) {
-            // A render API do libmpv desenha o vídeo dentro do egui, então a
-            // barra sobreposta pode ficar por cima sem uma janela nativa.
+            // Render API paints directly into egui, so the overlay stays above video without a native HWND.
             video_area = Some((rect, response));
         }
         player.resize(rect, ctx.pixels_per_point());
@@ -5553,6 +6978,13 @@ impl FastTube {
             }
         }
         self.playback.mini_player = !self.playback.mini_player;
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(
+            if self.playback.mini_player {
+                egui::vec2(320.0, 180.0)
+            } else {
+                egui::vec2(480.0, 420.0)
+            },
+        ));
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
             if self.playback.mini_player {
                 egui::WindowLevel::AlwaysOnTop
@@ -5562,7 +6994,7 @@ impl FastTube {
         ));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
             if self.playback.mini_player {
-                egui::vec2(720.0, 450.0)
+                egui::vec2(480.0, 270.0)
             } else {
                 self.playback
                     .mini_player_restore_size
@@ -5675,6 +7107,7 @@ impl FastTube {
         let (has_active_player_sub, _active_sid): (bool, Option<String>) = (false, None);
 
         let active_yt_url = self.watch.extras.active_subtitle_url.as_deref();
+        let has_active_yt_sub = active_yt_url.is_some();
 
         #[cfg(windows)]
         if let Some(player) = &self.player {
@@ -5705,7 +7138,9 @@ impl FastTube {
                     .filter(|title| !title.is_empty())
                     .or_else(|| player.property(&format!("track-list/{index}/lang")))
                     .unwrap_or_else(|| format!("Faixa {id}"));
-                let active = has_active_player_sub && active_sid.as_deref() == Some(id.as_str());
+                let active = !has_active_yt_sub
+                    && has_active_player_sub
+                    && active_sid.as_deref() == Some(id.as_str());
                 options.push(overlay::OverlaySubtitleOption {
                     id: format!("mpv:{id}"),
                     label,
@@ -5724,7 +7159,7 @@ impl FastTube {
                     ""
                 }
             );
-            let active = has_active_player_sub && active_yt_url == Some(track.url.as_str());
+            let active = active_yt_url == Some(track.url.as_str());
             options.push(overlay::OverlaySubtitleOption {
                 id: format!("yt:{}", track.url),
                 label,
@@ -5732,7 +7167,7 @@ impl FastTube {
             });
         }
 
-        (has_active_player_sub, options)
+        (has_active_player_sub || has_active_yt_sub, options)
     }
 
     fn select_overlay_subtitle(&mut self, id: Option<&str>, ctx: &egui::Context) {
@@ -5742,6 +7177,7 @@ impl FastTube {
                 self.playback.last_subtitle_id = Some(active.id);
             }
             self.watch.extras.active_subtitle_url = None;
+            self.watch.extras.active_subtitle_cues.clear();
             #[cfg(windows)]
             if let Some(player) = &self.player
                 && let Err(error) = player.disable_subtitles()
@@ -5753,6 +7189,7 @@ impl FastTube {
 
         if let Some(sid) = raw.strip_prefix("mpv:") {
             self.watch.extras.active_subtitle_url = None;
+            self.watch.extras.active_subtitle_cues.clear();
             self.playback.last_subtitle_id = Some(raw.to_owned());
             #[cfg(windows)]
             if let Some(player) = &self.player {
@@ -5774,37 +7211,19 @@ impl FastTube {
                 .find(|t| t.url == url)
                 .cloned()
         {
-            #[cfg(windows)]
-            {
-                let player_ready = self
-                    .playback
-                    .active
-                    .as_ref()
-                    .is_some_and(|active| active.has_live_sample)
-                    || self.player.as_ref().is_some_and(|player| {
-                        player.number("track-list/count").unwrap_or(0.0) > 0.0
-                    });
-                if self.player.is_none() {
-                    self.message = "O player não está disponível.".to_owned();
-                } else if !player_ready {
-                    self.message = "Aguarde o vídeo carregar antes de ativar legendas.".to_owned();
+            let label = format!(
+                "{}{}",
+                track.language,
+                if track.automatic {
+                    " (automática)"
                 } else {
-                    let label = format!(
-                        "{}{}",
-                        track.language,
-                        if track.automatic {
-                            " (automática)"
-                        } else {
-                            ""
-                        }
-                    );
-                    self.playback.last_subtitle_id = Some(raw.to_owned());
-                    self.watch.extras.start_apply_subtitle(&track, label, ctx);
-                    self.apply_ready_subtitle();
+                    ""
                 }
-            }
-            #[cfg(not(windows))]
-            let _ = (track, ctx);
+            );
+            self.playback.last_subtitle_id = Some(raw.to_owned());
+            self.watch.extras.active_subtitle_url = Some(track.url.clone());
+            self.watch.extras.start_apply_subtitle(&track, label, ctx);
+            self.apply_ready_subtitle();
         }
     }
 
@@ -6280,6 +7699,22 @@ impl FastTube {
         available_height: f32,
         mode: WatchLayoutMode,
     ) {
+        let show_metadata = !self.playback.fullscreen
+            && !self.playback.mini_player
+            && mode != WatchLayoutMode::Short;
+        self.player_ui_with_metadata(ui, ctx, column_width, available_height, mode, show_metadata);
+    }
+
+    #[cfg(windows)]
+    fn player_ui_with_metadata(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        column_width: f32,
+        available_height: f32,
+        mode: WatchLayoutMode,
+        show_metadata: bool,
+    ) {
         let Some(video) = self.selected.clone() else {
             self.sync_player_window_visibility();
             return;
@@ -6288,8 +7723,9 @@ impl FastTube {
         let settings_open = self.ui.settings_open;
         let fullscreen = self.playback.fullscreen;
         let theater_mode = self.playback.theater;
+        let chromeless = fullscreen || self.playback.mini_player;
 
-        let player_size = if fullscreen
+        let player_size = if chromeless
             && !settings_open
             && self
                 .player
@@ -6321,7 +7757,7 @@ impl FastTube {
             self.message = error;
             self.report_pending_queue_load_error();
         }
-        if !fullscreen || video_area.is_none() {
+        if (!chromeless && show_metadata) || video_area.is_none() {
             ui.add_space(6.0);
         }
 
@@ -6362,12 +7798,19 @@ impl FastTube {
             self.message = error;
         }
 
-        let has_queued = !self.queue.data.is_empty();
+        let next_fallback_video = if self.queue.data.is_empty() {
+            if mode == WatchLayoutMode::Short {
+                self.next_or_prev_short(true)
+            } else {
+                self.next_recommended_video()
+            }
+        } else {
+            None
+        };
+        let has_queued = !self.queue.data.is_empty() || next_fallback_video.is_some();
         let palette = self.palette();
         let mut actions = FullscreenControlsActions::default();
-        // Quando a render API do libmpv está ativa, todos os controles ficam integrados
-        // dentro do player (como no YouTube oficial). Se houver fallback para janela nativa
-        // (HWND), a barra externa aparece automaticamente em todos os modos.
+        // Show external control bar only when falling back to a native HWND.
         if video_area.is_none() && !settings_open {
             self.fullscreen_seek_ui(ui, width, position, duration, now);
             let bar = FullscreenBarContext {
@@ -6387,15 +7830,26 @@ impl FastTube {
             self.save_library();
         }
 
-        let chapters = if video_area.is_some() {
+        let overlay_active = video_area.as_ref().is_some_and(|(rect, response)| {
+            let hovered = response.hovered() || ui.rect_contains_pointer(*rect);
+            overlay::overlay_visible_with_state(
+                hovered,
+                telemetry.paused,
+                telemetry.ended,
+                self.playback.player_menu.is_some(),
+                self.playback.seek_drag.is_some(),
+                self.playback.overlay_last_activity.elapsed().as_secs_f64(),
+            )
+        });
+        let chapters = if overlay_active {
             self.collect_player_chapters()
         } else {
             Vec::new()
         };
-        let (has_active_subtitle, subtitles) = if video_area.is_some() {
+        let (has_active_subtitle, subtitles) = if overlay_active {
             self.collect_overlay_subtitles()
         } else {
-            (false, Vec::new())
+            (self.watch.extras.active_subtitle_url.is_some(), Vec::new())
         };
         let overlay_ctx = OverlayPlaybackContext {
             video: video.clone(),
@@ -6419,6 +7873,8 @@ impl FastTube {
             theater: theater_mode,
             fullscreen,
             mini_player: self.playback.mini_player,
+            autoplay: self.playback.autoplay,
+            loop_video: self.playback.loop_video,
             can_bookmark: history::youtube_video_id(&video.url).is_some(),
             raw_path: telemetry.raw_path.clone(),
             raw_position: telemetry.raw_position,
@@ -6435,16 +7891,11 @@ impl FastTube {
             self.flush_playback_history_at(now);
         }
 
-        let resolution_badge = if !fullscreen {
-            self.player.as_ref().and_then(|player| {
+        if show_metadata {
+            let resolution_badge = self.player.as_ref().and_then(|player| {
                 VideoSize::from_numbers(player.number("width"), player.number("height"))
                     .map(|size| format!("Reproduzindo em {size}"))
-            })
-        } else {
-            None
-        };
-
-        if !fullscreen && mode != WatchLayoutMode::Short {
+            });
             self.watch_metadata_card_ui(ui, &video, width, resolution_badge.as_deref());
         }
 
@@ -6459,7 +7910,13 @@ impl FastTube {
             self.toggle_fullscreen(ctx);
         }
         if actions.next_clicked {
-            self.request_queue_advance();
+            if !self.queue.data.is_empty() {
+                self.request_queue_advance();
+            } else if let Some(next_video) = next_fallback_video {
+                self.playback.pending_open_video = Some(next_video);
+            } else {
+                self.request_queue_advance();
+            }
         }
         if actions.close_clicked {
             self.close_video(ctx);
@@ -6531,6 +7988,15 @@ impl FastTube {
                 idle_secs,
             );
             let style = self.overlay_style();
+            let active_subtitle_text = if self.watch.extras.active_subtitle_url.is_some()
+                && !self.watch.extras.active_subtitle_cues.is_empty()
+            {
+                let pos_ms = (playback.position.max(0.0) * 1000.0).round() as u64;
+                transcript::active_cue_index(&self.watch.extras.active_subtitle_cues, pos_ms)
+                    .map(|idx| self.watch.extras.active_subtitle_cues[idx].text.clone())
+            } else {
+                None
+            };
             let telemetry = overlay::OverlayTelemetry {
                 title: playback.video.title.clone(),
                 paused: playback.paused,
@@ -6546,12 +8012,15 @@ impl FastTube {
                 qualities_loading: playback.qualities_loading,
                 has_queued: playback.has_queued,
                 has_active_subtitle: playback.has_active_subtitle,
+                active_subtitle_text,
                 subtitles: playback.subtitles.clone(),
                 subtitles_loading: playback.subtitles_loading,
                 chapters: playback.chapters.clone(),
                 theater: playback.theater,
                 fullscreen: playback.fullscreen,
                 mini_player: playback.mini_player,
+                autoplay: playback.autoplay,
+                loop_video: playback.loop_video,
                 can_bookmark: playback.can_bookmark,
                 menu: self.playback.player_menu,
             };
@@ -6699,7 +8168,40 @@ impl FastTube {
                     }
                 }
             }
-            OverlayAction::Next => self.request_queue_advance(),
+            OverlayAction::Next => {
+                if !self.queue.data.is_empty() {
+                    self.request_queue_advance();
+                } else if self.is_watch_short_mode() {
+                    if let Some(video) = self.next_or_prev_short(true) {
+                        self.playback.pending_open_video = Some(video);
+                    }
+                } else if let Some(video) = self.next_recommended_video() {
+                    self.playback.pending_open_video = Some(video);
+                } else {
+                    self.request_queue_advance();
+                }
+            }
+            OverlayAction::ToggleAutoplay => {
+                self.playback.autoplay = !self.playback.autoplay;
+                self.playback.autoplay_eof_handled = false;
+            }
+            OverlayAction::ToggleLoop => {
+                self.playback.loop_video = !self.playback.loop_video;
+                #[cfg(windows)]
+                if let Some(player) = &self.player
+                    && let Err(error) = player.set(
+                        "loop-file",
+                        if self.playback.loop_video {
+                            "inf"
+                        } else {
+                            "no"
+                        },
+                    )
+                {
+                    self.message = error;
+                }
+                self.playback.player_menu = None;
+            }
             OverlayAction::ToggleCaptions => self.toggle_player_captions(ctx),
             OverlayAction::SelectSubtitle(id) => {
                 self.select_overlay_subtitle(id.as_deref(), ctx);
@@ -6782,11 +8284,40 @@ impl FastTube {
         available_height: f32,
         mode: WatchLayoutMode,
     ) {
+        let show_metadata = !self.playback.fullscreen
+            && !self.playback.mini_player
+            && mode != WatchLayoutMode::Short;
+        self.watch_primary_with_metadata_ui(
+            ui,
+            ctx,
+            column_width,
+            available_height,
+            mode,
+            show_metadata,
+        );
+    }
+
+    fn watch_primary_with_metadata_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        column_width: f32,
+        available_height: f32,
+        mode: WatchLayoutMode,
+        show_metadata: bool,
+    ) {
         self.sync_theme_visuals(ctx);
         self.sync_player_window_visibility();
         #[cfg(windows)]
         if self.player.is_some() {
-            self.player_ui(ui, ctx, column_width, available_height, mode);
+            self.player_ui_with_metadata(
+                ui,
+                ctx,
+                column_width,
+                available_height,
+                mode,
+                show_metadata,
+            );
             return;
         }
         let Some(video) = self.selected.clone() else {
@@ -6800,7 +8331,14 @@ impl FastTube {
             mode,
         );
         let (rect, _) = ui.allocate_exact_size(player_size, egui::Sense::hover());
-        ui.painter().rect_filled(rect, 4.0, Color32::BLACK);
+        let corner_radius =
+            if self.playback.fullscreen || self.playback.theater || self.playback.mini_player {
+                0.0
+            } else {
+                4.0
+            };
+        ui.painter()
+            .rect_filled(rect, corner_radius, Color32::BLACK);
         let compact_controls = watch_controls_are_compact(player_size.x);
         self.paint_hidden_video_notice(ui, rect);
         ui.add_space(6.0);
@@ -6809,7 +8347,16 @@ impl FastTube {
         let mut settings_toggled = false;
         let mut close_clicked = false;
         let mut next_clicked = false;
-        let has_queued = !self.queue.data.is_empty();
+        let next_fallback_video = if self.queue.data.is_empty() {
+            if mode == WatchLayoutMode::Short {
+                self.next_or_prev_short(true)
+            } else {
+                self.next_recommended_video()
+            }
+        } else {
+            None
+        };
+        let has_queued = !self.queue.data.is_empty() || next_fallback_video.is_some();
         let fullscreen = self.playback.fullscreen;
         let theater_mode = self.playback.theater;
         let palette = self.palette();
@@ -6822,7 +8369,7 @@ impl FastTube {
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .add_enabled(has_queued, egui::Button::new("⏭ Próximo"))
-                        .on_hover_text("Avançar manualmente para o próximo vídeo da fila")
+                        .on_hover_text("Avançar para o próximo vídeo")
                         .clicked()
                     {
                         next_clicked = true;
@@ -6891,7 +8438,7 @@ impl FastTube {
                     }
                 });
             });
-        if !self.playback.fullscreen && mode != WatchLayoutMode::Short {
+        if show_metadata {
             self.watch_metadata_card_ui(ui, &video, player_size.x, None);
         }
         if settings_toggled {
@@ -6905,7 +8452,13 @@ impl FastTube {
             self.toggle_fullscreen(ctx);
         }
         if next_clicked {
-            self.request_queue_advance();
+            if !self.queue.data.is_empty() {
+                self.request_queue_advance();
+            } else if let Some(next_video) = next_fallback_video {
+                self.playback.pending_open_video = Some(next_video);
+            } else {
+                self.request_queue_advance();
+            }
         }
         if close_clicked {
             self.close_video(ctx);
@@ -6934,7 +8487,7 @@ impl FastTube {
         ui: &mut egui::Ui,
         video: &Video,
         display: &WatchChannelDisplay<'_>,
-    ) -> Option<ChannelTarget> {
+    ) -> (Option<ChannelTarget>, bool) {
         let palette = display.palette;
         let channel_label = display
             .channel_target
@@ -6944,6 +8497,7 @@ impl FastTube {
             .unwrap_or("Canal");
         let avatar = paint_channel_avatar(ui, channel_label, 40.0);
         let mut open_channel_target = None;
+        let mut toggle_subscribe = false;
         if avatar.clicked() {
             open_channel_target = display.channel_target.cloned();
         }
@@ -6983,7 +8537,40 @@ impl FastTube {
                 }
             }
         });
-        open_channel_target
+        if display.channel_target.is_some() {
+            let is_sub = display.subscribed == Some(true);
+            let sub_label = if is_sub {
+                "✓ Inscrito"
+            } else {
+                "Inscrever-se"
+            };
+            let sub_btn = egui::Button::new(RichText::new(sub_label).size(13.0).strong().color(
+                if is_sub {
+                    palette.header_button_fg
+                } else {
+                    palette.active_button_fg
+                },
+            ))
+            .fill(if is_sub {
+                palette.header_button_bg
+            } else {
+                palette.active_button_bg
+            })
+            .corner_radius(18);
+            if ui
+                .add_enabled(!display.sub_pending, sub_btn)
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(if is_sub {
+                    "Cancelar inscrição neste canal"
+                } else {
+                    "Inscrever-se neste canal"
+                })
+                .clicked()
+            {
+                toggle_subscribe = true;
+            }
+        }
+        (open_channel_target, toggle_subscribe)
     }
 
     fn watch_metadata_actions_ui(
@@ -7097,31 +8684,37 @@ impl FastTube {
                 flags.share_video = true;
             }
 
-            let save_label = if state.saved_for_later {
+            let save_label = if state.saved_in_library {
                 "✓ Salvo"
             } else {
                 "Salvar"
             };
-            let save_button = egui::Button::new(
-                RichText::new(save_label)
-                    .size(13.0)
-                    .color(palette.header_button_fg),
-            )
-            .fill(palette.header_button_bg)
+            let save_button = egui::Button::new(RichText::new(save_label).size(13.0).color(
+                if state.save_menu_open {
+                    palette.active_button_fg
+                } else {
+                    palette.header_button_fg
+                },
+            ))
+            .fill(if state.save_menu_open {
+                palette.active_button_bg
+            } else {
+                palette.header_button_bg
+            })
             .corner_radius(18);
             if ui
                 .add_sized([80.0, 36.0], save_button)
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text("Alternar este vídeo em Assistir depois")
+                .on_hover_text("Salvar em Assistir depois ou playlists")
                 .clicked()
             {
-                flags.toggle_watch_later = true;
+                flags.toggle_save_menu = true;
             }
         });
     }
 
     fn watch_metadata_description_ui(
-        &self,
+        &mut self,
         ui: &mut egui::Ui,
         video_url: &str,
         description: Option<&str>,
@@ -7142,10 +8735,11 @@ impl FastTube {
                     .inner_margin(egui::Margin::symmetric(12, 10))
                     .show(ui, |ui| {
                         ui.set_max_width((content_width - 24.0).max(1.0));
-                        ui.label(
-                            RichText::new(description)
-                                .size(13.0)
-                                .color(palette.description_fg),
+                        self.render_text_with_timestamps_ui(
+                            ui,
+                            &description,
+                            palette.description_fg,
+                            13.0,
                         );
                     });
             });
@@ -7162,14 +8756,15 @@ impl FastTube {
         let ctx = ui.ctx().clone();
         let metadata = self.metadata_for(&video.url).cloned();
         let channel_target = self.channel_target_for_video(video);
+        let channel_id_hint = metadata.as_ref().and_then(|meta| meta.channel_id.clone());
+        let subscribed = self
+            .subscription_status_for(channel_target.as_ref(), channel_id_hint.as_deref())
+            .map(|s| s.subscription_id.is_some());
+        let sub_pending = self.auth.sub_toggle_rx.is_some();
         let palette = self.palette();
         let content_width = width.min(ui.available_width()).max(1.0);
-        let saved_for_later = self
-            .library
-            .data
-            .watch_later
-            .iter()
-            .any(|record| record.video.url == video.url);
+        let saved_in_library = self.video_saved_in_library(video);
+        let save_menu_open = self.playback.save_menu_open;
         let video_id = history::youtube_video_id(&video.url);
         let current_rating = video_id
             .as_ref()
@@ -7177,6 +8772,7 @@ impl FastTube {
         let rating_pending = self.auth.rating_rx.is_some();
         let mut action_flags = WatchMetadataActionFlags::default();
         let mut open_channel_target = None;
+        let mut sub_clicked = false;
         let stats = Self::format_watch_metadata_stats(video, metadata.as_ref());
         let technical_resolution = resolution_badge.map(str::to_owned);
         let channel_display = WatchChannelDisplay {
@@ -7185,12 +8781,15 @@ impl FastTube {
             stats: &stats,
             technical_resolution: technical_resolution.as_deref(),
             palette: &palette,
+            subscribed,
+            sub_pending,
         };
         let action_state = WatchMetadataActionState {
             video_id: video_id.as_deref(),
             current_rating,
             rating_pending,
-            saved_for_later,
+            saved_in_library,
+            save_menu_open,
             share_recently_copied: self
                 .watch
                 .share_copied_at
@@ -7212,29 +8811,58 @@ impl FastTube {
             ui.add_space(12.0);
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(10.0, 6.0);
-                if let Some(target) =
-                    self.watch_metadata_channel_row_ui(ui, video, &channel_display)
-                {
+                let (target, sub) = self.watch_metadata_channel_row_ui(ui, video, &channel_display);
+                if let Some(target) = target {
                     open_channel_target = Some(target);
+                }
+                if sub {
+                    sub_clicked = true;
                 }
 
                 self.watch_metadata_actions_ui(ui, &action_state, &mut action_flags);
             });
 
+            if save_menu_open {
+                ui.add_space(8.0);
+                self.save_menu_ui(ui, video, &ctx);
+            }
+
+            let description_text = metadata
+                .as_ref()
+                .and_then(|meta| meta.description.as_deref())
+                .map(str::to_owned);
             self.watch_metadata_description_ui(
                 ui,
                 &video.url,
-                metadata
-                    .as_ref()
-                    .and_then(|meta| meta.description.as_deref()),
+                description_text.as_deref(),
                 content_width,
                 &palette,
             );
-            ui.add_space(6.0);
+
+            if !self.watch.extras.comments_loaded
+                && self.watch.extras.comments_loading.is_none()
+                && self.watch.extras.comments_error.is_none()
+                && self
+                    .auth
+                    .session
+                    .as_ref()
+                    .is_some_and(oauth::TokenSession::has_comment_scope)
+            {
+                self.watch
+                    .extras
+                    .start_comments(self.auth.session.as_ref(), false, &ctx);
+            }
+
+            ui.add_space(18.0);
+            self.comments_ui(ui, &ctx, "watch_primary_comments");
+            ui.add_space(12.0);
         });
 
         if let (Some(video_id), Some(rating)) = (video_id, action_flags.rating_to_apply) {
             self.start_video_rating(video_id, rating, &ctx);
+        }
+        if sub_clicked && let Some(target) = channel_target {
+            self.start_toggle_subscription(target, channel_id_hint, &ctx);
         }
         if action_flags.share_video {
             match copy_text_to_clipboard(&ctx, &video.url) {
@@ -7248,9 +8876,14 @@ impl FastTube {
                 }
             }
         }
-        if action_flags.toggle_watch_later {
-            self.library.data.toggle_watch_later(video.clone());
-            self.save_library();
+        if action_flags.toggle_save_menu {
+            self.playback.save_menu_open = !self.playback.save_menu_open;
+            if self.playback.save_menu_open
+                && self.auth.authenticated
+                && self.auth.remote_playlists.is_empty()
+            {
+                self.start_fetch_remote_playlists(&ctx);
+            }
         }
         if action_flags.enqueue_video {
             let _ = self.enqueue_video(video.clone());
@@ -8053,6 +9686,11 @@ impl FastTube {
         card_max_w: f32,
         palette: ThemePalette,
     ) {
+        let subscribed = self
+            .subscription_status_for(Some(&page.target), page.channel_id.as_deref())
+            .map(|s| s.subscription_id.is_some());
+        let sub_pending = self.auth.sub_toggle_rx.is_some();
+        let mut sub_clicked = false;
         egui::Frame::new()
             .fill(palette.metadata_card_bg)
             .inner_margin(egui::Margin::ZERO)
@@ -8110,6 +9748,35 @@ impl FastTube {
                                 )
                                 .on_hover_text("Canal verificado");
                             }
+                            let is_sub = subscribed == Some(true);
+                            let sub_label = if is_sub {
+                                "✓ Inscrito"
+                            } else {
+                                "Inscrever-se"
+                            };
+                            let sub_btn = egui::Button::new(
+                                RichText::new(sub_label)
+                                    .size(13.0)
+                                    .strong()
+                                    .color(if is_sub {
+                                        palette.header_button_fg
+                                    } else {
+                                        palette.active_button_fg
+                                    }),
+                            )
+                            .fill(if is_sub {
+                                palette.header_button_bg
+                            } else {
+                                palette.active_button_bg
+                            })
+                            .corner_radius(18);
+                            if ui
+                                .add_enabled(!sub_pending, sub_btn)
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                sub_clicked = true;
+                            }
                         });
                         let mut channel_meta = Vec::new();
                         if let Some(handle) = page
@@ -8145,6 +9812,9 @@ impl FastTube {
                     });
                 });
             });
+        if sub_clicked {
+            self.start_toggle_subscription(page.target.clone(), page.channel_id.clone(), ctx);
+        }
         ui.add_space(8.0);
     }
 
@@ -8167,6 +9837,36 @@ impl FastTube {
             .clicked()
             {
                 switch_to_tab = Some(ChannelTab::Videos);
+            }
+            let shorts_label = if self.channels.shorts.loaded {
+                format!("Shorts ({})", self.channels.shorts.items.len())
+            } else {
+                "Shorts".into()
+            };
+            if youtube_tab_button(
+                ui,
+                &shorts_label,
+                self.channels.tab == ChannelTab::Shorts,
+                &palette,
+            )
+            .clicked()
+            {
+                switch_to_tab = Some(ChannelTab::Shorts);
+            }
+            let streams_label = if self.channels.streams.loaded {
+                format!("Ao vivo ({})", self.channels.streams.items.len())
+            } else {
+                "Ao vivo".into()
+            };
+            if youtube_tab_button(
+                ui,
+                &streams_label,
+                self.channels.tab == ChannelTab::Streams,
+                &palette,
+            )
+            .clicked()
+            {
+                switch_to_tab = Some(ChannelTab::Streams);
             }
             let playlists_label = if self.channels.playlists.loaded {
                 format!("Playlists ({})", self.channels.playlists.items.len())
@@ -8208,6 +9908,22 @@ impl FastTube {
             self.channels.tab = tab;
             match tab {
                 ChannelTab::Videos => {}
+                ChannelTab::Shorts => {
+                    if !self.channels.shorts.loaded
+                        && !self.channels.is_shorts_loading()
+                        && self.channels.shorts.error.is_none()
+                    {
+                        self.start_channel_shorts(ctx);
+                    }
+                }
+                ChannelTab::Streams => {
+                    if !self.channels.streams.loaded
+                        && !self.channels.is_streams_loading()
+                        && self.channels.streams.error.is_none()
+                    {
+                        self.start_channel_streams(ctx);
+                    }
+                }
                 ChannelTab::Playlists => {
                     if !self.channels.playlists.loaded
                         && !self.is_channel_playlists_loading()
@@ -8281,6 +9997,12 @@ impl FastTube {
                 ChannelTab::Videos => {
                     chosen = self.channel_videos_tab_ui(ui, ctx, page, &layout);
                 }
+                ChannelTab::Shorts => {
+                    chosen = self.channel_tab_videos_ui(ui, ctx, true, &layout);
+                }
+                ChannelTab::Streams => {
+                    chosen = self.channel_tab_videos_ui(ui, ctx, false, &layout);
+                }
                 ChannelTab::Playlists => {
                     chosen = self.channel_playlists_tab_ui(ui, ctx, &layout);
                 }
@@ -8306,6 +10028,197 @@ impl FastTube {
         {
             let force = actions.force_refresh && actions.new_limit.is_none();
             self.open_channel_with_options(target, ctx, force);
+        }
+        chosen
+    }
+
+    fn channel_tab_videos_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        is_shorts: bool,
+        layout: &ChannelTabLayout<'_>,
+    ) -> Option<Video> {
+        let palette = layout.palette;
+        let (loading, loaded, error, videos) = if is_shorts {
+            (
+                self.channels.is_shorts_loading(),
+                self.channels.shorts.loaded,
+                self.channels.shorts.error.clone(),
+                self.channels
+                    .shorts
+                    .items
+                    .iter()
+                    .map(|item| item.video.clone())
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            (
+                self.channels.is_streams_loading(),
+                self.channels.streams.loaded,
+                self.channels.streams.error.clone(),
+                self.channels
+                    .streams
+                    .items
+                    .iter()
+                    .map(|item| item.video.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let mut reload = false;
+        let mut cancel = false;
+        let mut chosen = None;
+
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(if is_shorts {
+                    "Shorts públicos deste canal"
+                } else {
+                    "Transmissões ao vivo e gravadas deste canal"
+                })
+                .small()
+                .weak(),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        !loading,
+                        egui::Button::new(RichText::new("↻ Atualizar").small()),
+                    )
+                    .clicked()
+                {
+                    reload = true;
+                }
+            });
+        });
+        ui.add_space(6.0);
+
+        if loading {
+            egui::Frame::new()
+                .fill(palette.info_box_bg)
+                .stroke(egui::Stroke::new(1.0, palette.info_box_stroke))
+                .corner_radius(6)
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.set_min_width(layout.card_max_w);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new(if is_shorts {
+                                "Consultando Shorts do canal..."
+                            } else {
+                                "Consultando transmissões do canal..."
+                            })
+                            .color(palette.info_accent_fg),
+                        );
+                        if ui.button(RichText::new("Cancelar").small()).clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            ui.add_space(6.0);
+        }
+
+        if let Some(err) = &error {
+            egui::Frame::new()
+                .fill(palette.error_bg)
+                .stroke(egui::Stroke::new(1.0, palette.error_stroke))
+                .corner_radius(6)
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.set_min_width(layout.card_max_w);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!("Erro ao carregar: {err}"))
+                                .color(palette.error_banner_fg),
+                        );
+                        if ui
+                            .button(RichText::new("↻ Tentar novamente").small())
+                            .clicked()
+                        {
+                            reload = true;
+                        }
+                    });
+                });
+            ui.add_space(6.0);
+        }
+
+        if loaded && videos.is_empty() && error.is_none() {
+            egui::Frame::new()
+                .fill(palette.card_alt_bg)
+                .corner_radius(6)
+                .inner_margin(egui::Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.set_min_width(layout.card_max_w);
+                    ui.label(
+                        RichText::new(if is_shorts {
+                            "Nenhum Short público encontrado neste canal."
+                        } else {
+                            "Nenhuma transmissão pública encontrada neste canal."
+                        })
+                        .weak(),
+                    );
+                });
+        } else if !videos.is_empty() {
+            let current_url = self.selected.as_ref().map(|v| v.url.clone());
+            self.thumbnails.begin_pass();
+            egui::ScrollArea::vertical()
+                .id_salt(format!(
+                    "{}_{}",
+                    layout.scroll_id,
+                    if is_shorts { "shorts" } else { "streams" }
+                ))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let target_width = layout
+                        .max_card_width
+                        .map(|limit| ui.available_width().min(limit))
+                        .unwrap_or_else(|| ui.available_width());
+                    for (index, video) in videos.iter().enumerate() {
+                        let is_playing = current_url.as_deref() == Some(video.url.as_str());
+                        ui.push_id(
+                            (
+                                if is_shorts {
+                                    "chan_short"
+                                } else {
+                                    "chan_stream"
+                                },
+                                index,
+                            ),
+                            |ui| {
+                                ui.scope(|ui| {
+                                    ui.set_max_width(target_width);
+                                    if self.video_card_ui(
+                                        ui,
+                                        ctx,
+                                        video,
+                                        layout.compact,
+                                        is_playing,
+                                    ) {
+                                        chosen = Some(video.clone());
+                                    }
+                                });
+                            },
+                        );
+                        ui.add_space(6.0);
+                    }
+                });
+            self.thumbnails.end_pass(ctx);
+        }
+
+        if cancel {
+            if is_shorts {
+                self.cancel_channel_shorts();
+            } else {
+                self.cancel_channel_streams();
+            }
+        } else if reload {
+            if is_shorts {
+                self.start_channel_shorts(ctx);
+            } else {
+                self.start_channel_streams(ctx);
+            }
         }
         chosen
     }
@@ -9660,26 +11573,32 @@ impl FastTube {
         });
         let panel_width = ui.available_width().max(160.0);
         let thumb_width = if compact {
-            (panel_width * 0.38).clamp(132.0, 168.0)
+            (panel_width * 0.42).clamp(140.0, 168.0)
         } else {
-            (panel_width * 0.34).clamp(168.0, 220.0)
+            (panel_width * 0.36).clamp(168.0, 210.0)
         };
-        let thumb_size = egui::vec2(thumb_width, thumb_width * 9.0 / 16.0);
+        let thumb_size = egui::vec2(thumb_width, (thumb_width * 9.0 / 16.0).round());
+        let is_music = recommendations::is_music_video(video, metadata.as_ref());
+        let is_new = recommendations::is_recent_upload(metadata.as_ref(), None);
 
         ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = 10.0;
+            ui.spacing_mut().item_spacing.x = 8.0;
             let thumb = self
                 .thumbnails
                 .show_rounded(ui, ctx, &video.thumbnail, thumb_size, 8.0);
-            paint_thumbnail_overlays(ui, thumb.rect, &video.duration, progress_ratio, false);
+            paint_thumbnail_overlays(ui, thumb.rect, &video.duration, progress_ratio, is_music);
+            if is_new {
+                paint_thumbnail_novidade_badge(ui, thumb.rect);
+            }
             if thumb.clicked() {
                 clicked = true;
             }
 
             ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 3.0;
                 ui.set_max_width(ui.available_width().max(60.0));
                 let title_button = egui::Button::new(
-                    RichText::new(truncate_text_chars(&video.title, 88))
+                    RichText::new(truncate_text_chars(&video.title, 74))
                         .size(14.0)
                         .strong()
                         .color(palette.header_button_fg),
@@ -9696,8 +11615,17 @@ impl FastTube {
                 }
 
                 if !video.channel.is_empty() {
+                    let verified = metadata
+                        .as_ref()
+                        .and_then(|m| m.view_count)
+                        .is_some_and(|v| v >= 50_000);
+                    let channel_label = if verified {
+                        format!("{} \u{2714}", truncate_text_chars(&video.channel, 34))
+                    } else {
+                        truncate_text_chars(&video.channel, 38)
+                    };
                     let channel_button = egui::Button::new(
-                        RichText::new(truncate_text_chars(&video.channel, 42))
+                        RichText::new(channel_label)
                             .size(12.0)
                             .color(palette.neutral_status_fg),
                     )
@@ -10079,7 +12007,6 @@ impl FastTube {
 
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            // Ícone vermelho do Shorts + título "Shorts" igual ao YouTube
             let (badge_rect, _) =
                 ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
             ui.painter()
@@ -10283,7 +12210,6 @@ impl FastTube {
         } else {
             ranked.into_iter().partition(|item| item.is_short)
         };
-        // Se todos os vídeos forem curtos ou não houver vídeos regulares suficientes, exibe todos na grade principal
         if regular_list.is_empty() {
             (shorts_list, Vec::new())
         } else {
@@ -10327,8 +12253,7 @@ impl FastTube {
             .title
             .as_deref()
             .is_some_and(|title| title.contains("envios recentes"));
-        // Os filtros da página de inscrições alteram apenas a visualização. Preserva
-        // a classificação base para que desmarcar um filtro não elimine candidatos.
+        // Keep base ranking intact so clearing a filter restores filtered-out items.
         let ranked_base = is_subscription_feed.then(|| ranked.clone());
         if is_subscription_feed {
             self.apply_subscription_feed_filters(ui, &mut ranked);
@@ -10400,7 +12325,6 @@ impl FastTube {
                     });
                     ui.add_space(24.0);
 
-                    // Após a primeira linha de vídeos 16:9, exibe a prateleira "Shorts" igual ao YouTube
                     if row_index == 0 && !shelf_shorts.is_empty() {
                         let (short_sel, short_enq) =
                             self.shorts_shelf_ui(ui, ctx, &shelf_shorts, available);
@@ -10616,6 +12540,133 @@ impl FastTube {
 
     fn search_results_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> Option<Video> {
         let palette = self.palette();
+        let mut trigger_search_query: Option<String> = None;
+        let mut filters_changed = false;
+
+        ui.horizontal_wrapped(|ui| {
+            let filters_active = !self.feed.search_filters.is_default();
+            let toggle_label = if filters_active {
+                "⚙ Filtros (ativos)"
+            } else {
+                "⚙ Filtros"
+            };
+            let filter_btn = egui::Button::new(RichText::new(toggle_label).small().strong().color(
+                if self.feed.search_filters_open || filters_active {
+                    palette.active_button_fg
+                } else {
+                    palette.header_button_fg
+                },
+            ))
+            .fill(if self.feed.search_filters_open || filters_active {
+                palette.active_button_bg
+            } else {
+                palette.header_button_bg
+            })
+            .corner_radius(16);
+            if ui
+                .add(filter_btn)
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
+                self.feed.search_filters_open = !self.feed.search_filters_open;
+            }
+
+            if !self.feed.recent_searches.is_empty() {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Recentes:")
+                        .small()
+                        .color(palette.neutral_status_fg),
+                );
+                let recent = self.feed.recent_searches.clone();
+                for term in recent {
+                    let chip = egui::Button::new(
+                        RichText::new(&term).small().color(palette.header_button_fg),
+                    )
+                    .fill(palette.card_alt_bg)
+                    .corner_radius(14);
+                    if ui
+                        .add(chip)
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        trigger_search_query = Some(term);
+                    }
+                }
+            }
+        });
+
+        if self.feed.search_filters_open {
+            ui.add_space(6.0);
+            egui::Frame::new()
+                .fill(palette.card_alt_bg)
+                .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+                .corner_radius(10)
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Ordenar:").small().strong());
+                        for (label, sort) in [
+                            ("Relevância", search::SearchSort::Relevance),
+                            ("Data", search::SearchSort::Date),
+                            ("Visualizações", search::SearchSort::Views),
+                        ] {
+                            let selected = self.feed.search_filters.sort == sort;
+                            if ui.selectable_label(selected, label).clicked() && !selected {
+                                self.feed.search_filters.sort = sort;
+                                filters_changed = true;
+                            }
+                        }
+
+                        ui.separator();
+                        ui.label(RichText::new("Duração:").small().strong());
+                        for (label, dur) in [
+                            ("Qualquer", search::SearchDurationFilter::Any),
+                            ("< 4 min", search::SearchDurationFilter::Short),
+                            ("4–20 min", search::SearchDurationFilter::Medium),
+                            ("> 20 min", search::SearchDurationFilter::Long),
+                        ] {
+                            let selected = self.feed.search_filters.duration == dur;
+                            if ui.selectable_label(selected, label).clicked() && !selected {
+                                self.feed.search_filters.duration = dur;
+                                filters_changed = true;
+                            }
+                        }
+
+                        ui.separator();
+                        ui.label(RichText::new("Tipo:").small().strong());
+                        for (label, kind) in [
+                            ("Tudo", search::SearchTypeFilter::All),
+                            ("Vídeos", search::SearchTypeFilter::Videos),
+                            ("Shorts", search::SearchTypeFilter::Shorts),
+                            ("Ao vivo", search::SearchTypeFilter::Live),
+                        ] {
+                            let selected = self.feed.search_filters.kind == kind;
+                            if ui.selectable_label(selected, label).clicked() && !selected {
+                                self.feed.search_filters.kind = kind;
+                                filters_changed = true;
+                            }
+                        }
+
+                        if !self.feed.search_filters.is_default()
+                            && ui.small_button("Limpar filtros").clicked()
+                        {
+                            self.feed.search_filters = search::SearchFilters::default();
+                            filters_changed = true;
+                        }
+                    });
+                });
+        }
+        ui.add_space(6.0);
+
+        if let Some(term) = trigger_search_query {
+            self.feed.query = term.clone();
+            self.record_recent_search(&term);
+            self.start_search(ctx);
+        } else if filters_changed && !self.feed.query.trim().is_empty() {
+            self.start_search(ctx);
+        }
+
         if self.feed.videos.is_empty() {
             ui.add_space(28.0);
             ui.vertical_centered(|ui| {
@@ -10703,112 +12754,75 @@ impl FastTube {
         ctx: &egui::Context,
         palette: &ThemePalette,
     ) {
-        let tab_button = |ui: &mut egui::Ui, label: &str, selected: bool| {
-            let response = ui.add(
-                egui::Button::new(RichText::new(label).size(12.5).strong().color(if selected {
-                    palette.header_button_fg
-                } else {
-                    palette.neutral_status_fg
-                }))
-                .fill(Color32::TRANSPARENT)
-                .frame(false)
-                .min_size(egui::vec2(0.0, 34.0)),
-            );
-            if selected {
-                let y = response.rect.bottom() - 1.0;
-                ui.painter().line_segment(
-                    [
-                        egui::pos2(response.rect.left() + 8.0, y),
-                        egui::pos2(response.rect.right() - 8.0, y),
-                    ],
-                    egui::Stroke::new(2.0, Color32::from_rgb(255, 0, 51)),
-                );
-            }
-            response
-        };
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(2.0, 4.0);
-            if tab_button(
-                ui,
-                "Em seguida",
-                self.watch.extras.tab == watch_extras::Tab::Results,
-            )
-            .clicked()
-            {
-                self.watch.extras.tab = watch_extras::Tab::Results;
-            }
-            if tab_button(
-                ui,
-                "Coment\u{00e1}rios",
-                self.watch.extras.tab == watch_extras::Tab::Comments,
-            )
-            .clicked()
-            {
-                self.watch.extras.tab = watch_extras::Tab::Comments;
-                if !self.watch.extras.comments_loaded {
-                    self.watch
-                        .extras
-                        .start_comments(self.auth.session.as_ref(), false, ctx);
-                }
-            }
-            if tab_button(
-                ui,
-                "Legendas",
-                self.watch.extras.tab == watch_extras::Tab::Subtitles,
-            )
-            .clicked()
-            {
-                self.watch.extras.tab = watch_extras::Tab::Subtitles;
-                if !self.watch.extras.subtitles_loaded {
-                    self.watch.extras.start_subtitles(ctx);
-                }
-            }
-            if tab_button(
-                ui,
-                "Marcadores",
-                self.watch.extras.tab == watch_extras::Tab::Markers,
-            )
-            .clicked()
-            {
-                self.watch.extras.tab = watch_extras::Tab::Markers;
-            }
-        });
-    }
-
-    fn watch_sidebar_markers_ui(&self, ui: &mut egui::Ui) {
-        let id = self
+        let current_channel = self
             .selected
             .as_ref()
-            .and_then(|v| history::youtube_video_id(&v.url));
-        if let Some(id) = id {
-            let marks: Vec<_> = self
-                .library
-                .data
-                .bookmarks
-                .iter()
-                .filter(|m| m.video_id == id)
-                .cloned()
-                .collect();
-            if marks.is_empty() {
-                ui.label("Nenhum marcador para este vídeo.");
-            }
-            for mark in marks {
-                if ui
-                    .link(format!(
-                        "{} — {}",
-                        format_time(mark.time_ms as f64 / 1000.0),
-                        mark.note
-                    ))
-                    .clicked()
-                {
-                    #[cfg(windows)]
-                    if let Some(player) = &self.player {
-                        let _ = player.seek(mark.time_ms as f64 / 1000.0, "absolute");
+            .map(|v| v.channel.trim())
+            .filter(|ch| !ch.is_empty())
+            .map(|ch| format!("De {}", truncate_text_chars(ch, 20)))
+            .unwrap_or_else(|| "Deste canal".to_owned());
+
+        let tabs = [
+            ("Todos".to_owned(), watch_extras::SidebarTab::All),
+            (current_channel, watch_extras::SidebarTab::FromChannel),
+            ("Relacionados".to_owned(), watch_extras::SidebarTab::Related),
+            (
+                "Para voc\u{00ea}".to_owned(),
+                watch_extras::SidebarTab::ForYou,
+            ),
+        ];
+
+        let mut clicked_tab = None;
+        egui::ScrollArea::horizontal()
+            .id_salt("watch_sidebar_filter_chips")
+            .auto_shrink([false, true])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+                    for (label, tab) in &tabs {
+                        let is_selected =
+                            self.watch.extras.sidebar_tab == *tab && !self.channels.view_open;
+                        let (bg, fg) = if is_selected {
+                            (palette.active_button_bg, palette.active_button_fg)
+                        } else {
+                            (palette.header_button_bg, palette.header_button_fg)
+                        };
+                        let text = if is_selected {
+                            RichText::new(label).size(13.0).strong().color(fg)
+                        } else {
+                            RichText::new(label).size(13.0).color(fg)
+                        };
+                        let btn = egui::Button::new(text).fill(bg).corner_radius(8);
+                        if ui
+                            .add_sized([0.0, 32.0], btn)
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            clicked_tab = Some(*tab);
+                        }
                     }
+                });
+            });
+
+        if let Some(tab) = clicked_tab {
+            self.channels.view_open = false;
+            self.watch.extras.sidebar_tab = tab;
+            self.watch.extras.tab = watch_extras::Tab::Results;
+            if matches!(tab, watch_extras::SidebarTab::FromChannel)
+                && let Some(video) = self.selected.clone()
+                && !video.channel.trim().is_empty()
+            {
+                let ch_key = recommendations::normalize_channel_key(&video.channel);
+                let has_channel_videos = self.feed.videos.iter().any(|v| {
+                    v.url != video.url
+                        && recommendations::normalize_channel_key(&v.channel) == ch_key
+                });
+                if !has_channel_videos && self.feed.search.rx.is_none() {
+                    self.feed.query = video.channel.clone();
+                    self.start_search(ctx);
                 }
             }
-        } else {
-            ui.label("Marcadores disponíveis para vídeos do YouTube.");
         }
     }
 
@@ -10837,9 +12851,16 @@ impl FastTube {
         ctx: &egui::Context,
         scroll_id: &str,
     ) -> Option<Video> {
-        ui.label(RichText::new("Em seguida").size(16.0).strong());
-        ui.add_space(6.0);
-        if self.feed.videos.is_empty() {
+        let mut candidate_videos = self.feed.videos.clone();
+        if let Some(page) = &self.channels.page {
+            for ch_item in &page.videos {
+                if !candidate_videos.iter().any(|v| v.url == ch_item.video.url) {
+                    candidate_videos.push(ch_item.video.clone());
+                }
+            }
+        }
+
+        if candidate_videos.is_empty() {
             let text = if self.feed.search.rx.is_some() {
                 "Pesquisando v\u{00ed}deos..."
             } else {
@@ -10858,7 +12879,47 @@ impl FastTube {
             }
             return None;
         }
-        self.results_feed_ui(ui, ctx, scroll_id, true, None)
+
+        let current_video = self.selected.clone();
+        let current_meta = current_video
+            .as_ref()
+            .and_then(|v| self.metadata_for(&v.url).cloned());
+        let profile =
+            UserProfile::build(&self.history.data, &self.queue.data, current_video.as_ref());
+        let scored = RecommendationEngine::rank_sidebar_videos(
+            &candidate_videos,
+            &self.video_metadata,
+            &profile,
+            current_video.as_ref(),
+            current_meta.as_ref(),
+            self.watch.extras.sidebar_tab,
+        );
+        let display_videos: Vec<Video> = if scored.is_empty() {
+            candidate_videos
+        } else {
+            scored.into_iter().map(|s| s.video).collect()
+        };
+
+        let mut chosen = None;
+        self.thumbnails.begin_pass();
+        let target_width = ui.available_width();
+        for (index, video) in display_videos.iter().enumerate() {
+            ui.push_id((scroll_id, index), |ui| {
+                ui.scope(|ui| {
+                    ui.set_max_width(target_width);
+                    if self.watch_recommendation_card_ui(ui, ctx, video, true) {
+                        if self.feed.home.playlist_urls.contains(&video.url) {
+                            self.start_browser_feed(video.url.clone(), false, ctx);
+                        } else {
+                            chosen = Some(video.clone());
+                        }
+                    }
+                });
+            });
+            ui.add_space(8.0);
+        }
+        self.thumbnails.end_pass(ctx);
+        chosen
     }
 
     fn watch_sidebar_results_ui(
@@ -10871,19 +12932,7 @@ impl FastTube {
         self.ensure_history_synchronized();
         let palette = self.palette();
         self.watch_sidebar_tabs_ui(ui, ctx, &palette);
-        ui.add_space(6.0);
-        if self.watch.extras.tab == watch_extras::Tab::Comments {
-            self.comments_ui(ui, ctx, scroll_id);
-            return None;
-        }
-        if self.watch.extras.tab == watch_extras::Tab::Subtitles {
-            self.subtitles_ui(ui, ctx, scroll_id);
-            return None;
-        }
-        if self.watch.extras.tab == watch_extras::Tab::Markers {
-            self.watch_sidebar_markers_ui(ui);
-            return None;
-        }
+        ui.add_space(10.0);
         self.watch_sidebar_queue_section_ui(ui, scroll_id);
         if self.channels.view_open {
             return self.channel_section_ui(ui, ctx, &format!("{scroll_id}_channel"), true, None);
@@ -10891,191 +12940,1232 @@ impl FastTube {
         self.watch_sidebar_feed_ui(ui, ctx, scroll_id)
     }
 
+    fn paint_avatar_or_initials(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        avatar_url: Option<&str>,
+        fallback_name: &str,
+        diameter: f32,
+        clickable_cursor: bool,
+    ) -> egui::Response {
+        let sense = if clickable_cursor {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        };
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(diameter, diameter), sense);
+        let painted_image = avatar_url
+            .map(str::trim)
+            .filter(|uri| !uri.is_empty())
+            .is_some_and(|uri| self.avatars.try_paint_circle(ui, ctx, rect, uri));
+        if !painted_image {
+            let label = if fallback_name.trim().is_empty() {
+                "YT"
+            } else {
+                fallback_name
+            };
+            let [r, g, b] = recommendations::channel_avatar_rgb(label);
+            let initials = recommendations::channel_avatar_initials(label);
+            ui.painter()
+                .circle_filled(rect.center(), diameter * 0.5, Color32::from_rgb(r, g, b));
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                initials,
+                egui::FontId::proportional((diameter * 0.39).clamp(10.0, 16.0)),
+                Color32::WHITE,
+            );
+        }
+        if clickable_cursor {
+            response.on_hover_cursor(egui::CursorIcon::PointingHand)
+        } else {
+            response
+        }
+    }
+
+    fn insert_emoji_into_draft(
+        ctx: &egui::Context,
+        input_id: egui::Id,
+        draft: &mut String,
+        emoji: &str,
+    ) {
+        let char_pos: usize = egui::TextEdit::load_state(ctx, input_id)
+            .and_then(|state| state.cursor.char_range())
+            .map(|range| usize::from(range.primary.index))
+            .unwrap_or_else(|| draft.chars().count());
+        let byte_idx = draft
+            .char_indices()
+            .nth(char_pos)
+            .map(|(idx, _)| idx)
+            .unwrap_or(draft.len());
+        draft.insert_str(byte_idx, emoji);
+        let new_char_pos = char_pos + emoji.chars().count();
+        if let Some(mut state) = egui::TextEdit::load_state(ctx, input_id) {
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::one(
+                    egui::text::CCursor::new(new_char_pos),
+                )));
+            state.store(ctx, input_id);
+        }
+        ctx.memory_mut(|mem| mem.request_focus(input_id));
+    }
+
+    fn comment_emoji_picker_ui(
+        ui: &mut egui::Ui,
+        palette: &ThemePalette,
+        id_salt: impl std::hash::Hash + std::fmt::Debug,
+    ) -> Option<&'static str> {
+        const EMOJIS: &[&str] = &[
+            "\u{1f600}",
+            "\u{1f602}",
+            "\u{1f923}",
+            "\u{1f60a}",
+            "\u{1f60d}",
+            "\u{1f970}",
+            "\u{1f914}",
+            "\u{1f62e}",
+            "\u{1f622}",
+            "\u{1f62d}",
+            "\u{1f621}",
+            "\u{1f525}",
+            "\u{2764}\u{fe0f}",
+            "\u{1f44d}",
+            "\u{1f44e}",
+            "\u{1f44f}",
+            "\u{1f64c}",
+            "\u{1f389}",
+            "\u{1f4af}",
+            "\u{2728}",
+            "\u{1f440}",
+            "\u{1f64f}",
+            "\u{1f680}",
+            "\u{26a1}",
+        ];
+        let mut chosen = None;
+        ui.push_id(id_salt, |ui| {
+            egui::Frame::new()
+                .fill(palette.card_alt_bg)
+                .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+                .corner_radius(10)
+                .inner_margin(egui::Margin::symmetric(8, 6))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                        for &emoji in EMOJIS {
+                            let btn = egui::Button::new(RichText::new(emoji).size(16.0))
+                                .fill(Color32::TRANSPARENT)
+                                .frame(false)
+                                .min_size(egui::vec2(28.0, 28.0));
+                            if ui
+                                .add(btn)
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                chosen = Some(emoji);
+                            }
+                        }
+                    });
+                });
+        });
+        chosen
+    }
+
+    fn comment_item_body_and_actions_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        comment: &oauth::Comment,
+        parent_comment_id: Option<&str>,
+        text_size: f32,
+        can_reply: bool,
+    ) {
+        let palette = self.palette();
+        let translation = self.watch.extras.comment_translations.get(&comment.id);
+        let showing_translated = translation.is_some_and(|t| t.showing_translated);
+        let translation_loading = translation.is_some_and(|t| t.loading);
+        let translation_error = translation.and_then(|t| t.error.clone());
+        let displayed_text = if showing_translated {
+            translation
+                .and_then(|t| t.translated_text.as_deref())
+                .unwrap_or(&comment.text)
+                .to_owned()
+        } else {
+            comment.text.clone()
+        };
+
+        self.render_text_with_timestamps_ui(ui, &displayed_text, palette.channel_fg, text_size);
+
+        let translate_label = if translation_loading {
+            "Traduzindo..."
+        } else if showing_translated {
+            "Ver original"
+        } else {
+            "Traduzir para o portugu\u{00ea}s"
+        };
+        let translate_btn = egui::Button::new(RichText::new(translate_label).size(12.0).color(
+            if showing_translated {
+                palette.info_accent_fg
+            } else {
+                palette.neutral_status_fg
+            },
+        ))
+        .fill(Color32::TRANSPARENT)
+        .frame(false);
+        if ui
+            .add_enabled(!translation_loading, translate_btn)
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            self.watch
+                .extras
+                .toggle_comment_translation(&comment.id, &comment.text, ctx);
+        }
+        if let Some(error) = translation_error {
+            ui.label(RichText::new(error).size(11.5).color(palette.warning_fg));
+        }
+
+        let rating_busy_any = self.watch.extras.is_rating_any_comment();
+        let rating_busy_here = self.watch.extras.is_rating_comment(&comment.id);
+        let rating_error = self
+            .watch
+            .extras
+            .comment_rating_errors
+            .get(&comment.id)
+            .cloned();
+
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            let rating = self.watch.extras.comment_ratings.get(&comment.id).copied();
+            let liked = rating == Some(watch_extras::CommentRating::Like);
+            let disliked = rating == Some(watch_extras::CommentRating::Dislike);
+            let displayed_likes = self
+                .watch
+                .extras
+                .comment_displayed_likes(&comment.id, comment.likes);
+            let like_color = if liked {
+                palette.info_accent_fg
+            } else {
+                palette.neutral_status_fg
+            };
+            let like_icon = Icon::ThumbsUp.image(like_color, 15.0);
+            let like_btn = if displayed_likes > 0 {
+                let compact = recommendations::format_youtube_compact_views(displayed_likes)
+                    .trim_end_matches(" visualiza\u{00e7}\u{00f5}es")
+                    .trim_end_matches(" visualiza\u{00e7}\u{00e3}o")
+                    .to_owned();
+                egui::Button::image_and_text(
+                    like_icon,
+                    RichText::new(compact).size(12.5).color(like_color),
+                )
+            } else {
+                egui::Button::image(like_icon)
+            }
+            .fill(Color32::TRANSPARENT)
+            .frame(false);
+            if ui
+                .add_enabled(!rating_busy_any, like_btn)
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Gostei")
+                .clicked()
+            {
+                self.watch.extras.start_comment_rating(
+                    &comment.id,
+                    parent_comment_id,
+                    watch_extras::CommentRating::Like,
+                    self.auth.youtube_web_session.as_ref(),
+                    ctx,
+                );
+            }
+
+            let dislike_color = if disliked {
+                palette.info_accent_fg
+            } else {
+                palette.neutral_status_fg
+            };
+            let dislike_btn = egui::Button::image(Icon::ThumbsDown.image(dislike_color, 15.0))
+                .fill(Color32::TRANSPARENT)
+                .frame(false);
+            if ui
+                .add_enabled(!rating_busy_any, dislike_btn)
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("N\u{00e3}o gostei")
+                .clicked()
+            {
+                self.watch.extras.start_comment_rating(
+                    &comment.id,
+                    parent_comment_id,
+                    watch_extras::CommentRating::Dislike,
+                    self.auth.youtube_web_session.as_ref(),
+                    ctx,
+                );
+            }
+
+            if rating_busy_here {
+                ui.spinner();
+            }
+
+            if can_reply {
+                let reply_btn = egui::Button::new(
+                    RichText::new("Responder")
+                        .size(12.0)
+                        .strong()
+                        .color(palette.header_button_fg),
+                )
+                .fill(Color32::TRANSPARENT)
+                .frame(false);
+                if ui
+                    .add(reply_btn)
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    let entry = self
+                        .watch
+                        .extras
+                        .comment_replies
+                        .entry(comment.id.clone())
+                        .or_default();
+                    entry.reply_open = !entry.reply_open;
+                    entry.reply_post_error = None;
+                    if !entry.reply_open
+                        && self.watch.extras.reply_emoji_picker_for.as_deref()
+                            == Some(comment.id.as_str())
+                    {
+                        self.watch.extras.reply_emoji_picker_for = None;
+                    }
+                }
+            }
+        });
+        if let Some(error) = rating_error {
+            ui.label(RichText::new(error).size(11.5).color(palette.warning_fg));
+        }
+    }
+
     fn comments_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, scroll_id: &str) {
+        let palette = self.palette();
+        if self.auth.authenticated
+            && self.auth.my_channel_avatar_url.is_none()
+            && self.auth.my_channel_rx.is_none()
+            && !self.auth.my_channel_fetch_attempted
+        {
+            self.start_fetch_my_channel(false, ctx);
+        }
+        if !cfg!(test)
+            && self.watch.extras.comments_loaded
+            && !self.watch.extras.comments.is_empty()
+            && !self.watch.extras.comment_state_sync_started
+            && (self.auth.youtube_web_session.is_some()
+                || (!self.auth.youtube_web_session_checked && session::has_saved_profile()))
+        {
+            self.watch
+                .extras
+                .start_comment_state_sync(self.auth.youtube_web_session.as_ref(), ctx);
+        }
+
         let needs_reauth = self
             .auth
             .session
             .as_ref()
             .is_some_and(|s| !s.has_comment_scope());
-        ui.horizontal(|ui| {
-            ui.heading("Coment\u{00e1}rios");
+        let can_write_comments = self
+            .auth
+            .session
+            .as_ref()
+            .is_some_and(oauth::TokenSession::has_comment_scope);
+
+        let displayed_total = self
+            .watch
+            .extras
+            .comments_total
+            .unwrap_or(self.watch.extras.comments.len() as u64)
+            .max(self.watch.extras.comments.len() as u64);
+        let count_text = if displayed_total == 1 {
+            "1 coment\u{00e1}rio".to_owned()
+        } else {
+            format!("{displayed_total} coment\u{00e1}rios")
+        };
+
+        let mut new_order = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(24.0, 8.0);
+            ui.label(
+                RichText::new(count_text)
+                    .size(20.0)
+                    .strong()
+                    .color(palette.header_button_fg),
+            );
+
+            let sort_btn = egui::Button::new(
+                RichText::new("\u{2261}  Ordenar por")
+                    .size(14.0)
+                    .strong()
+                    .color(palette.header_button_fg),
+            )
+            .fill(Color32::TRANSPARENT)
+            .frame(false);
             if ui
-                .add_enabled(
-                    self.watch.extras.comments_loading.is_none(),
-                    egui::Button::new("\u{21bb} Atualizar"),
-                )
+                .add_enabled(self.watch.extras.comments_loading.is_none(), sort_btn)
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Escolher ordena\u{00e7}\u{00e3}o dos coment\u{00e1}rios")
                 .clicked()
+            {
+                self.watch.extras.comments_order_menu_open =
+                    !self.watch.extras.comments_order_menu_open;
+            }
+
+            if !self.watch.extras.comments_loaded
+                && self.watch.extras.comments_loading.is_none()
+                && !needs_reauth
+            {
+                let load_btn = egui::Button::new(
+                    RichText::new("Carregar coment\u{00e1}rios")
+                        .size(12.5)
+                        .color(palette.header_button_fg),
+                )
+                .fill(palette.card_alt_bg)
+                .corner_radius(14);
+                if ui
+                    .add(load_btn)
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    self.watch
+                        .extras
+                        .start_comments(self.auth.session.as_ref(), false, ctx);
+                }
+            } else if self.watch.extras.comments_loaded
+                && ui
+                    .add_enabled(
+                        self.watch.extras.comments_loading.is_none(),
+                        egui::Button::new(
+                            RichText::new("\u{21bb}")
+                                .size(14.0)
+                                .color(palette.neutral_status_fg),
+                        )
+                        .frame(false),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Atualizar coment\u{00e1}rios")
+                    .clicked()
             {
                 self.watch
                     .extras
                     .start_comments(self.auth.session.as_ref(), false, ctx);
             }
         });
-        ui.label(
-            RichText::new(format!(
-                "{} de 100 coment\u{00e1}rios \u{2022} somente leitura",
-                self.watch.extras.comments.len()
-            ))
-            .small()
-            .weak(),
-        );
+
+        if self.watch.extras.comments_order_menu_open {
+            ui.add_space(6.0);
+            egui::Frame::new()
+                .fill(Color32::from_rgb(40, 40, 40))
+                .corner_radius(12)
+                .inner_margin(egui::Margin::symmetric(0, 8))
+                .stroke(egui::Stroke::new(1.0, Color32::from_rgb(62, 62, 62)))
+                .show(ui, |ui| {
+                    ui.set_max_width(340.0);
+                    for (title, subtitle, order) in [
+                        (
+                            "Principais",
+                            "Mostrar coment\u{00e1}rios em destaque",
+                            oauth::CommentOrder::Relevance,
+                        ),
+                        (
+                            "Mais recentes",
+                            "Mostrar coment\u{00e1}rios recentes, incluindo spam em potencial",
+                            oauth::CommentOrder::Time,
+                        ),
+                    ] {
+                        let selected = self.watch.extras.comments_order == order;
+                        let item_fill = if selected {
+                            Color32::from_rgb(68, 68, 68)
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        let resp = egui::Frame::new()
+                            .fill(item_fill)
+                            .inner_margin(egui::Margin::symmetric(16, 10))
+                            .show(ui, |ui| {
+                                ui.set_min_width(308.0);
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 2.0;
+                                    ui.label(
+                                        RichText::new(title)
+                                            .size(14.0)
+                                            .strong()
+                                            .color(Color32::from_rgb(241, 241, 241)),
+                                    );
+                                    ui.label(
+                                        RichText::new(subtitle)
+                                            .size(12.0)
+                                            .color(Color32::from_rgb(170, 170, 170)),
+                                    );
+                                });
+                            })
+                            .response
+                            .interact(egui::Sense::click())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if resp.clicked() {
+                            new_order = Some(order);
+                            self.watch.extras.comments_order_menu_open = false;
+                        }
+                    }
+                });
+        }
+
+        if let Some(order) = new_order {
+            self.watch
+                .extras
+                .set_comments_order(order, self.auth.session.as_ref(), ctx);
+        }
+
+        ui.add_space(12.0);
+
         if needs_reauth {
             if self.auth.reauth_rx.is_some() {
-                ui.spinner();
-                ui.label("Aguardando autoriza\u{00e7}\u{00e3}o no navegador...");
-                if ui.button("Cancelar").clicked() {
-                    self.cancel_reauth();
-                }
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Aguardando autoriza\u{00e7}\u{00e3}o no navegador...");
+                    if ui.button("Cancelar").clicked() {
+                        self.cancel_reauth();
+                    }
+                });
             } else if ui.button("Autorizar coment\u{00e1}rios").clicked() {
                 self.start_reauth(ctx);
             }
+        } else if can_write_comments {
+            let mut post_comment = false;
+            let user_avatar_url = self.auth.my_channel_avatar_url.clone();
+            let user_name = self
+                .auth
+                .my_channel_title
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| match &self.auth.my_channel {
+                    Some(ChannelTarget::Handle(h)) => h.trim_start_matches('@').to_owned(),
+                    Some(ChannelTarget::ChannelId(id)) => id.clone(),
+                    None => "Voc\u{00ea}".to_owned(),
+                });
+            let composer_id = ui.make_persistent_id((scroll_id, "comment_composer_input"));
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 14.0;
+                let _ = self.paint_avatar_or_initials(
+                    ui,
+                    ctx,
+                    user_avatar_url.as_deref(),
+                    &user_name,
+                    40.0,
+                    false,
+                );
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let has_draft = !self.watch.extras.comment_draft.trim().is_empty();
+                    let resp = ui.add(
+                        egui::TextEdit::multiline(&mut self.watch.extras.comment_draft)
+                            .id(composer_id)
+                            .desired_rows(1)
+                            .desired_width(f32::INFINITY)
+                            .frame(egui::Frame::NONE)
+                            .hint_text(
+                                RichText::new("Adicione um coment\u{00e1}rio...")
+                                    .size(14.0)
+                                    .color(palette.neutral_status_fg),
+                            ),
+                    );
+                    if resp.gained_focus() || resp.clicked() || has_draft {
+                        self.watch.extras.comment_composer_active = true;
+                    }
+                    let line_y = resp.rect.bottom() + 4.0;
+                    let line_stroke = if resp.has_focus() {
+                        egui::Stroke::new(2.0, palette.header_button_fg)
+                    } else {
+                        egui::Stroke::new(1.0, palette.neutral_status_fg.gamma_multiply(0.5))
+                    };
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(resp.rect.left(), line_y),
+                            egui::pos2(ui.max_rect().right(), line_y),
+                        ],
+                        line_stroke,
+                    );
+                    ui.add_space(10.0);
+
+                    let sending = self.watch.extras.is_posting_comment();
+                    let ready = !sending && has_draft;
+                    let ctrl_enter = resp.has_focus()
+                        && ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter));
+                    if ctrl_enter && ready {
+                        post_comment = true;
+                    }
+
+                    if self.watch.extras.comment_composer_active
+                        || has_draft
+                        || self.watch.extras.comment_emoji_picker_open
+                    {
+                        ui.horizontal(|ui| {
+                            let emoji_btn =
+                                egui::Button::image(Icon::Smile.image(palette.icon_fg, 19.0))
+                                    .fill(if self.watch.extras.comment_emoji_picker_open {
+                                        palette.card_alt_bg
+                                    } else {
+                                        Color32::TRANSPARENT
+                                    })
+                                    .frame(false)
+                                    .corner_radius(16)
+                                    .min_size(egui::vec2(32.0, 32.0));
+                            if ui
+                                .add(emoji_btn)
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text("Inserir emoji")
+                                .clicked()
+                            {
+                                self.watch.extras.comment_emoji_picker_open =
+                                    !self.watch.extras.comment_emoji_picker_open;
+                                if self.watch.extras.comment_emoji_picker_open {
+                                    self.watch.extras.reply_emoji_picker_for = None;
+                                }
+                            }
+
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.spacing_mut().item_spacing.x = 8.0;
+                                    let comentar_btn = egui::Button::new(
+                                        RichText::new("Comentar").size(13.0).strong().color(
+                                            if ready {
+                                                palette.active_button_fg
+                                            } else {
+                                                palette.neutral_status_fg
+                                            },
+                                        ),
+                                    )
+                                    .fill(if ready {
+                                        palette.active_button_bg
+                                    } else {
+                                        palette.header_button_bg
+                                    })
+                                    .corner_radius(18)
+                                    .min_size(egui::vec2(92.0, 34.0));
+                                    if ui
+                                        .add_enabled(ready, comentar_btn)
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .clicked()
+                                    {
+                                        post_comment = true;
+                                    }
+
+                                    let cancel_btn = egui::Button::new(
+                                        RichText::new("Cancelar")
+                                            .size(13.0)
+                                            .strong()
+                                            .color(palette.header_button_fg),
+                                    )
+                                    .fill(Color32::TRANSPARENT)
+                                    .frame(false)
+                                    .corner_radius(18)
+                                    .min_size(egui::vec2(74.0, 34.0));
+                                    if ui
+                                        .add(cancel_btn)
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .clicked()
+                                    {
+                                        self.watch.extras.comment_draft.clear();
+                                        self.watch.extras.comment_composer_active = false;
+                                        self.watch.extras.comment_emoji_picker_open = false;
+                                        self.watch.extras.comment_post_error = None;
+                                        resp.surrender_focus();
+                                    }
+                                },
+                            );
+                        });
+
+                        if self.watch.extras.comment_emoji_picker_open {
+                            ui.add_space(8.0);
+                            if let Some(emoji) = Self::comment_emoji_picker_ui(
+                                ui,
+                                &palette,
+                                (scroll_id, "comment_emoji_picker"),
+                            ) {
+                                Self::insert_emoji_into_draft(
+                                    ctx,
+                                    composer_id,
+                                    &mut self.watch.extras.comment_draft,
+                                    emoji,
+                                );
+                                self.watch.extras.comment_composer_active = true;
+                            }
+                        }
+                    }
+                });
+            });
+            if post_comment {
+                self.watch
+                    .extras
+                    .start_post_comment(self.auth.session.as_ref(), ctx);
+            }
+            if let Some(error) = &self.watch.extras.comment_post_error {
+                ui.add_space(4.0);
+                ui.colored_label(palette.warning_fg, error);
+            }
+        } else if !self.auth.authenticated {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 14.0;
+                let _ = self.paint_avatar_or_initials(ui, ctx, None, "FT", 40.0, false);
+                ui.vertical(|ui| {
+                    let row = ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Adicione um coment\u{00e1}rio...")
+                                .size(13.5)
+                                .color(palette.neutral_status_fg),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let enter_btn = egui::Button::new(
+                                RichText::new("Entrar")
+                                    .size(12.5)
+                                    .strong()
+                                    .color(palette.header_button_fg),
+                            )
+                            .fill(palette.header_button_bg)
+                            .corner_radius(16);
+                            if ui
+                                .add(enter_btn)
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                self.start_reauth(ctx);
+                            }
+                        });
+                    });
+                    let line_y = row.response.rect.bottom() + 2.0;
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(row.response.rect.left(), line_y),
+                            egui::pos2(row.response.rect.right(), line_y),
+                        ],
+                        egui::Stroke::new(1.0, palette.neutral_status_fg.gamma_multiply(0.5)),
+                    );
+                });
+            });
         }
-        if self.watch.extras.comments_loading.is_some() {
-            ui.spinner();
-        }
+
+        ui.add_space(14.0);
+
         if let Some(error) = &self.watch.extras.comments_error {
-            ui.label(error);
+            ui.colored_label(palette.warning_fg, error);
         }
         if self.watch.extras.comments_loaded
             && self.watch.extras.comments.is_empty()
             && self.watch.extras.comments_error.is_none()
         {
-            ui.label("Nenhum comentário disponível.");
+            ui.label(
+                RichText::new("Nenhum coment\u{00e1}rio dispon\u{00ed}vel.")
+                    .color(palette.neutral_status_fg),
+            );
         }
-        egui::ScrollArea::vertical()
-            .id_salt(format!("{scroll_id}_comments"))
-            .show(ui, |ui| {
-                let comments = self.watch.extras.comments.clone();
-                for comment in &comments {
-                    ui.separator();
-                    ui.label(RichText::new(&comment.author).strong());
-                    ui.label(&comment.text);
-                    ui.label(
-                        RichText::new(format!(
-                            "{}  •  {} curtidas  •  {} respostas",
-                            comment.published, comment.likes, comment.replies
-                        ))
-                        .small()
-                        .weak(),
+
+        let render_comments_body = |this: &mut Self, ui: &mut egui::Ui| {
+            let comments = this.watch.extras.comments.clone();
+            for comment in &comments {
+                ui.add_space(10.0);
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    let avatar_name = comment.author.trim_start_matches('@');
+                    let _ = this.paint_avatar_or_initials(
+                        ui,
+                        ctx,
+                        comment.author_avatar.as_deref(),
+                        if avatar_name.is_empty() {
+                            "YT"
+                        } else {
+                            avatar_name
+                        },
+                        36.0,
+                        false,
                     );
-                    if comment.replies > 0 {
-                        let state = self.watch.extras.comment_replies.get(&comment.id);
-                        if state.is_none_or(|state| !state.loaded) {
-                            let loading = state.is_some_and(|state| state.is_loading());
-                            if ui
-                                .add_enabled(
-                                    !loading,
-                                    egui::Button::new(format!(
-                                        "Carregar respostas ({})",
-                                        comment.replies
-                                    )),
-                                )
-                                .clicked()
-                            {
-                                self.watch.extras.start_replies(
-                                    &comment.id,
-                                    false,
-                                    self.auth.session.as_ref(),
-                                    ctx,
+
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 4.0;
+                        ui.set_max_width(ui.available_width().max(80.0));
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let handle = if comment.author.starts_with('@') {
+                                comment.author.clone()
+                            } else {
+                                format!("@{}", comment.author)
+                            };
+                            ui.label(
+                                RichText::new(handle)
+                                    .size(13.0)
+                                    .strong()
+                                    .color(palette.header_button_fg),
+                            );
+                            let rel_time = recommendations::format_youtube_relative_time(
+                                &comment.published,
+                                None,
+                            )
+                            .unwrap_or_else(|| comment.published.clone());
+                            if !rel_time.is_empty() {
+                                ui.label(
+                                    RichText::new(rel_time)
+                                        .size(12.0)
+                                        .color(palette.neutral_status_fg),
                                 );
                             }
-                        }
-                        let (loaded, loading, error, replies, has_next) = self
+                        });
+
+                        this.comment_item_body_and_actions_ui(
+                            ui,
+                            ctx,
+                            comment,
+                            None,
+                            14.0,
+                            can_write_comments,
+                        );
+
+                        if this
                             .watch
                             .extras
                             .comment_replies
                             .get(&comment.id)
-                            .map(|state| {
-                                (
-                                    state.loaded,
-                                    state.is_loading(),
-                                    state.error.clone(),
-                                    state.comments.clone(),
-                                    state.next.is_some(),
-                                )
-                            })
-                            .unwrap_or_default();
-                        if loading {
-                            ui.spinner();
-                        }
-                        if let Some(error) = error {
-                            ui.label(error);
-                            if ui.button("Tentar novamente").clicked() {
-                                let retry_next = self
-                                    .watch
-                                    .extras
-                                    .comment_replies
-                                    .get(&comment.id)
-                                    .is_some_and(
-                                        watch_extras::CommentReplies::retry_uses_next_page,
-                                    );
-                                self.watch.extras.start_replies(
+                            .is_some_and(|state| state.reply_open)
+                        {
+                            let mut post_reply = false;
+                            let mut cancel_reply = false;
+                            let mut toggle_reply_emoji = false;
+                            let mut picked_reply_emoji: Option<&'static str> = None;
+                            let reply_input_id =
+                                ui.make_persistent_id(("reply_composer_input", &comment.id));
+                            let reply_emoji_open =
+                                this.watch.extras.reply_emoji_picker_for.as_deref()
+                                    == Some(comment.id.as_str());
+                            let user_avatar_url = this.auth.my_channel_avatar_url.clone();
+                            let user_name = this
+                                .auth
+                                .my_channel_title
+                                .as_deref()
+                                .filter(|s| !s.trim().is_empty())
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| "Voc\u{00ea}".to_owned());
+
+                            ui.add_space(4.0);
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = 10.0;
+                                let _ = this.paint_avatar_or_initials(
+                                    ui,
+                                    ctx,
+                                    user_avatar_url.as_deref(),
+                                    &user_name,
+                                    26.0,
+                                    false,
+                                );
+                                if let Some(state) =
+                                    this.watch.extras.comment_replies.get_mut(&comment.id)
+                                {
+                                    ui.vertical(|ui| {
+                                        ui.spacing_mut().item_spacing.y = 0.0;
+                                        let resp = ui.add(
+                                            egui::TextEdit::multiline(&mut state.reply_draft)
+                                                .id(reply_input_id)
+                                                .desired_rows(1)
+                                                .desired_width(f32::INFINITY)
+                                                .frame(egui::Frame::NONE)
+                                                .hint_text(
+                                                    RichText::new("Adicione uma resposta...")
+                                                        .size(13.0)
+                                                        .color(palette.neutral_status_fg),
+                                                ),
+                                        );
+                                        let line_y = resp.rect.bottom() + 4.0;
+                                        let line_stroke = if resp.has_focus() {
+                                            egui::Stroke::new(2.0, palette.header_button_fg)
+                                        } else {
+                                            egui::Stroke::new(
+                                                1.0,
+                                                palette.neutral_status_fg.gamma_multiply(0.5),
+                                            )
+                                        };
+                                        ui.painter().line_segment(
+                                            [
+                                                egui::pos2(resp.rect.left(), line_y),
+                                                egui::pos2(ui.max_rect().right(), line_y),
+                                            ],
+                                            line_stroke,
+                                        );
+                                        ui.add_space(8.0);
+
+                                        let sending = state.is_posting_reply();
+                                        let ready =
+                                            !sending && !state.reply_draft.trim().is_empty();
+                                        let ctrl_enter = resp.has_focus()
+                                            && ui.input(|i| {
+                                                i.modifiers.ctrl && i.key_pressed(egui::Key::Enter)
+                                            });
+                                        if ctrl_enter && ready {
+                                            post_reply = true;
+                                        }
+
+                                        ui.horizontal(|ui| {
+                                            let emoji_btn = egui::Button::image(
+                                                Icon::Smile.image(palette.icon_fg, 17.0),
+                                            )
+                                            .fill(if reply_emoji_open {
+                                                palette.card_alt_bg
+                                            } else {
+                                                Color32::TRANSPARENT
+                                            })
+                                            .frame(false)
+                                            .corner_radius(14)
+                                            .min_size(egui::vec2(28.0, 28.0));
+                                            if ui
+                                                .add(emoji_btn)
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                .on_hover_text("Inserir emoji")
+                                                .clicked()
+                                            {
+                                                toggle_reply_emoji = true;
+                                            }
+
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.spacing_mut().item_spacing.x = 8.0;
+                                                    let responder_btn = egui::Button::new(
+                                                        RichText::new("Responder")
+                                                            .size(12.5)
+                                                            .strong()
+                                                            .color(if ready {
+                                                                palette.active_button_fg
+                                                            } else {
+                                                                palette.neutral_status_fg
+                                                            }),
+                                                    )
+                                                    .fill(if ready {
+                                                        palette.active_button_bg
+                                                    } else {
+                                                        palette.header_button_bg
+                                                    })
+                                                    .corner_radius(16)
+                                                    .min_size(egui::vec2(88.0, 30.0));
+                                                    if ui
+                                                        .add_enabled(ready, responder_btn)
+                                                        .on_hover_cursor(
+                                                            egui::CursorIcon::PointingHand,
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        post_reply = true;
+                                                    }
+
+                                                    let cancel_btn = egui::Button::new(
+                                                        RichText::new("Cancelar")
+                                                            .size(12.5)
+                                                            .strong()
+                                                            .color(palette.header_button_fg),
+                                                    )
+                                                    .fill(Color32::TRANSPARENT)
+                                                    .frame(false)
+                                                    .corner_radius(16)
+                                                    .min_size(egui::vec2(68.0, 30.0));
+                                                    if ui
+                                                        .add(cancel_btn)
+                                                        .on_hover_cursor(
+                                                            egui::CursorIcon::PointingHand,
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        cancel_reply = true;
+                                                        resp.surrender_focus();
+                                                    }
+                                                },
+                                            );
+                                        });
+
+                                        if reply_emoji_open {
+                                            ui.add_space(6.0);
+                                            picked_reply_emoji = Self::comment_emoji_picker_ui(
+                                                ui,
+                                                &palette,
+                                                ("reply_emoji_picker", &comment.id),
+                                            );
+                                        }
+                                        if state.is_posting_reply() {
+                                            ui.spinner();
+                                        }
+                                        if let Some(err) = &state.reply_post_error {
+                                            ui.colored_label(palette.warning_fg, err);
+                                        }
+                                    });
+                                }
+                            });
+
+                            if toggle_reply_emoji {
+                                if reply_emoji_open {
+                                    this.watch.extras.reply_emoji_picker_for = None;
+                                } else {
+                                    this.watch.extras.reply_emoji_picker_for =
+                                        Some(comment.id.clone());
+                                    this.watch.extras.comment_emoji_picker_open = false;
+                                }
+                            }
+                            if let Some(emoji) = picked_reply_emoji
+                                && let Some(state) =
+                                    this.watch.extras.comment_replies.get_mut(&comment.id)
+                            {
+                                Self::insert_emoji_into_draft(
+                                    ctx,
+                                    reply_input_id,
+                                    &mut state.reply_draft,
+                                    emoji,
+                                );
+                            }
+                            if cancel_reply
+                                && let Some(state) =
+                                    this.watch.extras.comment_replies.get_mut(&comment.id)
+                            {
+                                state.reply_open = false;
+                                state.reply_post_error = None;
+                                if this.watch.extras.reply_emoji_picker_for.as_deref()
+                                    == Some(comment.id.as_str())
+                                {
+                                    this.watch.extras.reply_emoji_picker_for = None;
+                                }
+                            } else if post_reply {
+                                if this.watch.extras.reply_emoji_picker_for.as_deref()
+                                    == Some(comment.id.as_str())
+                                {
+                                    this.watch.extras.reply_emoji_picker_for = None;
+                                }
+                                this.watch.extras.start_post_reply(
                                     &comment.id,
-                                    retry_next,
-                                    self.auth.session.as_ref(),
+                                    this.auth.session.as_ref(),
                                     ctx,
                                 );
                             }
                         }
-                        if loaded {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} de 100 respostas carregadas",
-                                    replies.len()
-                                ))
-                                .small()
-                                .weak(),
-                            );
+
+                        let has_local_replies = this
+                            .watch
+                            .extras
+                            .comment_replies
+                            .get(&comment.id)
+                            .is_some_and(|state| !state.comments.is_empty() || state.loaded);
+                        if comment.replies > 0 || has_local_replies {
+                            let state = this.watch.extras.comment_replies.get(&comment.id);
+                            if comment.replies > 0 && state.is_none_or(|state| !state.loaded) {
+                                let loading = state.is_some_and(|state| state.is_loading());
+                                let reply_word = if comment.replies == 1 {
+                                    "1 resposta \u{2304}".to_owned()
+                                } else {
+                                    format!("{} respostas \u{2304}", comment.replies)
+                                };
+                                let btn = egui::Button::new(
+                                    RichText::new(reply_word)
+                                        .size(13.0)
+                                        .strong()
+                                        .color(Color32::from_rgb(62, 166, 255)),
+                                )
+                                .fill(Color32::TRANSPARENT)
+                                .frame(false);
+                                if ui
+                                    .add_enabled(!loading, btn)
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .clicked()
+                                {
+                                    this.watch.extras.start_replies(
+                                        &comment.id,
+                                        false,
+                                        this.auth.session.as_ref(),
+                                        ctx,
+                                    );
+                                }
+                            }
+                            let (loaded, loading, error, replies, has_next) = this
+                                .watch
+                                .extras
+                                .comment_replies
+                                .get(&comment.id)
+                                .map(|state| {
+                                    (
+                                        state.loaded,
+                                        state.is_loading(),
+                                        state.error.clone(),
+                                        state.comments.clone(),
+                                        state.next.is_some(),
+                                    )
+                                })
+                                .unwrap_or_default();
+                            if loading {
+                                ui.spinner();
+                            }
+                            if let Some(error) = error {
+                                ui.colored_label(palette.warning_fg, error);
+                                if ui.button("Tentar novamente").clicked() {
+                                    let retry_next = this
+                                        .watch
+                                        .extras
+                                        .comment_replies
+                                        .get(&comment.id)
+                                        .is_some_and(
+                                            watch_extras::CommentReplies::retry_uses_next_page,
+                                        );
+                                    this.watch.extras.start_replies(
+                                        &comment.id,
+                                        retry_next,
+                                        this.auth.session.as_ref(),
+                                        ctx,
+                                    );
+                                }
+                            }
+                            if loaded && !replies.is_empty() {
+                                for reply in &replies {
+                                    ui.add_space(6.0);
+                                    ui.horizontal_top(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 10.0;
+                                        let r_avatar = reply.author.trim_start_matches('@');
+                                        let _ = this.paint_avatar_or_initials(
+                                            ui,
+                                            ctx,
+                                            reply.author_avatar.as_deref(),
+                                            if r_avatar.is_empty() { "YT" } else { r_avatar },
+                                            26.0,
+                                            false,
+                                        );
+                                        ui.vertical(|ui| {
+                                            ui.spacing_mut().item_spacing.y = 3.0;
+                                            ui.horizontal_wrapped(|ui| {
+                                                let r_handle = if reply.author.starts_with('@') {
+                                                    reply.author.clone()
+                                                } else {
+                                                    format!("@{}", reply.author)
+                                                };
+                                                ui.label(
+                                                    RichText::new(r_handle)
+                                                        .size(12.5)
+                                                        .strong()
+                                                        .color(palette.header_button_fg),
+                                                );
+                                                let r_time =
+                                                    recommendations::format_youtube_relative_time(
+                                                        &reply.published,
+                                                        None,
+                                                    )
+                                                    .unwrap_or_else(|| reply.published.clone());
+                                                if !r_time.is_empty() {
+                                                    ui.label(
+                                                        RichText::new(r_time)
+                                                            .size(11.5)
+                                                            .color(palette.neutral_status_fg),
+                                                    );
+                                                }
+                                            });
+                                            this.comment_item_body_and_actions_ui(
+                                                ui,
+                                                ctx,
+                                                reply,
+                                                Some(&comment.id),
+                                                13.0,
+                                                false,
+                                            );
+                                        });
+                                    });
+                                }
+                            }
+                            if has_next
+                                && ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("Mostrar mais respostas \u{2304}")
+                                                .size(12.5)
+                                                .strong()
+                                                .color(Color32::from_rgb(62, 166, 255)),
+                                        )
+                                        .fill(Color32::TRANSPARENT)
+                                        .frame(false),
+                                    )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .clicked()
+                            {
+                                this.watch.extras.start_replies(
+                                    &comment.id,
+                                    true,
+                                    this.auth.session.as_ref(),
+                                    ctx,
+                                );
+                            }
                         }
-                        for reply in &replies {
-                            ui.indent(&reply.id, |ui| {
-                                ui.label(RichText::new(&reply.author).strong());
-                                ui.label(&reply.text);
-                                ui.label(RichText::new(&reply.published).small().weak());
-                            });
-                        }
-                        if has_next && ui.button("Carregar mais respostas").clicked() {
-                            self.watch.extras.start_replies(
-                                &comment.id,
-                                true,
-                                self.auth.session.as_ref(),
-                                ctx,
-                            );
-                        }
-                    }
-                }
-                if self.watch.extras.comments_next.is_some()
-                    && ui
-                        .add_enabled(
-                            self.watch.extras.comments_loading.is_none(),
-                            egui::Button::new("Carregar mais comentários"),
+                    });
+                });
+                ui.add_space(6.0);
+            }
+
+            if this.watch.extras.comments_loading.is_some()
+                || this.watch.extras.is_posting_comment()
+            {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        RichText::new("Carregando coment\u{00e1}rios...")
+                            .size(12.5)
+                            .color(palette.neutral_status_fg),
+                    );
+                });
+            }
+
+            if this.watch.extras.comments_next.is_some() {
+                ui.add_space(8.0);
+                let (sentinel_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(32.0, 8.0), egui::Sense::hover());
+                let auto_trigger = ui.is_rect_visible(sentinel_rect)
+                    && this.watch.extras.comments_loading.is_none()
+                    && this.watch.extras.comments_error.is_none();
+                let manual_click = ui
+                    .add_enabled(
+                        this.watch.extras.comments_loading.is_none(),
+                        egui::Button::new(
+                            RichText::new("Carregar mais 50 coment\u{00e1}rios")
+                                .size(12.5)
+                                .color(palette.header_button_fg),
                         )
-                        .clicked()
-                {
-                    self.watch
+                        .fill(palette.card_alt_bg)
+                        .corner_radius(16),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked();
+                if auto_trigger || manual_click {
+                    this.watch
                         .extras
-                        .start_comments(self.auth.session.as_ref(), true, ctx);
+                        .start_comments(this.auth.session.as_ref(), true, ctx);
                 }
-            });
+            }
+        };
+
+        if scroll_id == "shorts_comments" {
+            egui::ScrollArea::vertical()
+                .id_salt(format!("{scroll_id}_comments"))
+                .show(ui, |ui| {
+                    render_comments_body(self, ui);
+                });
+        } else {
+            render_comments_body(self, ui);
+        }
     }
 
     fn apply_ready_subtitle(&mut self) {
         #[cfg(windows)]
         if let Some(sub) = self.watch.extras.take_ready_subtitle() {
-            let path = sub.path.to_string_lossy().into_owned();
-            let result = self
-                .player
-                .as_ref()
-                .ok_or("O player não está disponível.".to_owned())
-                .and_then(|player| player.add_subtitle(&path, &sub.label, &sub.language));
-            match result {
-                Ok(()) => {
-                    self.playback.last_subtitle_id = Some(format!("yt:{}", sub.url));
-                    self.watch.extras.active_subtitle_url = Some(sub.url);
-                    self.watch.extras.subtitles_error = None;
-                }
-                Err(error) => {
-                    self.watch.extras.subtitles_error = Some(error);
+            self.playback.last_subtitle_id = Some(format!("yt:{}", sub.url));
+            self.watch.extras.active_subtitle_url = Some(sub.url.clone());
+            self.watch.extras.subtitles_error = None;
+            if let Some(player) = &self.player {
+                if !self.watch.extras.active_subtitle_cues.is_empty() && player.is_render_api() {
+                    let _ = player.disable_subtitles();
+                } else {
+                    let path = sub.path.to_string_lossy().into_owned();
+                    if let Err(error) = player.add_subtitle(&path, &sub.label, &sub.language) {
+                        self.watch.extras.subtitles_error = Some(error);
+                    }
                 }
             }
         }
@@ -11083,6 +14173,7 @@ impl FastTube {
         let _ = self.watch.extras.take_ready_subtitle();
     }
 
+    #[cfg(test)]
     fn subtitles_tracks_list_ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -11094,9 +14185,10 @@ impl FastTube {
             .player
             .as_ref()
             .and_then(|player| player.property("sid"))
-            .is_some_and(|sid| !sid.is_empty() && sid != "no");
+            .is_some_and(|sid| !sid.is_empty() && sid != "no")
+            || self.watch.extras.active_subtitle_url.is_some();
         #[cfg(not(windows))]
-        let has_active_player_subtitle = false;
+        let has_active_player_subtitle = self.watch.extras.active_subtitle_url.is_some();
 
         ui.horizontal(|ui| {
             ui.heading("Legendas");
@@ -11109,19 +14201,15 @@ impl FastTube {
             {
                 self.watch.extras.start_subtitles(ctx);
             }
-            #[cfg(windows)]
-            if has_active_player_subtitle
-                && ui.button("Desativar").clicked()
-                && let Some(player) = &self.player
-            {
-                match player.disable_subtitles() {
-                    Ok(()) => {
-                        self.watch.extras.active_subtitle_url = None;
-                        self.watch.extras.subtitles_error = None;
-                    }
-                    Err(error) => {
-                        self.watch.extras.subtitles_error = Some(error);
-                    }
+            if has_active_player_subtitle && ui.button("Desativar").clicked() {
+                self.watch.extras.active_subtitle_url = None;
+                self.watch.extras.active_subtitle_cues.clear();
+                self.watch.extras.subtitles_error = None;
+                #[cfg(windows)]
+                if let Some(player) = &self.player
+                    && let Err(error) = player.disable_subtitles()
+                {
+                    self.watch.extras.subtitles_error = Some(error);
                 }
             }
         });
@@ -11182,35 +14270,16 @@ impl FastTube {
                 }
             });
         if let Some((track, label)) = chosen {
-            #[cfg(windows)]
-            {
-                let player_ready = self
-                    .playback
-                    .active
-                    .as_ref()
-                    .is_some_and(|active| active.has_live_sample)
-                    || self.player.as_ref().is_some_and(|player| {
-                        player.number("track-list/count").unwrap_or(0.0) > 0.0
-                    });
-                if self.player.is_none() {
-                    self.watch.extras.subtitles_error =
-                        Some("O player não está disponível.".to_owned());
-                } else if !player_ready {
-                    self.watch.extras.subtitles_error =
-                        Some("Aguarde o vídeo carregar antes de ativar legendas.".to_owned());
-                } else {
-                    self.watch.extras.start_apply_subtitle(&track, label, ctx);
-                    self.apply_ready_subtitle();
-                }
-            }
-            #[cfg(not(windows))]
-            let _ = (track, label);
+            self.watch.extras.active_subtitle_url = Some(track.url.clone());
+            self.watch.extras.start_apply_subtitle(&track, label, ctx);
+            self.apply_ready_subtitle();
         }
         if let Some(track) = transcript_track {
             self.watch.extras.start_transcript(&track, ctx);
         }
     }
 
+    #[cfg(test)]
     fn transcript_active_cue_card_ui(
         &self,
         ui: &mut egui::Ui,
@@ -11276,6 +14345,7 @@ impl FastTube {
         seek_to_ms
     }
 
+    #[cfg(test)]
     fn transcript_matches_ui(
         &self,
         ui: &mut egui::Ui,
@@ -11325,6 +14395,7 @@ impl FastTube {
         seek_to_ms
     }
 
+    #[cfg(test)]
     fn transcript_cues_list_ui(
         &self,
         ui: &mut egui::Ui,
@@ -11397,6 +14468,7 @@ impl FastTube {
         seek_to_ms
     }
 
+    #[cfg(test)]
     fn subtitles_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, scroll_id: &str) {
         self.subtitles_tracks_list_ui(ui, ctx, scroll_id);
         ui.separator();
@@ -11456,6 +14528,7 @@ impl FastTube {
         let _ = seek_to_ms;
     }
 
+    #[cfg(test)]
     fn transcript_settings_ui(&mut self, ui: &mut egui::Ui) -> (f32, bool) {
         let mut follow = self.watch.extras.transcript_follow;
         let mut font_size = self.watch.extras.transcript_font_size.clamp(13.0, 24.0);
@@ -12125,10 +15198,13 @@ impl FastTube {
         ui: &mut egui::Ui,
         channel_label: &str,
         channel_target: Option<&ChannelTarget>,
+        subscribed: Option<bool>,
+        sub_pending: bool,
         palette: &ThemePalette,
-    ) -> Option<ChannelTarget> {
+    ) -> (Option<ChannelTarget>, bool) {
         let mut open_channel_target = None;
-        ui.horizontal_top(|ui| {
+        let mut toggle_subscribe = false;
+        ui.horizontal_wrapped(|ui| {
             if paint_channel_avatar(
                 ui,
                 if channel_label.is_empty() {
@@ -12170,19 +15246,128 @@ impl FastTube {
                         .color(palette.neutral_status_fg),
                 );
             });
+            if channel_target.is_some() {
+                let is_sub = subscribed == Some(true);
+                let sub_label = if is_sub {
+                    "✓ Inscrito"
+                } else {
+                    "Inscrever-se"
+                };
+                let sub_btn =
+                    egui::Button::new(RichText::new(sub_label).size(12.5).strong().color(
+                        if is_sub {
+                            palette.header_button_fg
+                        } else {
+                            palette.active_button_fg
+                        },
+                    ))
+                    .fill(if is_sub {
+                        palette.header_button_bg
+                    } else {
+                        palette.active_button_bg
+                    })
+                    .corner_radius(18);
+                if ui
+                    .add_enabled(!sub_pending, sub_btn)
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    toggle_subscribe = true;
+                }
+            }
         });
-        open_channel_target
+        (open_channel_target, toggle_subscribe)
     }
 
     fn shorts_watch_actions_ui(
         &self,
         ui: &mut egui::Ui,
-        saved_for_later: bool,
-        share_recently_copied: bool,
+        details: &ShortsWatchDetails<'_>,
         palette: &ThemePalette,
         actions: &mut ShortsWatchActions,
     ) {
         ui.horizontal_wrapped(|ui| {
+            let like_active = details.current_rating == Some(oauth::VideoRating::Like);
+            let like_btn = egui::Button::new(RichText::new("👍 Gostei").size(12.5).strong().color(
+                if like_active {
+                    palette.active_button_fg
+                } else {
+                    palette.header_button_fg
+                },
+            ))
+            .fill(if like_active {
+                palette.active_button_bg
+            } else {
+                palette.header_button_bg
+            })
+            .corner_radius(18);
+            if ui
+                .add_enabled_ui(
+                    !details.rating_pending && details.video_id.is_some(),
+                    |ui| ui.add_sized([88.0, 36.0], like_btn),
+                )
+                .inner
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
+                actions.rating_to_apply = Some(if like_active {
+                    None
+                } else {
+                    Some(oauth::VideoRating::Like)
+                });
+            }
+
+            let dislike_active = details.current_rating == Some(oauth::VideoRating::Dislike);
+            let dislike_btn =
+                egui::Button::new(RichText::new("👎").size(14.5).color(if dislike_active {
+                    palette.active_button_fg
+                } else {
+                    palette.header_button_fg
+                }))
+                .fill(if dislike_active {
+                    palette.active_button_bg
+                } else {
+                    palette.header_button_bg
+                })
+                .corner_radius(18);
+            if ui
+                .add_enabled_ui(
+                    !details.rating_pending && details.video_id.is_some(),
+                    |ui| ui.add_sized([42.0, 36.0], dislike_btn),
+                )
+                .inner
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
+                actions.rating_to_apply = Some(if dislike_active {
+                    None
+                } else {
+                    Some(oauth::VideoRating::Dislike)
+                });
+            }
+
+            let comments_btn =
+                egui::Button::new(RichText::new("💬 Comentários").size(12.5).strong().color(
+                    if details.comments_open {
+                        palette.active_button_fg
+                    } else {
+                        palette.header_button_fg
+                    },
+                ))
+                .fill(if details.comments_open {
+                    palette.active_button_bg
+                } else {
+                    palette.header_button_bg
+                })
+                .corner_radius(18);
+            if ui
+                .add_sized([122.0, 36.0], comments_btn)
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+            {
+                actions.toggle_comments = true;
+            }
+
             let queue = egui::Button::new(
                 RichText::new("Fila")
                     .size(13.0)
@@ -12191,47 +15376,89 @@ impl FastTube {
             )
             .fill(palette.header_button_bg)
             .corner_radius(18);
-            if ui.add_sized([70.0, 36.0], queue).clicked() {
+            if ui.add_sized([64.0, 36.0], queue).clicked() {
                 actions.enqueue_video = true;
             }
-            let share_label = if share_recently_copied {
+            let share_label = if details.share_recently_copied {
                 "✓ Copiado"
             } else {
                 "Compartilhar"
             };
             let share = egui::Button::new(RichText::new(share_label).size(13.0).strong().color(
-                if share_recently_copied {
+                if details.share_recently_copied {
                     palette.active_button_fg
                 } else {
                     palette.header_button_fg
                 },
             ))
-            .fill(if share_recently_copied {
+            .fill(if details.share_recently_copied {
                 palette.active_button_bg
             } else {
                 palette.header_button_bg
             })
             .corner_radius(18);
-            if ui.add_sized([116.0, 36.0], share).clicked() {
+            if ui.add_sized([114.0, 36.0], share).clicked() {
                 actions.share_video = true;
             }
-            let save = egui::Button::new(
-                RichText::new(if saved_for_later { "Salvo" } else { "Salvar" })
-                    .size(13.0)
-                    .strong()
+            let save_label = if details.saved_in_library {
+                "✓ Salvo"
+            } else {
+                "Salvar"
+            };
+            let save = egui::Button::new(RichText::new(save_label).size(13.0).strong().color(
+                if details.save_menu_open {
+                    palette.active_button_fg
+                } else {
+                    palette.header_button_fg
+                },
+            ))
+            .fill(if details.save_menu_open {
+                palette.active_button_bg
+            } else {
+                palette.header_button_bg
+            })
+            .corner_radius(18);
+            if ui.add_sized([82.0, 36.0], save).clicked() {
+                actions.toggle_save_menu = true;
+            }
+        });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let prev_btn = egui::Button::new(
+                RichText::new("↑ Anterior")
+                    .size(12.5)
                     .color(palette.header_button_fg),
             )
             .fill(palette.header_button_bg)
-            .corner_radius(18);
-            if ui.add_sized([86.0, 36.0], save).clicked() {
-                actions.toggle_watch_later = true;
+            .corner_radius(16);
+            if ui
+                .add_enabled(details.has_prev_short, prev_btn)
+                .on_hover_text("Short anterior (↑)")
+                .clicked()
+            {
+                actions.prev_short = true;
+            }
+            let next_btn = egui::Button::new(
+                RichText::new("↓ Próximo")
+                    .size(12.5)
+                    .color(palette.header_button_fg),
+            )
+            .fill(palette.header_button_bg)
+            .corner_radius(16);
+            if ui
+                .add_enabled(details.has_next_short, next_btn)
+                .on_hover_text("Próximo Short (↓)")
+                .clicked()
+            {
+                actions.next_short = true;
             }
         });
     }
 
     fn shorts_watch_details_ui(
-        &self,
+        &mut self,
         ui: &mut egui::Ui,
+        ctx: &egui::Context,
         details: &ShortsWatchDetails<'_>,
         palette: &ThemePalette,
         actions: &mut ShortsWatchActions,
@@ -12265,19 +15492,26 @@ impl FastTube {
             );
         }
         ui.add_space(12.0);
-        if let Some(target) =
-            self.shorts_watch_channel_ui(ui, channel_label, details.channel_target, palette)
-        {
+        let (target, sub_clicked) = self.shorts_watch_channel_ui(
+            ui,
+            channel_label,
+            details.channel_target,
+            details.subscribed,
+            details.sub_pending,
+            palette,
+        );
+        if let Some(target) = target {
             actions.open_channel_target = Some(target);
         }
+        if sub_clicked {
+            actions.toggle_subscribe = true;
+        }
         ui.add_space(14.0);
-        self.shorts_watch_actions_ui(
-            ui,
-            details.saved_for_later,
-            details.share_recently_copied,
-            palette,
-            actions,
-        );
+        self.shorts_watch_actions_ui(ui, details, palette, actions);
+        if details.save_menu_open {
+            ui.add_space(10.0);
+            self.save_menu_ui(ui, video, ctx);
+        }
         if let Some(text) = &description {
             ui.add_space(14.0);
             egui::Frame::new()
@@ -12285,7 +15519,17 @@ impl FastTube {
                 .corner_radius(12)
                 .inner_margin(egui::Margin::symmetric(14, 12))
                 .show(ui, |ui| {
-                    ui.label(RichText::new(text).size(13.0).color(palette.description_fg));
+                    self.render_text_with_timestamps_ui(ui, text, palette.description_fg, 13.0);
+                });
+        }
+        if details.comments_open {
+            ui.add_space(12.0);
+            egui::Frame::new()
+                .fill(palette.card_alt_bg)
+                .corner_radius(12)
+                .inner_margin(egui::Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    self.comments_ui(ui, ctx, "shorts_comments");
                 });
         }
         if !self.message.is_empty() {
@@ -12299,7 +15543,7 @@ impl FastTube {
         ui.add_space(12.0);
         ui.label(
             RichText::new(
-                "Use os controles sobre o vídeo para pausar, ajustar o volume ou abrir a tela cheia.",
+                "Use ↑ / ↓ para navegar entre Shorts ou os controles sobre o vídeo para pausar e ajustar o volume.",
             )
             .size(12.0)
             .color(palette.neutral_status_fg),
@@ -12320,18 +15564,36 @@ impl FastTube {
             WatchLayoutMode::Short,
         );
         let wide = available_width >= 760.0;
-        let saved_for_later = self
-            .library
-            .data
-            .watch_later
-            .iter()
-            .any(|record| record.video.url == video.url);
+        let saved_in_library = self.video_saved_in_library(&video);
+        let save_menu_open = self.playback.save_menu_open;
+        let comments_open = self.watch.extras.tab == watch_extras::Tab::Comments;
         let channel_target = self.channel_target_for_video(&video);
+        let channel_id_hint = metadata.as_ref().and_then(|meta| meta.channel_id.clone());
+        let subscribed = self
+            .subscription_status_for(channel_target.as_ref(), channel_id_hint.as_deref())
+            .map(|s| s.subscription_id.is_some());
+        let sub_pending = self.auth.sub_toggle_rx.is_some();
+        let video_id = history::youtube_video_id(&video.url);
+        let current_rating = video_id
+            .as_ref()
+            .and_then(|id| self.auth.ratings.get(id).copied());
+        let rating_pending = self.auth.rating_rx.is_some();
+        let has_prev_short = self.next_or_prev_short(false).is_some();
+        let has_next_short = self.next_or_prev_short(true).is_some();
         let details = ShortsWatchDetails {
             video: &video,
             metadata: metadata.as_ref(),
             channel_target: channel_target.as_ref(),
-            saved_for_later,
+            video_id: video_id.as_deref(),
+            current_rating,
+            rating_pending,
+            subscribed,
+            sub_pending,
+            saved_in_library,
+            save_menu_open,
+            comments_open,
+            has_prev_short,
+            has_next_short,
             share_recently_copied: self
                 .watch
                 .share_copied_at
@@ -12345,7 +15607,7 @@ impl FastTube {
             .show(ui, |ui| {
                 ui.add_space(8.0);
                 if wide {
-                    let details_width = 330.0;
+                    let details_width = 350.0;
                     let content_width = player_size.x + 24.0 + details_width;
                     let left = ((available_width - content_width) * 0.5).max(0.0);
                     ui.horizontal_top(|ui| {
@@ -12365,7 +15627,7 @@ impl FastTube {
                         ui.vertical(|ui| {
                             ui.set_width(details_width);
                             ui.set_max_width(details_width);
-                            self.shorts_watch_details_ui(ui, &details, &palette, &mut actions);
+                            self.shorts_watch_details_ui(ui, ctx, &details, &palette, &mut actions);
                         });
                     });
                 } else {
@@ -12380,11 +15642,31 @@ impl FastTube {
                     });
                     ui.add_space(12.0);
                     ui.vertical(|ui| {
-                        self.shorts_watch_details_ui(ui, &details, &palette, &mut actions);
+                        self.shorts_watch_details_ui(ui, ctx, &details, &palette, &mut actions);
                     });
                 }
             });
 
+        if let (Some(id), Some(rating)) = (video_id, actions.rating_to_apply) {
+            self.start_video_rating(id, rating, ctx);
+        }
+        if actions.toggle_subscribe
+            && let Some(target) = channel_target
+        {
+            self.start_toggle_subscription(target, channel_id_hint, ctx);
+        }
+        if actions.toggle_comments {
+            if self.watch.extras.tab == watch_extras::Tab::Comments {
+                self.watch.extras.tab = watch_extras::Tab::Results;
+            } else {
+                self.watch.extras.tab = watch_extras::Tab::Comments;
+                if !self.watch.extras.comments_loaded {
+                    self.watch
+                        .extras
+                        .start_comments(self.auth.session.as_ref(), false, ctx);
+                }
+            }
+        }
         if actions.enqueue_video {
             let _ = self.enqueue_video(video.clone());
         }
@@ -12400,12 +15682,23 @@ impl FastTube {
                 }
             }
         }
-        if actions.toggle_watch_later {
-            self.library.data.toggle_watch_later(video);
-            self.save_library();
+        if actions.toggle_save_menu {
+            self.playback.save_menu_open = !self.playback.save_menu_open;
+            if self.playback.save_menu_open
+                && self.auth.authenticated
+                && self.auth.remote_playlists.is_empty()
+            {
+                self.start_fetch_remote_playlists(ctx);
+            }
         }
         if let Some(target) = actions.open_channel_target {
             self.open_channel(target, ctx);
+        }
+        if actions.prev_short {
+            return self.next_or_prev_short(false);
+        }
+        if actions.next_short {
+            return self.next_or_prev_short(true);
         }
         None
     }
@@ -12430,16 +15723,16 @@ impl FastTube {
         available_height: f32,
     ) -> Option<Video> {
         let mut chosen = None;
-        ui.horizontal_top(|ui| {
-            ui.add_space(watch_page_margin());
-            ui.vertical(|ui| {
-                ui.set_width(columns.primary_width);
-                ui.set_max_width(columns.primary_width);
-                egui::ScrollArea::vertical()
-                    .id_salt("watch_primary_page_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
+        let side_margin = watch_page_side_margin(ui.available_width(), columns);
+        egui::ScrollArea::vertical()
+            .id_salt("watch_primary_page_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    ui.add_space(side_margin);
+                    ui.vertical(|ui| {
                         ui.set_width(columns.primary_width);
+                        ui.set_max_width(columns.primary_width);
                         self.watch_primary_ui(
                             ui,
                             ctx,
@@ -12452,21 +15745,15 @@ impl FastTube {
                             ui.label(&self.message);
                         }
                     });
-            });
-            ui.add_space(columns.gap);
-            ui.vertical(|ui| {
-                ui.set_width(columns.secondary_width);
-                ui.set_max_width(columns.secondary_width);
-                egui::ScrollArea::vertical()
-                    .id_salt("watch_recommendations_page_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
+                    ui.add_space(columns.gap);
+                    ui.vertical(|ui| {
                         ui.set_width(columns.secondary_width);
+                        ui.set_max_width(columns.secondary_width);
                         chosen =
                             self.watch_sidebar_results_ui(ui, ctx, "watch_sidebar_results_scroll");
                     });
+                });
             });
-        });
         chosen
     }
 
@@ -12509,38 +15796,132 @@ impl FastTube {
         available_height: f32,
     ) -> Option<Video> {
         let mut chosen = None;
-        let scroll_id = if self.playback.theater {
-            "watch_theater_main_scroll"
-        } else {
-            "watch_stacked_page_scroll"
-        };
+        if self.playback.theater {
+            egui::ScrollArea::vertical()
+                .id_salt("watch_theater_main_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let theater_width = ui.available_width().max(columns.primary_width);
+                    egui::Frame::NONE.fill(Color32::BLACK).show(ui, |ui| {
+                        ui.set_width(theater_width);
+                        ui.vertical_centered(|ui| {
+                            self.watch_primary_with_metadata_ui(
+                                ui,
+                                ctx,
+                                theater_width,
+                                available_height,
+                                WatchLayoutMode::Stacked,
+                                false,
+                            );
+                        });
+                    });
+                    ui.add_space(12.0);
+                    let margin = if theater_width >= 680.0 {
+                        watch_page_margin()
+                    } else {
+                        12.0
+                    };
+                    let inner_width = (theater_width - margin * 2.0).max(260.0);
+                    let below_columns = compute_watch_columns(inner_width);
+                    let side_margin = watch_page_side_margin(theater_width, &below_columns);
+                    let selected_video = self.selected.clone();
+                    #[cfg(windows)]
+                    let resolution_badge = self.player.as_ref().and_then(|player| {
+                        VideoSize::from_numbers(player.number("width"), player.number("height"))
+                            .map(|size| format!("Reproduzindo em {size}"))
+                    });
+                    #[cfg(not(windows))]
+                    let resolution_badge: Option<String> = None;
+                    if below_columns.mode == WatchLayoutMode::SideBySide {
+                        ui.horizontal_top(|ui| {
+                            ui.add_space(side_margin);
+                            ui.vertical(|ui| {
+                                ui.set_width(below_columns.primary_width);
+                                ui.set_max_width(below_columns.primary_width);
+                                if let Some(video) = &selected_video {
+                                    self.watch_metadata_card_ui(
+                                        ui,
+                                        video,
+                                        below_columns.primary_width,
+                                        resolution_badge.as_deref(),
+                                    );
+                                }
+                                if !self.message.is_empty() {
+                                    ui.add_space(6.0);
+                                    ui.label(&self.message);
+                                }
+                            });
+                            ui.add_space(below_columns.gap);
+                            ui.vertical(|ui| {
+                                ui.set_width(below_columns.secondary_width);
+                                ui.set_max_width(below_columns.secondary_width);
+                                chosen = self.watch_sidebar_results_ui(
+                                    ui,
+                                    ctx,
+                                    "watch_theater_results_scroll",
+                                );
+                            });
+                        });
+                    } else {
+                        ui.horizontal_top(|ui| {
+                            ui.add_space(side_margin);
+                            ui.vertical(|ui| {
+                                ui.set_width(below_columns.primary_width);
+                                ui.set_max_width(below_columns.primary_width);
+                                if let Some(video) = &selected_video {
+                                    self.watch_metadata_card_ui(
+                                        ui,
+                                        video,
+                                        below_columns.primary_width,
+                                        resolution_badge.as_deref(),
+                                    );
+                                }
+                                if !self.message.is_empty() {
+                                    ui.add_space(6.0);
+                                    ui.label(&self.message);
+                                }
+                                ui.add_space(8.0);
+                                ui.separator();
+                                ui.add_space(6.0);
+                                chosen = self.watch_sidebar_results_ui(
+                                    ui,
+                                    ctx,
+                                    "watch_theater_results_scroll",
+                                );
+                            });
+                        });
+                    }
+                });
+            return chosen;
+        }
+        let side_margin = watch_page_side_margin(ui.available_width(), columns);
         egui::ScrollArea::vertical()
-            .id_salt(scroll_id)
+            .id_salt("watch_stacked_page_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                self.watch_primary_ui(
-                    ui,
-                    ctx,
-                    columns.primary_width,
-                    available_height,
-                    WatchLayoutMode::Stacked,
-                );
-                if !self.message.is_empty() {
-                    ui.add_space(6.0);
-                    ui.label(&self.message);
-                }
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(6.0);
-                chosen = self.watch_sidebar_results_ui(
-                    ui,
-                    ctx,
-                    if self.playback.theater {
-                        "watch_theater_results_scroll"
-                    } else {
-                        "watch_stacked_results_scroll"
-                    },
-                );
+                ui.horizontal_top(|ui| {
+                    ui.add_space(side_margin);
+                    ui.vertical(|ui| {
+                        ui.set_width(columns.primary_width);
+                        ui.set_max_width(columns.primary_width);
+                        self.watch_primary_ui(
+                            ui,
+                            ctx,
+                            columns.primary_width,
+                            available_height,
+                            WatchLayoutMode::Stacked,
+                        );
+                        if !self.message.is_empty() {
+                            ui.add_space(6.0);
+                            ui.label(&self.message);
+                        }
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(6.0);
+                        chosen =
+                            self.watch_sidebar_results_ui(ui, ctx, "watch_stacked_results_scroll");
+                    });
+                });
             });
         chosen
     }
@@ -12639,6 +16020,41 @@ fn youtube_tab_button(
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+fn sidebar_section_header_item(
+    ui: &mut egui::Ui,
+    title: &str,
+    show_chevron: bool,
+    active: bool,
+    palette: &ThemePalette,
+) -> egui::Response {
+    let desired = egui::vec2(ui.available_width().max(110.0), 40.0);
+    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
+    let pill_rect = rect.shrink2(egui::vec2(12.0, 0.0));
+    let fill = if active {
+        palette.card_alt_bg
+    } else if response.hovered() {
+        palette.header_button_bg
+    } else {
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(pill_rect, 10.0, fill);
+    }
+    let header_text = if show_chevron {
+        format!("{title}  ›")
+    } else {
+        title.to_owned()
+    };
+    ui.painter().text(
+        egui::pos2(pill_rect.left() + 12.0, pill_rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        header_text,
+        egui::FontId::proportional(15.5),
+        palette.header_button_fg,
+    );
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 fn sidebar_pill_item(
     ui: &mut egui::Ui,
     icon: &str,
@@ -12649,6 +16065,7 @@ fn sidebar_pill_item(
 ) -> egui::Response {
     let desired = egui::vec2(ui.available_width().max(110.0), 40.0);
     let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
+    let pill_rect = rect.shrink2(egui::vec2(12.0, 0.0));
     let fill = if active {
         palette.card_alt_bg
     } else if response.hovered() {
@@ -12657,27 +16074,32 @@ fn sidebar_pill_item(
         Color32::TRANSPARENT
     };
     if fill != Color32::TRANSPARENT {
-        ui.painter().rect_filled(rect, 10.0, fill);
+        ui.painter().rect_filled(pill_rect, 10.0, fill);
     }
+    let text_color = if active {
+        palette.header_button_fg
+    } else {
+        palette.channel_fg
+    };
     ui.painter().text(
-        egui::pos2(rect.left() + 16.0, rect.center().y),
+        egui::pos2(pill_rect.left() + 12.0, pill_rect.center().y),
         egui::Align2::LEFT_CENTER,
         icon,
         egui::FontId::proportional(16.0),
-        palette.channel_fg,
+        text_color,
     );
-    let display_label = truncate_text_chars(label, 24);
+    let display_label = truncate_text_chars(label, 23);
     ui.painter().text(
-        egui::pos2(rect.left() + 48.0, rect.center().y),
+        egui::pos2(pill_rect.left() + 48.0, pill_rect.center().y),
         egui::Align2::LEFT_CENTER,
         display_label,
         egui::FontId::proportional(14.0),
-        palette.channel_fg,
+        text_color,
     );
     if unread_dot {
         ui.painter().circle_filled(
-            egui::pos2(rect.right() - 14.0, rect.center().y),
-            3.0,
+            egui::pos2(pill_rect.right() - 12.0, pill_rect.center().y),
+            2.5,
             Color32::from_rgb(62, 166, 255),
         );
     }
@@ -12727,37 +16149,43 @@ fn sidebar_channel_item(
     active: bool,
     palette: &ThemePalette,
 ) -> egui::Response {
-    let desired = egui::vec2(ui.available_width().max(110.0), 34.0);
+    let desired = egui::vec2(ui.available_width().max(110.0), 40.0);
     let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
+    let pill_rect = rect.shrink2(egui::vec2(12.0, 0.0));
     let fill = if active {
-        palette.header_button_bg
-    } else if response.hovered() {
         palette.card_alt_bg
+    } else if response.hovered() {
+        palette.header_button_bg
     } else {
         Color32::TRANSPARENT
     };
     if fill != Color32::TRANSPARENT {
-        ui.painter().rect_filled(rect, 10.0, fill);
+        ui.painter().rect_filled(pill_rect, 10.0, fill);
     }
-    let avatar_center = egui::pos2(rect.left() + 20.0, rect.center().y);
+    let avatar_center = egui::pos2(pill_rect.left() + 24.0, pill_rect.center().y);
     let [r, g, b] = recommendations::channel_avatar_rgb(channel_name);
     let initials = recommendations::channel_avatar_initials(channel_name);
     ui.painter()
-        .circle_filled(avatar_center, 11.5, Color32::from_rgb(r, g, b));
+        .circle_filled(avatar_center, 12.0, Color32::from_rgb(r, g, b));
     ui.painter().text(
         avatar_center,
         egui::Align2::CENTER_CENTER,
         initials,
-        egui::FontId::proportional(9.5),
+        egui::FontId::proportional(10.0),
         Color32::WHITE,
     );
-    let display_name = truncate_text_chars(channel_name, 17);
+    let display_name = truncate_text_chars(channel_name, 16);
     ui.painter().text(
-        egui::pos2(rect.left() + 40.0, rect.center().y),
+        egui::pos2(pill_rect.left() + 48.0, pill_rect.center().y),
         egui::Align2::LEFT_CENTER,
         display_name,
-        egui::FontId::proportional(13.0),
+        egui::FontId::proportional(14.0),
         palette.channel_fg,
+    );
+    ui.painter().circle_filled(
+        egui::pos2(pill_rect.right() - 12.0, pill_rect.center().y),
+        2.5,
+        Color32::from_rgb(62, 166, 255),
     );
     response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -12820,6 +16248,27 @@ fn paint_thumbnail_overlays(
         ui.painter()
             .rect_filled(fill_rect, 2.0, Color32::from_rgb(255, 0, 51));
     }
+}
+
+fn paint_thumbnail_novidade_badge(ui: &egui::Ui, rect: egui::Rect) {
+    let badge_w = 58.0;
+    let badge_h = 18.0;
+    let badge_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 6.0, rect.top() + 6.0),
+        egui::vec2(badge_w, badge_h),
+    );
+    ui.painter().rect_filled(
+        badge_rect,
+        4.0,
+        Color32::from_rgba_unmultiplied(241, 241, 241, 235),
+    );
+    ui.painter().text(
+        badge_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "Novidade",
+        egui::FontId::proportional(11.0),
+        Color32::from_rgb(15, 15, 15),
+    );
 }
 
 fn truncate_text_chars(text: &str, max_chars: usize) -> String {
@@ -12888,8 +16337,28 @@ impl eframe::App for FastTube {
         if let Some(cancel) = self.auth.rating_cancel.take() {
             cancel.cancel();
         }
+        if let Some(cancel) = self.auth.sub_check_cancel.take() {
+            cancel.cancel();
+        }
+        if let Some(cancel) = self.auth.sub_toggle_cancel.take() {
+            cancel.cancel();
+        }
+        if let Some(cancel) = self.auth.my_channel_cancel.take() {
+            cancel.cancel();
+        }
+        if let Some(cancel) = self.auth.remote_playlists_cancel.take() {
+            cancel.cancel();
+        }
+        if let Some(cancel) = self.auth.playlist_action_cancel.take() {
+            cancel.cancel();
+        }
         self.auth.reauth_rx = None;
         self.auth.rating_rx = None;
+        self.auth.sub_check_rx = None;
+        self.auth.sub_toggle_rx = None;
+        self.auth.my_channel_rx = None;
+        self.auth.remote_playlists_rx = None;
+        self.auth.playlist_action_rx = None;
         let now = Instant::now();
         #[cfg(windows)]
         self.sample_player_before_transition(now);
@@ -12901,8 +16370,18 @@ impl eframe::App for FastTube {
         self.watch
             .extras
             .sync_video(self.selected.as_ref().map(|video| video.url.as_str()));
-        self.watch.extras.poll();
+        if let Some(status) = self.watch.extras.poll_with_session(
+            &mut self.auth.youtube_web_session,
+            &mut self.auth.youtube_web_session_checked,
+        ) {
+            self.message = status;
+        }
         self.apply_ready_subtitle();
+        if let Some(err) = self.watch.extras.subtitles_error.clone() {
+            if self.message != err {
+                self.message = err;
+            }
+        }
         self.poll_async_tasks(&ctx);
         if self.auth.authenticated && !self.auth.restore_attempted {
             self.auth.restore_attempted = true;
@@ -12917,17 +16396,39 @@ impl eframe::App for FastTube {
         self.thumbnails.maintain(&ctx);
         #[cfg(windows)]
         if self.selected.is_some() {
-            let ended = self
+            let eof = self
                 .player
                 .as_ref()
-                .is_some_and(|player| player.property("eof-reached").as_deref() == Some("yes"))
-                && self.queue_auto_advance_ready(true);
+                .is_some_and(|player| player.property("eof-reached").as_deref() == Some("yes"));
+            let ended = eof && self.queue_auto_advance_ready(true);
             if queue::should_advance(
                 ended,
                 &mut self.queue.eof_handled,
                 !self.queue.data.is_empty(),
             ) {
                 let _ = self.advance_queue_with_frame(frame, &ctx);
+            } else if self.queue.data.is_empty()
+                && !self.playback.loop_video
+                && self.playback.autoplay
+            {
+                let has_live = self
+                    .playback
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.has_live_sample);
+                if !eof {
+                    self.playback.autoplay_eof_handled = false;
+                } else if has_live && !self.playback.autoplay_eof_handled {
+                    self.playback.autoplay_eof_handled = true;
+                    let next_video = if self.is_watch_short_mode() {
+                        self.next_or_prev_short(true)
+                    } else {
+                        self.next_recommended_video()
+                    };
+                    if let Some(video) = next_video {
+                        self.playback.pending_open_video = Some(video);
+                    }
+                }
             }
         }
         let escape_pressed = ctx.input(|input| input.key_pressed(egui::Key::Escape));
@@ -12941,7 +16442,9 @@ impl eframe::App for FastTube {
         if closed_player_menu {
             self.playback.player_menu = None;
         }
+        let had_shortcuts_open = self.ui.shortcuts_open;
         self.handle_help_shortcuts(&ctx);
+        let closed_shortcuts = escape_pressed && had_shortcuts_open && !self.ui.shortcuts_open;
         if !ctx.egui_wants_keyboard_input() {
             let (home, explore, history, queue, library) = ctx.input(|input| {
                 let alt = input.modifiers.alt;
@@ -12966,7 +16469,40 @@ impl eframe::App for FastTube {
             }
         }
         if self.selected.is_some() && !ctx.egui_wants_keyboard_input() {
-            let (toggle, back, forward, mute, captions, theater, fullscreen) = ctx.input(|input| {
+            let short_mode = self.is_watch_short_mode();
+            let (
+                toggle,
+                back,
+                forward,
+                mute,
+                captions,
+                theater,
+                fullscreen,
+                mini_player,
+                next_shortcut,
+                short_prev,
+                short_next,
+                pct_seek,
+            ) = ctx.input(|input| {
+                let no_alt_ctrl = !input.modifiers.alt && !input.modifiers.ctrl;
+                let pct = if no_alt_ctrl {
+                    [
+                        (egui::Key::Num0, 0.0),
+                        (egui::Key::Num1, 0.1),
+                        (egui::Key::Num2, 0.2),
+                        (egui::Key::Num3, 0.3),
+                        (egui::Key::Num4, 0.4),
+                        (egui::Key::Num5, 0.5),
+                        (egui::Key::Num6, 0.6),
+                        (egui::Key::Num7, 0.7),
+                        (egui::Key::Num8, 0.8),
+                        (egui::Key::Num9, 0.9),
+                    ]
+                    .into_iter()
+                    .find_map(|(k, p)| input.key_pressed(k).then_some(p))
+                } else {
+                    None
+                };
                 (
                     input.key_pressed(egui::Key::Space) || input.key_pressed(egui::Key::K),
                     input.key_pressed(egui::Key::ArrowLeft) || input.key_pressed(egui::Key::J),
@@ -12975,9 +16511,26 @@ impl eframe::App for FastTube {
                     input.key_pressed(egui::Key::C),
                     input.key_pressed(egui::Key::T),
                     input.key_pressed(egui::Key::F),
+                    input.key_pressed(egui::Key::I),
+                    input.modifiers.shift && input.key_pressed(egui::Key::N),
+                    short_mode && input.key_pressed(egui::Key::ArrowUp),
+                    short_mode && input.key_pressed(egui::Key::ArrowDown),
+                    pct,
                 )
             });
-            if toggle || back || forward || mute || captions || theater || fullscreen {
+            if toggle
+                || back
+                || forward
+                || mute
+                || captions
+                || theater
+                || fullscreen
+                || mini_player
+                || next_shortcut
+                || short_prev
+                || short_next
+                || pct_seek.is_some()
+            {
                 self.playback.overlay_last_activity = Instant::now();
             }
             #[cfg(windows)]
@@ -12997,6 +16550,20 @@ impl eframe::App for FastTube {
                                 .map(|active| active.position_ms as f64 / 1000.0)
                         })
                         .unwrap_or(0.0);
+                    let pct_target = pct_seek.and_then(|pct| {
+                        player
+                            .number("duration")
+                            .filter(|&d| d > 0.0)
+                            .or_else(|| {
+                                self.playback
+                                    .active
+                                    .as_ref()
+                                    .and_then(|a| a.duration_ms)
+                                    .filter(|&d| d > 0)
+                                    .map(|d| d as f64 / 1000.0)
+                            })
+                            .map(|dur| dur * pct)
+                    });
                     let result = if toggle {
                         if was_ended {
                             player
@@ -13009,6 +16576,8 @@ impl eframe::App for FastTube {
                         player.seek(-10.0, "relative")
                     } else if forward {
                         player.seek(10.0, "relative")
+                    } else if let Some(target) = pct_target {
+                        player.seek(target, "absolute+exact")
                     } else if mute {
                         player.set(
                             "mute",
@@ -13033,6 +16602,8 @@ impl eframe::App for FastTube {
                                 key_seek_pos = Some((cur_pos - 10.0).max(0.0));
                             } else if forward {
                                 key_seek_pos = Some(cur_pos + 10.0);
+                            } else if let Some(target) = pct_target {
+                                key_seek_pos = Some(target);
                             }
                         }
                         Err(error) => self.message = error,
@@ -13045,7 +16616,7 @@ impl eframe::App for FastTube {
                 }
             }
             #[cfg(not(windows))]
-            let _ = (toggle, back, forward, mute);
+            let _ = (toggle, back, forward, mute, pct_seek);
             if captions {
                 self.toggle_player_captions(&ctx);
             }
@@ -13056,36 +16627,77 @@ impl eframe::App for FastTube {
                 || (escape_pressed
                     && !closed_settings
                     && !closed_player_menu
+                    && !closed_shortcuts
                     && self.playback.fullscreen)
             {
                 self.toggle_fullscreen(&ctx);
             }
+            if mini_player {
+                self.toggle_mini_player(&ctx);
+            }
+            if next_shortcut {
+                if !self.queue.data.is_empty() {
+                    self.request_queue_advance();
+                } else {
+                    let next = if short_mode {
+                        self.next_or_prev_short(true)
+                    } else {
+                        self.next_recommended_video()
+                    };
+                    if let Some(video) = next {
+                        self.playback.pending_open_video = Some(video);
+                    }
+                }
+            } else if short_prev {
+                if let Some(video) = self.next_or_prev_short(false) {
+                    self.playback.pending_open_video = Some(video);
+                }
+            } else if short_next && let Some(video) = self.next_or_prev_short(true) {
+                self.playback.pending_open_video = Some(video);
+            }
         }
         let viewport_width = ui.available_width();
-        if !self.playback.fullscreen {
+        let chromeless_video =
+            self.playback.fullscreen || (self.playback.mini_player && self.selected.is_some());
+        if escape_pressed
+            && !closed_settings
+            && !closed_player_menu
+            && !closed_shortcuts
+            && !self.playback.fullscreen
+            && should_show_navigation_drawer(
+                viewport_width,
+                self.ui.navigation_open,
+                chromeless_video,
+                self.selected.is_some(),
+            )
+        {
+            self.ui.navigation_open = false;
+        }
+        if !chromeless_video {
             egui::Panel::top("header")
                 .show_separator_line(false)
                 .show(ui, |ui| {
                     self.header_ui(ui, &ctx);
                 });
-            if self.selected.is_none()
-                && should_show_navigation_panel(
-                    self.ui.navigation_open,
-                    self.playback.fullscreen,
-                    false,
-                    self.playback.theater,
-                )
-            {
+            let has_selected_video = self.selected.is_some();
+            if should_show_persistent_navigation_panel(
+                viewport_width,
+                self.ui.navigation_open,
+                chromeless_video,
+                has_selected_video,
+                self.playback.theater,
+            ) {
                 let nav_width = layout::compute_youtube_sidebar_width(viewport_width);
                 egui::Panel::left("navigation")
                     .exact_size(nav_width)
                     .show(ui, |ui| {
                         self.navigation_ui(ui, &ctx);
                     });
-            } else if should_show_compact_navigation(
+            } else if should_show_compact_navigation_for_page(
                 viewport_width,
                 self.ui.navigation_open,
-                self.playback.fullscreen,
+                chromeless_video,
+                has_selected_video,
                 self.playback.theater,
             ) {
                 egui::Panel::left("compact_navigation")
@@ -13095,16 +16707,22 @@ impl eframe::App for FastTube {
                     });
             }
         }
-        egui::CentralPanel::default().show(ui, |ui| {
-            if self.playback.fullscreen {
+        let mut central_panel = egui::CentralPanel::default();
+        if chromeless_video {
+            central_panel = central_panel.frame(egui::Frame::NONE.fill(Color32::BLACK));
+        }
+        central_panel.show(ui, |ui| {
+            if chromeless_video {
                 let avail_w = ui.available_width();
                 let avail_h = ui.available_height();
                 self.watch_primary_ui(ui, &ctx, avail_w, avail_h, WatchLayoutMode::SideBySide);
                 if self.queue.pending_advance {
                     self.queue.pending_advance = false;
                     let _ = self.advance_queue_with_frame(frame, &ctx);
+                } else if let Some(video) = self.playback.pending_open_video.take() {
+                    let _ = self.open_video(video, frame, &ctx);
                 }
-                if !self.message.is_empty() {
+                if !self.message.is_empty() && !self.playback.mini_player {
                     ui.add_space(6.0);
                     ui.label(&self.message);
                 }
@@ -13123,13 +16741,16 @@ impl eframe::App for FastTube {
             if self.queue.pending_advance {
                 self.queue.pending_advance = false;
                 let _ = self.advance_queue_with_frame(frame, &ctx);
+            } else if let Some(video) = self.playback.pending_open_video.take() {
+                let _ = self.open_video(video, frame, &ctx);
             }
         });
-        if self.selected.is_some()
-            && self.ui.navigation_open
-            && !self.playback.fullscreen
-            && !self.playback.theater
-        {
+        if should_show_navigation_drawer(
+            viewport_width,
+            self.ui.navigation_open,
+            chromeless_video,
+            self.selected.is_some(),
+        ) {
             self.watch_navigation_drawer_ui(&ctx);
         }
         self.in_app_ui_pass = false;

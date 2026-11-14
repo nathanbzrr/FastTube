@@ -28,7 +28,6 @@ pub fn is_valid_video_id(video_id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
-/// Extrai e valida o ID de 11 caracteres somente para URLs de vídeo do YouTube.
 pub fn youtube_video_id(url: &str) -> Option<String> {
     let trimmed = url.trim();
     let after_scheme = if let Some(rest) = trimmed.strip_prefix("https://") {
@@ -139,7 +138,6 @@ pub fn youtube_watch_url(video_id: &str) -> Option<String> {
     }
 }
 
-/// Verifica se a posição está próxima demais do fim para ser retomada.
 pub fn is_near_end(position_ms: u64, duration_ms: Option<u64>) -> bool {
     let Some(duration_ms) = duration_ms else {
         return false;
@@ -160,7 +158,6 @@ pub fn is_near_end(position_ms: u64, duration_ms: Option<u64>) -> bool {
     false
 }
 
-/// Retorna a posição de retomada em milissegundos, ou `None` quando no início ou perto do fim.
 pub fn should_resume(position_ms: u64, duration_ms: Option<u64>) -> Option<u64> {
     if position_ms == 0 || is_near_end(position_ms, duration_ms) {
         None

@@ -128,20 +128,14 @@ pub fn safe_report(kind: FailureKind, authenticated: bool, player_active: bool) 
     )
 }
 
-/// Propriedade `libmpv` da política de decodificação por hardware configurada.
 pub const PROP_HWDEC: &str = "hwdec";
-/// Propriedade `libmpv` do backend de decodificação por hardware efetivamente ativo.
 pub const PROP_HWDEC_CURRENT: &str = "hwdec-current";
-/// Propriedade `libmpv` com o codec de vídeo da faixa ativa.
 pub const PROP_VIDEO_CODEC: &str = "video-codec";
-/// Propriedade `libmpv` com a largura do vídeo em pixels.
 pub const PROP_WIDTH: &str = "width";
-/// Propriedade `libmpv` com a altura do vídeo em pixels.
 pub const PROP_HEIGHT: &str = "height";
 
 const MAX_DIMENSION: u32 = 65_535;
 
-/// Dimensões válidas do vídeo em pixels (`largura × altura`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VideoSize {
     pub width: u32,
@@ -172,18 +166,12 @@ impl fmt::Display for VideoSize {
     }
 }
 
-/// Estado efetivo de decodificação reportado por `hwdec-current`.
-///
-/// Reconhece apenas backends explícitos e conhecidos do `libmpv` no Windows;
-/// qualquer valor ausente, vazio ou não reconhecido é classificado como [`Self::Unknown`]
-/// sem suposições sobre aceleração de hardware.
+/// Only explicit known Windows `libmpv` backends count as active hardware decoding;
+/// policy strings (`"auto"`, `"auto-safe"`, `"yes"`) and unknown values remain `Unknown`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EffectiveDecoding {
-    /// Backend de hardware confirmado por `hwdec-current` (ex.: `d3d11va`, `d3d11va-copy`, `nvdec`).
     HardwareActive(String),
-    /// Decodificação por software confirmada (`hwdec-current = "no"`).
     Software,
-    /// Estado desconhecido ou não confirmado.
     Unknown(Option<String>),
 }
 
@@ -217,11 +205,6 @@ impl EffectiveDecoding {
     }
 }
 
-/// Classifica `hwdec-current` de forma conservadora.
-///
-/// - `"no"` -> [`EffectiveDecoding::Software`]
-/// - Backend de hardware conhecido do `libmpv` -> [`EffectiveDecoding::HardwareActive`]
-/// - Ausente, vazio, políticas (`"auto"`, `"auto-safe"`, `"yes"`) ou nome desconhecido -> [`EffectiveDecoding::Unknown`]
 pub fn classify_hwdec_current(raw: Option<&str>) -> EffectiveDecoding {
     let Some(trimmed) = clean_non_empty(raw) else {
         return EffectiveDecoding::Unknown(None);
@@ -254,21 +237,15 @@ fn is_known_hwdec_backend(lower: &str) -> bool {
     )
 }
 
-/// Diagnóstico conciso de decodificação de vídeo a partir do `libmpv`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodingDiagnostics {
-    /// Valor configurado em `hwdec` (ex.: `"auto-safe"`, `"no"`), quando presente.
     pub configured_hwdec: Option<String>,
-    /// Estado efetivo de decodificação observado em `hwdec-current`.
     pub effective_decoding: EffectiveDecoding,
-    /// Codec da faixa de vídeo ativa, quando presente.
     pub codec: Option<String>,
-    /// Dimensões do vídeo (`largura × altura`), quando presentes.
     pub size: Option<VideoSize>,
 }
 
 impl DecodingDiagnostics {
-    /// Constrói o diagnóstico a partir dos valores brutos de `hwdec`, `hwdec-current`, `video-codec`, `width` e `height`.
     pub fn from_raw(
         hwdec: Option<&str>,
         hwdec_current: Option<&str>,
@@ -284,7 +261,6 @@ impl DecodingDiagnostics {
         }
     }
 
-    /// Coleta o diagnóstico usando um leitor de propriedades `FnMut(&str) -> Option<String>` (ex.: `|name| player.property(name)`).
     pub fn from_property_reader<F>(mut read_property: F) -> Self
     where
         F: FnMut(&str) -> Option<String>,
@@ -303,7 +279,6 @@ impl DecodingDiagnostics {
         )
     }
 
-    /// Diagnóstico padrão quando o player está inativo ou sem leitura disponível.
     pub fn unknown(configured_hwdec: Option<&str>) -> Self {
         Self {
             configured_hwdec: clean_field(configured_hwdec),
@@ -313,12 +288,10 @@ impl DecodingDiagnostics {
         }
     }
 
-    /// Rótulo curto da propriedade `hwdec` configurada.
     pub fn configured_hwdec_label(&self) -> &str {
         self.configured_hwdec.as_deref().unwrap_or("desconhecido")
     }
 
-    /// Resumo conciso em linha única com `hwdec-current`, `hwdec` configurado e metadados presentes (`codec`, `tamanho`).
     pub fn summary_line(&self) -> String {
         let mut parts = vec![
             format!("hwdec-current: {}", self.effective_decoding.short_label()),
@@ -334,7 +307,6 @@ impl DecodingDiagnostics {
     }
 }
 
-/// Função de conveniência para integração direta com `Player::property`.
 pub fn collect_from_property_reader<F>(read_property: F) -> DecodingDiagnostics
 where
     F: FnMut(&str) -> Option<String>,

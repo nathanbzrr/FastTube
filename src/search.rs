@@ -185,6 +185,12 @@ fn is_hls_playlist_format(format: &Value, parsed: &url::Url) -> bool {
         || parsed.path().ends_with(".m3u8")
 }
 
+static SUBTITLE_HLS_FALLBACKS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn subtitle_hls_fallbacks() -> &'static Mutex<HashMap<String, String>> {
+    SUBTITLE_HLS_FALLBACKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn parse_subtitles(value: &Value) -> Vec<SubtitleTrack> {
     let mut candidates = Vec::new();
     for (field, automatic) in [("subtitles", false), ("automatic_captions", true)] {
@@ -217,10 +223,17 @@ fn parse_subtitles(value: &Value) -> Vec<SubtitleTrack> {
                         if hls.is_none() {
                             hls = Some((value, parsed));
                         }
-                    } else {
+                    } else if direct.is_none() {
                         direct = Some((value, parsed));
-                        break;
                     }
+                }
+                if let (Some((d_url, _)), Some((h_url, _))) = (&direct, &hls)
+                    && let Ok(mut map) = subtitle_hls_fallbacks().lock()
+                {
+                    if map.len() > 512 {
+                        map.clear();
+                    }
+                    map.insert((*d_url).to_owned(), (*h_url).to_owned());
                 }
                 direct.or(hls)
             }) else {
@@ -409,7 +422,7 @@ fn hls_vtt_segment_merger_strips_duplicate_headers() {
     assert!(merged.contains("Mundo"));
 }
 
-pub fn download_vtt(url: &str) -> Result<String, String> {
+fn download_vtt_single(url: &str) -> Result<String, String> {
     let parsed = validate_subtitle_url(url)?;
     let client = reqwest::blocking::Client::builder()
         .timeout(QUERY_TIMEOUT)
@@ -445,6 +458,96 @@ pub fn download_vtt(url: &str) -> Result<String, String> {
         segments.push(segment_text);
     }
     Ok(merge_vtt_segments(segments.iter().map(String::as_str)))
+}
+
+fn download_vtt_via_yt_dlp(url: &str) -> Option<String> {
+    let parsed = validate_subtitle_url(url).ok()?;
+    let mut video_id = None;
+    let mut lang = None;
+    let mut tlang = None;
+    for (k, v) in parsed.query_pairs() {
+        match k.as_ref() {
+            "v" if !v.is_empty() => video_id = Some(v.into_owned()),
+            "lang" if !v.is_empty() => lang = Some(v.into_owned()),
+            "tlang" if !v.is_empty() => tlang = Some(v.into_owned()),
+            _ => {}
+        }
+    }
+    let video_id = video_id?;
+    let watch_url = crate::history::youtube_watch_url(&video_id)?;
+    let target_lang = tlang.or(lang)?;
+    if !target_lang
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp_dir =
+        std::env::temp_dir().join(format!("fasttube-ytdlp-sub-{}-{seq}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).ok()?;
+    struct TempDirGuard(std::path::PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _guard = TempDirGuard(temp_dir.clone());
+    let out_tmpl = temp_dir.join("sub.%(ext)s");
+    let cancel = Cancellation::default();
+    let _ = process::output(
+        yt_dlp().args([
+            "--skip-download",
+            "--write-subs",
+            "--write-auto-subs",
+            "--sub-langs",
+            &target_lang,
+            "--sub-format",
+            "vtt",
+            "--no-playlist",
+            "--no-warnings",
+            "-o",
+            &out_tmpl.to_string_lossy(),
+            "--",
+            &watch_url,
+        ]),
+        &cancel,
+        QUERY_TIMEOUT,
+    )
+    .ok()?;
+    let entries = std::fs::read_dir(&temp_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("vtt")
+            && let Ok(text) = std::fs::read_to_string(&path)
+            && !text.trim().is_empty()
+        {
+            return Some(text);
+        }
+    }
+    None
+}
+
+pub fn download_vtt(url: &str) -> Result<String, String> {
+    match download_vtt_single(url) {
+        Ok(vtt) => Ok(vtt),
+        Err(primary_err) => {
+            let fallback_hls = subtitle_hls_fallbacks()
+                .lock()
+                .ok()
+                .and_then(|map| map.get(url).cloned());
+            if let Some(hls_url) = fallback_hls
+                && let Ok(vtt) = download_vtt_single(&hls_url)
+            {
+                return Ok(vtt);
+            }
+            if let Some(vtt) = download_vtt_via_yt_dlp(url) {
+                return Ok(vtt);
+            }
+            Err(primary_err)
+        }
+    }
 }
 
 fn is_playlist_url(url: &str) -> bool {
@@ -613,6 +716,14 @@ impl ChannelTarget {
 
     pub fn videos_tab_url(&self) -> String {
         format!("{}/videos", self.canonical_url())
+    }
+
+    pub fn shorts_tab_url(&self) -> String {
+        format!("{}/shorts", self.canonical_url())
+    }
+
+    pub fn streams_tab_url(&self) -> String {
+        format!("{}/streams", self.canonical_url())
     }
 
     pub fn playlists_tab_url(&self) -> String {
@@ -1025,6 +1136,149 @@ fn fetch_resolutions(url: &str, cancellation: &Cancellation) -> Result<Vec<u32>,
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchSort {
+    #[default]
+    Relevance,
+    Date,
+    Views,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchDurationFilter {
+    #[default]
+    Any,
+    Short,
+    Medium,
+    Long,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchTypeFilter {
+    #[default]
+    All,
+    Videos,
+    Shorts,
+    Live,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SearchFilters {
+    pub sort: SearchSort,
+    pub duration: SearchDurationFilter,
+    pub kind: SearchTypeFilter,
+}
+
+impl SearchFilters {
+    pub fn is_default(self) -> bool {
+        self == Self::default()
+    }
+}
+
+pub fn parse_duration_label_secs(label: &str) -> Option<u64> {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut parts = trimmed.split(':');
+    let a = parts.next()?.parse::<u64>().ok()?;
+    let b = parts.next()?.parse::<u64>().ok()?;
+    match parts.next() {
+        None => Some(a * 60 + b),
+        Some(c_str) => {
+            if parts.next().is_some() {
+                return None;
+            }
+            let c = c_str.parse::<u64>().ok()?;
+            Some(a * 3600 + b * 60 + c)
+        }
+    }
+}
+
+pub fn apply_search_filters(
+    mut results: Vec<SearchResult>,
+    filters: SearchFilters,
+) -> Vec<SearchResult> {
+    results.retain(|item| {
+        let secs = parse_duration_label_secs(&item.video.duration);
+        let is_short =
+            item.video.url.contains("/shorts/") || secs.is_some_and(|s| s > 0 && s <= 60);
+        let is_live = item.video.duration.trim().is_empty();
+
+        let kind_ok = match filters.kind {
+            SearchTypeFilter::All => true,
+            SearchTypeFilter::Videos => !is_short && !is_live,
+            SearchTypeFilter::Shorts => is_short,
+            SearchTypeFilter::Live => is_live,
+        };
+        if !kind_ok {
+            return false;
+        }
+        match filters.duration {
+            SearchDurationFilter::Any => true,
+            SearchDurationFilter::Short => secs.is_some_and(|s| s < 240),
+            SearchDurationFilter::Medium => secs.is_some_and(|s| (240..=1200).contains(&s)),
+            SearchDurationFilter::Long => secs.is_some_and(|s| s > 1200),
+        }
+    });
+    if filters.sort == SearchSort::Views {
+        results.sort_by(|a, b| {
+            b.metadata
+                .view_count
+                .unwrap_or(0)
+                .cmp(&a.metadata.view_count.unwrap_or(0))
+        });
+    }
+    results
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChannelFeedTab {
+    #[default]
+    Videos,
+    Shorts,
+    Streams,
+}
+
+pub fn fetch_channel_tab_videos_with_cancel(
+    input: &str,
+    tab: ChannelFeedTab,
+    limit: usize,
+    cancellation: &Cancellation,
+) -> Result<Vec<SearchResult>, String> {
+    let (target, effective_limit) = parse_and_clamp_channel_request(input, limit)?;
+    let limit_arg = effective_limit.to_string();
+    let tab_url = match tab {
+        ChannelFeedTab::Videos => target.videos_tab_url(),
+        ChannelFeedTab::Shorts => target.shorts_tab_url(),
+        ChannelFeedTab::Streams => target.streams_tab_url(),
+    };
+    let output = process::output(
+        yt_dlp().args([
+            "--flat-playlist",
+            "--playlist-end",
+            &limit_arg,
+            "--dump-single-json",
+            "--skip-download",
+            "--no-warnings",
+            "--",
+            &tab_url,
+        ]),
+        cancellation,
+        QUERY_TIMEOUT,
+    )
+    .map_err(|error| {
+        format!("Não foi possível executar yt-dlp: {error}. Verifique se ele está ao lado do app ou no PATH.")
+    })?;
+    if !output.status.success() {
+        return Err(format!(
+            "Não foi possível consultar esta aba do canal: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_channel_page(&output.stdout, &target, effective_limit).map(|page| page.videos)
+}
+
 #[cfg(test)]
 pub fn find(query: &str) -> Result<Vec<Video>, String> {
     find_with_metadata(query)
@@ -1040,8 +1294,22 @@ pub fn find_with_cancel(
     query: &str,
     cancellation: &Cancellation,
 ) -> Result<Vec<SearchResult>, String> {
-    let target = if query.starts_with("https://") || query.starts_with("http://") {
+    find_filtered_with_cancel(query, SearchFilters::default(), cancellation)
+}
+
+pub fn find_filtered_with_cancel(
+    query: &str,
+    filters: SearchFilters,
+    cancellation: &Cancellation,
+) -> Result<Vec<SearchResult>, String> {
+    let is_url = query.starts_with("https://") || query.starts_with("http://");
+    let target = if is_url {
         query.to_owned()
+    } else if filters.sort == SearchSort::Date {
+        format!("ytsearchdate20:{query}")
+    } else if filters.duration != SearchDurationFilter::Any || filters.kind != SearchTypeFilter::All
+    {
+        format!("ytsearch30:{query}")
     } else {
         format!("ytsearch20:{query}")
     };
@@ -1062,7 +1330,12 @@ pub fn find_with_cancel(
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    parse_results(&output.stdout, target.starts_with("ytsearch20:"))
+    let parsed = parse_results(&output.stdout, !is_url)?;
+    Ok(if is_url {
+        parsed
+    } else {
+        apply_search_filters(parsed, filters)
+    })
 }
 
 #[cfg(test)]
@@ -3222,5 +3495,98 @@ mod tests {
             about.avatar_url.as_deref(),
             Some("https://yt3.googleusercontent.com/avatar=s900")
         );
+    }
+
+    #[test]
+    fn channel_target_exposes_shorts_and_streams_tab_urls() {
+        let target = ChannelTarget::Handle("@rustlang".to_owned());
+        assert_eq!(
+            target.shorts_tab_url(),
+            "https://www.youtube.com/@rustlang/shorts"
+        );
+        assert_eq!(
+            target.streams_tab_url(),
+            "https://www.youtube.com/@rustlang/streams"
+        );
+    }
+
+    #[test]
+    fn search_filters_filter_by_type_duration_and_sort_by_views() {
+        let mk = |title: &str, url: &str, dur: &str, views: Option<u64>| SearchResult {
+            video: Video {
+                title: title.into(),
+                channel: "Canal".into(),
+                url: url.into(),
+                thumbnail: String::new(),
+                duration: dur.into(),
+            },
+            metadata: VideoMetadata {
+                view_count: views,
+                ..Default::default()
+            },
+        };
+        let items = vec![
+            mk(
+                "Short",
+                "https://www.youtube.com/shorts/aaa",
+                "0:45",
+                Some(100),
+            ),
+            mk(
+                "Medium A",
+                "https://www.youtube.com/watch?v=bbb",
+                "8:10",
+                Some(500),
+            ),
+            mk(
+                "Medium B",
+                "https://www.youtube.com/watch?v=ccc",
+                "12:00",
+                Some(1200),
+            ),
+            mk(
+                "Long",
+                "https://www.youtube.com/watch?v=ddd",
+                "1:05:00",
+                Some(3000),
+            ),
+            mk("Live", "https://www.youtube.com/watch?v=eee", "", Some(900)),
+        ];
+
+        assert_eq!(parse_duration_label_secs("8:10"), Some(490));
+        assert_eq!(parse_duration_label_secs("1:05:00"), Some(3900));
+        assert_eq!(parse_duration_label_secs(""), None);
+
+        let shorts = apply_search_filters(
+            items.clone(),
+            SearchFilters {
+                kind: SearchTypeFilter::Shorts,
+                ..Default::default()
+            },
+        );
+        assert_eq!(shorts.len(), 1);
+        assert_eq!(shorts[0].video.title, "Short");
+
+        let live = apply_search_filters(
+            items.clone(),
+            SearchFilters {
+                kind: SearchTypeFilter::Live,
+                ..Default::default()
+            },
+        );
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].video.title, "Live");
+
+        let medium_by_views = apply_search_filters(
+            items,
+            SearchFilters {
+                sort: SearchSort::Views,
+                duration: SearchDurationFilter::Medium,
+                kind: SearchTypeFilter::Videos,
+            },
+        );
+        assert_eq!(medium_by_views.len(), 2);
+        assert_eq!(medium_by_views[0].video.title, "Medium B");
+        assert_eq!(medium_by_views[1].video.title, "Medium A");
     }
 }

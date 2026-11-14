@@ -375,6 +375,7 @@ struct RenderShared {
     gl: Arc<glow::Context>,
     context: RenderContext,
     surface: Mutex<Option<GlSurface>>,
+    needs_render: AtomicBool,
     failed: AtomicBool,
 }
 
@@ -386,10 +387,29 @@ impl RenderShared {
         if self.failed.load(Ordering::Relaxed) {
             return;
         }
-        let viewport = info.viewport_in_pixels();
-        let width = viewport.width_px;
-        let height = viewport.height_px;
+        let update_flags = unsafe { (self.context.update)(self.context.handle) };
+        if (update_flags & 1) != 0 {
+            self.needs_render.store(true, Ordering::Relaxed);
+        }
+        let clip = info.clip_rect_in_pixels();
+        if clip.width_px <= 0 || clip.height_px <= 0 {
+            return;
+        }
+        let ppp = info.pixels_per_point.max(0.5);
+        let screen_h = info.screen_size_px[1] as i32;
+        let dst_left = (info.viewport.min.x * ppp).round() as i32;
+        let dst_top = (info.viewport.min.y * ppp).round() as i32;
+        let width = (info.viewport.width() * ppp).round() as i32;
+        let height = (info.viewport.height() * ppp).round() as i32;
         if width <= 0 || height <= 0 {
+            return;
+        }
+        let dst_bottom = screen_h - (dst_top + height);
+        let vis_x0 = dst_left.max(clip.left_px);
+        let vis_y0 = dst_bottom.max(clip.from_bottom_px);
+        let vis_x1 = (dst_left + width).min(clip.left_px + clip.width_px);
+        let vis_y1 = (dst_bottom + height).min(clip.from_bottom_px + clip.height_px);
+        if vis_x1 <= vis_x0 || vis_y1 <= vis_y0 {
             return;
         }
         let gl = self.gl.as_ref();
@@ -413,43 +433,44 @@ impl RenderShared {
         let Some(surface) = surface.as_ref() else {
             return;
         };
+        let should_render_mpv = recreate || self.needs_render.swap(false, Ordering::Relaxed);
         unsafe {
-            let _ = (self.context.update)(self.context.handle);
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(surface.framebuffer));
-            gl.viewport(0, 0, width, height);
-            gl.disable(glow::SCISSOR_TEST);
-            let mut fbo = MpvOpenglFbo {
-                fbo: surface.framebuffer.0.get() as c_int,
-                width,
-                height,
-                internal_format: 0,
-            };
-            let mut flip_y: c_int = 1;
-            let mut params = [
-                MpvRenderParam {
-                    type_: MPV_RENDER_PARAM_OPENGL_FBO,
-                    data: (&mut fbo as *mut MpvOpenglFbo).cast(),
-                },
-                MpvRenderParam {
-                    type_: MPV_RENDER_PARAM_FLIP_Y,
-                    data: (&mut flip_y as *mut c_int).cast(),
-                },
-                MpvRenderParam {
-                    type_: 0,
-                    data: ptr::null_mut(),
-                },
-            ];
-            let result = (self.context.render)(self.context.handle, params.as_mut_ptr());
-            if result < 0 {
-                self.failed.store(true, Ordering::Relaxed);
-                gl.bind_framebuffer(glow::FRAMEBUFFER, painter.intermediate_fbo());
-                return;
+            if should_render_mpv {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(surface.framebuffer));
+                gl.viewport(0, 0, width, height);
+                gl.disable(glow::SCISSOR_TEST);
+                let mut fbo = MpvOpenglFbo {
+                    fbo: surface.framebuffer.0.get() as c_int,
+                    width,
+                    height,
+                    internal_format: 0,
+                };
+                let mut flip_y: c_int = 1;
+                let mut params = [
+                    MpvRenderParam {
+                        type_: MPV_RENDER_PARAM_OPENGL_FBO,
+                        data: (&mut fbo as *mut MpvOpenglFbo).cast(),
+                    },
+                    MpvRenderParam {
+                        type_: MPV_RENDER_PARAM_FLIP_Y,
+                        data: (&mut flip_y as *mut c_int).cast(),
+                    },
+                    MpvRenderParam {
+                        type_: 0,
+                        data: ptr::null_mut(),
+                    },
+                ];
+                let result = (self.context.render)(self.context.handle, params.as_mut_ptr());
+                if result < 0 {
+                    self.failed.store(true, Ordering::Relaxed);
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, painter.intermediate_fbo());
+                    return;
+                }
             }
-            let clip = info.clip_rect_in_pixels();
-            if clip.width_px <= 0 || clip.height_px <= 0 {
-                gl.bind_framebuffer(glow::FRAMEBUFFER, painter.intermediate_fbo());
-                return;
-            }
+            let src_x0 = vis_x0 - dst_left;
+            let src_y0 = vis_y0 - dst_bottom;
+            let src_x1 = vis_x1 - dst_left;
+            let src_y1 = vis_y1 - dst_bottom;
             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(surface.framebuffer));
             gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, painter.intermediate_fbo());
             gl.enable(glow::SCISSOR_TEST);
@@ -460,14 +481,14 @@ impl RenderShared {
                 clip.height_px,
             );
             gl.blit_framebuffer(
-                0,
-                0,
-                width,
-                height,
-                viewport.left_px,
-                viewport.from_bottom_px,
-                viewport.left_px + width,
-                viewport.from_bottom_px + height,
+                src_x0,
+                src_y0,
+                src_x1,
+                src_y1,
+                vis_x0,
+                vis_y0,
+                vis_x1,
+                vis_y1,
                 glow::COLOR_BUFFER_BIT,
                 glow::NEAREST,
             );
@@ -607,10 +628,13 @@ impl Player {
     fn load_library() -> Result<Library, String> {
         for name in ["libmpv-2.dll", "mpv-2.dll"] {
             let mut candidates = Vec::new();
-            if let Ok(executable) = std::env::current_exe()
-                && let Some(directory) = executable.parent()
-            {
-                candidates.push(directory.join(name));
+            if let Ok(executable) = std::env::current_exe() {
+                let mut current = executable.parent();
+                for _ in 0..4 {
+                    let Some(directory) = current else { break };
+                    candidates.push(directory.join(name));
+                    current = directory.parent();
+                }
             }
             if let Ok(directory) = std::env::current_dir() {
                 candidates.push(directory.join(name));
@@ -657,7 +681,6 @@ impl Player {
                 let result = (api.set_option)(handle, option_name.as_ptr(), value.as_ptr());
                 if result < 0 {
                     let detail = player.describe_error(result);
-                    (api.terminate)(handle);
                     return Err(format!("Não foi possível configurar {name}: {detail}"));
                 }
             }
@@ -667,7 +690,6 @@ impl Player {
                     let event_result = (api.request_event)(handle, event_id, 0);
                     if event_result < 0 {
                         let detail = player.describe_error(event_result);
-                        (api.terminate)(handle);
                         return Err(format!(
                             "N??o foi poss??vel habilitar a correla????o de eventos do libmpv: {detail}"
                         ));
@@ -676,7 +698,6 @@ impl Player {
             }
             if result < 0 {
                 let detail = player.describe_error(result);
-                (api.terminate)(handle);
                 return Err(format!("Não foi possível inicializar o libmpv: {detail}"));
             }
             let render_context = create_render_context(&api, handle, ctx)?;
@@ -684,6 +705,7 @@ impl Player {
                 gl,
                 context: render_context,
                 surface: Mutex::new(None),
+                needs_render: AtomicBool::new(true),
                 failed: AtomicBool::new(false),
             }));
             Ok(player)
@@ -974,10 +996,7 @@ impl Player {
             .is_some_and(|shared| !shared.failed.load(Ordering::Relaxed))
     }
 
-    /// Desenha o quadro atual do libmpv dentro de `rect`.
-    ///
-    /// Retorna `false` quando o player está no modo de janela nativa, onde o
-    /// egui não consegue pintar por cima do vídeo.
+    /// Returns `false` in native `HWND` fallback mode where `egui` cannot draw over video.
     pub fn paint_into(&self, painter: &egui::Painter, rect: Rect) -> bool {
         let Some(shared) = &self.render else {
             return false;
@@ -1017,7 +1036,6 @@ unsafe fn create_render_context(
     ctx: &egui::Context,
 ) -> Result<RenderContext, String> {
     unsafe {
-        let mut api_type = MPV_RENDER_API_TYPE_OPENGL.as_ptr() as *mut c_void;
         let mut init = MpvOpenglInitParams {
             get_proc_address: Some(mpv_get_proc_address),
             get_proc_address_ctx: ptr::null_mut(),
@@ -1025,7 +1043,7 @@ unsafe fn create_render_context(
         let mut params = [
             MpvRenderParam {
                 type_: MPV_RENDER_PARAM_API_TYPE,
-                data: (&mut api_type as *mut *mut c_void).cast(),
+                data: MPV_RENDER_API_TYPE_OPENGL.as_ptr().cast_mut().cast(),
             },
             MpvRenderParam {
                 type_: MPV_RENDER_PARAM_OPENGL_INIT_PARAMS,
@@ -1092,24 +1110,20 @@ mod tests {
         let style_initial = unsafe { GetWindowLongW(video_window.hwnd(), GWL_STYLE) as u32 };
         assert_ne!(style_initial & WS_VISIBLE, 0);
 
-        // Redimensiona em modo normal.
         let initial_rect = Rect::from_min_max(Pos2::new(16.0, 48.0), Pos2::new(656.0, 408.0));
         video_window.resize(initial_rect, 1.0);
 
-        // Oculta o HWND quando a janela de configurações é aberta (sem destruir o HWND).
         video_window.set_visible(false);
         assert!(!video_window.is_visible());
         let style_hidden = unsafe { GetWindowLongW(video_window.hwnd(), GWL_STYLE) as u32 };
         assert_eq!(style_hidden & WS_VISIBLE, 0);
 
-        // Mesmo se a geometria mudar enquanto oculto (ex.: alternar tela cheia),
-        // o HWND permanece oculto e memoriza o novo retângulo.
+        // Bounds changed while hidden must still apply once the HWND is restored.
         let fullscreen_rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1280.0, 720.0));
         video_window.resize(fullscreen_rect, 1.5);
         let style_still_hidden = unsafe { GetWindowLongW(video_window.hwnd(), GWL_STYLE) as u32 };
         assert_eq!(style_still_hidden & WS_VISIBLE, 0);
 
-        // Ao fechar a janela de configurações, restaura o HWND imediatamente com o último tamanho.
         video_window.set_visible(true);
         assert!(video_window.is_visible());
         let style_restored = unsafe { GetWindowLongW(video_window.hwnd(), GWL_STYLE) as u32 };

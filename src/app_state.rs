@@ -8,10 +8,11 @@ use crate::{
     ActivePlayback, BackupImportMode, BackupPreview, BrowseSection, BufferProfile,
     ChannelAboutFetchMessage, ChannelFetchMessage, ChannelMoreVideosFetchMessage, ChannelPage,
     ChannelPlaylistVideosFetchMessage, ChannelPlaylistsFetchMessage, ChannelTab,
-    DecodingDiagnostics, FeedDerivedCache, FeedFilter, HISTORY_MIN_POSITION_DELTA_MS,
-    HISTORY_SAVE_INTERVAL, HomeFetchMessage, ImportedUserData, PlaybackPreferences, Queue,
-    QueuePlaybackCorrelation, SearchFetchMessage, SearchResult, Theme, ThemePalette, Video,
-    apply_theme_visuals, buffer_profile_name, buffer_profile_summary, parse_duration_ms,
+    ChannelTabVideosFetchMessage, DecodingDiagnostics, FeedDerivedCache, FeedFilter,
+    HISTORY_MIN_POSITION_DELTA_MS, HISTORY_SAVE_INTERVAL, HomeFetchMessage, ImportedUserData,
+    PlaybackPreferences, Queue, QueuePlaybackCorrelation, SearchFetchMessage, SearchResult, Theme,
+    ThemePalette, Video, apply_theme_visuals, buffer_profile_name, buffer_profile_summary,
+    parse_duration_ms,
 };
 use eframe::egui::{self, Color32};
 use std::collections::HashMap;
@@ -28,6 +29,9 @@ pub(crate) struct BrowseFeedState {
     pub(crate) cache: FeedDerivedCache,
     pub(crate) search: SearchJob,
     pub(crate) home: HomeFeedState,
+    pub(crate) search_filters: search::SearchFilters,
+    pub(crate) search_filters_open: bool,
+    pub(crate) recent_searches: Vec<String>,
 }
 
 impl Default for BrowseFeedState {
@@ -41,6 +45,9 @@ impl Default for BrowseFeedState {
             cache: FeedDerivedCache::default(),
             search: SearchJob::default(),
             home: HomeFeedState::default(),
+            search_filters: search::SearchFilters::default(),
+            search_filters_open: false,
+            recent_searches: Vec::new(),
         }
     }
 }
@@ -84,6 +91,8 @@ pub(crate) struct ChannelState {
     pub(crate) video_limit: usize,
     pub(crate) from_cache: bool,
     pub(crate) videos: ChannelVideosState,
+    pub(crate) shorts: ChannelTabFeedState,
+    pub(crate) streams: ChannelTabFeedState,
     pub(crate) playlists: ChannelPlaylistsState,
     pub(crate) playlist_detail: ChannelPlaylistDetailState,
     pub(crate) about: ChannelAboutState,
@@ -102,6 +111,8 @@ impl ChannelState {
             video_limit: search::DEFAULT_CHANNEL_VIDEOS_LIMIT,
             from_cache: false,
             videos: ChannelVideosState::default(),
+            shorts: ChannelTabFeedState::default(),
+            streams: ChannelTabFeedState::default(),
             playlists: ChannelPlaylistsState::default(),
             playlist_detail: ChannelPlaylistDetailState::default(),
             about: ChannelAboutState::default(),
@@ -126,6 +137,16 @@ pub(crate) struct ChannelVideosState {
     pub(crate) more_error: Option<String>,
     pub(crate) has_more: bool,
     pub(crate) reached_max: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct ChannelTabFeedState {
+    pub(crate) items: Vec<SearchResult>,
+    pub(crate) loaded: bool,
+    pub(crate) rx: Option<Receiver<ChannelTabVideosFetchMessage>>,
+    pub(crate) cancel: Option<process::Cancellation>,
+    pub(crate) active_request_id: Option<u64>,
+    pub(crate) error: Option<String>,
 }
 
 #[derive(Default)]
@@ -164,6 +185,26 @@ pub(crate) type RatingResultReceiver = Receiver<(
     Result<(String, Option<crate::oauth::VideoRating>), String>,
 )>;
 
+pub(crate) type SubscriptionResultReceiver = Receiver<(
+    Option<crate::oauth::TokenSession>,
+    Result<(String, crate::oauth::SubscriptionStatus), String>,
+)>;
+
+pub(crate) type MyChannelResultReceiver = Receiver<(
+    Option<crate::oauth::TokenSession>,
+    Result<crate::oauth::MyChannelProfile, String>,
+)>;
+
+pub(crate) type RemotePlaylistsResultReceiver = Receiver<(
+    Option<crate::oauth::TokenSession>,
+    Result<Vec<(String, String)>, String>,
+)>;
+
+pub(crate) type PlaylistActionResultReceiver = Receiver<(
+    Option<crate::oauth::TokenSession>,
+    Result<(Option<(String, String)>, String), String>,
+)>;
+
 #[derive(Default)]
 pub(crate) struct AuthState {
     pub(crate) reauth_rx: Option<Receiver<Result<crate::oauth::TokenSession, String>>>,
@@ -173,6 +214,25 @@ pub(crate) struct AuthState {
     pub(crate) ratings: HashMap<String, crate::oauth::VideoRating>,
     pub(crate) rating_rx: Option<RatingResultReceiver>,
     pub(crate) rating_cancel: Option<process::Cancellation>,
+    pub(crate) subscriptions: HashMap<String, crate::oauth::SubscriptionStatus>,
+    pub(crate) sub_check_rx: Option<SubscriptionResultReceiver>,
+    pub(crate) sub_check_cancel: Option<process::Cancellation>,
+    pub(crate) sub_toggle_rx: Option<SubscriptionResultReceiver>,
+    pub(crate) sub_toggle_cancel: Option<process::Cancellation>,
+    pub(crate) my_channel: Option<ChannelTarget>,
+    pub(crate) my_channel_title: Option<String>,
+    pub(crate) my_channel_avatar_url: Option<String>,
+    pub(crate) my_channel_open_when_ready: bool,
+    pub(crate) my_channel_fetch_attempted: bool,
+    pub(crate) my_channel_rx: Option<MyChannelResultReceiver>,
+    pub(crate) my_channel_cancel: Option<process::Cancellation>,
+    pub(crate) remote_playlists: Vec<(String, String)>,
+    pub(crate) remote_playlists_rx: Option<RemotePlaylistsResultReceiver>,
+    pub(crate) remote_playlists_cancel: Option<process::Cancellation>,
+    pub(crate) playlist_action_rx: Option<PlaylistActionResultReceiver>,
+    pub(crate) playlist_action_cancel: Option<process::Cancellation>,
+    pub(crate) youtube_web_session: Option<crate::comment_actions::YouTubeWebSession>,
+    pub(crate) youtube_web_session_checked: bool,
     pub(crate) restore_attempted: bool,
 }
 
@@ -193,6 +253,12 @@ pub(crate) struct PlaybackState {
     pub(crate) overlay_last_activity: Instant,
     pub(crate) player_menu: Option<overlay::OverlayMenu>,
     pub(crate) last_subtitle_id: Option<String>,
+    pub(crate) autoplay: bool,
+    pub(crate) loop_video: bool,
+    pub(crate) autoplay_eof_handled: bool,
+    pub(crate) save_menu_open: bool,
+    pub(crate) new_remote_playlist_title: String,
+    pub(crate) pending_open_video: Option<Video>,
     pub(crate) diagnostics: DecodingDiagnostics,
     pub(crate) last_diagnostics_poll_at: Option<Instant>,
 }
@@ -216,6 +282,12 @@ impl Default for PlaybackState {
             overlay_last_activity: Instant::now(),
             player_menu: None,
             last_subtitle_id: None,
+            autoplay: true,
+            loop_video: false,
+            autoplay_eof_handled: false,
+            save_menu_open: false,
+            new_remote_playlist_title: String::new(),
+            pending_open_video: None,
             diagnostics: DecodingDiagnostics::unknown(Some(crate::DEFAULT_CONFIGURED_HWDEC)),
             last_diagnostics_poll_at: None,
         }
@@ -335,6 +407,7 @@ pub(crate) struct NavigationUiState {
     pub(crate) settings_open: bool,
     pub(crate) shortcuts_open: bool,
     pub(crate) subscriptions_expanded: bool,
+    pub(crate) explore_expanded: bool,
     pub(crate) browse_section: BrowseSection,
 }
 
@@ -779,6 +852,14 @@ impl ChannelState {
         self.videos.active_more_request_id.is_some()
     }
 
+    pub(crate) fn is_shorts_loading(&self) -> bool {
+        self.shorts.active_request_id.is_some()
+    }
+
+    pub(crate) fn is_streams_loading(&self) -> bool {
+        self.streams.active_request_id.is_some()
+    }
+
     pub(crate) fn is_playlists_loading(&self) -> bool {
         self.playlists.active_request_id.is_some()
     }
@@ -804,6 +885,8 @@ impl ChannelState {
         }
         self.videos.more_rx = None;
         self.videos.active_more_request_id = None;
+        self.cancel_shorts();
+        self.cancel_streams();
         if let Some(cancel) = self.playlists.cancel.take() {
             cancel.cancel();
         }
@@ -848,6 +931,22 @@ impl ChannelState {
         }
         self.videos.more_rx = None;
         self.videos.active_more_request_id = None;
+    }
+
+    pub(crate) fn cancel_shorts(&mut self) {
+        if let Some(cancel) = self.shorts.cancel.take() {
+            cancel.cancel();
+        }
+        self.shorts.rx = None;
+        self.shorts.active_request_id = None;
+    }
+
+    pub(crate) fn cancel_streams(&mut self) {
+        if let Some(cancel) = self.streams.cancel.take() {
+            cancel.cancel();
+        }
+        self.streams.rx = None;
+        self.streams.active_request_id = None;
     }
 
     pub(crate) fn cancel_playlists(&mut self) {
@@ -901,6 +1000,38 @@ impl ChannelState {
         self.videos.active_more_request_id = Some(request_id);
         self.videos.more_error = None;
         Some((request_id, target, start, count))
+    }
+
+    pub(crate) fn begin_shorts_request(&mut self) -> Option<(u64, ChannelTarget)> {
+        if self.is_shorts_loading() {
+            return None;
+        }
+        let target = self
+            .page
+            .as_ref()
+            .map(|page| page.target.clone())
+            .or_else(|| self.current_target())?;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        let request_id = self.next_request_id;
+        self.shorts.active_request_id = Some(request_id);
+        self.shorts.error = None;
+        Some((request_id, target))
+    }
+
+    pub(crate) fn begin_streams_request(&mut self) -> Option<(u64, ChannelTarget)> {
+        if self.is_streams_loading() {
+            return None;
+        }
+        let target = self
+            .page
+            .as_ref()
+            .map(|page| page.target.clone())
+            .or_else(|| self.current_target())?;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        let request_id = self.next_request_id;
+        self.streams.active_request_id = Some(request_id);
+        self.streams.error = None;
+        Some((request_id, target))
     }
 
     pub(crate) fn begin_playlists_request(&mut self) -> Option<(u64, ChannelTarget)> {

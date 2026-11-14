@@ -108,6 +108,7 @@ fn strip_tags(s: &str) -> String {
         .replace("&lt;", "<")
         .replace("&gt;", ">")
 }
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn search<'a>(cues: &'a [Cue], query: &str) -> Vec<&'a Cue> {
     let q = query.trim().to_lowercase();
     if q.is_empty() {

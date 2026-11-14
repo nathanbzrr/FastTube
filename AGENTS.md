@@ -1,9 +1,42 @@
-# Regras do projeto FastTube
+# FastTube Agent & Contributor Guide
 
-## Regra absoluta: testes e validações
+FastTube is a Windows-first Rust desktop YouTube client (`eframe`/`egui` + `libmpv` + `yt-dlp` + YouTube Data API v3).
 
-Em toda tarefa ou prompt neste projeto, consulte e aplique esta regra antes de planejar ou executar qualquer trabalho. Toda atividade de teste ou validação, inclusive testes e validações associados à adição ou alteração de funcionalidades, deve ser delegada a um subagente **GPT-6 Luna com esforço high** ou **Gemini 3.8 Flash com esforço high**. Outros modelos e o agente principal não devem executar essas atividades. Se nenhum dos modelos permitidos estiver disponível, informe o bloqueio e não substitua o modelo sem autorização explícita do usuário.
+## Architecture & Navigation
 
-Outros modelos, incluindo Gemini 4 Argon com esforço medium, podem realizar análise, planejamento e implementação, desde que não executem testes ou validações. As medições de desempenho devem ficar para a última etapa, conforme a orientação do usuário.
+- Read [`docs/architecture.md`](docs/architecture.md) first for the 21-module map, the 12 domain substates in [`src/app_state.rs`](src/app_state.rs), and system invariants.
+- [`src/main.rs`](src/main.rs) is ~16,000 lines. **Do not read it sequentially.**
+- **Graphify decision rule (per prompt)**:
+  - **Use Graphify (`graphify query --budget 1800`, `explain`, `affected`, `path`)** when the prompt involves cross-module call flows, impact/dependency analysis, architectural questions, or locating logic inside `src/main.rs` without a known symbol/line (see [`docs/graphify.md`](docs/graphify.md)).
+  - **Skip Graphify (use targeted search / `view_file` directly)** when the prompt names a specific file, function, struct, UI string, or small localized fix, to avoid CLI overhead and save tokens.
+  - Run `graphify update .` after structural Rust changes (or `graphify update . --force` if `graphify-out/` is missing).
 
-O subagente delegado que já estiver executando como GPT-6 Luna high ou Gemini 3.8 Flash high deve realizar pessoalmente os testes e as validações atribuídos a ele; não precisa delegá-los novamente. A delegação exigida é a feita pelo agente principal ao subagente autorizado.
+## Core Invariants
+
+Preserve these invariants across all changes:
+
+1. **Atomic persistence & rollback**: Local JSON/settings files use temp-file + atomic replace. Corrupt files must remain untouched on disk and surface an error. Multi-file imports snapshot to `.fasttube-import-recovery` and roll back on failure or interrupted startup (`src/backup.rs`).
+2. **No secret leakage**: OAuth secrets, tokens, and cookies must never be written to backups (`src/backup.rs`). Diagnostic reports (`src/diagnostics.rs`) must never expose raw error text, URLs, tokens, cookies, or filesystem paths.
+3. **Async staleness & cancellation**: Background workers (`std::thread::spawn` + `mpsc`) must use `process::Cancellation` and validate monotonic `request_id`s before applying results to state.
+4. **Queue confirmation**: Never remove a queued item until `libmpv` confirms loading that exact `QueuePlaybackCorrelation` occurrence ID.
+5. **Isolated `cargo` targets**: Always use `--target-dir target\<name>` when building or testing locally if `fasttube.exe` may be running, to avoid Windows file-lock errors.
+
+## Validation Commands
+
+Run formatting, compilation, lints, and tests before concluding code changes:
+
+```powershell
+cargo fmt --check
+cargo check --all-targets --locked --target-dir target\validation
+cargo clippy --all-targets --locked --target-dir target\validation
+cargo test --locked --target-dir target\validation
+```
+
+- CI runs on Windows MSVC (`stable`). For GNU builds (`+stable-x86_64-pc-windows-gnu`), configure `CC_x86_64_pc_windows_gnu`, `CXX_x86_64_pc_windows_gnu`, `AR_x86_64_pc_windows_gnu`, and `CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER` if MinGW is not already in `PATH`.
+- PowerShell tooling tests: `.\scripts\test-portable-package.ps1`, `.\scripts\test-measure-process.ps1`, `.\scripts\test-measure-network.ps1`.
+
+## Code & Documentation Style
+
+- Write all code comments, commit messages, filenames, and documentation in **English** (user-facing UI strings follow the app's UI language).
+- Keep code comments minimal and high-signal: document non-obvious invariants or *why* a constraint exists—never narrate step-by-step *what* the code does or restate identifiers.
+- Do not commit dated session logs, line-by-line code walkthroughs, or one-off measurement/validation diaries to `docs/`.
