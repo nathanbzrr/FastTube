@@ -64,6 +64,14 @@ pub struct ScoredVideo {
     pub is_short: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HomeQueryPlan {
+    pub video_queries: Vec<String>,
+    pub channel_targets: Vec<crate::search::ChannelTarget>,
+    pub playlist_query: Option<String>,
+    pub shorts_query: Option<String>,
+}
+
 impl UserProfile {
     pub fn build(history: &History, queue: &Queue, current_video: Option<&Video>) -> Self {
         let mut profile = Self::default();
@@ -156,6 +164,17 @@ impl UserProfile {
             .take(limit)
             .map(|(token, _)| capitalize_first(token))
             .collect()
+    }
+
+    pub fn apply_muted_topics(&mut self, muted_topics: &[String]) {
+        for raw in muted_topics {
+            let key = raw.trim().to_lowercase();
+            if key.is_empty() {
+                continue;
+            }
+            self.token_weights.remove(&key);
+            self.active_tokens.remove(&key);
+        }
     }
 }
 
@@ -266,6 +285,23 @@ impl RecommendationEngine {
         reference_epoch: i64,
         filter: &FeedFilter,
     ) -> ScoredVideo {
+        let (score, is_short) =
+            Self::score_single_parts(video, metadata, profile, reference_epoch, filter);
+        ScoredVideo {
+            video: video.clone(),
+            metadata: metadata.cloned().unwrap_or_default(),
+            score,
+            is_short,
+        }
+    }
+
+    fn score_single_parts(
+        video: &Video,
+        metadata: Option<&VideoMetadata>,
+        profile: &UserProfile,
+        reference_epoch: i64,
+        filter: &FeedFilter,
+    ) -> (f64, bool) {
         let mut score = 20.0;
 
         let channel_key = normalize_channel_key(&video.channel);
@@ -367,13 +403,11 @@ impl RecommendationEngine {
                 score -= channel_affinity * 5.0;
             }
         }
-
-        ScoredVideo {
-            video: video.clone(),
-            metadata: metadata.cloned().unwrap_or_default(),
-            score,
-            is_short,
+        if matches!(filter, FeedFilter::All) && video.url.contains("playlist?list=") {
+            score += 6.5;
         }
+
+        (score, is_short)
     }
 
     pub fn available_chips(
@@ -383,10 +417,10 @@ impl RecommendationEngine {
     ) -> Vec<FeedFilter> {
         let mut chips = vec![
             FeedFilter::All,
-            FeedFilter::Recommended,
-            FeedFilter::Music,
-            FeedFilter::Podcasts,
             FeedFilter::Gaming,
+            FeedFilter::Podcasts,
+            FeedFilter::Music,
+            FeedFilter::Mixes,
         ];
 
         let mut dynamic_topics = profile.top_topics(2);
@@ -404,13 +438,7 @@ impl RecommendationEngine {
             }
         }
 
-        if videos
-            .iter()
-            .any(|v| is_live_video(v, metadata_map.get(&v.url)))
-        {
-            chips.push(FeedFilter::Live);
-        }
-        chips.push(FeedFilter::Mixes);
+        chips.push(FeedFilter::Live);
         if videos
             .iter()
             .any(|v| is_short_video(v, metadata_map.get(&v.url)))
@@ -423,43 +451,201 @@ impl RecommendationEngine {
         chips
     }
 
-    pub fn build_discovery_query(profile: &UserProfile, filter: &FeedFilter) -> String {
+    pub fn build_home_query_plan(
+        profile: &UserProfile,
+        subscribed_channels: &[crate::search::HomeChannel],
+        filter: &FeedFilter,
+        page: usize,
+    ) -> HomeQueryPlan {
+        const GENERAL_DISCOVERY_POOL: &[&str] = &[
+            "brasil jogos tecnologia podcast",
+            "entretenimento brasil música cortes",
+            "gameplay humor brasil novidades",
+            "ciência história cinema análise",
+            "programação engenharia dev brasil",
+            "esportes futebol highlights brasil",
+            "música ao vivo acústico brasil",
+            "documentário curiosidades brasil",
+        ];
+        const PLAYLIST_POOL: &[&str] = &[
+            "mix rock indie brasil",
+            "mix música brasil playlist",
+            "mix lofi hip hop estudo",
+            "playlist podcast tecnologia",
+        ];
+        const SHORTS_POOL: &[&str] = &[
+            "#shorts brasil humor",
+            "#shorts gaming memes",
+            "#shorts tecnologia curiosidades",
+            "#shorts música highlights",
+        ];
+
+        let mut plan = HomeQueryPlan::default();
+        let top_topics = profile.top_topics(6);
+
+        let mut ranked_channels: Vec<(&String, &f64)> = profile.channel_weights.iter().collect();
+        ranked_channels.sort_by(|a, b| {
+            b.1.partial_cmp(a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(b.0))
+        });
+
         match filter {
-            FeedFilter::Music => "música clipe ao vivo oficial".into(),
-            FeedFilter::Podcasts => "podcast entrevista episódio completo".into(),
-            FeedFilter::Gaming => "gameplay jogos brasil".into(),
-            FeedFilter::Live => "ao vivo live stream".into(),
-            FeedFilter::Mixes => "mix música playlist".into(),
-            FeedFilter::Shorts => "#shorts brasil".into(),
-            FeedFilter::Topic(topic) => topic.clone(),
-            FeedFilter::Channel(channel) => channel.clone(),
             FeedFilter::All
             | FeedFilter::Recommended
             | FeedFilter::RecentlyUploaded
             | FeedFilter::NewToYou => {
-                let topics = profile.top_topics(3);
-                if !topics.is_empty() {
-                    topics.join(" ")
-                } else {
-                    "recomendados brasil em alta".into()
+                if !top_topics.is_empty() {
+                    let start = (page * 2) % top_topics.len();
+                    let q1 = (0..top_topics.len().min(2))
+                        .map(|offset| top_topics[(start + offset) % top_topics.len()].as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if !q1.trim().is_empty() {
+                        plan.video_queries.push(q1);
+                    }
+                }
+                if !ranked_channels.is_empty() {
+                    let (ch, _) = ranked_channels[page % ranked_channels.len()];
+                    plan.video_queries.push(ch.clone());
+                } else if !subscribed_channels.is_empty() {
+                    let ch = &subscribed_channels[page % subscribed_channels.len()];
+                    plan.video_queries.push(ch.title.clone());
+                }
+                let fallback_idx = page % GENERAL_DISCOVERY_POOL.len();
+                let fallback_query = GENERAL_DISCOVERY_POOL[fallback_idx].to_owned();
+                if plan.video_queries.len() < 2 {
+                    plan.video_queries.push(fallback_query);
+                }
+                if page > 0 || plan.video_queries.len() < 2 {
+                    let extra_idx = (page + 3) % GENERAL_DISCOVERY_POOL.len();
+                    let extra = GENERAL_DISCOVERY_POOL[extra_idx].to_owned();
+                    if !plan.video_queries.contains(&extra) {
+                        plan.video_queries.push(extra);
+                    }
+                }
+
+                if !subscribed_channels.is_empty() {
+                    let max_targets = 2.min(subscribed_channels.len());
+                    let base = (page * max_targets) % subscribed_channels.len();
+                    for offset in 0..max_targets {
+                        let ch = &subscribed_channels[(base + offset) % subscribed_channels.len()];
+                        if ch.channel_id.starts_with("UC") && ch.channel_id.len() >= 12 {
+                            plan.channel_targets
+                                .push(crate::search::ChannelTarget::ChannelId(
+                                    ch.channel_id.clone(),
+                                ));
+                        }
+                    }
+                }
+
+                if page.is_multiple_of(2) {
+                    let playlist_q = if !top_topics.is_empty() && page == 0 {
+                        format!("{} mix", top_topics[0])
+                    } else {
+                        PLAYLIST_POOL[(page / 2) % PLAYLIST_POOL.len()].to_owned()
+                    };
+                    plan.playlist_query = Some(playlist_q);
+                }
+
+                if page.is_multiple_of(2) {
+                    let shorts_q = if !top_topics.is_empty() && page == 0 {
+                        format!("{} #shorts", top_topics[0])
+                    } else {
+                        SHORTS_POOL[(page / 2) % SHORTS_POOL.len()].to_owned()
+                    };
+                    plan.shorts_query = Some(shorts_q);
                 }
             }
+            FeedFilter::Music => {
+                let variants = [
+                    "música clipe ao vivo oficial",
+                    "álbum acústico música brasil",
+                    "show ao vivo rock pop brasil",
+                ];
+                plan.video_queries
+                    .push(variants[page % variants.len()].to_owned());
+                plan.playlist_query = Some("mix música brasil playlist".into());
+                if page == 0 {
+                    plan.shorts_query = Some("música #shorts".into());
+                }
+            }
+            FeedFilter::Podcasts => {
+                let variants = [
+                    "podcast entrevista episódio completo",
+                    "cortes podcast brasil debate",
+                    "podcast tecnologia história completo",
+                ];
+                plan.video_queries
+                    .push(variants[page % variants.len()].to_owned());
+                plan.playlist_query = Some("podcast episódios completos playlist".into());
+            }
+            FeedFilter::Gaming => {
+                let variants = [
+                    "gameplay jogos brasil",
+                    "league of legends gta minecraft brasil",
+                    "review análise jogos lançamento",
+                ];
+                plan.video_queries
+                    .push(variants[page % variants.len()].to_owned());
+                if page == 0 {
+                    plan.shorts_query = Some("gaming #shorts".into());
+                }
+            }
+            FeedFilter::Live => {
+                let variants = ["ao vivo live stream brasil", "transmissão ao vivo agora"];
+                plan.video_queries
+                    .push(variants[page % variants.len()].to_owned());
+            }
+            FeedFilter::Mixes => {
+                let mix_q = if !top_topics.is_empty() {
+                    format!("{} mix playlist", top_topics[page % top_topics.len()])
+                } else {
+                    PLAYLIST_POOL[page % PLAYLIST_POOL.len()].to_owned()
+                };
+                plan.video_queries.push("mix música ao vivo".into());
+                plan.playlist_query = Some(mix_q);
+            }
+            FeedFilter::Shorts => {
+                let shorts_q = SHORTS_POOL[page % SHORTS_POOL.len()].to_owned();
+                plan.shorts_query = Some(shorts_q);
+                plan.video_queries.push(if page == 0 {
+                    "#shorts brasil".into()
+                } else {
+                    format!("#shorts {}", SHORTS_POOL[page % SHORTS_POOL.len()])
+                });
+            }
+            FeedFilter::Topic(topic) => {
+                plan.video_queries.push(if page == 0 {
+                    topic.clone()
+                } else {
+                    format!("{topic} novidades {}", page + 1)
+                });
+                if page == 0 {
+                    plan.shorts_query = Some(format!("{topic} #shorts"));
+                }
+            }
+            FeedFilter::Channel(channel) => {
+                plan.video_queries.push(channel.clone());
+            }
         }
+
+        plan
     }
 
-    pub fn rank_sidebar_videos(
-        videos: &[Video],
+    pub fn rank_sidebar_video_indices(
+        videos: &[&Video],
         metadata_map: &HashMap<String, VideoMetadata>,
         profile: &UserProfile,
         current_video: Option<&Video>,
         current_metadata: Option<&VideoMetadata>,
         tab: crate::watch_extras::SidebarTab,
-    ) -> Vec<ScoredVideo> {
+    ) -> Vec<(usize, f64, bool)> {
         if videos.is_empty() {
             return Vec::new();
         }
 
-        let reference_epoch = latest_dataset_epoch(videos, metadata_map)
+        let reference_epoch = latest_dataset_epoch_refs(videos, metadata_map)
             .or_else(current_unix_epoch)
             .unwrap_or(1_762_728_000);
 
@@ -486,28 +672,29 @@ impl RecommendationEngine {
         let current_is_podcast =
             current_video.is_some_and(|v| is_podcast_video(v, current_metadata));
 
-        let non_self: Vec<&Video> = videos
+        let non_self: Vec<usize> = videos
             .iter()
-            .filter(|v| {
+            .enumerate()
+            .filter_map(|(orig_idx, v)| {
                 if !current_url.is_empty() && v.url == current_url {
-                    return false;
+                    return None;
                 }
                 if let (Some(cid), Some(vid)) = (&current_id, history::youtube_video_id(&v.url))
                     && cid == &vid
                 {
-                    return false;
+                    return None;
                 }
-                true
+                Some(orig_idx)
             })
             .collect();
 
         if matches!(tab, crate::watch_extras::SidebarTab::FromChannel) {
-            let same_channel: Vec<&Video> = non_self
+            let same_channel: Vec<usize> = non_self
                 .iter()
                 .copied()
-                .filter(|v| {
+                .filter(|&orig_idx| {
                     !current_ch_key.is_empty()
-                        && normalize_channel_key(&v.channel) == current_ch_key
+                        && normalize_channel_key(&videos[orig_idx].channel) == current_ch_key
                 })
                 .collect();
             let pool = if !same_channel.is_empty() {
@@ -515,37 +702,54 @@ impl RecommendationEngine {
             } else {
                 non_self
             };
-            let mut scored_list: Vec<(usize, ScoredVideo)> = pool
+            let mut scored_list: Vec<(usize, usize, f64, bool)> = pool
                 .into_iter()
                 .enumerate()
-                .map(|(idx, video)| {
+                .map(|(idx, orig_idx)| {
+                    let video = videos[orig_idx];
                     let meta = metadata_map.get(&video.url);
-                    let mut scored =
-                        Self::score_single(video, meta, profile, reference_epoch, &FeedFilter::All);
+                    let (mut score, is_short) = Self::score_single_parts(
+                        video,
+                        meta,
+                        profile,
+                        reference_epoch,
+                        &FeedFilter::All,
+                    );
                     if !current_ch_key.is_empty()
                         && normalize_channel_key(&video.channel) == current_ch_key
                     {
-                        scored.score += 100.0;
+                        score += 100.0;
                     }
-                    scored.score -= (idx as f64) * 0.05;
-                    (idx, scored)
+                    score -= (idx as f64) * 0.05;
+                    (idx, orig_idx, score, is_short)
                 })
                 .collect();
             scored_list.sort_by(|a, b| {
-                b.1.score
-                    .partial_cmp(&a.1.score)
+                b.2.partial_cmp(&a.2)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| a.0.cmp(&b.0))
             });
-            return scored_list.into_iter().map(|(_, s)| s).collect();
+            return scored_list
+                .into_iter()
+                .map(|(_, orig_idx, score, is_short)| (orig_idx, score, is_short))
+                .collect();
         }
 
-        let mut candidates: Vec<(usize, ScoredVideo)> = non_self
+        struct CandidateEntry {
+            pos_idx: usize,
+            orig_idx: usize,
+            score: f64,
+            is_short: bool,
+            ch_key: String,
+        }
+
+        let mut candidates: Vec<CandidateEntry> = non_self
             .into_iter()
             .enumerate()
-            .map(|(idx, video)| {
+            .map(|(idx, orig_idx)| {
+                let video = videos[orig_idx];
                 let meta = metadata_map.get(&video.url);
-                let mut scored = Self::score_single(
+                let (mut score, is_short) = Self::score_single_parts(
                     video,
                     meta,
                     profile,
@@ -564,18 +768,18 @@ impl RecommendationEngine {
 
                 match tab {
                     crate::watch_extras::SidebarTab::All => {
-                        scored.score -= (idx as f64) * 0.04;
+                        score -= (idx as f64) * 0.04;
                     }
                     crate::watch_extras::SidebarTab::FromChannel => {}
                     crate::watch_extras::SidebarTab::Related => {
-                        scored.score += (shared_with_current as f64) * 16.0;
+                        score += (shared_with_current as f64) * 16.0;
                         if same_category {
-                            scored.score += 18.0;
+                            score += 18.0;
                         }
                         if !current_ch_key.is_empty() && ch_key == current_ch_key {
-                            scored.score += 10.0;
+                            score += 10.0;
                         }
-                        scored.score -= (idx as f64) * 0.03;
+                        score -= (idx as f64) * 0.03;
                     }
                     crate::watch_extras::SidebarTab::ForYou => {
                         let ch_affinity =
@@ -586,31 +790,37 @@ impl RecommendationEngine {
                                 personal_topic_score += w;
                             }
                         }
-                        scored.score += (ch_affinity * 9.0).min(42.0);
-                        scored.score += (personal_topic_score * 7.5).min(38.0);
+                        score += (ch_affinity * 9.0).min(42.0);
+                        score += (personal_topic_score * 7.5).min(38.0);
 
                         let is_unwatched = history::youtube_video_id(&video.url)
                             .is_none_or(|id| !profile.watched_states.contains_key(&id));
                         if is_unwatched {
-                            scored.score += 16.0;
+                            score += 16.0;
                         }
                         if !current_ch_key.is_empty() && ch_key != current_ch_key {
-                            scored.score += 9.0;
+                            score += 9.0;
                         }
                         if is_recent_upload(meta, Some(reference_epoch)) {
-                            scored.score += 8.0;
+                            score += 8.0;
                         }
                     }
                 }
-                (idx, scored)
+                CandidateEntry {
+                    pos_idx: idx,
+                    orig_idx,
+                    score,
+                    is_short,
+                    ch_key,
+                }
             })
             .collect();
 
         candidates.sort_by(|a, b| {
-            b.1.score
-                .partial_cmp(&a.1.score)
+            b.score
+                .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.pos_idx.cmp(&b.pos_idx))
         });
 
         let mut ranked = Vec::with_capacity(candidates.len());
@@ -627,19 +837,19 @@ impl RecommendationEngine {
             let mut best_effective_score = f64::NEG_INFINITY;
 
             let search_window = candidates.len().min(24);
-            for (pos, (_, candidate)) in candidates.iter().enumerate().take(search_window) {
-                let ch_key = normalize_channel_key(&candidate.video.channel);
-                let count = if ch_key.is_empty() {
+            for (pos, candidate) in candidates.iter().enumerate().take(search_window) {
+                let count = if candidate.ch_key.is_empty() {
                     0
                 } else {
-                    *channel_appearances.get(&ch_key).unwrap_or(&0)
+                    *channel_appearances.get(&candidate.ch_key).unwrap_or(&0)
                 };
                 let repeat_penalty = (count as f64) * repeat_weight;
-                let consecutive_penalty = if !ch_key.is_empty() && ch_key == last_channel {
-                    14.0
-                } else {
-                    0.0
-                };
+                let consecutive_penalty =
+                    if !candidate.ch_key.is_empty() && candidate.ch_key == last_channel {
+                        14.0
+                    } else {
+                        0.0
+                    };
                 let effective = candidate.score - repeat_penalty - consecutive_penalty;
                 if effective > best_effective_score {
                     best_effective_score = effective;
@@ -647,17 +857,48 @@ impl RecommendationEngine {
                 }
             }
 
-            let (_, mut chosen) = candidates.remove(best_pos);
-            chosen.score = best_effective_score;
-            let ch_key = normalize_channel_key(&chosen.video.channel);
-            if !ch_key.is_empty() {
-                *channel_appearances.entry(ch_key.clone()).or_insert(0) += 1;
-                last_channel = ch_key;
+            let chosen = candidates.remove(best_pos);
+            if !chosen.ch_key.is_empty() {
+                *channel_appearances
+                    .entry(chosen.ch_key.clone())
+                    .or_insert(0) += 1;
+                last_channel = chosen.ch_key;
             }
-            ranked.push(chosen);
+            ranked.push((chosen.orig_idx, best_effective_score, chosen.is_short));
         }
 
         ranked
+    }
+
+    #[cfg(test)]
+    pub fn rank_sidebar_videos(
+        videos: &[Video],
+        metadata_map: &HashMap<String, VideoMetadata>,
+        profile: &UserProfile,
+        current_video: Option<&Video>,
+        current_metadata: Option<&VideoMetadata>,
+        tab: crate::watch_extras::SidebarTab,
+    ) -> Vec<ScoredVideo> {
+        let refs: Vec<&Video> = videos.iter().collect();
+        Self::rank_sidebar_video_indices(
+            &refs,
+            metadata_map,
+            profile,
+            current_video,
+            current_metadata,
+            tab,
+        )
+        .into_iter()
+        .map(|(orig_idx, score, is_short)| {
+            let video = &videos[orig_idx];
+            ScoredVideo {
+                video: video.clone(),
+                metadata: metadata_map.get(&video.url).cloned().unwrap_or_default(),
+                score,
+                is_short,
+            }
+        })
+        .collect()
     }
 }
 
@@ -688,7 +929,12 @@ pub fn matches_filter(
         FeedFilter::Podcasts => is_podcast_video(video, metadata),
         FeedFilter::Gaming => is_gaming_video(video, metadata),
         FeedFilter::Live => is_live_video(video, metadata),
-        FeedFilter::Mixes => is_music_video(video, metadata) || is_podcast_video(video, metadata),
+        FeedFilter::Mixes => {
+            video.url.contains("playlist?list=")
+                || contains_ignore_case(&video.title, "mix")
+                || is_music_video(video, metadata)
+                || is_podcast_video(video, metadata)
+        }
         FeedFilter::NewToYou => {
             if let Some(id) = history::youtube_video_id(&video.url)
                 && profile.watched_states.contains_key(&id)
@@ -701,11 +947,11 @@ pub fn matches_filter(
         }
         FeedFilter::Topic(topic) => {
             let needle = topic.to_lowercase();
-            video.title.to_lowercase().contains(&needle)
-                || video.channel.to_lowercase().contains(&needle)
+            contains_ignore_case(&video.title, &needle)
+                || contains_ignore_case(&video.channel, &needle)
                 || metadata
                     .and_then(|m| m.description.as_deref())
-                    .is_some_and(|d| d.to_lowercase().contains(&needle))
+                    .is_some_and(|d| contains_ignore_case(d, &needle))
         }
         FeedFilter::Channel(channel) => {
             normalize_channel_key(&video.channel) == normalize_channel_key(channel)
@@ -714,25 +960,25 @@ pub fn matches_filter(
 }
 
 pub fn is_short_video(video: &Video, metadata: Option<&VideoMetadata>) -> bool {
-    let url_lower = video.url.to_lowercase();
-    if url_lower.contains("/shorts/") {
+    if contains_ignore_case(&video.url, "playlist?list=") {
+        return false;
+    }
+    if contains_ignore_case(&video.url, "/shorts/") {
         return true;
     }
-    let title_lower = video.title.to_lowercase();
-    if title_lower.contains("#shorts")
-        || title_lower.contains("#short")
-        || title_lower.contains("#meme")
-        || title_lower.contains("#humorbr")
-        || title_lower.contains("#memeviral")
-        || title_lower.contains("#psiutourette")
+    if contains_ignore_case(&video.title, "#shorts")
+        || contains_ignore_case(&video.title, "#short")
+        || contains_ignore_case(&video.title, "#meme")
+        || contains_ignore_case(&video.title, "#humorbr")
+        || contains_ignore_case(&video.title, "#memeviral")
+        || contains_ignore_case(&video.title, "#psiutourette")
     {
         return true;
     }
-    if let Some(desc) = metadata.and_then(|m| m.description.as_deref()) {
-        let desc_lower = desc.to_lowercase();
-        if desc_lower.contains("#shorts") || desc_lower.contains("#short") {
-            return true;
-        }
+    if let Some(desc) = metadata.and_then(|m| m.description.as_deref())
+        && (contains_ignore_case(desc, "#shorts") || contains_ignore_case(desc, "#short"))
+    {
+        return true;
     }
     if let Some(secs) = parse_duration_seconds(&video.duration)
         && secs > 0.0
@@ -744,7 +990,6 @@ pub fn is_short_video(video: &Video, metadata: Option<&VideoMetadata>) -> bool {
 }
 
 pub fn is_music_video(video: &Video, metadata: Option<&VideoMetadata>) -> bool {
-    let text = combined_searchable_text(video, metadata);
     const KEYWORDS: &[&str] = &[
         "music",
         "música",
@@ -769,11 +1014,10 @@ pub fn is_music_video(video: &Video, metadata: Option<&VideoMetadata>) -> bool {
         "remix",
         "soundtrack",
     ];
-    KEYWORDS.iter().any(|kw| text.contains(kw))
+    video_matches_keywords(video, metadata, KEYWORDS)
 }
 
 pub fn is_podcast_video(video: &Video, metadata: Option<&VideoMetadata>) -> bool {
-    let text = combined_searchable_text(video, metadata);
     const KEYWORDS: &[&str] = &[
         "podcast",
         "cortes",
@@ -789,7 +1033,7 @@ pub fn is_podcast_video(video: &Video, metadata: Option<&VideoMetadata>) -> bool
         "monark",
         "debate",
     ];
-    if KEYWORDS.iter().any(|kw| text.contains(kw)) {
+    if video_matches_keywords(video, metadata, KEYWORDS) {
         return true;
     }
     if let Some(secs) = parse_duration_seconds(&video.duration)
@@ -801,7 +1045,6 @@ pub fn is_podcast_video(video: &Video, metadata: Option<&VideoMetadata>) -> bool
 }
 
 pub fn is_gaming_video(video: &Video, metadata: Option<&VideoMetadata>) -> bool {
-    let text = combined_searchable_text(video, metadata);
     const KEYWORDS: &[&str] = &[
         "gameplay",
         "jogo",
@@ -824,29 +1067,69 @@ pub fn is_gaming_video(video: &Video, metadata: Option<&VideoMetadata>) -> bool 
         "steam",
         "gamer",
     ];
-    KEYWORDS.iter().any(|kw| text.contains(kw))
+    video_matches_keywords(video, metadata, KEYWORDS)
 }
 
 pub fn is_live_video(video: &Video, metadata: Option<&VideoMetadata>) -> bool {
-    let dur = video.duration.trim().to_lowercase();
-    if dur == "live" || dur == "ao vivo" {
+    let dur = video.duration.trim();
+    if dur.eq_ignore_ascii_case("live") || dur.eq_ignore_ascii_case("ao vivo") {
         return true;
     }
-    let text = combined_searchable_text(video, metadata);
-    text.contains("ao vivo") || text.contains("(live") || text.contains("[live")
+    const KEYWORDS: &[&str] = &["ao vivo", "(live", "[live"];
+    video_matches_keywords(video, metadata, KEYWORDS)
 }
 
-fn combined_searchable_text(video: &Video, metadata: Option<&VideoMetadata>) -> String {
-    let mut text = format!(
-        "{} {}",
-        video.title.to_lowercase(),
-        video.channel.to_lowercase()
-    );
-    if let Some(desc) = metadata.and_then(|m| m.description.as_deref()) {
-        text.push(' ');
-        text.push_str(&desc.to_lowercase());
+fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
     }
-    text
+    if needle_lower.is_ascii() {
+        let needle_bytes = needle_lower.as_bytes();
+        return haystack.len() >= needle_bytes.len()
+            && haystack
+                .as_bytes()
+                .windows(needle_bytes.len())
+                .any(|window| window.eq_ignore_ascii_case(needle_bytes));
+    }
+    if haystack.is_ascii() {
+        return false;
+    }
+    haystack.to_lowercase().contains(needle_lower)
+}
+
+fn field_matches_keywords(field: &str, keywords_lower: &[&str]) -> bool {
+    if field.is_empty() {
+        return false;
+    }
+    let mut has_non_ascii_kw = false;
+    for &kw in keywords_lower {
+        if kw.is_ascii() {
+            if contains_ignore_case(field, kw) {
+                return true;
+            }
+        } else {
+            has_non_ascii_kw = true;
+        }
+    }
+    if has_non_ascii_kw && !field.is_ascii() {
+        let lower = field.to_lowercase();
+        return keywords_lower
+            .iter()
+            .any(|&kw| !kw.is_ascii() && lower.contains(kw));
+    }
+    false
+}
+
+fn video_matches_keywords(
+    video: &Video,
+    metadata: Option<&VideoMetadata>,
+    keywords_lower: &[&str],
+) -> bool {
+    field_matches_keywords(&video.title, keywords_lower)
+        || field_matches_keywords(&video.channel, keywords_lower)
+        || metadata
+            .and_then(|m| m.description.as_deref())
+            .is_some_and(|desc| field_matches_keywords(desc, keywords_lower))
 }
 
 pub fn normalize_channel_key(channel: &str) -> String {
@@ -986,7 +1269,7 @@ fn ymd_hms_to_epoch(year: i32, month: u32, day: u32, hour: u32, min: u32, sec: u
     Some(days * 86_400 + (hour as i64) * 3_600 + (min as i64) * 60 + (sec as i64))
 }
 
-fn current_unix_epoch() -> Option<i64> {
+pub(crate) fn current_unix_epoch() -> Option<i64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
@@ -995,6 +1278,18 @@ fn current_unix_epoch() -> Option<i64> {
 
 pub fn latest_dataset_epoch(
     videos: &[Video],
+    metadata_map: &HashMap<String, VideoMetadata>,
+) -> Option<i64> {
+    videos
+        .iter()
+        .filter_map(|v| metadata_map.get(&v.url))
+        .filter_map(|m| m.upload_date.as_deref())
+        .filter_map(parse_upload_date_epoch)
+        .max()
+}
+
+fn latest_dataset_epoch_refs(
+    videos: &[&Video],
     metadata_map: &HashMap<String, VideoMetadata>,
 ) -> Option<i64> {
     videos
@@ -1363,5 +1658,108 @@ mod tests {
             crate::watch_extras::SidebarTab::ForYou,
         );
         assert_eq!(for_you[0].video.url, v_for_you_rust.url);
+    }
+
+    #[test]
+    fn home_query_plan_rotates_queries_and_channels_across_pages() {
+        let mut profile = UserProfile::default();
+        profile.token_weights.insert("strokes".into(), 5.0);
+        profile.token_weights.insert("rust".into(), 4.0);
+        profile.channel_weights.insert("almanaque sos".into(), 3.0);
+
+        let subs = vec![
+            crate::search::HomeChannel {
+                title: "5 Alguma Coisa".into(),
+                channel_id: "UC0000000000000000000001".into(),
+                avatar_url: None,
+            },
+            crate::search::HomeChannel {
+                title: "1155 do ET".into(),
+                channel_id: "UC0000000000000000000002".into(),
+                avatar_url: None,
+            },
+            crate::search::HomeChannel {
+                title: "AchismosTV".into(),
+                channel_id: "UC0000000000000000000003".into(),
+                avatar_url: None,
+            },
+        ];
+
+        let p0 = RecommendationEngine::build_home_query_plan(&profile, &subs, &FeedFilter::All, 0);
+        let p1 = RecommendationEngine::build_home_query_plan(&profile, &subs, &FeedFilter::All, 1);
+        let p2 = RecommendationEngine::build_home_query_plan(&profile, &subs, &FeedFilter::All, 2);
+
+        assert!(!p0.video_queries.is_empty());
+        assert_eq!(p0.channel_targets.len(), 2);
+        assert!(p0.playlist_query.is_some());
+        assert!(p0.shorts_query.is_some());
+        assert_ne!(p0.channel_targets, p1.channel_targets);
+        assert_ne!(p0.video_queries, p1.video_queries);
+        assert!(p2.playlist_query.is_some());
+    }
+
+    #[test]
+    fn playlist_mix_matches_mixes_filter_and_is_not_classified_as_short() {
+        let mix_playlist = Video {
+            title: "Mix de One way trigger (mellow version) - The Strokes".into(),
+            channel: "The Strokes e outros".into(),
+            url: "https://www.youtube.com/playlist?list=RDEM12345".into(),
+            thumbnail: String::new(),
+            duration: String::new(),
+        };
+        assert!(!is_short_video(&mix_playlist, None));
+        assert!(matches_filter(
+            &mix_playlist,
+            None,
+            &UserProfile::default(),
+            &FeedFilter::Mixes
+        ));
+    }
+
+    #[test]
+    fn zero_alloc_keyword_matchers_handle_ascii_and_accented_portuguese_terms() {
+        let music = sample_video(
+            "m1",
+            "Banda X - MÚSICA NOVA (Clipe Oficial)",
+            "VEVO Brasil",
+            "3:45",
+        );
+        assert!(is_music_video(&music, None));
+
+        let podcast = sample_video(
+            "p1",
+            "Conversa Longa - EPISÓDIO #42",
+            "Canal Geral",
+            "1:15:00",
+        );
+        assert!(is_podcast_video(&podcast, None));
+
+        let gaming = sample_video("g1", "Ranked no VALORANT com amigos", "Streamer", "22:10");
+        assert!(is_gaming_video(&gaming, None));
+
+        let live = sample_video("l1", "TRANSMISSÃO AO VIVO DE SÁBADO", "Canal Live", "45:00");
+        assert!(is_live_video(&live, None));
+    }
+
+    #[test]
+    fn apply_muted_topics_excludes_muted_tokens_from_top_topics_and_chips() {
+        let mut profile = UserProfile {
+            token_weights: HashMap::from([
+                ("rust".to_owned(), 5.0),
+                ("gaming".to_owned(), 4.0),
+                ("tokio".to_owned(), 3.0),
+            ]),
+            active_tokens: HashSet::from(["rust".to_owned(), "tokio".to_owned()]),
+            ..UserProfile::default()
+        };
+        profile.apply_muted_topics(&["  RUST ".to_owned()]);
+        assert_eq!(profile.top_topics(4), vec!["Gaming", "Tokio"]);
+        assert!(!profile.active_tokens.contains("rust"));
+        let chips = RecommendationEngine::available_chips(&[], &HashMap::new(), &profile);
+        assert!(
+            !chips
+                .iter()
+                .any(|c| matches!(c, FeedFilter::Topic(t) if t.eq_ignore_ascii_case("rust")))
+        );
     }
 }

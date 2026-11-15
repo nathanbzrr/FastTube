@@ -4,7 +4,7 @@ FastTube is a native Windows YouTube desktop client built with `eframe`/`egui` (
 
 ## State Layout
 
-The root application struct `FastTube` in [`src/main.rs`](../src/main.rs) acts as the UI and workflow coordinator. It holds 8 cross-cutting root fields (`video_metadata`, `selected_metadata`, `thumbnails`, `message`, `selected`, `scrolling`, `in_app_ui_pass`, `player`) and 12 domain substates defined in [`src/app_state.rs`](../src/app_state.rs):
+The root application struct `FastTube` in [`src/main.rs`](../src/main.rs) acts as the UI and workflow coordinator. It holds 9 cross-cutting root fields (`video_metadata`, `selected_metadata`, `thumbnails`, `message`, `selected`, `scrolling`, `in_app_ui_pass`, `player`, `desktop`) and 12 domain substates defined in [`src/app_state.rs`](../src/app_state.rs):
 
 | Field on `FastTube` | Type in `src/app_state.rs` | Domain |
 | --- | --- | --- |
@@ -13,13 +13,13 @@ The root application struct `FastTube` in [`src/main.rs`](../src/main.rs) acts a
 | `channels` | `ChannelState` | Active channel page, tab selection, video/shorts/streams pagination, public playlists, About info |
 | `auth` | `AuthState` | OAuth `TokenSession`, reauth job, rating submission job, cached video ratings |
 | `playback` | `PlaybackState` | Active playback correlation, playback preferences, quality fetch job, overlay/subtitles/player UI state, decoding diagnostics |
-| `settings` | `SettingsState` | Theme, buffer profile, settings window state |
+| `settings` | `SettingsState` | Theme, buffer profile, playback defaults, JSON app preferences (`SponsorBlock`, `hwdec`, privacy, storage), and active Settings tab state |
 | `history` | `HistoryState` | Local watch history and throttled save checkpointing |
 | `queue` | `QueueState` | Persisted FIFO playback queue and load confirmation state |
 | `library` | `LibraryState` | OAuth-independent shelves, named collections, and timestamp bookmarks |
 | `backup` | `BackupState` | JSON v1 backup export, import preview, merge/replace execution |
 | `ui` | `NavigationUiState` | Active browse section, sidebar drawer state, shortcut modal, clipboard/status flags |
-| `watch` | `WatchState` | Watch-page sidebar tab, transcript UI state, live comments pagination/posting |
+| `watch` | `WatchState` | Watch-page sidebar tab, transcript UI state, live comments pagination/posting, and SponsorBlock runtime state |
 
 ## Module Map (`src/`)
 
@@ -28,6 +28,7 @@ The root application struct `FastTube` in [`src/main.rs`](../src/main.rs) acts a
 | [`src/main.rs`](../src/main.rs) | `FastTube` coordinator, `eframe::App` loop, async task polling, top-level UI views |
 | [`src/main_tests.rs`](../src/main_tests.rs) | Integration and headless `egui` UI tests |
 | [`src/app_state.rs`](../src/app_state.rs) | Domain substate definitions and local state transition helpers |
+| [`src/desktop.rs`](../src/desktop.rs) | Windows desktop integrations (`fastframe-instance`, `fastframe-now-playing`, `fastframe-power`, `fastframe-autostart`) |
 | [`src/player.rs`](../src/player.rs) | `libmpv` dynamic loading, OpenGL render API context, Win32 child `HWND` fallback |
 | [`src/overlay.rs`](../src/overlay.rs) | In-player YouTube-style controls, progress bar, chapters, and popup menus |
 | [`src/layout.rs`](../src/layout.rs) | Responsive grid, watch columns, header, and rail geometry calculations |
@@ -40,7 +41,9 @@ The root application struct `FastTube` in [`src/main.rs`](../src/main.rs) acts a
 | [`src/history.rs`](../src/history.rs) | Local watch history (`history.json`, max 200 entries) and resume threshold logic |
 | [`src/library.rs`](../src/library.rs) | Local shelves (Watch Later, Favorites), collections, and timestamp bookmarks (`library.json`) |
 | [`src/backup.rs`](../src/backup.rs) | Non-secret JSON v1 backup envelope and `.fasttube-import-recovery` atomic rollback |
-| [`src/settings.rs`](../src/settings.rs) | Theme, buffer profile, and playback preferences persistence |
+| [`src/settings.rs`](../src/settings.rs) | Theme, buffer profile, playback defaults, JSON `app-preferences.json`, and cache directory helpers |
+| [`src/settings_ui.rs`](../src/settings_ui.rs) | Dedicated 6-tab Settings page UI (`CentralPanel`), category rail, and backup import modal |
+| [`src/sponsorblock.rs`](../src/sponsorblock.rs) | SponsorBlock API client, segment filtering/markers, and auto-skip runtime state |
 | [`src/feed_prefs.rs`](../src/feed_prefs.rs) | Subscriptions feed filter and sort persistence |
 | [`src/oauth.rs`](../src/oauth.rs) | Desktop OAuth flow, DPAPI/local token storage, YouTube Data API calls |
 | [`src/session.rs`](../src/session.rs) | Dedicated isolated browser profile launcher for Google OAuth sign-in |
@@ -52,7 +55,7 @@ The root application struct `FastTube` in [`src/main.rs`](../src/main.rs) acts a
 `src/main.rs` is large (~16k lines). Avoid reading it sequentially; search by symbol name or query the Graphify index ([`docs/graphify.md`](graphify.md)):
 
 - `struct FastTube` — root state and domain composition.
-- `impl FastTube` — async pollers (`poll_*`), playback lifecycle (`open_video`, `close_video`), queue/history/library coordination, and decomposed UI helpers (`watch_primary_ui`, `watch_page_ui`, `navigation_ui`, `browse_ui`, `home_grid_ui`, `channel_section_ui`, `settings_panel_ui`).
+- `impl FastTube` — async pollers (`poll_*`), playback lifecycle (`open_video`, `close_video`), queue/history/library coordination, and decomposed UI helpers (`watch_primary_ui`, `watch_page_ui`, `navigation_ui`, `browse_ui`, `home_grid_ui`, `channel_section_ui`, and `settings_page_ui` in [`src/settings_ui.rs`](../src/settings_ui.rs)).
 - `impl eframe::App for FastTube` — frame loop (`update`), keyboard shortcuts, and `on_exit` cleanup.
 
 ## System Invariants

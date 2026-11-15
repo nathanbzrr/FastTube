@@ -193,6 +193,12 @@ pub struct MergeSummary {
     pub progress_updated: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordTickOutcome {
+    pub changed: bool,
+    pub ranking_changed: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct History {
     entries: Vec<Entry>,
@@ -241,10 +247,52 @@ impl History {
                 "invalid history entry",
             ));
         }
+        if let Some(first) = self.entries.first_mut()
+            && first.video_id == entry.video_id
+        {
+            *first = entry;
+            return Ok(());
+        }
         self.entries.retain(|old| old.video_id != entry.video_id);
         self.entries.insert(0, entry);
         self.entries.truncate(MAX_ENTRIES);
         Ok(())
+    }
+    /// Fast path for active playback ticks: updates the front entry in-place when
+    /// `video_id` already leads history, reporting whether recommendation-relevant
+    /// state changed so callers do not rebuild feed rankings every video frame.
+    pub fn record_active_tick(&mut self, entry: Entry) -> io::Result<RecordTickOutcome> {
+        if !entry.valid() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid history entry",
+            ));
+        }
+        if let Some(first) = self.entries.first_mut()
+            && first.video_id == entry.video_id
+        {
+            if *first == entry {
+                return Ok(RecordTickOutcome {
+                    changed: false,
+                    ranking_changed: false,
+                });
+            }
+            let ranking_changed = first.title != entry.title
+                || first.channel != entry.channel
+                || first.duration_ms.is_some() != entry.duration_ms.is_some()
+                || first.is_near_end() != entry.is_near_end()
+                || first.resume_position_ms().is_some() != entry.resume_position_ms().is_some();
+            *first = entry;
+            return Ok(RecordTickOutcome {
+                changed: true,
+                ranking_changed,
+            });
+        }
+        self.record(entry)?;
+        Ok(RecordTickOutcome {
+            changed: true,
+            ranking_changed: true,
+        })
     }
     pub fn remove(&mut self, video_id: &str) -> bool {
         let previous = self.entries.len();
@@ -585,5 +633,33 @@ mod tests {
         assert_eq!(summary.added, 1);
         assert_eq!(summary.conflicts, 1);
         assert_eq!(summary.progress_updated, 0);
+    }
+
+    #[test]
+    fn record_active_tick_skips_ranking_churn_on_routine_position_ticks() {
+        let mut history = History::default();
+
+        let mut e = entry(1);
+        e.position_ms = 5_000;
+        e.duration_ms = Some(120_000);
+        let first = history.record_active_tick(e.clone()).unwrap();
+        assert!(first.changed);
+        assert!(first.ranking_changed);
+
+        e.position_ms = 15_000;
+        let second = history.record_active_tick(e.clone()).unwrap();
+        assert!(second.changed);
+        assert!(!second.ranking_changed);
+
+        // No-op identical tick does not even mark history dirty.
+        let same = history.record_active_tick(e.clone()).unwrap();
+        assert!(!same.changed);
+        assert!(!same.ranking_changed);
+
+        // Crossing near-end threshold counts as a ranking-relevant completion signal.
+        e.position_ms = 116_000;
+        let completed = history.record_active_tick(e).unwrap();
+        assert!(completed.changed);
+        assert!(completed.ranking_changed);
     }
 }

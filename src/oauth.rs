@@ -1,12 +1,13 @@
 use crate::process::Cancellation;
-use crate::search::{HomeChannel, HomeFeed, SearchResult, Video, VideoMetadata};
+use crate::search::{HomeChannel, HomeFeed, SearchResult, SearchResultKind, Video, VideoMetadata};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(not(test))]
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,11 +15,20 @@ use zeroize::Zeroize;
 
 pub const COMMENT_SCOPE: &str = "https://www.googleapis.com/auth/youtube.force-ssl";
 const SUBSCRIPTION_PAGE_SIZE: usize = 50;
-const MAX_SUBSCRIPTIONS: usize = 100;
+const MAX_SUBSCRIPTIONS: usize = 500;
 const MAX_UPLOADS_PER_CHANNEL: usize = 5;
 const MAX_PLAYLISTS: usize = 100;
 const MAX_PLAYLIST_VIDEOS: usize = 200;
 const PROGRESS_CHANNEL_BATCH: usize = 5;
+const PROGRESS_LATER_CHANNEL_BATCH: usize = 15;
+const SUBSCRIPTION_WORKER_COUNT: usize = 24;
+const RSS_MAX_BYTES: usize = 512 * 1024;
+const RSS_TIMEOUT: Duration = Duration::from_secs(6);
+const RSS_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+const SUBSCRIPTIONS_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const SUBSCRIPTIONS_CACHE_VERSION: u32 = 1;
+static SUBSCRIPTIONS_CACHE_TEMP_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 #[cfg(not(test))]
 const MAX_SESSION_BYTES: usize = 64 * 1024;
 #[cfg(not(test))]
@@ -1209,6 +1219,7 @@ pub struct MyChannelProfile {
     pub target: crate::search::ChannelTarget,
     pub title: Option<String>,
     pub avatar_url: Option<String>,
+    pub subscriber_count: Option<u64>,
 }
 
 fn parse_my_channel_profile(json: &Value) -> Result<MyChannelProfile, String> {
@@ -1230,10 +1241,23 @@ fn parse_my_channel_profile(json: &Value) -> Result<MyChannelProfile, String> {
             .or_else(|| item.pointer("/snippet/thumbnails/medium/url"))
             .and_then(Value::as_str),
     );
+    let hidden_subs = item
+        .pointer("/statistics/hiddenSubscriberCount")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let subscriber_count = if hidden_subs {
+        None
+    } else {
+        item.pointer("/statistics/subscriberCount").and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        })
+    };
     Ok(MyChannelProfile {
         target: crate::search::ChannelTarget::ChannelId(id.to_owned()),
         title,
         avatar_url,
+        subscriber_count,
     })
 }
 
@@ -1246,7 +1270,7 @@ pub fn my_channel_profile(token: &str, cancel: &Cancellation) -> Result<MyChanne
         token,
         "channels",
         &[
-            ("part", "id,snippet"),
+            ("part", "id,snippet,statistics"),
             ("mine", "true"),
             ("maxResults", "1"),
         ],
@@ -1573,6 +1597,206 @@ fn rate_video_at(
     Err(api_failure_message(status.as_u16(), &body))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbuseReportReason {
+    SexualContent,
+    ViolentOrRepulsive,
+    HatefulOrAbusive,
+    HarmfulOrDangerous,
+    SpamOrMisleading,
+}
+
+impl AbuseReportReason {
+    pub const ALL: [Self; 5] = [
+        Self::SexualContent,
+        Self::ViolentOrRepulsive,
+        Self::HatefulOrAbusive,
+        Self::HarmfulOrDangerous,
+        Self::SpamOrMisleading,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SexualContent => "Conteúdo sexual",
+            Self::ViolentOrRepulsive => "Conteúdo violento ou repulsivo",
+            Self::HatefulOrAbusive => "Conteúdo abominável ou abusivo",
+            Self::HarmfulOrDangerous => "Atos perigosos ou nocivos",
+            Self::SpamOrMisleading => "Spam ou enganoso",
+        }
+    }
+
+    fn fallback_reason_ids(self) -> (&'static str, Option<&'static str>) {
+        match self {
+            Self::SexualContent => ("N", None),
+            Self::ViolentOrRepulsive => ("V", Some("41")),
+            Self::HatefulOrAbusive => ("H", None),
+            Self::HarmfulOrDangerous => ("V", Some("35")),
+            Self::SpamOrMisleading => ("S", None),
+        }
+    }
+
+    fn label_keywords(self) -> &'static [&'static str] {
+        match self {
+            Self::SexualContent => &["sexual", "nudez", "nudity"],
+            Self::ViolentOrRepulsive => &["violento", "repulsivo", "violent", "repulsive"],
+            Self::HatefulOrAbusive => &[
+                "abominável",
+                "abusivo",
+                "ódio",
+                "hateful",
+                "abusive",
+                "harassment",
+            ],
+            Self::HarmfulOrDangerous => &["perigosos", "nocivos", "harmful", "dangerous"],
+            Self::SpamOrMisleading => &["spam", "enganoso", "misleading"],
+        }
+    }
+}
+
+fn resolve_abuse_reason_ids(
+    client: &reqwest::blocking::Client,
+    base_url: &str,
+    token: &str,
+    reason: AbuseReportReason,
+) -> (String, Option<String>) {
+    let base = base_url.trim_end_matches('/');
+    let url = format!("{base}/videoAbuseReportReasons");
+    let response = client
+        .get(&url)
+        .bearer_auth(token)
+        .query(&[("part", "id,snippet"), ("hl", "pt")])
+        .send();
+    let Ok(response) = response else {
+        let (primary, secondary) = reason.fallback_reason_ids();
+        return (primary.to_owned(), secondary.map(str::to_owned));
+    };
+    if !response.status().is_success() {
+        let (primary, secondary) = reason.fallback_reason_ids();
+        return (primary.to_owned(), secondary.map(str::to_owned));
+    }
+    let Ok(body) = response.json::<Value>() else {
+        let (primary, secondary) = reason.fallback_reason_ids();
+        return (primary.to_owned(), secondary.map(str::to_owned));
+    };
+    let Some(items) = body["items"].as_array() else {
+        let (primary, secondary) = reason.fallback_reason_ids();
+        return (primary.to_owned(), secondary.map(str::to_owned));
+    };
+
+    let keywords = reason.label_keywords();
+    let matches_keywords = |text: &str| {
+        let lower = text.to_lowercase();
+        keywords.iter().any(|kw| lower.contains(kw))
+    };
+
+    for item in items {
+        let Some(id) = item["id"].as_str().filter(|id| !id.trim().is_empty()) else {
+            continue;
+        };
+        let label = item
+            .pointer("/snippet/label")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if matches_keywords(label) {
+            let secondary = item
+                .pointer("/snippet/secondaryReasons")
+                .and_then(Value::as_array)
+                .and_then(|rows| {
+                    rows.iter()
+                        .find(|row| row["label"].as_str().is_some_and(matches_keywords))
+                        .or_else(|| rows.first())
+                        .and_then(|row| row["id"].as_str())
+                        .filter(|sid| !sid.trim().is_empty())
+                        .map(str::to_owned)
+                });
+            return (id.to_owned(), secondary);
+        }
+    }
+
+    for item in items {
+        let Some(id) = item["id"].as_str().filter(|id| !id.trim().is_empty()) else {
+            continue;
+        };
+        if let Some(secondary) = item
+            .pointer("/snippet/secondaryReasons")
+            .and_then(Value::as_array)
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|row| row["label"].as_str().is_some_and(matches_keywords))
+                    .and_then(|row| row["id"].as_str())
+                    .filter(|sid| !sid.trim().is_empty())
+                    .map(str::to_owned)
+            })
+        {
+            return (id.to_owned(), Some(secondary));
+        }
+    }
+
+    let (primary, secondary) = reason.fallback_reason_ids();
+    (primary.to_owned(), secondary.map(str::to_owned))
+}
+
+pub fn report_video_abuse(
+    token: &str,
+    video_id: &str,
+    reason: AbuseReportReason,
+    cancel: &Cancellation,
+) -> Result<(), String> {
+    report_video_abuse_at(
+        "https://www.googleapis.com/youtube/v3",
+        token,
+        video_id,
+        reason,
+        cancel,
+    )
+}
+
+fn report_video_abuse_at(
+    base_url: &str,
+    token: &str,
+    video_id: &str,
+    reason: AbuseReportReason,
+    cancel: &Cancellation,
+) -> Result<(), String> {
+    if cancel.cancelled() {
+        return Err("Denúncia cancelada.".into());
+    }
+    if !valid_id(video_id) {
+        return Err("Este vídeo não possui um ID válido do YouTube.".into());
+    }
+    let client = http_client()?;
+    let (reason_id, secondary_reason_id) =
+        resolve_abuse_reason_ids(&client, base_url, token, reason);
+    if cancel.cancelled() {
+        return Err("Denúncia cancelada.".into());
+    }
+    let mut payload = serde_json::json!({
+        "videoId": video_id,
+        "reasonId": reason_id,
+        "language": "pt",
+    });
+    if let Some(secondary) = secondary_reason_id {
+        payload["secondaryReasonId"] = Value::String(secondary);
+    }
+    let base = base_url.trim_end_matches('/');
+    let endpoint = format!("{base}/videos/reportAbuse");
+    let response = client
+        .post(endpoint)
+        .bearer_auth(token)
+        .json(&payload)
+        .send()
+        .map_err(|_| "Falha de conexão ao enviar a denúncia.".to_owned())?;
+    if cancel.cancelled() {
+        return Err("Denúncia cancelada.".into());
+    }
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body: Value = response.json().unwrap_or(Value::Null);
+    Err(api_failure_message(status.as_u16(), &body))
+}
+
 fn parse_upload(item: &Value) -> Option<(String, SearchResult)> {
     let snippet = item.get("snippet")?;
     let id = snippet.pointer("/resourceId/videoId")?.as_str()?;
@@ -1794,216 +2018,31 @@ fn append_subscription_channels(
             .map(str::trim)
             .filter(|title| !title.is_empty() && title.len() <= 4096)
             .unwrap_or(channel_id);
+        let avatar_url = sanitize_avatar_url(
+            item.pointer("/snippet/thumbnails/default/url")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    item.pointer("/snippet/thumbnails/medium/url")
+                        .and_then(Value::as_str)
+                })
+                .or_else(|| {
+                    item.pointer("/snippet/thumbnails/high/url")
+                        .and_then(Value::as_str)
+                }),
+        );
         ids.push(channel_id.to_owned());
         channels.push(HomeChannel {
             title: title.to_owned(),
             channel_id: channel_id.to_owned(),
+            avatar_url,
         });
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SubscriptionProgress {
-    pub items: Vec<SearchResult>,
-    pub channels: Vec<HomeChannel>,
-    pub completed_channels: usize,
-    pub total_channels: usize,
-    pub reached_limit: bool,
-}
-
-pub fn subscriptions_feed(
-    token: &str,
+fn fetch_subscription_channels_with<F>(
     cancel: &Cancellation,
-    mut progress: impl FnMut(SubscriptionProgress),
-) -> Result<HomeFeed, String> {
-    let client = http_client()?;
-    let mut ids = Vec::new();
-    let mut subscription_channels = Vec::new();
-    let mut page_token = None;
-    let mut reached_limit = false;
-    loop {
-        if cancel.cancelled() {
-            return Err("Consulta cancelada.".into());
-        }
-        let max_results = (MAX_SUBSCRIPTIONS - ids.len()).min(SUBSCRIPTION_PAGE_SIZE);
-        let max_results_text = max_results.to_string();
-        let mut params = vec![
-            ("part", "snippet"),
-            ("mine", "true"),
-            ("maxResults", max_results_text.as_str()),
-            ("order", "alphabetical"),
-        ];
-        if let Some(page) = page_token.as_deref() {
-            params.push(("pageToken", page));
-        }
-        let subscriptions = api(&client, token, "subscriptions", &params)?;
-        let items = subscriptions["items"]
-            .as_array()
-            .ok_or("Lista de inscri\u{e7}\u{f5}es inv\u{e1}lida.")?;
-        append_subscription_channels(items, &mut ids, &mut subscription_channels);
-        let next = subscriptions["nextPageToken"]
-            .as_str()
-            .filter(|page| !page.is_empty() && page.len() <= 1024)
-            .map(str::to_owned);
-        if ids.len() == MAX_SUBSCRIPTIONS {
-            reached_limit = next.is_some();
-            break;
-        }
-        let Some(next) = next else { break };
-        page_token = Some(next);
-    }
-
-    let total_channels = ids.len();
-    progress(SubscriptionProgress {
-        items: Vec::new(),
-        channels: subscription_channels.clone(),
-        completed_channels: 0,
-        total_channels,
-        reached_limit,
-    });
-    let mut upload_playlists = Vec::new();
-    for channel_ids in ids.chunks(50) {
-        if cancel.cancelled() {
-            return Err("Consulta cancelada.".into());
-        }
-        let joined_ids = channel_ids.join(",");
-        let channels = api(
-            &client,
-            token,
-            "channels",
-            &[
-                ("part", "contentDetails"),
-                ("id", &joined_ids),
-                ("maxResults", "50"),
-            ],
-        )?;
-        let channels = channels["items"]
-            .as_array()
-            .ok_or("Lista de canais inv\u{e1}lida.")?;
-        let uploads_by_channel: std::collections::HashMap<_, _> = channels
-            .iter()
-            .enumerate()
-            .filter_map(|(index, channel)| {
-                let channel_id = channel
-                    .get("id")
-                    .and_then(serde_json::Value::as_str)
-                    .or_else(|| channel_ids.get(index).map(String::as_str))?;
-                let playlist_id = channel
-                    .pointer("/contentDetails/relatedPlaylists/uploads")?
-                    .as_str()?;
-                valid_id(playlist_id).then(|| (channel_id.to_owned(), playlist_id.to_owned()))
-            })
-            .collect();
-        upload_playlists.extend(
-            channel_ids
-                .iter()
-                .map(|channel_id| uploads_by_channel.get(channel_id).cloned()),
-        );
-    }
-
-    let worker_count = upload_playlists.len().min(8);
-    if worker_count == 0 {
-        return Ok(HomeFeed {
-            items: Vec::new(),
-            playlists: Vec::new(),
-            channels: subscription_channels,
-        });
-    }
-    let next_index = std::sync::atomic::AtomicUsize::new(0);
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let mut videos = Vec::new();
-    let mut completed_channels = 0;
-    let mut fetch_error = None;
-    std::thread::scope(|scope| {
-        for _ in 0..worker_count {
-            let sender = sender.clone();
-            let client = &client;
-            let playlists = &upload_playlists;
-            let next_index = &next_index;
-            scope.spawn(move || {
-                loop {
-                    if cancel.cancelled() {
-                        break;
-                    }
-                    let index = next_index.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(playlist) = playlists.get(index) else {
-                        break;
-                    };
-                    let result = match playlist {
-                        Some(playlist) => api(
-                            client,
-                            token,
-                            "playlistItems",
-                            &[
-                                ("part", "snippet"),
-                                ("playlistId", playlist),
-                                ("maxResults", "5"),
-                            ],
-                        ),
-                        None => Ok(Value::Null),
-                    };
-                    if sender.send((result, index + 1)).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        drop(sender);
-        while let Ok((result, _index)) = receiver.recv() {
-            completed_channels += 1;
-            match result {
-                Ok(uploads) => {
-                    if let Some(items) = uploads["items"].as_array() {
-                        videos.extend(
-                            items
-                                .iter()
-                                .take(MAX_UPLOADS_PER_CHANNEL)
-                                .filter_map(parse_upload),
-                        );
-                    }
-                }
-                Err(error) => {
-                    if fetch_error.is_none() {
-                        fetch_error = Some(error);
-                    }
-                }
-            }
-            if completed_channels == 1
-                || completed_channels % PROGRESS_CHANNEL_BATCH == 0
-                || completed_channels == total_channels
-            {
-                let mut ordered = videos.clone();
-                ordered.sort_by(|left, right| right.0.cmp(&left.0));
-                progress(SubscriptionProgress {
-                    items: ordered.into_iter().map(|(_, item)| item).collect(),
-                    channels: subscription_channels.clone(),
-                    completed_channels,
-                    total_channels,
-                    reached_limit,
-                });
-            }
-        }
-    });
-    if cancel.cancelled() {
-        return Err("Consulta cancelada.".into());
-    }
-    if let Some(error) = fetch_error {
-        return Err(error);
-    }
-    videos.sort_by(|left, right| right.0.cmp(&left.0));
-    Ok(HomeFeed {
-        items: videos.into_iter().map(|(_, video)| video).collect(),
-        playlists: Vec::new(),
-        channels: subscription_channels,
-    })
-}
-
-#[cfg(test)]
-fn subscriptions_feed_with<F>(
-    cancel: &Cancellation,
-    mut progress: impl FnMut(SubscriptionProgress),
     mut fetch: F,
-) -> Result<HomeFeed, String>
+) -> Result<(Vec<String>, Vec<HomeChannel>, bool), String>
 where
     F: FnMut(&str, &[(&str, &str)]) -> Result<Value, String>,
 {
@@ -2023,25 +2062,1049 @@ where
             ("maxResults", max_results_text.as_str()),
             ("order", "alphabetical"),
         ];
-        if let Some(token) = page_token.as_deref() {
-            params.push(("pageToken", token));
+        if let Some(page) = page_token.as_deref() {
+            params.push(("pageToken", page));
         }
         let subscriptions = fetch("subscriptions", &params)?;
         let items = subscriptions["items"]
             .as_array()
             .ok_or("Lista de inscri\u{e7}\u{f5}es inv\u{e1}lida.")?;
         append_subscription_channels(items, &mut ids, &mut subscription_channels);
-        let next_page = subscriptions["nextPageToken"]
+        let next = subscriptions["nextPageToken"]
             .as_str()
-            .filter(|token| !token.is_empty() && token.len() <= 1024)
+            .filter(|page| !page.is_empty() && page.len() <= 1024)
             .map(str::to_owned);
         if ids.len() == MAX_SUBSCRIPTIONS {
-            reached_limit = next_page.is_some();
+            reached_limit = next.is_some();
             break;
         }
-        let Some(next_page) = next_page else { break };
-        page_token = Some(next_page);
+        let Some(next) = next else { break };
+        page_token = Some(next);
     }
+    Ok((ids, subscription_channels, reached_limit))
+}
+
+pub fn list_subscriptions(token: &str, cancel: &Cancellation) -> Result<Vec<HomeChannel>, String> {
+    let client = http_client()?;
+    let (_, channels, _) = fetch_subscription_channels_with(cancel, |resource, params| {
+        api(&client, token, resource, params)
+    })?;
+    Ok(channels)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedFeedItem {
+    pub title: String,
+    pub channel: String,
+    pub url: String,
+    pub thumbnail: String,
+    pub duration: String,
+    pub upload_date: Option<String>,
+    pub channel_id: Option<String>,
+    pub view_count: Option<u64>,
+    #[serde(default)]
+    pub is_short: bool,
+}
+
+impl From<&SearchResult> for CachedFeedItem {
+    fn from(item: &SearchResult) -> Self {
+        Self {
+            title: item.video.title.clone(),
+            channel: item.video.channel.clone(),
+            url: item.video.url.clone(),
+            thumbnail: item.video.thumbnail.clone(),
+            duration: item.video.duration.clone(),
+            upload_date: item.metadata.upload_date.clone(),
+            channel_id: item.metadata.channel_id.clone(),
+            view_count: item.metadata.view_count,
+            is_short: item.metadata.kind == SearchResultKind::Short,
+        }
+    }
+}
+
+impl From<CachedFeedItem> for SearchResult {
+    fn from(item: CachedFeedItem) -> Self {
+        let is_short = item.is_short || item.url.contains("/shorts/");
+        Self {
+            video: Video {
+                title: item.title,
+                channel: item.channel,
+                url: item.url,
+                thumbnail: item.thumbnail,
+                duration: item.duration,
+            },
+            metadata: VideoMetadata {
+                upload_date: item.upload_date,
+                channel_id: item.channel_id,
+                view_count: item.view_count,
+                kind: if is_short {
+                    SearchResultKind::Short
+                } else {
+                    SearchResultKind::Video
+                },
+                ..Default::default()
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedRssHeaders {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChannelRssCacheEntry {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub items: Vec<SearchResult>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedSubscriptionChannel {
+    pub title: String,
+    pub channel_id: String,
+    pub avatar_url: Option<String>,
+}
+
+impl From<&HomeChannel> for CachedSubscriptionChannel {
+    fn from(channel: &HomeChannel) -> Self {
+        Self {
+            title: channel.title.clone(),
+            channel_id: channel.channel_id.clone(),
+            avatar_url: channel.avatar_url.clone(),
+        }
+    }
+}
+
+impl From<CachedSubscriptionChannel> for HomeChannel {
+    fn from(channel: CachedSubscriptionChannel) -> Self {
+        Self {
+            title: channel.title,
+            channel_id: channel.channel_id,
+            avatar_url: channel.avatar_url,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscriptionsDiskCache {
+    pub version: u32,
+    pub saved_at_unix_secs: u64,
+    pub channels: Vec<CachedSubscriptionChannel>,
+    pub items: Vec<CachedFeedItem>,
+    #[serde(default)]
+    pub rss_headers: HashMap<String, CachedRssHeaders>,
+}
+
+impl SubscriptionsDiskCache {
+    pub fn from_feed(
+        feed: &HomeFeed,
+        rss_cache: &HashMap<String, ChannelRssCacheEntry>,
+        saved_at_unix_secs: u64,
+    ) -> Self {
+        let channels = feed
+            .channels
+            .iter()
+            .filter(|ch| valid_id(&ch.channel_id))
+            .map(CachedSubscriptionChannel::from)
+            .collect();
+        let items = feed.items.iter().map(CachedFeedItem::from).collect();
+        let rss_headers = rss_cache
+            .iter()
+            .filter(|(id, entry)| {
+                valid_id(id) && (entry.etag.is_some() || entry.last_modified.is_some())
+            })
+            .map(|(id, entry)| {
+                (
+                    id.clone(),
+                    CachedRssHeaders {
+                        etag: entry.etag.clone(),
+                        last_modified: entry.last_modified.clone(),
+                    },
+                )
+            })
+            .collect();
+        Self {
+            version: SUBSCRIPTIONS_CACHE_VERSION,
+            saved_at_unix_secs,
+            channels,
+            items,
+            rss_headers,
+        }
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        u64,
+        Vec<HomeChannel>,
+        Vec<SearchResult>,
+        HashMap<String, ChannelRssCacheEntry>,
+    ) {
+        let channels: Vec<HomeChannel> = self
+            .channels
+            .into_iter()
+            .filter(|ch| valid_id(&ch.channel_id))
+            .map(|mut ch| {
+                ch.avatar_url = sanitize_avatar_url(ch.avatar_url.as_deref());
+                HomeChannel::from(ch)
+            })
+            .collect();
+        let items: Vec<SearchResult> = self.items.into_iter().map(SearchResult::from).collect();
+        let mut items_by_channel: HashMap<String, Vec<SearchResult>> = HashMap::new();
+        for item in &items {
+            if let Some(cid) = item.metadata.channel_id.as_deref()
+                && valid_id(cid)
+            {
+                items_by_channel
+                    .entry(cid.to_owned())
+                    .or_default()
+                    .push(item.clone());
+            }
+        }
+        let mut rss_cache = HashMap::new();
+        for (cid, headers) in self.rss_headers {
+            if !valid_id(&cid) {
+                continue;
+            }
+            if let Some(channel_items) = items_by_channel.remove(&cid) {
+                rss_cache.insert(
+                    cid,
+                    ChannelRssCacheEntry {
+                        etag: headers.etag,
+                        last_modified: headers.last_modified,
+                        items: channel_items,
+                    },
+                );
+            }
+        }
+        (self.saved_at_unix_secs, channels, items, rss_cache)
+    }
+}
+
+pub fn load_subscriptions_cache_from_path(
+    path: &Path,
+) -> Result<Option<SubscriptionsDiskCache>, String> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("Não foi possível ler o cache de inscrições.".into()),
+    };
+    let mut bytes = Vec::new();
+    file.take((SUBSCRIPTIONS_CACHE_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "Não foi possível ler o cache de inscrições.".to_owned())?;
+    if bytes.is_empty() || bytes.len() > SUBSCRIPTIONS_CACHE_MAX_BYTES {
+        return Err("Arquivo de cache de inscrições inválido.".into());
+    }
+    let parsed: SubscriptionsDiskCache = serde_json::from_slice(&bytes)
+        .map_err(|_| "Arquivo de cache de inscrições corrompido.".to_owned())?;
+    if parsed.version != SUBSCRIPTIONS_CACHE_VERSION {
+        return Ok(None);
+    }
+    Ok(Some(parsed))
+}
+
+pub fn save_subscriptions_cache_to_path(
+    path: &Path,
+    cache: &SubscriptionsDiskCache,
+) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or("Diretório do cache de inscrições inválido.")?;
+    std::fs::create_dir_all(parent).map_err(|_| "Não foi possível criar pasta de cache.")?;
+    let bytes = serde_json::to_vec(cache)
+        .map_err(|_| "Não foi possível codificar o cache de inscrições.")?;
+    if bytes.len() > SUBSCRIPTIONS_CACHE_MAX_BYTES {
+        return Err("Cache de inscrições excede o limite de tamanho.".into());
+    }
+    let (temporary, mut file) = loop {
+        let id = SUBSCRIPTIONS_CACHE_TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temporary = parent.join(format!(
+            ".fasttube-subs-cache-{}-{id}.tmp",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err("Não foi possível gravar o cache de inscrições.".into()),
+        }
+    };
+    let result = (|| {
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|_| "Não foi possível gravar o cache de inscrições.".to_owned())?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+            .map_err(|_| "Não foi possível finalizar o cache de inscrições.".to_owned())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+
+pub fn delete_subscriptions_cache_at_path(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("Não foi possível limpar o cache de inscrições.".into()),
+    }
+}
+
+#[cfg(not(test))]
+pub fn subscriptions_cache_path() -> Result<PathBuf, String> {
+    Ok(crate::settings::settings_path()
+        .map_err(|_| "Não foi possível localizar a pasta de configurações.")?
+        .with_file_name("subscriptions-cache.json"))
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SubscriptionFeedOptions {
+    pub known_channels: Option<Vec<HomeChannel>>,
+    pub prioritized_channel_ids: Vec<String>,
+    pub rss_cache: HashMap<String, ChannelRssCacheEntry>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SubscriptionFeedOutput {
+    pub feed: HomeFeed,
+    pub rss_cache: HashMap<String, ChannelRssCacheEntry>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub used_cached_channels: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub rss_hits: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub not_modified_hits: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub api_fallbacks: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscriptionProgress {
+    pub items: Vec<SearchResult>,
+    pub channels: Vec<HomeChannel>,
+    pub completed_channels: usize,
+    pub total_channels: usize,
+    pub reached_limit: bool,
+}
+
+fn rss_http_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(RSS_CONNECT_TIMEOUT)
+        .timeout(RSS_TIMEOUT)
+        .pool_max_idle_per_host(SUBSCRIPTION_WORKER_COUNT + 4)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+        .build()
+        .map_err(|_| "Não foi possível iniciar o cliente RSS.".into())
+}
+
+fn sanitize_http_cache_header(value: Option<&reqwest::header::HeaderValue>) -> Option<String> {
+    value
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.len() <= 256 && v.is_ascii())
+        .map(str::to_owned)
+}
+
+fn sanitize_rss_thumbnail_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 1024 {
+        return None;
+    }
+    let parsed = url::Url::parse(trimmed).ok()?;
+    let host = parsed.host_str()?;
+    let valid_host = host == "i.ytimg.com"
+        || host == "ytimg.com"
+        || (host.ends_with(".ytimg.com") && !host.contains(".."));
+    (parsed.scheme() == "https" && valid_host).then(|| trimmed.to_owned())
+}
+
+fn decode_xml_entities(input: &str) -> String {
+    let inner = input
+        .trim()
+        .strip_prefix("<![CDATA[")
+        .and_then(|s| s.strip_suffix("]]>"))
+        .unwrap_or(input);
+    if !inner.contains('&') {
+        return inner.to_owned();
+    }
+    let mut out = String::with_capacity(inner.len());
+    let mut rest = inner;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp..];
+        if let Some(semi) = after.find(';')
+            && semi <= 12
+        {
+            let entity = &after[1..semi];
+            let decoded = match entity {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+                    u32::from_str_radix(&entity[2..], 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                }
+                _ if entity.starts_with('#') => {
+                    entity[1..].parse::<u32>().ok().and_then(char::from_u32)
+                }
+                _ => None,
+            };
+            if let Some(ch) = decoded {
+                out.push(ch);
+                rest = &after[semi + 1..];
+                continue;
+            }
+        }
+        out.push('&');
+        rest = &rest[amp + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn extract_xml_tag_text<'a>(block: &'a str, tag: &str) -> Option<&'a str> {
+    let open_prefix = format!("<{tag}");
+    let close_tag = format!("</{tag}>");
+    let mut search_from = 0;
+    while let Some(rel_start) = block[search_from..].find(&open_prefix) {
+        let start = search_from + rel_start;
+        let after_name = &block[start + open_prefix.len()..];
+        if let Some(first) = after_name.chars().next()
+            && first != '>'
+            && !first.is_ascii_whitespace()
+        {
+            search_from = start + open_prefix.len();
+            continue;
+        }
+        let open_end_rel = after_name.find('>')?;
+        if after_name[..open_end_rel].ends_with('/') {
+            return None;
+        }
+        let content_start = start + open_prefix.len() + open_end_rel + 1;
+        let close_rel = block[content_start..].find(&close_tag)?;
+        return Some(&block[content_start..content_start + close_rel]);
+    }
+    None
+}
+
+fn extract_xml_attr<'a>(tag_text: &'a str, attr: &str) -> Option<&'a str> {
+    let needle = format!("{attr}=\"");
+    if let Some(pos) = tag_text.find(&needle) {
+        let rest = &tag_text[pos + needle.len()..];
+        let end = rest.find('"')?;
+        return Some(&rest[..end]);
+    }
+    let needle_single = format!("{attr}='");
+    let pos = tag_text.find(&needle_single)?;
+    let rest = &tag_text[pos + needle_single.len()..];
+    let end = rest.find('\'')?;
+    Some(&rest[..end])
+}
+
+pub(crate) fn parse_youtube_atom_feed(
+    xml: &str,
+    fallback_channel_title: &str,
+    channel_id_hint: &str,
+) -> Option<Vec<(String, SearchResult)>> {
+    if !xml.contains("<feed") {
+        return None;
+    }
+    let feed_author = extract_xml_tag_text(xml, "author")
+        .and_then(|author| extract_xml_tag_text(author, "name"))
+        .map(decode_xml_entities)
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    let mut results = Vec::new();
+    let mut cursor = xml;
+    while let Some(entry_start) = cursor.find("<entry>") {
+        let after_open = &cursor[entry_start + "<entry>".len()..];
+        let Some(entry_end) = after_open.find("</entry>") else {
+            break;
+        };
+        let entry = &after_open[..entry_end];
+        cursor = &after_open[entry_end + "</entry>".len()..];
+
+        let Some(video_id) = extract_xml_tag_text(entry, "yt:videoId")
+            .map(str::trim)
+            .filter(|id| valid_id(id))
+        else {
+            continue;
+        };
+        let Some(raw_title) = extract_xml_tag_text(entry, "title")
+            .or_else(|| extract_xml_tag_text(entry, "media:title"))
+        else {
+            continue;
+        };
+        let title = decode_xml_entities(raw_title).trim().to_owned();
+        if title.is_empty() || title == "Private video" || title == "Deleted video" {
+            continue;
+        }
+        let published = extract_xml_tag_text(entry, "published")
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.len() <= 64)
+            .unwrap_or("")
+            .to_owned();
+        let entry_channel_id = extract_xml_tag_text(entry, "yt:channelId")
+            .map(str::trim)
+            .filter(|id| valid_id(id))
+            .unwrap_or(channel_id_hint);
+        let channel_name = extract_xml_tag_text(entry, "author")
+            .and_then(|author| extract_xml_tag_text(author, "name"))
+            .map(decode_xml_entities)
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .or_else(|| feed_author.clone())
+            .unwrap_or_else(|| fallback_channel_title.to_owned());
+
+        let is_short = entry.find("<link ").is_some_and(|pos| {
+            entry[pos..]
+                .find('>')
+                .and_then(|end| extract_xml_attr(&entry[pos..pos + end], "href"))
+                .is_some_and(|href| href.contains("/shorts/"))
+        });
+
+        let thumbnail = entry
+            .find("<media:thumbnail")
+            .and_then(|pos| {
+                let end = entry[pos..].find('>')?;
+                extract_xml_attr(&entry[pos..pos + end], "url")
+            })
+            .and_then(|raw| sanitize_rss_thumbnail_url(&decode_xml_entities(raw)))
+            .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"));
+
+        let description = extract_xml_tag_text(entry, "media:description")
+            .map(decode_xml_entities)
+            .map(|s| s.trim().chars().take(512).collect::<String>())
+            .filter(|s| !s.is_empty());
+
+        let view_count = entry.find("<media:statistics").and_then(|pos| {
+            let end = entry[pos..].find('>')?;
+            extract_xml_attr(&entry[pos..pos + end], "views")?
+                .parse::<u64>()
+                .ok()
+        });
+
+        results.push((
+            published.clone(),
+            SearchResult {
+                video: Video {
+                    title,
+                    channel: channel_name,
+                    url: format!("https://www.youtube.com/watch?v={video_id}"),
+                    thumbnail,
+                    duration: String::new(),
+                },
+                metadata: VideoMetadata {
+                    upload_date: (!published.is_empty()).then_some(published),
+                    channel_id: valid_id(entry_channel_id).then(|| entry_channel_id.to_owned()),
+                    description,
+                    view_count,
+                    kind: if is_short {
+                        SearchResultKind::Short
+                    } else {
+                        SearchResultKind::Video
+                    },
+                    ..Default::default()
+                },
+            },
+        ));
+        if results.len() >= MAX_UPLOADS_PER_CHANNEL {
+            break;
+        }
+    }
+    Some(results)
+}
+
+enum ChannelRssOutcome {
+    NotModified,
+    Updated {
+        items: Vec<(String, SearchResult)>,
+        etag: Option<String>,
+        last_modified: Option<String>,
+    },
+    FallbackNeeded,
+}
+
+fn fetch_channel_rss_at(
+    client: &reqwest::blocking::Client,
+    rss_base_url: &str,
+    channel: &HomeChannel,
+    cached: Option<&ChannelRssCacheEntry>,
+) -> ChannelRssOutcome {
+    if !valid_id(&channel.channel_id) {
+        return ChannelRssOutcome::FallbackNeeded;
+    }
+    let url = format!(
+        "{rss_base_url}/feeds/videos.xml?channel_id={}",
+        channel.channel_id
+    );
+    let mut request = client.get(&url);
+    if let Some(entry) = cached {
+        if let Some(etag) = entry.etag.as_deref() {
+            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+        }
+        if let Some(last_modified) = entry.last_modified.as_deref() {
+            request = request.header(reqwest::header::IF_MODIFIED_SINCE, last_modified);
+        }
+    }
+    let Ok(response) = request.send() else {
+        return ChannelRssOutcome::FallbackNeeded;
+    };
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_MODIFIED {
+        return if cached.is_some() {
+            ChannelRssOutcome::NotModified
+        } else {
+            ChannelRssOutcome::FallbackNeeded
+        };
+    }
+    if !status.is_success() {
+        return ChannelRssOutcome::FallbackNeeded;
+    }
+    let etag = sanitize_http_cache_header(response.headers().get(reqwest::header::ETAG));
+    let last_modified =
+        sanitize_http_cache_header(response.headers().get(reqwest::header::LAST_MODIFIED));
+    let mut body = Vec::new();
+    if response
+        .take((RSS_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut body)
+        .is_err()
+        || body.len() > RSS_MAX_BYTES
+    {
+        return ChannelRssOutcome::FallbackNeeded;
+    }
+    let Ok(xml) = std::str::from_utf8(&body) else {
+        return ChannelRssOutcome::FallbackNeeded;
+    };
+    let Some(items) = parse_youtube_atom_feed(xml, &channel.title, &channel.channel_id) else {
+        return ChannelRssOutcome::FallbackNeeded;
+    };
+    ChannelRssOutcome::Updated {
+        items,
+        etag,
+        last_modified,
+    }
+}
+
+fn fetch_channel_uploads_via_api_at(
+    client: &reqwest::blocking::Client,
+    api_base_url: &str,
+    token: &str,
+    channel_id: &str,
+) -> Result<Vec<(String, SearchResult)>, String> {
+    if !valid_id(channel_id) {
+        return Ok(Vec::new());
+    }
+    // Standard YouTube channels (`UC...`) map deterministically to their uploads playlist (`UU...`),
+    // avoiding a `channels?part=contentDetails` roundtrip unless that lookup is missing/non-UC.
+    let direct_playlist = channel_id
+        .strip_prefix("UC")
+        .filter(|rest| !rest.is_empty())
+        .map(|rest| format!("UU{rest}"))
+        .filter(|id| valid_id(id));
+
+    if let Some(playlist_id) = direct_playlist.as_deref() {
+        match api_at(
+            client,
+            api_base_url,
+            token,
+            "playlistItems",
+            &[
+                ("part", "snippet"),
+                ("playlistId", playlist_id),
+                ("maxResults", "5"),
+            ],
+        ) {
+            Ok(uploads) => {
+                let items = uploads["items"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .take(MAX_UPLOADS_PER_CHANNEL)
+                            .filter_map(parse_upload)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                return Ok(items);
+            }
+            Err(err) if err.starts_with("Sess\u{00e3}o expirada") => return Err(err),
+            Err(_) => {}
+        }
+    }
+
+    let channels = api_at(
+        client,
+        api_base_url,
+        token,
+        "channels",
+        &[
+            ("part", "contentDetails"),
+            ("id", channel_id),
+            ("maxResults", "1"),
+        ],
+    )?;
+    let playlist_id = channels["items"]
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|ch| ch.pointer("/contentDetails/relatedPlaylists/uploads"))
+        .and_then(Value::as_str)
+        .filter(|id| valid_id(id));
+    let Some(playlist_id) = playlist_id else {
+        return Ok(Vec::new());
+    };
+    let uploads = api_at(
+        client,
+        api_base_url,
+        token,
+        "playlistItems",
+        &[
+            ("part", "snippet"),
+            ("playlistId", playlist_id),
+            ("maxResults", "5"),
+        ],
+    )?;
+    Ok(uploads["items"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .take(MAX_UPLOADS_PER_CHANNEL)
+                .filter_map(parse_upload)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+fn order_channels_by_priority(
+    channels: &[HomeChannel],
+    prioritized_ids: &[String],
+) -> Vec<HomeChannel> {
+    if prioritized_ids.is_empty() || channels.len() <= 1 {
+        return channels.to_vec();
+    }
+    let rank_map: HashMap<&str, usize> = prioritized_ids
+        .iter()
+        .enumerate()
+        .map(|(idx, id)| (id.as_str(), idx))
+        .collect();
+    let mut indexed: Vec<(usize, usize, HomeChannel)> = channels
+        .iter()
+        .enumerate()
+        .map(|(orig_idx, ch)| {
+            let prio = rank_map
+                .get(ch.channel_id.as_str())
+                .copied()
+                .unwrap_or(usize::MAX);
+            (prio, orig_idx, ch.clone())
+        })
+        .collect();
+    indexed.sort_by_key(|(prio, orig_idx, _)| (*prio, *orig_idx));
+    indexed.into_iter().map(|(_, _, ch)| ch).collect()
+}
+
+pub fn subscriptions_feed(
+    token: &str,
+    cancel: &Cancellation,
+    progress: impl FnMut(SubscriptionProgress),
+) -> Result<HomeFeed, String> {
+    subscriptions_feed_fast(token, SubscriptionFeedOptions::default(), cancel, progress)
+        .map(|output| output.feed)
+}
+
+pub fn subscriptions_feed_fast(
+    token: &str,
+    options: SubscriptionFeedOptions,
+    cancel: &Cancellation,
+    progress: impl FnMut(SubscriptionProgress),
+) -> Result<SubscriptionFeedOutput, String> {
+    subscriptions_feed_fast_at(
+        "https://www.googleapis.com/youtube/v3",
+        "https://www.youtube.com",
+        token,
+        options,
+        cancel,
+        progress,
+    )
+}
+
+fn subscriptions_feed_fast_at(
+    api_base_url: &str,
+    rss_base_url: &str,
+    token: &str,
+    options: SubscriptionFeedOptions,
+    cancel: &Cancellation,
+    mut progress: impl FnMut(SubscriptionProgress),
+) -> Result<SubscriptionFeedOutput, String> {
+    let api_client = http_client()?;
+    let rss_client = rss_http_client()?;
+
+    let (subscription_channels, reached_limit, used_cached_channels) = match options.known_channels
+    {
+        Some(channels) if !channels.is_empty() => (
+            channels
+                .into_iter()
+                .filter(|ch| valid_id(&ch.channel_id))
+                .take(MAX_SUBSCRIPTIONS)
+                .collect(),
+            false,
+            true,
+        ),
+        _ => {
+            let (_, channels, reached_limit) =
+                fetch_subscription_channels_with(cancel, |resource, params| {
+                    api_at(&api_client, api_base_url, token, resource, params)
+                })?;
+            (channels, reached_limit, false)
+        }
+    };
+
+    let total_channels = subscription_channels.len();
+    progress(SubscriptionProgress {
+        items: Vec::new(),
+        channels: subscription_channels.clone(),
+        completed_channels: 0,
+        total_channels,
+        reached_limit,
+    });
+
+    if total_channels == 0 {
+        return Ok(SubscriptionFeedOutput {
+            feed: HomeFeed {
+                items: Vec::new(),
+                playlists: Vec::new(),
+                channels: subscription_channels,
+            },
+            rss_cache: options.rss_cache,
+            used_cached_channels,
+            rss_hits: 0,
+            not_modified_hits: 0,
+            api_fallbacks: 0,
+        });
+    }
+
+    let ordered_channels =
+        order_channels_by_priority(&subscription_channels, &options.prioritized_channel_ids);
+    let worker_count = ordered_channels.len().min(SUBSCRIPTION_WORKER_COUNT);
+    let next_index = std::sync::atomic::AtomicUsize::new(0);
+    let (sender, receiver) = std::sync::mpsc::channel();
+
+    enum WorkerChannelResult {
+        RssUpdated {
+            channel_id: String,
+            items: Vec<(String, SearchResult)>,
+            etag: Option<String>,
+            last_modified: Option<String>,
+        },
+        RssNotModified {
+            channel_id: String,
+        },
+        ApiSuccess {
+            items: Vec<(String, SearchResult)>,
+        },
+        Error {
+            fatal_auth: bool,
+            message: String,
+        },
+    }
+
+    let mut videos: Vec<(String, SearchResult)> = Vec::new();
+    let initial_rss_cache = options.rss_cache;
+    let mut updated_rss_cache = initial_rss_cache.clone();
+    let mut completed_channels = 0usize;
+    let mut succeeded_channels = 0usize;
+    let mut rss_hits = 0usize;
+    let mut not_modified_hits = 0usize;
+    let mut api_fallbacks = 0usize;
+    let mut first_error: Option<String> = None;
+    let mut fatal_auth_error: Option<String> = None;
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            let api_client = &api_client;
+            let rss_client = &rss_client;
+            let channels = &ordered_channels;
+            let rss_cache_ref = &initial_rss_cache;
+            let next_index = &next_index;
+            scope.spawn(move || {
+                loop {
+                    if cancel.cancelled() {
+                        break;
+                    }
+                    let index = next_index.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(channel) = channels.get(index) else {
+                        break;
+                    };
+                    let cached_entry = rss_cache_ref.get(&channel.channel_id);
+                    let msg =
+                        match fetch_channel_rss_at(rss_client, rss_base_url, channel, cached_entry)
+                        {
+                            ChannelRssOutcome::NotModified => WorkerChannelResult::RssNotModified {
+                                channel_id: channel.channel_id.clone(),
+                            },
+                            ChannelRssOutcome::Updated {
+                                items,
+                                etag,
+                                last_modified,
+                            } => WorkerChannelResult::RssUpdated {
+                                channel_id: channel.channel_id.clone(),
+                                items,
+                                etag,
+                                last_modified,
+                            },
+                            ChannelRssOutcome::FallbackNeeded => {
+                                if cancel.cancelled() {
+                                    break;
+                                }
+                                match fetch_channel_uploads_via_api_at(
+                                    api_client,
+                                    api_base_url,
+                                    token,
+                                    &channel.channel_id,
+                                ) {
+                                    Ok(items) => WorkerChannelResult::ApiSuccess { items },
+                                    Err(err) => WorkerChannelResult::Error {
+                                        fatal_auth: err.starts_with("Sess\u{00e3}o expirada"),
+                                        message: err,
+                                    },
+                                }
+                            }
+                        };
+                    if sender.send(msg).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+        while let Ok(msg) = receiver.recv() {
+            completed_channels += 1;
+            match msg {
+                WorkerChannelResult::RssNotModified { channel_id } => {
+                    succeeded_channels += 1;
+                    not_modified_hits += 1;
+                    if let Some(entry) = updated_rss_cache.get(&channel_id) {
+                        videos.extend(entry.items.iter().map(|item| {
+                            (
+                                item.metadata.upload_date.clone().unwrap_or_default(),
+                                item.clone(),
+                            )
+                        }));
+                    }
+                }
+                WorkerChannelResult::RssUpdated {
+                    channel_id,
+                    items,
+                    etag,
+                    last_modified,
+                } => {
+                    succeeded_channels += 1;
+                    rss_hits += 1;
+                    let cache_items: Vec<SearchResult> =
+                        items.iter().map(|(_, item)| item.clone()).collect();
+                    updated_rss_cache.insert(
+                        channel_id,
+                        ChannelRssCacheEntry {
+                            etag,
+                            last_modified,
+                            items: cache_items,
+                        },
+                    );
+                    videos.extend(items);
+                }
+                WorkerChannelResult::ApiSuccess { items } => {
+                    succeeded_channels += 1;
+                    api_fallbacks += 1;
+                    videos.extend(items);
+                }
+                WorkerChannelResult::Error {
+                    fatal_auth,
+                    message,
+                } => {
+                    if fatal_auth && fatal_auth_error.is_none() {
+                        fatal_auth_error = Some(message);
+                        cancel.cancel();
+                    } else if first_error.is_none() {
+                        first_error = Some(message);
+                    }
+                }
+            }
+
+            let should_emit_progress = completed_channels == 1
+                || (completed_channels <= 30
+                    && completed_channels.is_multiple_of(PROGRESS_CHANNEL_BATCH))
+                || completed_channels.is_multiple_of(PROGRESS_LATER_CHANNEL_BATCH)
+                || completed_channels == total_channels;
+            if should_emit_progress {
+                let mut ordered = videos.clone();
+                ordered.sort_by(|left, right| right.0.cmp(&left.0));
+                progress(SubscriptionProgress {
+                    items: ordered.into_iter().map(|(_, item)| item).collect(),
+                    channels: subscription_channels.clone(),
+                    completed_channels,
+                    total_channels,
+                    reached_limit,
+                });
+            }
+        }
+    });
+
+    if let Some(auth_err) = fatal_auth_error {
+        return Err(auth_err);
+    }
+    if cancel.cancelled() {
+        return Err("Consulta cancelada.".into());
+    }
+    if succeeded_channels == 0
+        && let Some(error) = first_error
+    {
+        return Err(error);
+    }
+    videos.sort_by(|left, right| right.0.cmp(&left.0));
+    let mut seen_urls = HashSet::with_capacity(videos.len());
+    let mut deduped_items = Vec::with_capacity(videos.len());
+    for (_, item) in videos {
+        if seen_urls.insert(item.video.url.clone()) {
+            deduped_items.push(item);
+        }
+    }
+    Ok(SubscriptionFeedOutput {
+        feed: HomeFeed {
+            items: deduped_items,
+            playlists: Vec::new(),
+            channels: subscription_channels,
+        },
+        rss_cache: updated_rss_cache,
+        used_cached_channels,
+        rss_hits,
+        not_modified_hits,
+        api_fallbacks,
+    })
+}
+
+#[cfg(test)]
+fn subscriptions_feed_with<F>(
+    cancel: &Cancellation,
+    mut progress: impl FnMut(SubscriptionProgress),
+    mut fetch: F,
+) -> Result<HomeFeed, String>
+where
+    F: FnMut(&str, &[(&str, &str)]) -> Result<Value, String>,
+{
+    let (ids, subscription_channels, reached_limit) =
+        fetch_subscription_channels_with(cancel, |resource, params| fetch(resource, params))?;
 
     let total_channels = ids.len();
     progress(SubscriptionProgress {
@@ -2408,25 +3471,23 @@ mod tests {
         let cancel = Cancellation::default();
         let mut progress = Vec::new();
         let mut pages = 0;
+        let expected_pages = MAX_SUBSCRIPTIONS / SUBSCRIPTION_PAGE_SIZE;
         let feed = subscriptions_feed_with(
             &cancel,
             |update| progress.push(update),
             |resource, params| match resource {
                 "subscriptions" => {
                     pages += 1;
-                    if pages == 1 {
-                        Ok(subscription_page(0, 50, Some("page-2")))
-                    } else {
-                        assert_eq!(
-                            params
-                                .iter()
-                                .find(|(key, _)| *key == "maxResults")
-                                .unwrap()
-                                .1,
-                            "50"
-                        );
-                        Ok(subscription_page(50, 50, Some("page-3")))
-                    }
+                    assert_eq!(
+                        params
+                            .iter()
+                            .find(|(key, _)| *key == "maxResults")
+                            .unwrap()
+                            .1,
+                        "50"
+                    );
+                    let next = Some(format!("page-{}", pages + 1));
+                    Ok(subscription_page((pages - 1) * 50, 50, next.as_deref()))
                 }
                 "channels" => Ok(channel_page(
                     params.iter().find(|(key, _)| *key == "id").unwrap().1,
@@ -2444,12 +3505,54 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(pages, 2);
+        assert_eq!(pages, expected_pages);
         assert!(feed.items.is_empty());
         assert_eq!(feed.channels.len(), MAX_SUBSCRIPTIONS);
         assert_eq!(progress.last().unwrap().total_channels, MAX_SUBSCRIPTIONS);
         assert_eq!(progress.last().unwrap().channels, feed.channels);
         assert!(progress.last().unwrap().reached_limit);
+    }
+
+    #[test]
+    fn subscription_channels_extract_valid_https_avatar_urls_without_upload_calls() {
+        let cancel = Cancellation::default();
+        let mut calls = Vec::new();
+        let (_, channels, reached_limit) =
+            fetch_subscription_channels_with(&cancel, |resource, _| {
+                calls.push(resource.to_owned());
+                Ok(serde_json::json!({
+                    "items": [
+                        {
+                            "snippet": {
+                                "title": "Almanaque SOS",
+                                "resourceId": { "channelId": "UC000000001" },
+                                "thumbnails": {
+                                    "default": { "url": "https://yt3.ggpht.com/almanaque=s88" }
+                                }
+                            }
+                        },
+                        {
+                            "snippet": {
+                                "title": "Canal Sem Avatar",
+                                "resourceId": { "channelId": "UC000000002" },
+                                "thumbnails": {
+                                    "default": { "url": "javascript:alert(1)" }
+                                }
+                            }
+                        }
+                    ]
+                }))
+            })
+            .unwrap();
+
+        assert_eq!(calls, vec!["subscriptions"]);
+        assert!(!reached_limit);
+        assert_eq!(channels.len(), 2);
+        assert_eq!(
+            channels[0].avatar_url.as_deref(),
+            Some("https://yt3.ggpht.com/almanaque=s88")
+        );
+        assert_eq!(channels[1].avatar_url, None);
     }
 
     #[test]
@@ -2937,6 +4040,10 @@ mod tests {
                             "url": "https://yt3.googleusercontent.com/me=s88-c-k-c0x00ffffff-no-rj"
                         }
                     }
+                },
+                "statistics": {
+                    "subscriberCount": "3",
+                    "hiddenSubscriberCount": false
                 }
             }]
         });
@@ -2950,5 +4057,344 @@ mod tests {
             profile.avatar_url.as_deref(),
             Some("https://yt3.googleusercontent.com/me=s88-c-k-c0x00ffffff-no-rj")
         );
+        assert_eq!(profile.subscriber_count, Some(3));
+    }
+
+    #[test]
+    fn report_video_abuse_resolves_reason_and_posts_to_youtube() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for step in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0u8; 4096];
+                let count = stream.read(&mut buf).unwrap_or(0);
+                requests.push(String::from_utf8_lossy(&buf[..count]).into_owned());
+                if step == 0 {
+                    let body = serde_json::json!({
+                        "items": [{
+                            "id": "V",
+                            "snippet": {
+                                "label": "Conte\u{00fa}do violento ou repulsivo",
+                                "secondaryReasons": [
+                                    { "id": "41", "label": "Viol\u{00ea}ncia gr\u{00e1}fica" }
+                                ]
+                            }
+                        }]
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                } else {
+                    stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .unwrap();
+                }
+            }
+            requests
+        });
+
+        let base_url = format!("http://{addr}/youtube/v3");
+        let cancel = Cancellation::default();
+        report_video_abuse_at(
+            &base_url,
+            "tok-report",
+            "dQw4w9WgXcQ",
+            AbuseReportReason::ViolentOrRepulsive,
+            &cancel,
+        )
+        .unwrap();
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /youtube/v3/videoAbuseReportReasons?"));
+        assert!(requests[1].starts_with("POST /youtube/v3/videos/reportAbuse "));
+        let body_start = requests[1].find("\r\n\r\n").unwrap() + 4;
+        let payload: Value = serde_json::from_str(&requests[1][body_start..]).unwrap();
+        assert_eq!(payload["videoId"], "dQw4w9WgXcQ");
+        assert_eq!(payload["reasonId"], "V");
+        assert_eq!(payload["secondaryReasonId"], "41");
+    }
+
+    #[test]
+    fn parse_youtube_atom_feed_extracts_entries_entities_shorts_and_thumbnails() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns:media="http://search.yahoo.com/mrss/" xmlns="http://www.w3.org/2005/Atom">
+  <title>Canal Principal</title>
+  <author><name>Canal Principal</name></author>
+  <entry>
+    <yt:videoId>vidNormal01</yt:videoId>
+    <yt:channelId>UC000000001</yt:channelId>
+    <title>Rust &amp; FastTube &quot;v2&quot; &#39;Demo&#39;</title>
+    <link rel="alternate" href="https://www.youtube.com/watch?v=vidNormal01"/>
+    <author><name>Canal Principal</name></author>
+    <published>2026-11-14T18:00:00+00:00</published>
+    <media:group>
+      <media:thumbnail url="https://i2.ytimg.com/vi/vidNormal01/hqdefault.jpg" width="480" height="360"/>
+      <media:description><![CDATA[Descrição com <tags> & detalhes]]></media:description>
+      <media:community><media:statistics views="4200"/></media:community>
+    </media:group>
+  </entry>
+  <entry>
+    <yt:videoId>vidShort001</yt:videoId>
+    <yt:channelId>UC000000001</yt:channelId>
+    <title>Quick Short</title>
+    <link rel="alternate" href="https://www.youtube.com/shorts/vidShort001"/>
+    <published>2026-11-15T01:00:00+00:00</published>
+    <media:group>
+      <media:thumbnail url="http://insecure.example.com/bad.jpg"/>
+    </media:group>
+  </entry>
+</feed>"#;
+        let parsed = parse_youtube_atom_feed(xml, "Fallback", "UC000000001").unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].0, "2026-11-14T18:00:00+00:00");
+        assert_eq!(parsed[0].1.video.title, "Rust & FastTube \"v2\" 'Demo'");
+        assert_eq!(
+            parsed[0].1.video.thumbnail,
+            "https://i2.ytimg.com/vi/vidNormal01/hqdefault.jpg"
+        );
+        assert_eq!(parsed[0].1.metadata.view_count, Some(4200));
+        assert_eq!(
+            parsed[0].1.metadata.description.as_deref(),
+            Some("Descrição com <tags> & detalhes")
+        );
+        assert_eq!(parsed[0].1.metadata.kind, SearchResultKind::Video);
+
+        assert_eq!(parsed[1].1.metadata.kind, SearchResultKind::Short);
+        assert_eq!(
+            parsed[1].1.video.thumbnail,
+            "https://i.ytimg.com/vi/vidShort001/hqdefault.jpg"
+        );
+    }
+
+    #[test]
+    fn subscriptions_feed_fast_uses_rss_etag_priority_and_uu_fallback() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured_requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured_for_server = std::sync::Arc::clone(&captured_requests);
+
+        let server = std::thread::spawn(move || {
+            // Round 1: UC000000002 (prioritized!) + UC000000001 (RSS fails 404 -> UU fallback)
+            // Round 2: UC000000002 sends If-None-Match -> 304 Not Modified; UC000000001 -> UU fallback
+            // Total expected HTTP requests = 2 RSS + 1 UU fallback (Round 1) + 2 RSS + 1 UU fallback (Round 2) = 6
+            for _ in 0..6 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0u8; 4096];
+                let count = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..count]).into_owned();
+                captured_for_server.lock().unwrap().push(req.clone());
+
+                let first_line = req.lines().next().unwrap_or("");
+                let has_etag = req.lines().any(|line| {
+                    line.to_ascii_lowercase()
+                        .starts_with("if-none-match: \"etag-c2\"")
+                });
+
+                let response = if first_line.contains("/feeds/videos.xml?channel_id=UC000000002") {
+                    if has_etag {
+                        "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_owned()
+                    } else {
+                        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns:media="http://search.yahoo.com/mrss/" xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <yt:videoId>c2Video0001</yt:videoId>
+    <yt:channelId>UC000000002</yt:channelId>
+    <title>Priority RSS Video</title>
+    <published>2026-11-15T02:00:00+00:00</published>
+  </entry>
+</feed>"#;
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/atom+xml\r\nETag: \"etag-c2\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            xml.len(),
+                            xml
+                        )
+                    }
+                } else if first_line.contains("/feeds/videos.xml?channel_id=UC000000001") {
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_owned()
+                } else if first_line.contains("/youtube/v3/playlistItems?")
+                    && first_line.contains("playlistId=UU000000001")
+                {
+                    let body = serde_json::json!({
+                        "items": [{
+                            "snippet": {
+                                "title": "Fallback UU Video",
+                                "channelId": "UC000000001",
+                                "channelTitle": "Canal 1",
+                                "publishedAt": "2026-11-14T20:00:00Z",
+                                "resourceId": { "videoId": "c1Fallback01" }
+                            }
+                        }]
+                    })
+                    .to_string();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_owned()
+                };
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let api_base = format!("http://{addr}/youtube/v3");
+        let rss_base = format!("http://{addr}");
+        let cancel = Cancellation::default();
+        let known_channels = vec![
+            HomeChannel {
+                title: "Canal 1".into(),
+                channel_id: "UC000000001".into(),
+                avatar_url: None,
+            },
+            HomeChannel {
+                title: "Canal 2".into(),
+                channel_id: "UC000000002".into(),
+                avatar_url: None,
+            },
+        ];
+
+        // Round 1: prioritizes UC000000002, hits RSS for C2, falls back to UU playlist for C1
+        let mut first_progress = Vec::new();
+        let out1 = subscriptions_feed_fast_at(
+            &api_base,
+            &rss_base,
+            "test-token",
+            SubscriptionFeedOptions {
+                known_channels: Some(known_channels.clone()),
+                prioritized_channel_ids: vec!["UC000000002".into()],
+                rss_cache: HashMap::new(),
+            },
+            &cancel,
+            |p| first_progress.push(p),
+        )
+        .unwrap();
+
+        assert!(out1.used_cached_channels);
+        assert_eq!(out1.rss_hits, 1);
+        assert_eq!(out1.api_fallbacks, 1);
+        assert_eq!(out1.feed.items.len(), 2);
+        assert_eq!(out1.feed.items[0].video.title, "Priority RSS Video");
+        assert_eq!(out1.feed.items[1].video.title, "Fallback UU Video");
+        assert_eq!(
+            out1.rss_cache
+                .get("UC000000002")
+                .and_then(|e| e.etag.as_deref()),
+            Some("\"etag-c2\"")
+        );
+
+        // Round 2: passes previous rss_cache -> receives 304 Not Modified for C2
+        let out2 = subscriptions_feed_fast_at(
+            &api_base,
+            &rss_base,
+            "test-token",
+            SubscriptionFeedOptions {
+                known_channels: Some(known_channels),
+                prioritized_channel_ids: vec!["UC000000002".into()],
+                rss_cache: out1.rss_cache,
+            },
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(out2.not_modified_hits, 1);
+        assert_eq!(out2.feed.items.len(), 2);
+        assert_eq!(out2.feed.items[0].video.title, "Priority RSS Video");
+
+        server.join().unwrap();
+        let recorded = captured_requests.lock().unwrap();
+        assert!(
+            !recorded
+                .iter()
+                .any(|req| req.contains("/youtube/v3/subscriptions")
+                    || req.contains("/youtube/v3/channels")),
+            "unexpected subscriptions/channels API call: {recorded:#?}"
+        );
+    }
+
+    #[test]
+    fn subscriptions_disk_cache_round_trips_atomically_and_rejects_corrupt_files() {
+        let dir =
+            std::env::temp_dir().join(format!("fasttube-subs-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache_path = dir.join("subscriptions-cache.json");
+
+        let feed = HomeFeed {
+            items: vec![SearchResult {
+                video: Video {
+                    title: "Cached Video".into(),
+                    channel: "Canal 1".into(),
+                    url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+                    thumbnail: "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg".into(),
+                    duration: String::new(),
+                },
+                metadata: VideoMetadata {
+                    upload_date: Some("2026-11-15T01:00:00+00:00".into()),
+                    channel_id: Some("UC000000001".into()),
+                    view_count: Some(99),
+                    kind: SearchResultKind::Video,
+                    ..Default::default()
+                },
+            }],
+            playlists: Vec::new(),
+            channels: vec![HomeChannel {
+                title: "Canal 1".into(),
+                channel_id: "UC000000001".into(),
+                avatar_url: Some("https://yt3.ggpht.com/avatar=s88".into()),
+            }],
+        };
+        let mut rss_cache = HashMap::new();
+        rss_cache.insert(
+            "UC000000001".into(),
+            ChannelRssCacheEntry {
+                etag: Some("\"etag-1\"".into()),
+                last_modified: None,
+                items: feed.items.clone(),
+            },
+        );
+        let snapshot = SubscriptionsDiskCache::from_feed(&feed, &rss_cache, 1_794_000_000);
+        save_subscriptions_cache_to_path(&cache_path, &snapshot).unwrap();
+
+        let loaded = load_subscriptions_cache_from_path(&cache_path)
+            .unwrap()
+            .unwrap();
+        let (saved_at, channels, items, restored_rss) = loaded.into_parts();
+        assert_eq!(saved_at, 1_794_000_000);
+        assert_eq!(channels.len(), 1);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].video.title, "Cached Video");
+        assert_eq!(
+            restored_rss
+                .get("UC000000001")
+                .and_then(|e| e.etag.as_deref()),
+            Some("\"etag-1\"")
+        );
+
+        delete_subscriptions_cache_at_path(&cache_path).unwrap();
+        assert!(
+            load_subscriptions_cache_from_path(&cache_path)
+                .unwrap()
+                .is_none()
+        );
+
+        std::fs::write(&cache_path, b"{not valid json").unwrap();
+        assert!(load_subscriptions_cache_from_path(&cache_path).is_err());
+        assert_eq!(std::fs::read(&cache_path).unwrap(), b"{not valid json");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

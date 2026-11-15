@@ -15,8 +15,13 @@ pub const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EntryState {
-    Loading { started_at: Instant },
-    Ready { size: [u32; 2] },
+    Loading {
+        started_at: Instant,
+    },
+    Ready {
+        size: [u32; 2],
+        texture_id: Option<egui::TextureId>,
+    },
     Failed,
 }
 
@@ -188,6 +193,14 @@ impl ThumbnailCache {
     }
 
     pub fn maintain(&mut self, ctx: &egui::Context) {
+        if self.retired_in_flight.is_empty()
+            && !self
+                .entries
+                .values()
+                .any(|entry| matches!(entry.state, EntryState::Loading { .. }))
+        {
+            return;
+        }
         let now = Instant::now();
         for uri in self.sweep_expired(now) {
             ctx.forget_image(&uri);
@@ -269,16 +282,20 @@ impl ThumbnailCache {
         let is_visible = viewport_intersects(viewport, rect, 0.0);
         let is_near_viewport = viewport_intersects(viewport, rect, VIEWPORT_OVERSCAN_PX);
 
-        let bg_color = if response.hovered() {
-            Color32::from_rgb(32, 32, 36)
-        } else {
-            Color32::from_rgb(20, 20, 23)
-        };
-        ui.painter().rect_filled(rect, corner_radius, bg_color);
+        if is_visible {
+            let bg_color = if response.hovered() {
+                Color32::from_rgb(32, 32, 36)
+            } else {
+                Color32::from_rgb(20, 20, 23)
+            };
+            ui.painter().rect_filled(rect, corner_radius, bg_color);
+        }
 
         if uri.is_empty() {
-            paint_placeholder(ui, rect, PlaceholderKind::Empty);
-            paint_hover_outline_rounded(ui, rect, response.hovered(), corner_radius);
+            if is_visible {
+                paint_placeholder(ui, rect, PlaceholderKind::Empty);
+                paint_hover_outline_rounded(ui, rect, response.hovered(), corner_radius);
+            }
             return response;
         }
 
@@ -293,12 +310,23 @@ impl ThumbnailCache {
 
         let state = self.entries.get(uri).map(|entry| entry.state);
         match state {
+            Some(EntryState::Ready {
+                size,
+                texture_id: Some(texture_id),
+            }) => {
+                if is_visible {
+                    paint_fitted_texture_rounded(ui, rect, texture_id, size, corner_radius);
+                }
+            }
             Some(EntryState::Ready { .. } | EntryState::Loading { .. }) => {
                 if is_near_viewport || matches!(state, Some(EntryState::Loading { .. })) {
                     match Self::poll_texture(ctx, uri) {
                         PollOutcome::Ready { texture_id, size } => {
                             if let Some(entry) = self.entries.get_mut(uri) {
-                                entry.state = EntryState::Ready { size };
+                                entry.state = EntryState::Ready {
+                                    size,
+                                    texture_id: Some(texture_id),
+                                };
                             }
                             if is_visible {
                                 paint_fitted_texture_rounded(
@@ -344,7 +372,9 @@ impl ThumbnailCache {
             }
         }
 
-        paint_hover_outline_rounded(ui, rect, response.hovered(), corner_radius);
+        if is_visible {
+            paint_hover_outline_rounded(ui, rect, response.hovered(), corner_radius);
+        }
         response
     }
 
@@ -375,9 +405,12 @@ impl ThumbnailCache {
 
         for uri in admitted {
             match Self::poll_texture(ctx, &uri) {
-                PollOutcome::Ready { size, .. } => {
+                PollOutcome::Ready { texture_id, size } => {
                     if let Some(entry) = self.entries.get_mut(&uri) {
-                        entry.state = EntryState::Ready { size };
+                        entry.state = EntryState::Ready {
+                            size,
+                            texture_id: Some(texture_id),
+                        };
                     }
                 }
                 PollOutcome::Pending => {}
@@ -596,8 +629,13 @@ pub const MAX_RETAINED_AVATARS: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AvatarEntryState {
-    Loading { started_at: Instant },
-    Ready { size: [u32; 2] },
+    Loading {
+        started_at: Instant,
+    },
+    Ready {
+        size: [u32; 2],
+        texture_id: Option<egui::TextureId>,
+    },
     Failed,
 }
 
@@ -684,6 +722,23 @@ impl AvatarCache {
         if let Some(entry) = self.entries.get_mut(trimmed) {
             match entry.state {
                 AvatarEntryState::Failed => return false,
+                AvatarEntryState::Ready {
+                    size,
+                    texture_id: Some(texture_id),
+                } => {
+                    self.access_counter = self.access_counter.wrapping_add(1);
+                    entry.last_access_tick = self.access_counter;
+                    if is_visible {
+                        paint_fitted_texture_rounded(
+                            ui,
+                            rect,
+                            texture_id,
+                            size,
+                            rect.width().min(rect.height()) * 0.5,
+                        );
+                    }
+                    return true;
+                }
                 AvatarEntryState::Loading { started_at }
                     if now.saturating_duration_since(started_at) >= IN_FLIGHT_TIMEOUT =>
                 {
@@ -711,7 +766,10 @@ impl AvatarCache {
                     texture.size.y.max(1.0).round() as u32,
                 ];
                 if let Some(entry) = self.entries.get_mut(trimmed) {
-                    entry.state = AvatarEntryState::Ready { size };
+                    entry.state = AvatarEntryState::Ready {
+                        size,
+                        texture_id: Some(texture.id),
+                    };
                 }
                 if is_visible {
                     paint_fitted_texture_rounded(
@@ -788,7 +846,10 @@ mod tests {
 
     fn mark_ready(cache: &mut ThumbnailCache, uri: &str) {
         if let Some(entry) = cache.entries.get_mut(uri) {
-            entry.state = EntryState::Ready { size: [320, 180] };
+            entry.state = EntryState::Ready {
+                size: [320, 180],
+                texture_id: None,
+            };
         }
     }
 
@@ -808,7 +869,10 @@ mod tests {
         cache.entries.insert(
             "https://img/old.jpg".into(),
             CacheEntry {
-                state: EntryState::Ready { size: [320, 180] },
+                state: EntryState::Ready {
+                    size: [320, 180],
+                    texture_id: None,
+                },
                 last_visible_pass: 0,
                 last_access_tick: 2,
             },

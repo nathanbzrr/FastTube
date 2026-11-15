@@ -269,6 +269,7 @@ fn sidebar_subscription_catalog_only_contains_oauth_subscriptions() {
             channels: vec![search::HomeChannel {
                 title: "Canal inscrito".into(),
                 channel_id: "UC000000001".into(),
+                avatar_url: None,
             }],
             completed_channels: 0,
             total_channels: 1,
@@ -2609,6 +2610,7 @@ fn concurrent_searches_and_channel_fetches_ignore_stale_results_and_handle_error
                 view_count: Some(7_777),
                 upload_date: Some("20261106".into()),
                 description: Some("Vídeo do canal Rust.".into()),
+                ..Default::default()
             },
         }],
     };
@@ -2783,6 +2785,7 @@ fn channel_view_preserves_navigation_queue_player_themes_history_and_thumbnail_c
                     view_count: Some(10_000),
                     upload_date: Some("20261106".into()),
                     description: Some("Vídeo com canal válido.".into()),
+                    ..Default::default()
                 },
             },
             SearchResult {
@@ -2885,6 +2888,7 @@ fn channel_view_preserves_navigation_queue_player_themes_history_and_thumbnail_c
                 view_count: Some(88_888),
                 upload_date: Some("20261105".into()),
                 description: Some("Vídeo exclusivo da aba do canal.".into()),
+                ..Default::default()
             },
         }],
     };
@@ -3644,6 +3648,10 @@ fn integrated_overlay_actions_update_menu_theater_fullscreen_miniplayer_and_app_
         mini_player: false,
         autoplay: true,
         loop_video: false,
+        is_live: false,
+        is_live_dvr: false,
+        at_live_edge: false,
+        live_behind_secs: 0.0,
         can_bookmark: true,
         raw_path: Some(video.url.clone()),
         raw_position: Some(42.0),
@@ -3665,18 +3673,68 @@ fn integrated_overlay_actions_update_menu_theater_fullscreen_miniplayer_and_app_
     assert_eq!(app.playback.player_menu, Some(overlay::OverlayMenu::Speed));
 
     app.handle_player_overlay_action(overlay::OverlayAction::SetSpeed(1.5), &overlay_ctx, &ctx);
-    assert_eq!(app.playback.player_menu, None);
+    assert_eq!(app.playback.player_menu, Some(overlay::OverlayMenu::Speed));
 
-    app.handle_player_overlay_action(overlay::OverlayAction::AddBookmark, &overlay_ctx, &ctx);
-    assert_eq!(app.library.data.bookmarks.len(), 1);
-    assert_eq!(app.library.data.bookmarks[0].time_ms, 42_000);
-    assert!(app.library.error.is_none());
+    app.handle_player_overlay_action(
+        overlay::OverlayAction::SetMenu(Some(overlay::OverlayMenu::Quality)),
+        &overlay_ctx,
+        &ctx,
+    );
+    app.handle_player_overlay_action(
+        overlay::OverlayAction::SelectQuality(Some(720)),
+        &overlay_ctx,
+        &ctx,
+    );
+    assert_eq!(
+        app.playback.player_menu,
+        Some(overlay::OverlayMenu::Quality)
+    );
+
+    app.handle_player_overlay_action(
+        overlay::OverlayAction::SetMenu(Some(overlay::OverlayMenu::Subtitles)),
+        &overlay_ctx,
+        &ctx,
+    );
+    app.handle_player_overlay_action(
+        overlay::OverlayAction::SelectSubtitle(None),
+        &overlay_ctx,
+        &ctx,
+    );
+    assert_eq!(
+        app.playback.player_menu,
+        Some(overlay::OverlayMenu::Subtitles)
+    );
+
+    app.handle_player_overlay_action(
+        overlay::OverlayAction::SetMenu(Some(overlay::OverlayMenu::Chapters)),
+        &overlay_ctx,
+        &ctx,
+    );
+    app.handle_player_overlay_action(overlay::OverlayAction::SeekChapter(0.0), &overlay_ctx, &ctx);
+    assert_eq!(
+        app.playback.player_menu,
+        Some(overlay::OverlayMenu::Chapters)
+    );
 
     app.handle_player_overlay_action(
         overlay::OverlayAction::SetMenu(Some(overlay::OverlayMenu::Root)),
         &overlay_ctx,
         &ctx,
     );
+    app.handle_player_overlay_action(overlay::OverlayAction::AddBookmark, &overlay_ctx, &ctx);
+    assert_eq!(app.library.data.bookmarks.len(), 1);
+    assert_eq!(app.library.data.bookmarks[0].time_ms, 42_000);
+    assert!(app.library.error.is_none());
+    assert_eq!(app.playback.player_menu, Some(overlay::OverlayMenu::Root));
+
+    app.handle_player_overlay_action(overlay::OverlayAction::ToggleAutoplay, &overlay_ctx, &ctx);
+    assert!(!app.playback.autoplay);
+    assert_eq!(app.playback.player_menu, Some(overlay::OverlayMenu::Root));
+
+    app.handle_player_overlay_action(overlay::OverlayAction::ToggleLoop, &overlay_ctx, &ctx);
+    assert!(app.playback.loop_video);
+    assert_eq!(app.playback.player_menu, Some(overlay::OverlayMenu::Root));
+
     app.handle_player_overlay_action(overlay::OverlayAction::OpenAppSettings, &overlay_ctx, &ctx);
     assert_eq!(app.playback.player_menu, None);
     assert!(app.ui.settings_open);
@@ -3693,16 +3751,11 @@ fn integrated_overlay_actions_update_menu_theater_fullscreen_miniplayer_and_app_
     assert!(app.playback.mini_player);
     assert!(!app.playback.fullscreen);
 
-    app.handle_player_overlay_action(overlay::OverlayAction::ToggleAutoplay, &overlay_ctx, &ctx);
-    assert!(!app.playback.autoplay);
-
-    app.handle_player_overlay_action(overlay::OverlayAction::ToggleLoop, &overlay_ctx, &ctx);
-    assert!(app.playback.loop_video);
-
     app.playback.player_menu = Some(overlay::OverlayMenu::Quality);
     app.close_video(&ctx);
     assert_eq!(app.playback.player_menu, None);
     assert_eq!(app.playback.last_subtitle_id, None);
+    assert!(!app.playback.mini_player);
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
@@ -3947,6 +4000,7 @@ fn poll_my_channel_stores_avatar_and_only_navigates_when_requested() {
             target: ChannelTarget::ChannelId("UCabc123".into()),
             title: Some("Canal Teste".into()),
             avatar_url: Some("https://yt3.ggpht.com/avatar=s88".into()),
+            subscriber_count: Some(3),
         }),
     ))
     .unwrap();
@@ -3962,6 +4016,7 @@ fn poll_my_channel_stores_avatar_and_only_navigates_when_requested() {
         app.auth.my_channel_avatar_url.as_deref(),
         Some("https://yt3.ggpht.com/avatar=s88")
     );
+    assert_eq!(app.auth.my_channel_subscribers, Some(3));
     assert!(!app.channels.view_open);
 }
 
@@ -4055,7 +4110,10 @@ fn youtube_sidebar_and_responsive_watch_resize_adapt_across_viewports() {
             rendered = collect_rendered_text(&output.shapes).join("\n");
             output.textures_delta.clear();
         }
-        assert!(rendered.contains("In\u{00ed}cio"), "rendered was:\n{rendered}");
+        assert!(
+            rendered.contains("In\u{00ed}cio"),
+            "rendered was:\n{rendered}"
+        );
         assert!(rendered.contains("Shorts"));
         assert!(rendered.contains("Inscri\u{00e7}\u{00f5}es"));
         assert!(rendered.contains("Voc\u{00ea}"));
@@ -4066,3 +4124,2358 @@ fn youtube_sidebar_and_responsive_watch_resize_adapt_across_viewports() {
     }
 }
 
+#[test]
+fn home_feed_cache_restores_without_refetch_on_inicio() {
+    let mut app = FastTube::default();
+    let ctx = egui::Context::default();
+    let (sender, receiver) = mpsc::channel();
+    app.feed.home.batch_rx = Some(receiver);
+    app.feed.home.batch_active_request_id = Some(1);
+    let mix_url = "https://www.youtube.com/playlist?list=RDmix01".to_owned();
+    sender
+        .send(HomeBatchFetchMessage {
+            request_id: 1,
+            page: 0,
+            result: Ok(search::HomeFeed {
+                items: vec![
+                    SearchResult {
+                        video: Video {
+                            title: "Mix de Rock".into(),
+                            channel: "Banda X e outros".into(),
+                            url: mix_url.clone(),
+                            thumbnail: String::new(),
+                            duration: String::new(),
+                        },
+                        metadata: VideoMetadata::default(),
+                    },
+                    SearchResult {
+                        video: Video {
+                            title: "Video Principal".into(),
+                            channel: "Canal Principal".into(),
+                            url: "https://www.youtube.com/watch?v=mainvid0001".into(),
+                            thumbnail: String::new(),
+                            duration: "12:34".into(),
+                        },
+                        metadata: VideoMetadata::default(),
+                    },
+                ],
+                playlists: vec![mix_url.clone()],
+                channels: Vec::new(),
+            }),
+        })
+        .unwrap();
+
+    app.poll_async_tasks(&ctx);
+    assert!(app.feed.home.cached_loaded);
+    assert_eq!(app.feed.home.cached_items.len(), 2);
+    assert_eq!(app.feed.videos.len(), 2);
+
+    // Switch away to a playlist/subscriptions view, then call start_public_home:
+    // it must restore cached Home instantly without spawning a new batch_rx fetch.
+    app.feed.home.title = Some("Inscri\u{00e7}\u{00f5}es: envios recentes".into());
+    app.feed.videos.clear();
+    app.start_public_home(&ctx);
+
+    assert!(app.feed.home.title.is_none());
+    assert!(app.feed.home.batch_rx.is_none());
+    assert_eq!(app.feed.videos.len(), 2);
+    assert!(app.feed.home.playlist_urls.contains(&mix_url));
+}
+
+#[test]
+fn home_feed_batch_pagination_accumulates_past_100_items() {
+    let mut app = FastTube::default();
+    let ctx = egui::Context::default();
+
+    for page in 0..2usize {
+        let request_id = (page + 1) as u64;
+        let (sender, receiver) = mpsc::channel();
+        app.feed.home.batch_rx = Some(receiver);
+        app.feed.home.batch_active_request_id = Some(request_id);
+        let items: Vec<SearchResult> = (0..65usize)
+            .map(|idx| {
+                let global_idx = page * 65 + idx;
+                SearchResult {
+                    video: Video {
+                        title: format!("Video Home {global_idx}"),
+                        channel: format!("Canal {}", global_idx % 9),
+                        url: format!("https://www.youtube.com/watch?v=vid{global_idx:08}"),
+                        thumbnail: String::new(),
+                        duration: "8:10".into(),
+                    },
+                    metadata: VideoMetadata::default(),
+                }
+            })
+            .collect();
+        sender
+            .send(HomeBatchFetchMessage {
+                request_id,
+                page,
+                result: Ok(search::HomeFeed {
+                    items,
+                    playlists: Vec::new(),
+                    channels: Vec::new(),
+                }),
+            })
+            .unwrap();
+        app.poll_async_tasks(&ctx);
+    }
+
+    assert_eq!(app.feed.home.cached_items.len(), 130);
+    assert_eq!(app.feed.videos.len(), 130);
+    assert_eq!(app.feed.home.page, 2);
+    assert!(app.feed.home.has_more);
+}
+
+#[test]
+fn youtube_home_grid_renders_mix_playlist_verified_channel_and_shorts_novo() {
+    let mut app = FastTube::default();
+    let ctx = egui::Context::default();
+    let days_since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+        / 86_400;
+    // Howard Hinnant civil-from-days algorithm for today's YYYYMMDD.
+    let z = days_since_epoch + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let today_ymd = format!("{y:04}{m:02}{d:02}");
+
+    let mix_url = "https://www.youtube.com/playlist?list=RD0001".to_owned();
+    app.feed.home.playlist_urls = vec![mix_url.clone()];
+    app.apply_search_results(
+        &ctx,
+        vec![
+            SearchResult {
+                video: Video {
+                    title: "Mix de One way trigger - The Strokes".into(),
+                    channel: "The Strokes e outros".into(),
+                    url: mix_url,
+                    thumbnail: String::new(),
+                    duration: String::new(),
+                },
+                metadata: VideoMetadata::default(),
+            },
+            SearchResult {
+                video: Video {
+                    title: "Gameplay Especial".into(),
+                    channel: "Canal Verificado".into(),
+                    url: "https://www.youtube.com/watch?v=normal00001".into(),
+                    thumbnail: String::new(),
+                    duration: "15:01".into(),
+                },
+                metadata: VideoMetadata {
+                    view_count: Some(288_000),
+                    channel_url: Some("https://www.youtube.com/@CanalVerificado".into()),
+                    ..Default::default()
+                },
+            },
+            SearchResult {
+                video: Video {
+                    title: "Curta recente".into(),
+                    channel: "Shorts Criador".into(),
+                    url: "https://www.youtube.com/shorts/short000001".into(),
+                    thumbnail: String::new(),
+                    duration: "0:32".into(),
+                },
+                metadata: VideoMetadata {
+                    view_count: Some(12_000),
+                    upload_date: Some(today_ymd),
+                    ..Default::default()
+                },
+            },
+        ],
+    );
+
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1360.0, 840.0),
+            )),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            egui::CentralPanel::default().show(ui, |ui| {
+                app.filter_chips_bar_ui(ui, &c);
+                let _ = app.home_grid_ui(ui, &c);
+            });
+        },
+    );
+    let rendered = collect_rendered_text(&output.shapes).join("\n");
+    output.textures_delta.clear();
+
+    assert!(rendered.contains("Tudo"), "rendered:\n{rendered}");
+    assert!(rendered.contains("Mix"), "rendered:\n{rendered}");
+    assert!(rendered.contains("Playlist"), "rendered:\n{rendered}");
+    assert!(
+        rendered.contains("Canal Verificado"),
+        "rendered:\n{rendered}"
+    );
+    assert!(rendered.contains("Shorts"), "rendered:\n{rendered}");
+    assert!(rendered.contains("Novo"), "rendered:\n{rendered}");
+}
+
+#[test]
+fn mini_player_viewport_settles_preserves_aspect_and_exits_on_maximize() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube {
+        selected: Some(sample_videos().remove(0)),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        FastTube::compute_mini_player_size(480.0, 270.0),
+        egui::vec2(480.0, 270.0)
+    );
+    let min_size = FastTube::compute_mini_player_size(260.0, 146.0);
+    assert!(min_size.x <= 260.0 && min_size.y <= 146.0);
+    let tall_size = FastTube::compute_mini_player_size(500.0, 400.0);
+    assert!((tall_size.x - 500.0).abs() < 0.01);
+    assert!((tall_size.y - 281.25).abs() < 0.01);
+
+    app.playback.fullscreen = true;
+    app.toggle_mini_player(&ctx);
+    assert!(app.playback.mini_player);
+    assert!(!app.playback.fullscreen);
+    assert!(app.playback.mini_player_pending_enter.is_some());
+    assert!(!app.playback.mini_player_settled);
+
+    // Frame with normal (unmaximized, unfullscreen) viewport settles PiP without exiting.
+    let mut raw_normal = egui::RawInput::default();
+    if let Some(vp) = raw_normal.viewports.get_mut(&egui::ViewportId::ROOT) {
+        vp.maximized = Some(false);
+        vp.fullscreen = Some(false);
+        vp.inner_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(800.0, 400.0),
+            egui::vec2(520.0, 292.5),
+        ));
+        vp.outer_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(792.0, 368.0),
+            egui::vec2(536.0, 332.5),
+        ));
+    }
+    let mut out1 = ctx.run_ui(raw_normal, |ui| {
+        app.sync_mini_player_viewport(ui.ctx());
+    });
+    out1.textures_delta.clear();
+    assert!(app.playback.mini_player);
+    assert!(app.playback.mini_player_pending_enter.is_none());
+    assert!(app.playback.mini_player_settled);
+
+    // Next frame records user move/resize bounds without snapping back.
+    let mut raw_moved = egui::RawInput::default();
+    if let Some(vp) = raw_moved.viewports.get_mut(&egui::ViewportId::ROOT) {
+        vp.maximized = Some(false);
+        vp.fullscreen = Some(false);
+        vp.inner_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(120.0, 140.0),
+            egui::vec2(640.0, 360.0),
+        ));
+        vp.outer_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(112.0, 108.0),
+            egui::vec2(656.0, 400.0),
+        ));
+    }
+    let mut out2 = ctx.run_ui(raw_moved, |ui| {
+        app.sync_mini_player_viewport(ui.ctx());
+    });
+    out2.textures_delta.clear();
+    assert_eq!(
+        app.playback.mini_player_saved_size,
+        Some(egui::vec2(640.0, 360.0))
+    );
+    assert_eq!(
+        app.playback.mini_player_saved_pos,
+        Some(egui::pos2(112.0, 108.0))
+    );
+
+    // Maximizing (or Aero-snapping) after settling exits PiP cleanly.
+    let mut raw_max = egui::RawInput::default();
+    if let Some(vp) = raw_max.viewports.get_mut(&egui::ViewportId::ROOT) {
+        vp.maximized = Some(true);
+    }
+    let mut out3 = ctx.run_ui(raw_max, |ui| {
+        app.sync_mini_player_viewport(ui.ctx());
+    });
+    out3.textures_delta.clear();
+    assert!(!app.playback.mini_player);
+    assert!(!app.playback.mini_player_settled);
+}
+
+#[test]
+fn poll_quality_populates_subtitles_from_playback_metadata() {
+    let mut app = FastTube::default();
+    let url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+    app.watch.extras.sync_video(Some(url));
+    assert!(!app.watch.extras.subtitles_loaded);
+
+    let (tx, rx) = mpsc::channel();
+    app.playback.quality_rx = Some(rx);
+    tx.send(Ok(search::VideoPlaybackMetadata {
+        heights: vec![1080, 720, 480],
+        subtitles: vec![search::SubtitleTrack {
+            language: "pt".into(),
+            url: "https://www.youtube.com/api/timedtext?v=dQw4w9WgXcQ&lang=pt&fmt=vtt".into(),
+            automatic: false,
+        }],
+        ..Default::default()
+    }))
+    .unwrap();
+
+    app.poll_quality();
+    assert!(app.playback.quality_rx.is_none());
+    assert_eq!(app.playback.qualities, vec![1080, 720, 480]);
+    assert!(app.watch.extras.subtitles_loaded);
+    assert_eq!(app.watch.extras.subtitles.len(), 1);
+    assert_eq!(app.watch.extras.subtitles[0].language, "pt");
+}
+
+#[test]
+fn record_active_playback_ticks_keep_feed_signal_revision_stable_until_completion() {
+    let mut app = FastTube::default();
+    app.feed.cache_dirty = false;
+    let initial_rev = app.feed.signal_revision;
+
+    app.playback.active = Some(ActivePlayback {
+        video_id: Some("dQw4w9WgXcQ".into()),
+        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+        title: "Sample".into(),
+        channel: "Channel".into(),
+        position_ms: 5_000,
+        duration_ms: Some(120_000),
+        resume_target_ms: None,
+        resume_seek_pending: false,
+        start_option_cleared: true,
+        has_live_sample: true,
+        stale_guard_pos_ms: None,
+        is_live: false,
+        live_dvr: false,
+        at_live_edge: false,
+        live_paused_since: None,
+        live_paused_accumulated_secs: 0.0,
+        live_behind_secs: 0.0,
+    });
+
+    // First sample inserts history entry -> invalidates once.
+    assert!(app.record_active_playback_in_memory());
+    let after_first = app.feed.signal_revision;
+    assert_ne!(after_first, initial_rev);
+
+    // Clear dirty flag and simulate normal playback progression.
+    app.feed.cache_dirty = false;
+    if let Some(active) = &mut app.playback.active {
+        active.position_ms = 25_000;
+    }
+    assert!(app.record_active_playback_in_memory());
+    assert_eq!(app.feed.signal_revision, after_first);
+    assert!(!app.feed.cache_dirty);
+
+    // Reaching near-end completion updates history ranking -> invalidates.
+    if let Some(active) = &mut app.playback.active {
+        active.position_ms = 116_000;
+    }
+    assert!(app.record_active_playback_in_memory());
+    assert_ne!(app.feed.signal_revision, after_first);
+}
+
+#[test]
+fn watch_sidebar_cache_reuses_cards_and_detects_tab_and_feed_mutations() {
+    let mut app = FastTube::default();
+    let v1 = Video {
+        title: "Current Video".into(),
+        channel: "Canal A".into(),
+        duration: "10:00".into(),
+        url: "https://www.youtube.com/watch?v=aaaaaaaaaaa".into(),
+        thumbnail: String::new(),
+    };
+    let v2 = Video {
+        title: "Next From Canal A".into(),
+        channel: "Canal A".into(),
+        duration: "08:00".into(),
+        url: "https://www.youtube.com/watch?v=bbbbbbbbbbb".into(),
+        thumbnail: String::new(),
+    };
+    let v3 = Video {
+        title: "Other Channel Video".into(),
+        channel: "Canal B".into(),
+        duration: "12:00".into(),
+        url: "https://www.youtube.com/watch?v=ccccccccccc".into(),
+        thumbnail: String::new(),
+    };
+    app.selected = Some(v1.clone());
+    app.feed.videos = vec![v1, v2.clone(), v3.clone()];
+
+    app.ensure_watch_sidebar_cache();
+    assert!(app.watch.sidebar_cache.valid);
+    assert_eq!(app.watch.sidebar_cache.cards.len(), 2);
+
+    // Record measured height on cached card and ensure subsequent unchanged checks preserve it.
+    app.watch.sidebar_cache.cards[0].measured_height = Some((380, 96.0));
+    app.ensure_watch_sidebar_cache();
+    assert_eq!(
+        app.watch.sidebar_cache.cards[0].measured_height,
+        Some((380, 96.0))
+    );
+
+    // Switching SidebarTab rebuilds filtered list cleanly.
+    app.watch.extras.sidebar_tab = watch_extras::SidebarTab::FromChannel;
+    app.ensure_watch_sidebar_cache();
+    assert_eq!(app.watch.sidebar_cache.cards.len(), 1);
+    assert_eq!(app.watch.sidebar_cache.cards[0].video.url, v2.url);
+
+    // Direct mutation of `feed.videos` (like tests or unhooked writers) is auto-detected.
+    app.watch.extras.sidebar_tab = watch_extras::SidebarTab::All;
+    app.ensure_watch_sidebar_cache();
+    assert_eq!(app.watch.sidebar_cache.cards.len(), 2);
+    app.feed.videos.push(Video {
+        title: "Newly Pushed".into(),
+        channel: "Canal C".into(),
+        duration: "05:00".into(),
+        url: "https://www.youtube.com/watch?v=ddddddddddd".into(),
+        thumbnail: String::new(),
+    });
+    app.ensure_watch_sidebar_cache();
+    assert_eq!(app.watch.sidebar_cache.cards.len(), 3);
+}
+
+fn collect_rendered_text_rects(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Rect)> {
+    let mut entries = Vec::new();
+    fn visit(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(text) => {
+                let rect = text.galley.rect.translate(text.pos.to_vec2());
+                out.push((text.galley.job.text.clone(), rect));
+            }
+            egui::Shape::Vec(items) => {
+                for item in items {
+                    visit(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    for clipped in shapes {
+        visit(&clipped.shape, &mut entries);
+    }
+    entries
+}
+
+#[test]
+fn search_results_ui_shows_youtube_chips_filters_and_non_overlapping_cards() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    app.ui.search_results_mode = true;
+    app.ui.browse_section = BrowseSection::Home;
+    app.feed.query = "resident evil".into();
+
+    let playlist_url = "https://www.youtube.com/playlist?list=PLsearch0001".to_owned();
+    app.apply_search_results(
+        &ctx,
+        vec![
+            SearchResult {
+                video: Video {
+                    title: "Live Jogando Agora".into(),
+                    channel: "Canal Live".into(),
+                    url: "https://www.youtube.com/watch?v=live0000001".into(),
+                    thumbnail: String::new(),
+                    duration: String::new(),
+                },
+                metadata: VideoMetadata {
+                    kind: search::SearchResultKind::Video,
+                    is_live: true,
+                    view_count: Some(64_000),
+                    view_count_text: Some("64 mil assistindo".into()),
+                    channel_verified: true,
+                    badges: vec!["AO VIVO".into()],
+                    description: Some("Transmissão ao vivo agora mesmo.".into()),
+                    ..Default::default()
+                },
+            },
+            SearchResult {
+                video: Video {
+                    title: "Gameplay Comentada".into(),
+                    channel: "Canal Gamer".into(),
+                    url: "https://www.youtube.com/watch?v=vod00000002".into(),
+                    thumbnail: String::new(),
+                    duration: "13:17".into(),
+                },
+                metadata: VideoMetadata {
+                    kind: search::SearchResultKind::Video,
+                    view_count: Some(53_000),
+                    view_count_text: Some("53 mil visualizações".into()),
+                    published_time_text: Some("há 1 hora".into()),
+                    badges: vec!["Novo".into(), "HD".into()],
+                    description: Some("Análise completa em 60fps.".into()),
+                    ..Default::default()
+                },
+            },
+            SearchResult {
+                video: Video {
+                    title: "Canal Oficial Exemplo".into(),
+                    channel: "@CanalExemplo".into(),
+                    url: "https://www.youtube.com/@CanalExemplo".into(),
+                    thumbnail: String::new(),
+                    duration: String::new(),
+                },
+                metadata: VideoMetadata {
+                    kind: search::SearchResultKind::Channel,
+                    subscriber_count_text: Some("989 inscritos".into()),
+                    channel_verified: true,
+                    description: Some("Vídeos semanais de tecnologia.".into()),
+                    ..Default::default()
+                },
+            },
+            SearchResult {
+                video: Video {
+                    title: "Trilha Sonora Completa".into(),
+                    channel: "Canal Música".into(),
+                    url: playlist_url.clone(),
+                    thumbnail: String::new(),
+                    duration: String::new(),
+                },
+                metadata: VideoMetadata {
+                    kind: search::SearchResultKind::Playlist,
+                    playlist_count: Some("91 vídeos".into()),
+                    ..Default::default()
+                },
+            },
+        ],
+    );
+    assert!(app.feed.home.playlist_urls.contains(&playlist_url));
+
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 1400.0),
+            )),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            egui::CentralPanel::default().show(ui, |ui| {
+                let _ = app.browse_page_ui(ui, &c);
+            });
+        },
+    );
+    let text_rects = collect_rendered_text_rects(&output.shapes);
+    let rendered = text_rects
+        .iter()
+        .map(|(text, _)| text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    output.textures_delta.clear();
+
+    // Home-only chips must not leak into search results mode.
+    assert!(!rendered.contains("Jogos"), "rendered:\n{rendered}");
+    assert!(!rendered.contains("Mixes"), "rendered:\n{rendered}");
+    assert_eq!(
+        rendered.matches("AO VIVO").count(),
+        1,
+        "rendered:\n{rendered}"
+    );
+
+    // Official search chips and right-aligned Filtros button are visible.
+    for expected in [
+        "Tudo",
+        "Shorts",
+        "Não assistidos",
+        "Vídeos",
+        "Enviados recentemente",
+        "Ao vivo",
+        "Filtros",
+        "64 mil assistindo",
+        "AO VIVO",
+        "53 mil visualizações • há 1 hora",
+        "13:17",
+        "Novo",
+        "HD",
+        "@CanalExemplo • 989 inscritos",
+        "Ver playlist completa",
+        "91 vídeos",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing '{expected}' in rendered:\n{rendered}"
+        );
+    }
+
+    // Geometry check: card title sits cleanly to the right of thumbnail/duration badge (zero overlap),
+    // and Filtros button sits cleanly to the right of the Ao vivo chip.
+    let dur_rect = text_rects
+        .iter()
+        .find(|(t, _)| t == "13:17")
+        .expect("duration rect")
+        .1;
+    let title_rect = text_rects
+        .iter()
+        .find(|(t, _)| t.contains("Gameplay Comentada"))
+        .expect("title rect")
+        .1;
+    assert!(
+        title_rect.min.x > dur_rect.max.x + 8.0,
+        "title overlapped thumbnail column: title={title_rect:?} dur={dur_rect:?}"
+    );
+
+    let ao_vivo_chip_rect = text_rects
+        .iter()
+        .find(|(t, _)| t == "Ao vivo")
+        .expect("Ao vivo chip")
+        .1;
+    let filtros_rect = text_rects
+        .iter()
+        .find(|(t, _)| t == "Filtros")
+        .expect("Filtros button")
+        .1;
+    assert!(
+        filtros_rect.min.x > ao_vivo_chip_rect.max.x,
+        "Filtros button should be right-aligned past search chips: chip={ao_vivo_chip_rect:?} filtros={filtros_rect:?}"
+    );
+}
+
+#[test]
+fn search_filters_modal_renders_five_youtube_columns_and_toggles_sort() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    app.ui.search_results_mode = true;
+    app.feed.search_filters_open = true;
+
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 820.0));
+    let mut output = egui::FullOutput::default();
+    for _ in 0..2 {
+        output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                let c = ui.ctx().clone();
+                app.search_filters_modal_ui(&c);
+            },
+        );
+        output.textures_delta.clear();
+    }
+    let text_rects = collect_rendered_text_rects(&output.shapes);
+    let rendered = text_rects
+        .iter()
+        .map(|(text, _)| text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for expected in [
+        "Filtros de pesquisa",
+        "TIPO",
+        "DURAÇÃO",
+        "DATA DO UPLOAD",
+        "CARACTERÍSTICAS",
+        "PRIORIDADE",
+        "Vídeos",
+        "Shorts",
+        "Canais",
+        "Playlists",
+        "Filmes",
+        "Menos de 3 minutos",
+        "De 3 a 20 minutos",
+        "Com mais de 20 minutos",
+        "Hoje",
+        "Esta semana",
+        "Este mês",
+        "Este ano",
+        "Ao vivo",
+        "4K",
+        "Alta Definição",
+        "Legendas/CC",
+        "Relevância",
+        "Popularidade",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing '{expected}' in filter modal:\n{rendered}"
+        );
+    }
+
+    let pop_pos = text_rects
+        .iter()
+        .find(|(t, _)| t == "Popularidade")
+        .expect("Popularidade option")
+        .1
+        .center();
+
+    let click_events = vec![
+        egui::Event::PointerMoved(pop_pos),
+        egui::Event::PointerButton {
+            pos: pop_pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        },
+        egui::Event::PointerButton {
+            pos: pop_pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        },
+    ];
+    let mut click_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: click_events,
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.search_filters_modal_ui(&c);
+        },
+    );
+    click_out.textures_delta.clear();
+
+    assert_eq!(app.feed.search_filters.sort, search::SearchSort::Views);
+    assert!(!app.feed.search_filters_open);
+}
+
+#[test]
+fn search_unwatched_chip_filters_watched_history_videos() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    app.ui.search_results_mode = true;
+    app.ui.browse_section = BrowseSection::Home;
+    app.feed.query = "tutorial".into();
+
+    app.history
+        .data
+        .record(history::Entry {
+            video_id: "watched0001".into(),
+            title: "Watched Video Title".into(),
+            channel: "Canal A".into(),
+            position_ms: 95_000,
+            duration_ms: Some(300_000),
+        })
+        .unwrap();
+
+    app.apply_search_results(
+        &ctx,
+        vec![
+            SearchResult {
+                video: Video {
+                    title: "Watched Video Title".into(),
+                    channel: "Canal A".into(),
+                    url: "https://www.youtube.com/watch?v=watched0001".into(),
+                    thumbnail: String::new(),
+                    duration: "5:00".into(),
+                },
+                metadata: VideoMetadata::default(),
+            },
+            SearchResult {
+                video: Video {
+                    title: "Unwatched Video Title".into(),
+                    channel: "Canal B".into(),
+                    url: "https://www.youtube.com/watch?v=unwatch0002".into(),
+                    thumbnail: String::new(),
+                    duration: "8:20".into(),
+                },
+                metadata: VideoMetadata::default(),
+            },
+        ],
+    );
+
+    app.feed.search_chip = search::SearchChip::Unwatched;
+    let mut out_unwatched = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            egui::CentralPanel::default().show(ui, |ui| {
+                let _ = app.search_results_ui(ui, &c);
+            });
+        },
+    );
+    let rendered_unwatched = collect_rendered_text(&out_unwatched.shapes).join("\n");
+    out_unwatched.textures_delta.clear();
+
+    assert!(
+        !rendered_unwatched.contains("Watched Video Title"),
+        "rendered:\n{rendered_unwatched}"
+    );
+    assert!(
+        rendered_unwatched.contains("Unwatched Video Title"),
+        "rendered:\n{rendered_unwatched}"
+    );
+
+    app.feed.search_chip = search::SearchChip::All;
+    let mut out_all = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            egui::CentralPanel::default().show(ui, |ui| {
+                let _ = app.search_results_ui(ui, &c);
+            });
+        },
+    );
+    let rendered_all = collect_rendered_text(&out_all.shapes).join("\n");
+    out_all.textures_delta.clear();
+    assert!(rendered_all.contains("Watched Video Title"));
+    assert!(rendered_all.contains("Unwatched Video Title"));
+}
+
+#[test]
+fn search_save_and_report_modals_render_and_hide_reported_video() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    let target_video = Video {
+        title: "Resultado Suspeito".into(),
+        channel: "Canal X".into(),
+        url: "https://www.youtube.com/watch?v=report00001".into(),
+        thumbnail: String::new(),
+        duration: "4:12".into(),
+    };
+    app.apply_search_results(
+        &ctx,
+        vec![SearchResult {
+            video: target_video.clone(),
+            metadata: VideoMetadata::default(),
+        }],
+    );
+
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+    app.feed.search_save_modal_video = Some(target_video.clone());
+    let mut save_out = egui::FullOutput::default();
+    for _ in 0..2 {
+        save_out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                let c = ui.ctx().clone();
+                app.search_save_modal_ui(&c);
+            },
+        );
+        save_out.textures_delta.clear();
+    }
+    let save_rendered = collect_rendered_text(&save_out.shapes).join("\n");
+    assert!(
+        save_rendered.contains("Assistir mais tarde"),
+        "save modal:\n{save_rendered}"
+    );
+    app.feed.search_save_modal_video = None;
+
+    app.feed.search_report_modal_video = Some(target_video.clone());
+    let mut report_out = egui::FullOutput::default();
+    for _ in 0..2 {
+        report_out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                let c = ui.ctx().clone();
+                app.search_report_modal_ui(&c);
+            },
+        );
+        report_out.textures_delta.clear();
+    }
+    let report_rects = collect_rendered_text_rects(&report_out.shapes);
+    let report_rendered = report_rects
+        .iter()
+        .map(|(t, _)| t.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        report_rendered.contains("Denunciar imagem ou título"),
+        "report modal:\n{report_rendered}"
+    );
+    for expected_reason in [
+        "Conteúdo sexual",
+        "Conteúdo violento ou repulsivo",
+        "Conteúdo abominável ou abusivo",
+        "Atos perigosos ou nocivos",
+        "Spam ou enganoso",
+    ] {
+        assert!(
+            report_rendered.contains(expected_reason),
+            "missing reason '{expected_reason}':\n{report_rendered}"
+        );
+    }
+
+    let click_at = |pos: egui::Pos2| -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    };
+
+    // Clicking "Denunciar" before picking a reason must keep the modal open.
+    let btn_pos = report_rects
+        .iter()
+        .find(|(t, _)| t == "Denunciar")
+        .expect("Denunciar button")
+        .1
+        .center();
+    let mut disabled_click_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: click_at(btn_pos),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.search_report_modal_ui(&c);
+        },
+    );
+    disabled_click_out.textures_delta.clear();
+    assert!(app.feed.search_report_modal_video.is_some());
+    assert!(app.feed.search_reported_urls.is_empty());
+
+    // Select "Spam ou enganoso" first.
+    let reason_pos = report_rects
+        .iter()
+        .find(|(t, _)| t == "Spam ou enganoso")
+        .expect("Spam ou enganoso option")
+        .1
+        .center();
+    let mut select_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: click_at(reason_pos),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.search_report_modal_ui(&c);
+        },
+    );
+    select_out.textures_delta.clear();
+    assert_eq!(app.feed.search_report_reason, Some(4));
+
+    // Now clicking "Denunciar" submits and hides the video.
+    let mut click_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: click_at(btn_pos),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.search_report_modal_ui(&c);
+        },
+    );
+    click_out.textures_delta.clear();
+
+    assert!(app.feed.search_report_modal_video.is_none());
+    assert!(app.feed.search_reported_urls.contains(&target_video.url));
+    assert!(app.feed.videos.is_empty());
+    assert!(app.message.contains("Spam ou enganoso"));
+}
+
+#[test]
+fn share_modal_opens_from_watch_and_updates_timestamp_and_embed() {
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+    let mut video = sample_videos().remove(0);
+    video.url = "https://www.youtube.com/watch?v=_wCXFKpfcgg".into();
+    app.selected = Some(video.clone());
+    app.auth.my_channel_subscribers = Some(3);
+
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 760.0));
+    let mut watch_out = egui::FullOutput::default();
+    for _ in 0..2 {
+        watch_out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                app.watch_metadata_card_ui(ui, &video, 680.0, None);
+            },
+        );
+        watch_out.textures_delta.clear();
+    }
+    let watch_rects = collect_rendered_text_rects(&watch_out.shapes);
+    let share_btn_pos = watch_rects
+        .iter()
+        .find(|(t, _)| t == "Compartilhar")
+        .expect("Compartilhar watch button")
+        .1
+        .center();
+
+    let click_at = |pos: egui::Pos2| -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    };
+
+    let mut open_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: click_at(share_btn_pos),
+            ..Default::default()
+        },
+        |ui| {
+            app.watch_metadata_card_ui(ui, &video, 680.0, None);
+        },
+    );
+    open_out.textures_delta.clear();
+    assert_eq!(app.feed.share_modal_video.as_ref(), Some(&video));
+
+    let mut share_out = egui::FullOutput::default();
+    for _ in 0..2 {
+        share_out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                let c = ui.ctx().clone();
+                app.share_modal_ui(&c);
+            },
+        );
+        share_out.textures_delta.clear();
+    }
+    let share_rects = collect_rendered_text_rects(&share_out.shapes);
+    let share_text = share_rects
+        .iter()
+        .map(|(t, _)| t.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for expected in [
+        "Compartilhar em um post",
+        "Criar post",
+        "3 inscritos",
+        "Compartilhar",
+        "Incorporar",
+        "WhatsApp",
+        "Mensagens",
+        "Facebook",
+        "https://youtu.be/_wCXFKpfcgg",
+        "Copiar",
+        "Começar em",
+    ] {
+        assert!(
+            share_text.contains(expected),
+            "missing '{expected}' in share modal:\n{share_text}"
+        );
+    }
+
+    // Enable "Começar em" with 1:23 -> URL updates with ?t=83
+    app.feed.share_start_at_text = "1:23".into();
+    let start_at_pos = share_rects
+        .iter()
+        .find(|(t, _)| t == "Começar em")
+        .expect("Começar em label")
+        .1
+        .center();
+    let mut toggle_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: click_at(start_at_pos),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.share_modal_ui(&c);
+        },
+    );
+    toggle_out.textures_delta.clear();
+    assert!(app.feed.share_start_at_enabled);
+    toggle_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.share_modal_ui(&c);
+        },
+    );
+    toggle_out.textures_delta.clear();
+    let toggled_text = collect_rendered_text(&toggle_out.shapes).join("\n");
+    assert!(
+        toggled_text.contains("https://youtu.be/_wCXFKpfcgg?t=83"),
+        "expected ?t=83 in:\n{toggled_text}"
+    );
+
+    // Click "Incorporar" -> switches to iframe embed snippet with ?start=83
+    let embed_pos = share_rects
+        .iter()
+        .find(|(t, _)| t == "Incorporar")
+        .expect("Incorporar button")
+        .1
+        .center();
+    let mut embed_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: click_at(embed_pos),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.share_modal_ui(&c);
+        },
+    );
+    embed_out.textures_delta.clear();
+    assert!(app.feed.share_embed_open);
+    embed_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.share_modal_ui(&c);
+        },
+    );
+    embed_out.textures_delta.clear();
+    let embed_text = collect_rendered_text(&embed_out.shapes).join("\n");
+    assert!(
+        embed_text.contains("https://www.youtube.com/embed/_wCXFKpfcgg?start=83"),
+        "expected embed iframe URL in:\n{embed_text}"
+    );
+}
+
+#[test]
+fn poll_report_updates_session_and_status_message() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    app.auth.authenticated = true;
+    app.auth.session = Some(oauth::TokenSession::test_session("tok-1"));
+    let (tx, rx) = mpsc::channel();
+    app.auth.report_rx = Some(rx);
+    tx.send((
+        Some(oauth::TokenSession::test_session("tok-2")),
+        Ok("Spam ou enganoso".into()),
+    ))
+    .unwrap();
+
+    app.poll_report(&ctx);
+
+    assert_eq!(
+        app.auth.session.as_ref().map(|s| s.access_token.as_str()),
+        Some("tok-2")
+    );
+    assert!(app.auth.report_rx.is_none());
+    assert!(app.message.contains("Denúncia enviada ao YouTube"));
+    assert!(app.message.contains("Spam ou enganoso"));
+}
+
+#[test]
+fn live_stream_skips_resume_and_records_zero_position_without_duration() {
+    let mut app = FastTube::default();
+    let live_video = Video {
+        title: "GEN 1x1 BLG | Worlds 2026".into(),
+        channel: "CBLOL".into(),
+        url: "https://www.youtube.com/watch?v=_UaGVka97no".into(),
+        thumbnail: String::new(),
+        duration: "Ao vivo".into(),
+    };
+
+    app.history
+        .data
+        .record_active_tick(HistoryEntry {
+            video_id: "_UaGVka97no".into(),
+            title: live_video.title.clone(),
+            channel: live_video.channel.clone(),
+            position_ms: 480_000,
+            duration_ms: Some(3_600_000),
+        })
+        .unwrap();
+
+    assert_eq!(app.planned_resume_ms(&live_video), None);
+
+    app.activate_video_playback(&live_video, Some(480_000), None, Instant::now());
+    let active = app.playback.active.as_mut().expect("active playback");
+    assert!(active.is_live);
+    assert_eq!(active.resume_target_ms, None);
+    assert!(!active.resume_seek_pending);
+    active.has_live_sample = true;
+    active.position_ms = 6_361_000;
+    active.duration_ms = Some(6_400_000);
+
+    assert!(app.record_active_playback_in_memory());
+    let saved = app.history.data.get("_UaGVka97no").expect("history entry");
+    assert_eq!(saved.position_ms, 0);
+    assert_eq!(saved.duration_ms, None);
+}
+
+#[test]
+fn watch_metadata_prefers_real_channel_name_over_channel_id_and_formats_live_stats() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    let video = Video {
+        title: "GEN 1x1 BLG | Worlds 2026 | Fase Eliminatória - Final (Md5)".into(),
+        channel: "UC48rkTIXjRd6pnqqBkdV0Mw".into(),
+        url: "https://www.youtube.com/watch?v=_UaGVka97no".into(),
+        thumbnail: String::new(),
+        duration: "1:46:03".into(),
+    };
+    app.selected = Some(video.clone());
+    app.watch.live.video_url = Some(video.url.clone());
+    app.watch.live.info_revision = 1;
+    app.watch.live.info = Some(live_chat::WatchLiveInfo {
+        video_id: "_UaGVka97no".into(),
+        is_live: true,
+        is_live_dvr: true,
+        title: Some(video.title.clone()),
+        channel: Some("CBLOL".into()),
+        channel_id: Some("UC48rkTIXjRd6pnqqBkdV0Mw".into()),
+        channel_url: Some("https://www.youtube.com/@CBLOL".into()),
+        subscriber_count_text: Some("1,6 mi de inscritos".into()),
+        concurrent_view_count: Some(61_285),
+        started_text: Some("Transmissão iniciada há 5 horas".into()),
+        ..Default::default()
+    });
+    app.apply_live_metadata_to_video(
+        &video.url,
+        true,
+        Some(true),
+        Some(&video.title),
+        Some("CBLOL"),
+        Some("UC48rkTIXjRd6pnqqBkdV0Mw"),
+        Some("https://www.youtube.com/@CBLOL"),
+        None,
+        Some("1,6 mi de inscritos"),
+        None,
+        Some(61_285),
+        None,
+    );
+
+    let selected = app.selected.clone().unwrap();
+    assert_eq!(selected.channel, "CBLOL");
+    assert_eq!(selected.duration, "Ao vivo");
+
+    let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(960.0, 600.0));
+    let mut out = egui::FullOutput::default();
+    for _ in 0..2 {
+        out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                app.watch_metadata_card_ui(ui, &selected, 800.0, None);
+            },
+        );
+        out.textures_delta.clear();
+    }
+    let rendered = collect_rendered_text(&out.shapes).join("\n");
+    assert!(rendered.contains("CBLOL"), "missing CBLOL in:\n{rendered}");
+    assert!(
+        !rendered.contains("UC48rkTIXjRd6pnqqBkdV0Mw"),
+        "raw channel ID leaked into metadata UI:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("1,6 mi de inscritos"),
+        "missing subscriber count in:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("61.285 assistindo agora"),
+        "missing concurrent viewer count in:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Transmissão iniciada há 5 horas"),
+        "missing started text in:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Duração"),
+        "live metadata should not show VOD duration label:\n{rendered}"
+    );
+}
+
+#[test]
+fn live_playback_state_tracks_pause_lag_dvr_lag_and_go_live_edge() {
+    let mut app = FastTube::default();
+    let video = Video {
+        title: "Live Stream".into(),
+        channel: "Canal".into(),
+        url: "https://www.youtube.com/watch?v=_UaGVka97no".into(),
+        thumbnail: String::new(),
+        duration: "Ao vivo".into(),
+    };
+    app.selected = Some(video.clone());
+    app.watch.live.video_url = Some(video.url.clone());
+    app.watch.live.info = Some(live_chat::WatchLiveInfo {
+        video_id: "_UaGVka97no".into(),
+        is_live: true,
+        is_live_dvr: false,
+        ..Default::default()
+    });
+    app.activate_video_playback(&video, None, None, Instant::now());
+
+    let t0 = Instant::now();
+    app.update_live_playback_state(false, Some(10.0), None, Some(false), t0);
+    {
+        let active = app.playback.active.as_ref().unwrap();
+        assert!(active.is_live);
+        assert!(!active.live_dvr);
+        assert!(active.at_live_edge);
+        assert_eq!(active.live_behind_secs, 0.0);
+    }
+
+    // Pausing for >= 2s puts a non-DVR stream behind the live edge.
+    app.update_live_playback_state(true, Some(10.0), None, Some(false), t0);
+    app.update_live_playback_state(
+        true,
+        Some(10.0),
+        None,
+        Some(false),
+        t0 + Duration::from_secs(5),
+    );
+    {
+        let active = app.playback.active.as_ref().unwrap();
+        assert!(!active.at_live_edge);
+        assert!(active.live_behind_secs >= 4.9);
+    }
+
+    app.go_live_edge(&video);
+    {
+        let active = app.playback.active.as_ref().unwrap();
+        assert!(active.at_live_edge);
+        assert_eq!(active.live_behind_secs, 0.0);
+    }
+
+    // Enable DVR and simulate rewinding 120s behind a 600s DVR window.
+    app.watch.live.info.as_mut().unwrap().is_live_dvr = true;
+    let t1 = t0 + Duration::from_secs(10);
+    app.update_live_playback_state(false, Some(480.0), Some(600.0), Some(true), t1);
+    {
+        let active = app.playback.active.as_ref().unwrap();
+        assert!(active.live_dvr);
+        assert!(!active.at_live_edge);
+        assert!((active.live_behind_secs - 120.0).abs() < 0.01);
+    }
+
+    // Seeking back near the DVR head snaps back onto live edge.
+    app.update_live_playback_state(false, Some(597.0), Some(600.0), Some(true), t1);
+    {
+        let active = app.playback.active.as_ref().unwrap();
+        assert!(active.at_live_edge);
+        assert_eq!(active.live_behind_secs, 0.0);
+    }
+}
+
+#[test]
+fn watch_live_chat_panel_ui_renders_modes_messages_and_toggles_visibility() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    let video = Video {
+        title: "Live".into(),
+        channel: "CBLOL".into(),
+        url: "https://www.youtube.com/watch?v=_UaGVka97no".into(),
+        thumbnail: String::new(),
+        duration: "Ao vivo".into(),
+    };
+    app.selected = Some(video.clone());
+    app.watch.live.video_url = Some(video.url.clone());
+    app.watch.live.video_id = Some("_UaGVka97no".into());
+    app.watch.live.chat_visible = true;
+    app.watch.live.auto_scroll = true;
+    app.watch.live.send_params = Some("send-token".into());
+    app.watch.live.chat_modes = vec![
+        live_chat::LiveChatMode {
+            label: "Principais mensagens".into(),
+            continuation: "cont-top".into(),
+            selected: true,
+        },
+        live_chat::LiveChatMode {
+            label: "Chat ao vivo".into(),
+            continuation: "cont-all".into(),
+            selected: false,
+        },
+    ];
+    app.watch.live.active_continuation = Some("cont-top".into());
+    app.watch.live.info = Some(live_chat::WatchLiveInfo {
+        video_id: "_UaGVka97no".into(),
+        is_live: true,
+        modes: app.watch.live.chat_modes.clone(),
+        initial_continuation: Some("cont-top".into()),
+        ..Default::default()
+    });
+    app.watch.live.push_message(live_chat::LiveChatMessage {
+        id: "m1".into(),
+        author_name: "@tiago.menezes075".into(),
+        author_channel_id: None,
+        author_avatar_url: None,
+        badges: vec![live_chat::LiveChatBadgeKind::Member],
+        text: "chovy pipoca".into(),
+        timestamp_text: None,
+        kind: live_chat::LiveChatMessageKind::Text,
+    });
+    app.watch.live.push_message(live_chat::LiveChatMessage {
+        id: "m2".into(),
+        author_name: "@apoiador".into(),
+        author_channel_id: None,
+        author_avatar_url: None,
+        badges: vec![],
+        text: "Bora GEN.G!".into(),
+        timestamp_text: None,
+        kind: live_chat::LiveChatMessageKind::Paid {
+            amount: "R$ 20,00".into(),
+            header_bg: 0xFF15_65C0,
+            body_bg: 0xFF1E_88E5,
+        },
+    });
+
+    let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(420.0, 620.0));
+    let mut out = egui::FullOutput::default();
+    for _ in 0..2 {
+        out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                app.watch_live_chat_panel_ui(ui, &ctx, 380.0, 520.0);
+            },
+        );
+        out.textures_delta.clear();
+    }
+    let rects = collect_rendered_text_rects(&out.shapes);
+    let rendered = rects
+        .iter()
+        .map(|(t, _)| t.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for expected in [
+        "Principais mensagens",
+        "Ocultar chat",
+        "@tiago.menezes075",
+        "Membro",
+        "chovy pipoca",
+        "R$ 20,00",
+        "Bora GEN.G!",
+        "Enviar",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing '{expected}' in live chat panel:\n{rendered}"
+        );
+    }
+
+    // Collapse chat panel by clicking "Ocultar chat".
+    let click_at = |pos: egui::Pos2| -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    };
+    let close_pos = rects
+        .iter()
+        .find(|(t, _)| t == "Ocultar chat")
+        .expect("Ocultar chat button")
+        .1
+        .center();
+    let mut click_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: click_at(close_pos),
+            ..Default::default()
+        },
+        |ui| {
+            app.watch_live_chat_panel_ui(ui, &ctx, 380.0, 520.0);
+        },
+    );
+    click_out.textures_delta.clear();
+    assert!(!app.watch.live.chat_visible);
+    assert!(app.watch.live.chat_user_toggled);
+
+    let mut collapsed_out = egui::FullOutput::default();
+    for _ in 0..2 {
+        collapsed_out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                app.watch_live_chat_panel_ui(ui, &ctx, 380.0, 520.0);
+            },
+        );
+        collapsed_out.textures_delta.clear();
+    }
+    let collapsed_text = collect_rendered_text(&collapsed_out.shapes).join("\n");
+    assert!(
+        collapsed_text.contains("Mostrar chat ao vivo"),
+        "expected collapsed toggle button in:\n{collapsed_text}"
+    );
+}
+
+#[test]
+fn handle_player_overlay_action_live_non_dvr_disables_loop_autoplay_and_restores_live_edge() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    let video = Video {
+        title: "Live".into(),
+        channel: "CBLOL".into(),
+        url: "https://www.youtube.com/watch?v=_UaGVka97no".into(),
+        thumbnail: String::new(),
+        duration: "Ao vivo".into(),
+    };
+    app.selected = Some(video.clone());
+    app.playback.autoplay = true;
+    app.playback.loop_video = false;
+    app.activate_video_playback(&video, None, None, Instant::now());
+    {
+        let active = app.playback.active.as_mut().unwrap();
+        active.is_live = true;
+        active.live_dvr = false;
+        active.at_live_edge = false;
+        active.live_behind_secs = 28.0;
+    }
+
+    let overlay_ctx = OverlayPlaybackContext {
+        video: video.clone(),
+        paused: false,
+        ended: false,
+        muted: false,
+        position: 100.0,
+        duration: None,
+        raw_volume: 80.0,
+        speed: 1.0,
+        current_height: Some(1080),
+        selected_quality: None,
+        qualities: vec![1080, 720],
+        qualities_loading: false,
+        has_queued: false,
+        has_active_subtitle: false,
+        subtitles: Vec::new(),
+        subtitles_loading: false,
+        chapters: Vec::new(),
+        theater: false,
+        fullscreen: false,
+        mini_player: false,
+        autoplay: true,
+        loop_video: false,
+        is_live: true,
+        is_live_dvr: false,
+        at_live_edge: false,
+        live_behind_secs: 28.0,
+        can_bookmark: true,
+        raw_path: Some(video.url.clone()),
+        raw_position: Some(100.0),
+        now: Instant::now(),
+    };
+
+    app.handle_player_overlay_action(overlay::OverlayAction::ToggleAutoplay, &overlay_ctx, &ctx);
+    assert!(app.playback.autoplay);
+    app.handle_player_overlay_action(overlay::OverlayAction::ToggleLoop, &overlay_ctx, &ctx);
+    assert!(!app.playback.loop_video);
+    app.handle_player_overlay_action(overlay::OverlayAction::SeekBack10, &overlay_ctx, &ctx);
+    assert_eq!(app.playback.active.as_ref().unwrap().position_ms, 0);
+
+    app.handle_player_overlay_action(overlay::OverlayAction::GoLive, &overlay_ctx, &ctx);
+    let active = app.playback.active.as_ref().unwrap();
+    assert!(active.at_live_edge);
+    assert_eq!(active.live_behind_secs, 0.0);
+}
+
+#[test]
+fn settings_page_renders_all_six_tabs_and_compact_layout_headlessly() {
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+    app.ui.settings_open = true;
+    app.selected = Some(Video {
+        title: "Video em segundo plano".into(),
+        channel: "Canal Teste".into(),
+        duration: "5:00".into(),
+        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+        thumbnail: String::new(),
+    });
+
+    let expectations = [
+        (app_state::SettingsTab::General, "Aparência e feed"),
+        (
+            app_state::SettingsTab::Playback,
+            "Decodificação por hardware (libmpv)",
+        ),
+        (
+            app_state::SettingsTab::SponsorBlock,
+            "Integração SponsorBlock",
+        ),
+        (
+            app_state::SettingsTab::Privacy,
+            "Histórico e recomendações locais",
+        ),
+        (app_state::SettingsTab::Storage, "Local da pasta de cache"),
+        (
+            app_state::SettingsTab::BackupDiagnostics,
+            "Backup de dados locais",
+        ),
+    ];
+
+    for (tab, expected_text) in expectations {
+        app.settings.active_tab = tab;
+        let mut rendered = String::new();
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1120.0, 2400.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let c = ui.ctx().clone();
+                    app.settings_page_ui(ui, &c);
+                },
+            );
+            rendered = collect_rendered_text(&output.shapes).join("\n");
+            output.textures_delta.clear();
+        }
+        assert!(
+            rendered.contains(expected_text),
+            "tab {tab:?} missing `{expected_text}` in:\n{rendered}"
+        );
+        assert!(rendered.contains("O vídeo continua em reprodução em segundo plano"));
+    }
+
+    // Narrow viewport collapses left rail into top pills and still renders cleanly.
+    app.settings.active_tab = app_state::SettingsTab::SponsorBlock;
+    let mut narrow_rendered = String::new();
+    for _ in 0..2 {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 1200.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let c = ui.ctx().clone();
+                app.settings_page_ui(ui, &c);
+            },
+        );
+        narrow_rendered = collect_rendered_text(&output.shapes).join("\n");
+        output.textures_delta.clear();
+    }
+    assert!(narrow_rendered.contains("← Voltar"));
+    assert!(narrow_rendered.contains("Categorias de segmentos"));
+}
+
+#[test]
+fn app_preferences_resume_privacy_and_feed_gates_work_as_configured() {
+    let mut app = FastTube::default();
+    let regular = Video {
+        title: "Rust Tutorial".into(),
+        channel: "Ferris".into(),
+        duration: "5:00".into(),
+        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+        thumbnail: String::new(),
+    };
+    let short_video = Video {
+        title: "Quick Short".into(),
+        channel: "Ferris".into(),
+        duration: "0:30".into(),
+        url: "https://www.youtube.com/shorts/short000001".into(),
+        thumbnail: String::new(),
+    };
+    app.feed.videos = vec![regular.clone(), short_video.clone()];
+
+    // Resume gate: enabled returns saved timestamp, disabled returns None.
+    app.record_video_in_history(&regular, 120_000, Some(300_000))
+        .unwrap();
+    assert_eq!(app.planned_resume_ms(&regular), Some(120_000));
+    app.settings.prefs.value.resume_enabled = false;
+    assert_eq!(app.planned_resume_ms(&regular), None);
+
+    // Pause watch history prevents new history entries.
+    app.settings.prefs.value.pause_watch_history = true;
+    let another = Video {
+        title: "Paused Video".into(),
+        channel: "Ferris".into(),
+        duration: "4:00".into(),
+        url: "https://www.youtube.com/watch?v=oHg5SJYRHA0".into(),
+        thumbnail: String::new(),
+    };
+    app.record_video_in_history(&another, 45_000, Some(240_000))
+        .unwrap();
+    assert!(app.history.data.get("oHg5SJYRHA0").is_none());
+
+    // Pause recommendations resets derived UserProfile to empty default.
+    app.settings.prefs.value.pause_recommendations = false;
+    app.invalidate_feed_cache();
+    app.ensure_feed_cache();
+    assert!(
+        app.feed
+            .cache
+            .profile
+            .channel_weights
+            .contains_key("ferris")
+    );
+    assert!(!app.feed.cache.profile.token_weights.is_empty());
+
+    app.settings.prefs.value.pause_recommendations = true;
+    app.ensure_feed_cache();
+    assert!(app.feed.cache.profile.channel_weights.is_empty());
+    assert!(app.feed.cache.profile.token_weights.is_empty());
+
+    // Hide Shorts in Home removes Shorts from Home ranked list, but preserves BrowseSection::Shorts.
+    app.settings.prefs.value.hide_shorts_in_home = true;
+    app.ui.browse_section = BrowseSection::Home;
+    app.ensure_feed_cache();
+    assert!(
+        app.feed
+            .cache
+            .ranked
+            .iter()
+            .all(|item| item.video.url != short_video.url)
+    );
+    app.ui.browse_section = BrowseSection::Shorts;
+    app.ensure_feed_cache();
+    assert!(
+        app.feed
+            .cache
+            .ranked
+            .iter()
+            .any(|item| item.video.url == short_video.url)
+    );
+
+    // Compact card density increases grid columns on wide viewports.
+    app.settings.prefs.value.compact_card_density = false;
+    let (_, normal_cols) = app.home_grid_metrics(1200.0);
+    app.settings.prefs.value.compact_card_density = true;
+    let (_, compact_cols) = app.home_grid_metrics(1200.0);
+    assert!(compact_cols > normal_cols);
+}
+
+#[test]
+fn sponsorblock_auto_skip_manual_skip_and_toast_respect_preferences() {
+    let mut app = FastTube::default();
+    let now = Instant::now();
+    app.watch.sponsorblock.segments = vec![
+        sponsorblock::SponsorSegment {
+            uuid: "seg-sponsor-1".into(),
+            start_secs: 10.0,
+            end_secs: 25.0,
+            category: sponsorblock::SponsorCategory::Sponsor,
+        },
+        sponsorblock::SponsorSegment {
+            uuid: "seg-short-intro".into(),
+            start_secs: 30.0,
+            end_secs: 30.5,
+            category: sponsorblock::SponsorCategory::Intro,
+        },
+    ];
+    app.settings.prefs.value.sponsorblock.enabled = true;
+    app.settings.prefs.value.sponsorblock.skip_mode = sponsorblock::SponsorSkipMode::AutoSkip;
+    app.settings.prefs.value.sponsorblock.min_duration_secs = 1.0;
+    app.settings.prefs.value.sponsorblock.show_skip_toast = true;
+
+    // Auto-skip matches valid segment once and records toast.
+    assert_eq!(
+        app.try_auto_skip_sponsor_segment(12.0, Some(120.0), false, now),
+        Some(25.0)
+    );
+    assert_eq!(
+        app.watch.sponsorblock.active_skip_toast(now),
+        Some("Pulado: Patrocínio")
+    );
+    // Same UUID is not auto-skipped a second time in the same playback.
+    assert_eq!(
+        app.try_auto_skip_sponsor_segment(12.5, Some(120.0), false, now),
+        None
+    );
+    // Segment shorter than min_duration_secs (0.5s < 1.0s) is ignored.
+    assert_eq!(
+        app.try_auto_skip_sponsor_segment(30.2, Some(120.0), false, now),
+        None
+    );
+    // Live streams never auto-skip.
+    assert_eq!(
+        app.try_auto_skip_sponsor_segment(12.0, Some(120.0), true, now),
+        None
+    );
+
+    // Manual button mode disables auto-skip, while manual skip marks UUID and toast.
+    app.watch.sponsorblock.auto_skipped_uuids.clear();
+    app.watch.sponsorblock.last_skip_notice = None;
+    app.settings.prefs.value.sponsorblock.skip_mode = sponsorblock::SponsorSkipMode::ManualButton;
+    assert_eq!(
+        app.try_auto_skip_sponsor_segment(12.0, Some(120.0), false, now),
+        None
+    );
+    app.record_manual_sponsor_skip(12.0, 25.0, now);
+    assert!(
+        app.watch
+            .sponsorblock
+            .auto_skipped_uuids
+            .contains("seg-sponsor-1")
+    );
+    assert_eq!(
+        app.watch.sponsorblock.active_skip_toast(now),
+        Some("Pulado: Patrocínio")
+    );
+}
+
+#[test]
+fn backup_round_trip_preserves_and_restores_app_preferences() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("fasttube-prefs-backup-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let backup_file = temp_dir.join("backup.json");
+
+    let configure_paths = |app: &mut FastTube| {
+        app.library.path = Some(temp_dir.join("library.json"));
+        app.queue.path = Some(temp_dir.join("queue.json"));
+        app.history.path = Some(temp_dir.join("history.json"));
+        app.settings.playback.path = Some(temp_dir.join("playback-settings.txt"));
+        app.settings.theme.path = Some(temp_dir.join("theme-settings.txt"));
+        app.feed_preferences.path = Some(temp_dir.join("feed-prefs.json"));
+        app.settings.buffer.path = Some(temp_dir.join("buffer-settings.txt"));
+        app.settings.prefs.path = Some(temp_dir.join("app-preferences.json"));
+    };
+
+    let mut exporter = FastTube::default();
+    configure_paths(&mut exporter);
+    exporter.settings.prefs.value.seek_step_secs = 15;
+    exporter.settings.prefs.value.hwdec_mode = settings::HwdecMode::Software;
+    exporter.settings.prefs.value.sponsorblock.skip_mode =
+        sponsorblock::SponsorSkipMode::ManualButton;
+    exporter.settings.prefs.value.pause_watch_history = true;
+    exporter.settings.prefs.value.compact_card_density = true;
+    exporter.backup.path_text = backup_file.display().to_string();
+    exporter.export_user_data();
+    assert!(backup_file.is_file());
+
+    let mut importer = FastTube::default();
+    configure_paths(&mut importer);
+    importer.backup.path_text = backup_file.display().to_string();
+    importer.analyze_import();
+    assert!(importer.backup.confirm_import);
+    importer.backup.import_mode = BackupImportMode::Replace;
+    importer.import_user_data();
+
+    assert_eq!(importer.settings.prefs.value, exporter.settings.prefs.value);
+    let persisted = settings::load_app_preferences(&temp_dir.join("app-preferences.json")).unwrap();
+    assert_eq!(persisted, exporter.settings.prefs.value);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn settings_search_custom_buffer_and_backup_modal_render_headlessly() {
+    let mut app = FastTube::default();
+    app.ui.settings_open = true;
+    app.settings.buffer.profile = BufferProfile::Custom(settings::BufferSettings {
+        max_mib: 96,
+        back_mib: 24,
+        cache_seconds: 45,
+    });
+    app.settings.custom_buffer_max_mib = 96;
+    app.settings.custom_buffer_back_mib = 24;
+    app.settings.custom_buffer_cache_secs = 45;
+
+    let ctx = egui::Context::default();
+    let run_settings = |app: &mut FastTube| -> String {
+        let mut rendered = String::new();
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1120.0, 3600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let c = ui.ctx().clone();
+                    app.settings_page_ui(ui, &c);
+                },
+            );
+            rendered = collect_rendered_text(&output.shapes).join("\n");
+            output.textures_delta.clear();
+        }
+        rendered
+    };
+
+    // Playback tab renders custom buffer sliders and Audio & Subtitles card.
+    app.settings.active_tab = app_state::SettingsTab::Playback;
+    let playback_text = run_settings(&mut app);
+    assert!(playback_text.contains("Áudio e legendas"));
+    assert!(playback_text.contains("Normalização de áudio (loudnorm)"));
+    assert!(playback_text.contains("Personalizado — 96 MiB máx / 24 MiB retorno / 45s"));
+    assert!(playback_text.contains("Aplicar buffer personalizado"));
+
+    // Cross-tab search matches entries across tabs and handles empty results.
+    app.settings.search_query = "loudnorm".into();
+    let search_hit = run_settings(&mut app);
+    assert!(search_hit.contains("Resultados para \"loudnorm\""));
+    assert!(search_hit.contains("Áudio e legendas"));
+    assert!(search_hit.contains("normalização (loudnorm)"));
+    assert!(search_hit.contains("Abrir aba →"));
+
+    app.settings.search_query = "zzzz_inexistente_12345".into();
+    let search_miss = run_settings(&mut app);
+    assert!(search_miss.contains("Nenhuma configuração encontrada"));
+
+    // Backup confirmation modal renders cleanly when confirm_import is active.
+    app.settings.search_query.clear();
+    app.settings.active_tab = app_state::SettingsTab::BackupDiagnostics;
+    app.backup.confirm_import = true;
+    app.backup.preview = Some(BackupPreview {
+        path: std::path::PathBuf::from("fasttube-backup.json"),
+        library_items: 4,
+        favorites: 2,
+        watch_later: 1,
+        collections: 1,
+        bookmarks: 3,
+        queue_items: 2,
+        history_entries: 5,
+        merge_added: 3,
+        merge_conflicts: 1,
+        merge_skipped: 0,
+        history_progress_updates: 2,
+    });
+    let modal_text = run_settings(&mut app);
+    assert!(modal_text.contains("Prévia da importação"));
+    assert!(modal_text.contains("fasttube-backup.json"));
+    assert!(modal_text.contains("Aplicar backup"));
+}
+
+#[test]
+fn settings_tab_defaults_reset_and_muted_topics_affect_feed_profile() {
+    let mut app = FastTube::default();
+    let ctx = egui::Context::default();
+
+    app.settings.theme.value = settings::Theme::Light;
+    app.settings.prefs.value.compact_card_density = true;
+    app.settings.prefs.value.seek_step_secs = 30;
+    app.settings.prefs.value.audio_normalization = true;
+    app.settings.prefs.value.sponsorblock.enabled = false;
+    app.settings.prefs.value.sponsorblock.min_duration_secs = 6.0;
+
+    app.reset_settings_tab_defaults(app_state::SettingsTab::General, &ctx);
+    assert_eq!(app.settings.theme.value, settings::Theme::Dark);
+    assert!(!app.settings.prefs.value.compact_card_density);
+    assert_eq!(app.settings.prefs.value.seek_step_secs, 30);
+
+    app.reset_settings_tab_defaults(app_state::SettingsTab::Playback, &ctx);
+    assert_eq!(app.settings.prefs.value.seek_step_secs, 10);
+    assert!(!app.settings.prefs.value.audio_normalization);
+    assert!(!app.settings.prefs.value.sponsorblock.enabled);
+
+    app.reset_settings_tab_defaults(app_state::SettingsTab::SponsorBlock, &ctx);
+    assert!(app.settings.prefs.value.sponsorblock.enabled);
+    assert_eq!(app.settings.prefs.value.sponsorblock.min_duration_secs, 1.0);
+
+    // Muted topics suppress learned topic weights in derived feed profile.
+    let video = Video {
+        title: "Rust Async Streams Tutorial".into(),
+        channel: "Ferris".into(),
+        duration: "10:00".into(),
+        url: "https://www.youtube.com/watch?v=abc123def45".into(),
+        thumbnail: String::new(),
+    };
+    app.record_video_in_history(&video, 60_000, Some(600_000))
+        .unwrap();
+    app.invalidate_feed_cache();
+    app.ensure_feed_cache();
+    assert!(app.feed.cache.profile.token_weights.contains_key("rust"));
+    assert!(app.feed.cache.profile.token_weights.contains_key("streams"));
+
+    app.settings.prefs.value.muted_topics = vec!["streams".into()];
+    app.ensure_feed_cache();
+    assert!(app.feed.cache.profile.token_weights.contains_key("rust"));
+    assert!(!app.feed.cache.profile.token_weights.contains_key("streams"));
+}
+
+fn test_sub_result(video_id: &str, title: &str, channel: &str, channel_id: &str) -> SearchResult {
+    SearchResult {
+        video: Video {
+            title: title.into(),
+            channel: channel.into(),
+            url: format!("https://www.youtube.com/watch?v={video_id}"),
+            thumbnail: format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"),
+            duration: "10:00".into(),
+        },
+        metadata: VideoMetadata {
+            channel_id: Some(channel_id.into()),
+            upload_date: Some("2026-11-14T12:00:00+00:00".into()),
+            ..VideoMetadata::default()
+        },
+    }
+}
+
+#[test]
+fn subscriptions_swr_fresh_cache_skips_network_and_renders_instantly() {
+    let mut app = FastTube::default();
+    let ctx = egui::Context::default();
+    app.auth.authenticated = true;
+    app.auth.session = Some(oauth::TokenSession::test_session("token-1"));
+    app.feed.home.subscriptions_disk_cache_loaded = true;
+    app.feed.home.subscriptions_cached_loaded = true;
+    app.feed.home.subscriptions_cached_at = Some(std::time::Instant::now());
+    app.feed.home.subscriptions_cached_items = vec![test_sub_result(
+        "dQw4w9WgXcQ",
+        "Video Instantaneo",
+        "Canal A",
+        "UC1234567890123456789012",
+    )];
+
+    app.open_subscriptions_section(false, &ctx);
+
+    assert_eq!(app.ui.browse_section, BrowseSection::Subscriptions);
+    assert_eq!(app.feed.videos.len(), 1);
+    assert_eq!(app.feed.videos[0].title, "Video Instantaneo");
+    assert!(app.feed.home.rx.is_none());
+    assert!(!app.feed.home.subscriptions_refreshing_in_background);
+    assert!(!app.feed.home.subscriptions_progressive_streaming);
+}
+
+#[test]
+fn subscriptions_swr_stale_disk_cache_displays_immediately_and_refreshes_in_background() {
+    let dir = std::env::temp_dir().join(format!("fasttube-main-subs-cache-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cache_path = dir.join("subscriptions-cache.json");
+
+    let channel_id = "UC1234567890123456789012";
+    let feed = search::HomeFeed {
+        items: vec![test_sub_result(
+            "dQw4w9WgXcQ",
+            "Video do Disco",
+            "Canal A",
+            channel_id,
+        )],
+        playlists: Vec::new(),
+        channels: vec![search::HomeChannel {
+            title: "Canal A".into(),
+            channel_id: channel_id.into(),
+            avatar_url: None,
+        }],
+    };
+    let mut rss_cache = std::collections::HashMap::new();
+    rss_cache.insert(
+        channel_id.to_owned(),
+        oauth::ChannelRssCacheEntry {
+            etag: Some("\"etag-disk\"".into()),
+            last_modified: None,
+            items: feed.items.clone(),
+        },
+    );
+    let disk_cache = oauth::SubscriptionsDiskCache::from_feed(&feed, &rss_cache, 1);
+    oauth::save_subscriptions_cache_to_path(&cache_path, &disk_cache).unwrap();
+
+    let mut app = FastTube::default();
+    let ctx = egui::Context::default();
+    app.auth.authenticated = true;
+    app.auth.session = Some(oauth::TokenSession::test_session("token-1"));
+    app.feed.home.subscriptions_disk_cache_path = Some(cache_path);
+
+    app.open_subscriptions_section(false, &ctx);
+
+    assert_eq!(app.ui.browse_section, BrowseSection::Subscriptions);
+    assert_eq!(app.feed.videos.len(), 1);
+    assert_eq!(app.feed.videos[0].title, "Video do Disco");
+    assert!(app.feed.home.subscription_channels_loaded);
+    assert_eq!(
+        app.feed
+            .home
+            .subscriptions_rss_cache
+            .get(channel_id)
+            .and_then(|entry| entry.etag.as_deref()),
+        Some("\"etag-disk\"")
+    );
+    assert!(app.feed.home.rx.is_some());
+    assert!(app.feed.home.subscriptions_refreshing_in_background);
+    assert!(!app.feed.home.subscriptions_progressive_streaming);
+
+    app.cancel_home_feed(&ctx);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn subscriptions_cold_open_streams_progress_directly_and_ignores_stale_request_id() {
+    let dir =
+        std::env::temp_dir().join(format!("fasttube-main-subs-stream-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cache_path = dir.join("subscriptions-cache.json");
+
+    let mut app = FastTube::default();
+    let ctx = egui::Context::default();
+    app.auth.authenticated = true;
+    app.ui.browse_section = BrowseSection::Subscriptions;
+    app.feed.home.subscriptions_disk_cache_path = Some(cache_path.clone());
+    app.feed.home.subscriptions_active_request_id = Some(42);
+    app.feed.home.subscriptions_progressive_streaming = true;
+    let (sender, receiver) = mpsc::channel();
+    app.feed.home.rx = Some(receiver);
+
+    // Stale progress from an older request_id must be discarded.
+    sender
+        .send(HomeFetchMessage::SubscriptionProgress {
+            request_id: 41,
+            progress: oauth::SubscriptionProgress {
+                items: vec![test_sub_result(
+                    "aaaaaaaaaaa",
+                    "Antigo",
+                    "Canal Old",
+                    "UC1111111111111111111111",
+                )],
+                channels: Vec::new(),
+                completed_channels: 1,
+                total_channels: 10,
+                reached_limit: false,
+            },
+        })
+        .unwrap();
+    // Active first batch should render immediately while still fetching.
+    sender
+        .send(HomeFetchMessage::SubscriptionProgress {
+            request_id: 42,
+            progress: oauth::SubscriptionProgress {
+                items: vec![test_sub_result(
+                    "bbbbbbbbbbb",
+                    "Lote Inicial",
+                    "Canal B",
+                    "UC2222222222222222222222",
+                )],
+                channels: vec![search::HomeChannel {
+                    title: "Canal B".into(),
+                    channel_id: "UC2222222222222222222222".into(),
+                    avatar_url: None,
+                }],
+                completed_channels: 5,
+                total_channels: 20,
+                reached_limit: false,
+            },
+        })
+        .unwrap();
+    app.poll_async_tasks(&ctx);
+
+    assert_eq!(app.feed.videos.len(), 1);
+    assert_eq!(app.feed.videos[0].title, "Lote Inicial");
+    assert!(app.feed.home.rx.is_some());
+
+    let final_item = test_sub_result(
+        "ccccccccccc",
+        "Final Completo",
+        "Canal B",
+        "UC2222222222222222222222",
+    );
+    let mut rss_cache = std::collections::HashMap::new();
+    rss_cache.insert(
+        "UC2222222222222222222222".to_owned(),
+        oauth::ChannelRssCacheEntry {
+            etag: Some("\"etag-final\"".into()),
+            last_modified: None,
+            items: vec![final_item.clone()],
+        },
+    );
+    sender
+        .send(HomeFetchMessage::SubscriptionFinished {
+            request_id: 42,
+            token: Some(oauth::TokenSession::test_session("token-2")),
+            result: Ok(oauth::SubscriptionFeedOutput {
+                feed: search::HomeFeed {
+                    items: vec![final_item],
+                    playlists: Vec::new(),
+                    channels: vec![search::HomeChannel {
+                        title: "Canal B".into(),
+                        channel_id: "UC2222222222222222222222".into(),
+                        avatar_url: None,
+                    }],
+                },
+                rss_cache,
+                used_cached_channels: true,
+                rss_hits: 1,
+                not_modified_hits: 0,
+                api_fallbacks: 0,
+            }),
+        })
+        .unwrap();
+    app.poll_async_tasks(&ctx);
+
+    assert_eq!(app.feed.videos.len(), 1);
+    assert_eq!(app.feed.videos[0].title, "Final Completo");
+    assert!(app.feed.home.subscriptions_cached_loaded);
+    assert!(!app.feed.home.subscriptions_progressive_streaming);
+    assert!(cache_path.exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn subscriptions_background_refresh_keeps_visible_cards_and_respects_tab_switch() {
+    let mut app = FastTube::default();
+    let ctx = egui::Context::default();
+    app.auth.authenticated = true;
+    app.ui.browse_section = BrowseSection::Subscriptions;
+    app.feed.videos = vec![Video {
+        title: "Video em Cache".into(),
+        channel: "Canal A".into(),
+        url: "https://www.youtube.com/watch?v=ddddddddddd".into(),
+        thumbnail: String::new(),
+        duration: String::new(),
+    }];
+    app.feed.home.subscriptions_active_request_id = Some(7);
+    app.feed.home.subscriptions_progressive_streaming = false;
+    app.feed.home.subscriptions_refreshing_in_background = true;
+    let (sender, receiver) = mpsc::channel();
+    app.feed.home.rx = Some(receiver);
+
+    // Partial batch during background refresh must not jump cards on screen.
+    sender
+        .send(HomeFetchMessage::SubscriptionProgress {
+            request_id: 7,
+            progress: oauth::SubscriptionProgress {
+                items: vec![test_sub_result(
+                    "eeeeeeeeeee",
+                    "Parcial Novo",
+                    "Canal A",
+                    "UC1234567890123456789012",
+                )],
+                channels: Vec::new(),
+                completed_channels: 3,
+                total_channels: 10,
+                reached_limit: false,
+            },
+        })
+        .unwrap();
+    app.poll_async_tasks(&ctx);
+    assert_eq!(app.feed.videos.len(), 1);
+    assert_eq!(app.feed.videos[0].title, "Video em Cache");
+
+    // User switches to Home before the background sync finishes; cache must still update
+    // without overwriting Home videos.
+    app.ui.browse_section = BrowseSection::Home;
+    app.feed.videos = vec![Video {
+        title: "Video da Home".into(),
+        channel: "Canal Home".into(),
+        url: "https://www.youtube.com/watch?v=fffffffffff".into(),
+        thumbnail: String::new(),
+        duration: String::new(),
+    }];
+    sender
+        .send(HomeFetchMessage::SubscriptionFinished {
+            request_id: 7,
+            token: Some(oauth::TokenSession::test_session("token-3")),
+            result: Ok(oauth::SubscriptionFeedOutput {
+                feed: search::HomeFeed {
+                    items: vec![test_sub_result(
+                        "ggggggggggg",
+                        "Atualizado em Background",
+                        "Canal A",
+                        "UC1234567890123456789012",
+                    )],
+                    playlists: Vec::new(),
+                    channels: Vec::new(),
+                },
+                rss_cache: std::collections::HashMap::new(),
+                used_cached_channels: true,
+                rss_hits: 1,
+                not_modified_hits: 0,
+                api_fallbacks: 0,
+            }),
+        })
+        .unwrap();
+    app.poll_async_tasks(&ctx);
+
+    assert_eq!(app.feed.videos.len(), 1);
+    assert_eq!(app.feed.videos[0].title, "Video da Home");
+    assert_eq!(app.feed.home.subscriptions_cached_items.len(), 1);
+    assert_eq!(
+        app.feed.home.subscriptions_cached_items[0].video.title,
+        "Atualizado em Background"
+    );
+    assert!(!app.feed.home.subscriptions_refreshing_in_background);
+}
+
+#[test]
+fn sign_out_clears_subscriptions_memory_rss_and_disk_cache() {
+    let dir =
+        std::env::temp_dir().join(format!("fasttube-main-subs-signout-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cache_path = dir.join("subscriptions-cache.json");
+    std::fs::write(&cache_path, b"{}").unwrap();
+
+    let mut app = FastTube::default();
+    let ctx = egui::Context::default();
+    app.auth.authenticated = true;
+    app.auth.session = Some(oauth::TokenSession::test_session("token-signout"));
+    app.feed.home.subscriptions_disk_cache_path = Some(cache_path.clone());
+    app.feed.home.subscriptions_cached_loaded = true;
+    app.feed.home.subscriptions_cached_at = Some(std::time::Instant::now());
+    app.feed.home.subscriptions_cached_items = vec![test_sub_result(
+        "hhhhhhhhhhh",
+        "Privado",
+        "Canal A",
+        "UC1234567890123456789012",
+    )];
+    app.feed.home.subscriptions_rss_cache.insert(
+        "UC1234567890123456789012".into(),
+        oauth::ChannelRssCacheEntry::default(),
+    );
+
+    app.sign_out_and_reload_home(&ctx);
+
+    assert!(!app.feed.home.subscriptions_cached_loaded);
+    assert!(app.feed.home.subscriptions_cached_items.is_empty());
+    assert!(app.feed.home.subscriptions_cached_at.is_none());
+    assert!(app.feed.home.subscriptions_rss_cache.is_empty());
+    assert!(!cache_path.exists());
+    // Stop the background home fetch started by sign_out_and_reload_home.
+    if let Some(cancel) = app.feed.home.batch_cancel.take() {
+        cancel.cancel();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Read;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -34,6 +35,137 @@ struct InFlight {
 }
 
 static RESOLUTION_CACHE: OnceLock<Mutex<ResolutionCache>> = OnceLock::new();
+
+struct CachedSubtitleTracks {
+    key: String,
+    tracks: Vec<SubtitleTrack>,
+    inserted: Instant,
+}
+
+#[derive(Default)]
+struct SubtitleTrackCache {
+    entries: Vec<CachedSubtitleTracks>,
+}
+
+static SUBTITLE_TRACK_CACHE: OnceLock<Mutex<SubtitleTrackCache>> = OnceLock::new();
+
+fn subtitle_cache_key(url: &str) -> String {
+    crate::history::youtube_video_id(url).unwrap_or_else(|| url.to_owned())
+}
+
+fn get_cached_subtitle_tracks(url: &str) -> Option<Vec<SubtitleTrack>> {
+    let key = subtitle_cache_key(url);
+    if key.len() > RESOLUTION_CACHE_MAX_URL_BYTES {
+        return None;
+    }
+    let cache_mutex =
+        SUBTITLE_TRACK_CACHE.get_or_init(|| Mutex::new(SubtitleTrackCache::default()));
+    let mut cache = cache_mutex
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let now = Instant::now();
+    cache
+        .entries
+        .retain(|entry| now.duration_since(entry.inserted) < RESOLUTION_CACHE_TTL);
+    cache
+        .entries
+        .iter()
+        .find(|entry| entry.key == key)
+        .map(|entry| entry.tracks.clone())
+}
+
+fn store_cached_subtitle_tracks(url: &str, tracks: &[SubtitleTrack]) {
+    let key = subtitle_cache_key(url);
+    if key.len() > RESOLUTION_CACHE_MAX_URL_BYTES {
+        return;
+    }
+    let cache_mutex =
+        SUBTITLE_TRACK_CACHE.get_or_init(|| Mutex::new(SubtitleTrackCache::default()));
+    let mut cache = cache_mutex
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let now = Instant::now();
+    cache.entries.retain(|entry| {
+        entry.key != key && now.duration_since(entry.inserted) < RESOLUTION_CACHE_TTL
+    });
+    if cache.entries.len() >= RESOLUTION_CACHE_LIMIT {
+        cache.entries.remove(0);
+    }
+    cache.entries.push(CachedSubtitleTracks {
+        key,
+        tracks: tracks.to_vec(),
+        inserted: now,
+    });
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PlaybackExtraInfo {
+    pub is_live: bool,
+    pub title: Option<String>,
+    pub channel: Option<String>,
+    pub channel_id: Option<String>,
+    pub channel_url: Option<String>,
+    pub description: Option<String>,
+    pub concurrent_view_count: Option<u64>,
+}
+
+struct CachedPlaybackExtra {
+    key: String,
+    info: PlaybackExtraInfo,
+    inserted: Instant,
+}
+
+#[derive(Default)]
+struct PlaybackExtraCache {
+    entries: Vec<CachedPlaybackExtra>,
+}
+
+static PLAYBACK_EXTRA_CACHE: OnceLock<Mutex<PlaybackExtraCache>> = OnceLock::new();
+
+fn get_cached_playback_extra(url: &str) -> Option<PlaybackExtraInfo> {
+    let key = subtitle_cache_key(url);
+    if key.len() > RESOLUTION_CACHE_MAX_URL_BYTES {
+        return None;
+    }
+    let cache_mutex =
+        PLAYBACK_EXTRA_CACHE.get_or_init(|| Mutex::new(PlaybackExtraCache::default()));
+    let mut cache = cache_mutex
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let now = Instant::now();
+    cache
+        .entries
+        .retain(|entry| now.duration_since(entry.inserted) < RESOLUTION_CACHE_TTL);
+    cache
+        .entries
+        .iter()
+        .find(|entry| entry.key == key)
+        .map(|entry| entry.info.clone())
+}
+
+fn store_cached_playback_extra(url: &str, info: PlaybackExtraInfo) {
+    let key = subtitle_cache_key(url);
+    if key.len() > RESOLUTION_CACHE_MAX_URL_BYTES {
+        return;
+    }
+    let cache_mutex =
+        PLAYBACK_EXTRA_CACHE.get_or_init(|| Mutex::new(PlaybackExtraCache::default()));
+    let mut cache = cache_mutex
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let now = Instant::now();
+    cache.entries.retain(|entry| {
+        entry.key != key && now.duration_since(entry.inserted) < RESOLUTION_CACHE_TTL
+    });
+    if cache.entries.len() >= RESOLUTION_CACHE_LIMIT {
+        cache.entries.remove(0);
+    }
+    cache.entries.push(CachedPlaybackExtra {
+        key,
+        info,
+        inserted: now,
+    });
+}
 
 fn cached_resolutions(
     cache: &Mutex<ResolutionCache>,
@@ -118,6 +250,16 @@ pub struct Video {
     pub duration: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchResultKind {
+    #[default]
+    Video,
+    Short,
+    Channel,
+    Playlist,
+    Movie,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VideoMetadata {
     pub view_count: Option<u64>,
@@ -125,6 +267,15 @@ pub struct VideoMetadata {
     pub description: Option<String>,
     pub channel_id: Option<String>,
     pub channel_url: Option<String>,
+    pub kind: SearchResultKind,
+    pub is_live: bool,
+    pub published_time_text: Option<String>,
+    pub view_count_text: Option<String>,
+    pub channel_avatar_url: Option<String>,
+    pub channel_verified: bool,
+    pub badges: Vec<String>,
+    pub playlist_count: Option<String>,
+    pub subscriber_count_text: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,8 +288,10 @@ pub struct SearchResult {
 pub struct HomeChannel {
     pub title: String,
     pub channel_id: String,
+    pub avatar_url: Option<String>,
 }
 
+#[derive(Clone, Debug)]
 pub struct HomeFeed {
     pub items: Vec<SearchResult>,
     pub playlists: Vec<String>,
@@ -150,6 +303,19 @@ pub struct SubtitleTrack {
     pub language: String,
     pub automatic: bool,
     pub url: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VideoPlaybackMetadata {
+    pub heights: Vec<u32>,
+    pub subtitles: Vec<SubtitleTrack>,
+    pub is_live: bool,
+    pub title: Option<String>,
+    pub channel: Option<String>,
+    pub channel_id: Option<String>,
+    pub channel_url: Option<String>,
+    pub description: Option<String>,
+    pub concurrent_view_count: Option<u64>,
 }
 
 const SUBTITLE_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -310,6 +476,9 @@ pub fn youtube_subtitles(
     let id = crate::history::youtube_video_id(video_url)
         .ok_or("Legendas disponíveis somente para vídeos do YouTube.")?;
     let url = crate::history::youtube_watch_url(&id).ok_or("URL de vídeo inválida.")?;
+    if let Some(cached) = get_cached_subtitle_tracks(&url) {
+        return Ok(cached);
+    }
     let output = process::output(
         yt_dlp().args([
             "--dump-single-json",
@@ -328,7 +497,9 @@ pub fn youtube_subtitles(
     }
     let json: Value =
         serde_json::from_slice(&output.stdout).map_err(|_| "Resposta de legendas inválida.")?;
-    Ok(parse_subtitles(&json))
+    let tracks = parse_subtitles(&json);
+    store_cached_subtitle_tracks(&url, &tracks);
+    Ok(tracks)
 }
 
 fn fetch_subtitle_text(
@@ -678,13 +849,206 @@ fn parse_home_feed(output: &[u8]) -> Result<HomeFeed, String> {
             .get("ie_key")
             .and_then(Value::as_str)
             .is_some_and(|s| s.eq_ignore_ascii_case("Youtube"))
-            && let Some(entry) = parse_video_entry(&value, true, None, None, None)
-            && crate::history::youtube_video_id(&entry.video.url).is_some()
         {
-            feed.items.push(entry);
+            let fallback_name = nonempty_str(&value, "playlist_channel")
+                .or_else(|| nonempty_str(&value, "playlist_uploader"))
+                .or_else(|| nonempty_str(&value, "playlist_title"))
+                .and_then(clean_channel_title);
+            let fallback_id = nonempty_str(&value, "playlist_channel_id")
+                .or_else(|| nonempty_str(&value, "playlist_id"))
+                .filter(|candidate| is_valid_channel_id(candidate));
+            let fallback_url = fallback_id
+                .map(|id| ChannelTarget::ChannelId(id.to_owned()).canonical_url())
+                .or_else(|| {
+                    nonempty_str(&value, "playlist_uploader_id")
+                        .filter(|handle| is_valid_channel_handle(handle))
+                        .map(|handle| ChannelTarget::Handle(handle.to_owned()).canonical_url())
+                });
+            if let Some(entry) = parse_video_entry(
+                &value,
+                true,
+                fallback_name.as_deref(),
+                fallback_id,
+                fallback_url.as_deref(),
+            ) && crate::history::youtube_video_id(&entry.video.url).is_some()
+            {
+                feed.items.push(entry);
+            }
         }
     }
     Ok(feed)
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HomeBatchRequest {
+    pub video_queries: Vec<String>,
+    pub channel_targets: Vec<ChannelTarget>,
+    pub playlist_query: Option<String>,
+    pub shorts_query: Option<String>,
+}
+
+fn percent_encode_query_component(raw: &str) -> String {
+    let mut encoded = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else if byte == b' ' {
+            encoded.push('+');
+        } else {
+            use std::fmt::Write;
+            let _ = write!(&mut encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+pub fn build_playlist_search_url(query: &str) -> String {
+    let trimmed = query.trim();
+    let encoded = percent_encode_query_component(if trimmed.is_empty() {
+        "mix musica playlist brasil"
+    } else {
+        trimmed
+    });
+    format!("https://www.youtube.com/results?search_query={encoded}&sp=EgIQAw%3D%3D")
+}
+
+fn fetch_home_lane(
+    target: &str,
+    playlist_end: Option<&str>,
+    cancellation: &Cancellation,
+) -> Result<HomeFeed, String> {
+    if cancellation.cancelled() {
+        return Err("Consulta cancelada.".into());
+    }
+    let mut cmd = yt_dlp();
+    cmd.arg("--flat-playlist");
+    if let Some(end) = playlist_end {
+        cmd.args(["--playlist-end", end]);
+    }
+    cmd.args(["--dump-json", "--no-warnings", "--", target]);
+    let output = process::output(&mut cmd, cancellation, QUERY_TIMEOUT)
+        .map_err(|error| format!("Não foi possível executar yt-dlp: {error}."))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if stderr.is_empty() {
+            "Não foi possível carregar o feed do YouTube.".into()
+        } else {
+            format!("Não foi possível carregar o feed: {stderr}")
+        });
+    }
+    parse_home_feed(&output.stdout)
+}
+
+fn merge_home_feeds(feeds: Vec<HomeFeed>) -> HomeFeed {
+    let mut merged = HomeFeed {
+        items: Vec::new(),
+        playlists: Vec::new(),
+        channels: Vec::new(),
+    };
+    let mut seen_keys = std::collections::HashSet::new();
+    let mut seen_playlists = std::collections::HashSet::new();
+    for feed in feeds {
+        for playlist in feed.playlists {
+            if seen_playlists.insert(playlist.clone()) {
+                merged.playlists.push(playlist);
+            }
+        }
+        for item in feed.items {
+            let key = crate::history::youtube_video_id(&item.video.url)
+                .unwrap_or_else(|| item.video.url.clone());
+            if seen_keys.insert(key) {
+                merged.items.push(item);
+            }
+        }
+    }
+    merged
+}
+
+pub fn fetch_home_batch(
+    request: &HomeBatchRequest,
+    cancellation: &Cancellation,
+) -> Result<HomeFeed, String> {
+    if cancellation.cancelled() {
+        return Err("Consulta cancelada.".into());
+    }
+
+    let mut targets: Vec<(String, Option<&'static str>)> = Vec::new();
+    for query in &request.video_queries {
+        let trimmed = query.trim();
+        if !trimmed.is_empty() {
+            targets.push((format!("ytsearch25:{trimmed}"), None));
+        }
+    }
+    for target in &request.channel_targets {
+        targets.push((target.videos_tab_url(), Some("10")));
+    }
+    if let Some(playlist_query) = request
+        .playlist_query
+        .as_deref()
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+    {
+        targets.push((build_playlist_search_url(playlist_query), Some("12")));
+    }
+    if let Some(shorts_query) = request
+        .shorts_query
+        .as_deref()
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+    {
+        targets.push((format!("ytsearch18:{shorts_query}"), None));
+    }
+    if targets.is_empty() {
+        return Ok(HomeFeed {
+            items: Vec::new(),
+            playlists: Vec::new(),
+            channels: Vec::new(),
+        });
+    }
+
+    let results: Vec<Result<HomeFeed, String>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = targets
+            .iter()
+            .map(|(target, playlist_end)| {
+                let target = target.as_str();
+                let playlist_end = *playlist_end;
+                scope.spawn(move || fetch_home_lane(target, playlist_end, cancellation))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err("Falha interna ao carregar o feed.".into()))
+            })
+            .collect()
+    });
+
+    let mut feeds = Vec::new();
+    let mut first_error = None;
+    for result in results {
+        match result {
+            Ok(feed) => feeds.push(feed),
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+
+    if cancellation.cancelled() {
+        return Err("Consulta cancelada.".into());
+    }
+
+    let merged = merge_home_feeds(feeds);
+    if merged.items.is_empty()
+        && let Some(error) = first_error
+    {
+        return Err(error);
+    }
+    Ok(merged)
 }
 
 pub const DEFAULT_CHANNEL_VIDEOS_LIMIT: usize = 20;
@@ -1039,12 +1403,47 @@ fn parse_youtube_channel_url(url: &str) -> Option<ChannelTarget> {
     }
 }
 
+static YT_DLP_CACHE_DIR: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+
+pub fn set_yt_dlp_cache_dir(base_cache_dir: Option<PathBuf>) {
+    let target = base_cache_dir.map(|dir| crate::settings::yt_dlp_cache_subdir(&dir));
+    let lock = YT_DLP_CACHE_DIR.get_or_init(|| Mutex::new(None));
+    let mut guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+    *guard = target;
+}
+
+pub fn effective_yt_dlp_cache_dir() -> Option<PathBuf> {
+    let lock = YT_DLP_CACHE_DIR.get_or_init(|| Mutex::new(None));
+    lock.lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+}
+
+pub fn clear_in_memory_caches() {
+    if let Some(lock) = RESOLUTION_CACHE.get() {
+        let mut cache = lock.lock().unwrap_or_else(|error| error.into_inner());
+        cache.entries.clear();
+    }
+    if let Some(lock) = SUBTITLE_TRACK_CACHE.get() {
+        let mut cache = lock.lock().unwrap_or_else(|error| error.into_inner());
+        cache.entries.clear();
+    }
+    if let Some(lock) = PLAYBACK_EXTRA_CACHE.get() {
+        let mut cache = lock.lock().unwrap_or_else(|error| error.into_inner());
+        cache.entries.clear();
+    }
+}
+
 fn yt_dlp() -> Command {
     let program = std::env::current_exe()
         .ok()
         .and_then(|executable| bundled_yt_dlp(&executable))
         .unwrap_or_else(|| "yt-dlp".into());
     let mut command = Command::new(program);
+    if let Some(cache_dir) = effective_yt_dlp_cache_dir() {
+        let _ = std::fs::create_dir_all(&cache_dir);
+        command.arg("--cache-dir").arg(cache_dir);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -1070,6 +1469,34 @@ pub(crate) fn ytdl_hook_path_option(path: &std::path::Path) -> String {
     format!("ytdl_hook-ytdl_path={value}")
 }
 
+pub fn playback_metadata_with_cancel(
+    url: &str,
+    cancellation: &Cancellation,
+) -> Result<VideoPlaybackMetadata, String> {
+    let heights = resolutions_with_cancel(url, cancellation)?;
+    let extra = get_cached_playback_extra(url).unwrap_or_default();
+    let subtitles = if crate::history::youtube_video_id(url).is_some() {
+        if let Some(cached) = get_cached_subtitle_tracks(url) {
+            cached
+        } else {
+            youtube_subtitles(url, cancellation).unwrap_or_default()
+        }
+    } else {
+        Vec::new()
+    };
+    Ok(VideoPlaybackMetadata {
+        heights,
+        subtitles,
+        is_live: extra.is_live,
+        title: extra.title,
+        channel: extra.channel,
+        channel_id: extra.channel_id,
+        channel_url: extra.channel_url,
+        description: extra.description,
+        concurrent_view_count: extra.concurrent_view_count,
+    })
+}
+
 pub fn resolutions_with_cancel(url: &str, cancellation: &Cancellation) -> Result<Vec<u32>, String> {
     let fetch = || {
         cached_resolutions(
@@ -1087,6 +1514,54 @@ pub fn resolutions_with_cancel(url: &str, cancellation: &Cancellation) -> Result
         fetch()
     } else {
         result
+    }
+}
+
+fn parse_resolutions_from_json(value: &Value) -> Result<Vec<u32>, String> {
+    let formats = value
+        .get("formats")
+        .and_then(Value::as_array)
+        .ok_or("O vídeo não informou as resoluções disponíveis.")?;
+    let mut heights: Vec<u32> = formats
+        .iter()
+        .filter_map(|format| {
+            let codec = format.get("vcodec").and_then(Value::as_str)?;
+            if codec == "none" || codec.is_empty() {
+                return None;
+            }
+            let height = format.get("height").and_then(Value::as_u64)?;
+            u32::try_from(height).ok().filter(|height| *height > 0)
+        })
+        .collect();
+    heights.sort_unstable_by(|first, second| second.cmp(first));
+    heights.dedup();
+    if heights.is_empty() {
+        Err("O vídeo não informou as resoluções disponíveis.".into())
+    } else {
+        Ok(heights)
+    }
+}
+
+fn parse_playback_extra_from_json(value: &Value) -> PlaybackExtraInfo {
+    let live_status = value.get("live_status").and_then(Value::as_str);
+    let is_live = value.get("is_live").and_then(Value::as_bool) == Some(true)
+        || live_status == Some("is_live");
+    let non_empty_str = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    PlaybackExtraInfo {
+        is_live,
+        title: non_empty_str("title"),
+        channel: non_empty_str("channel").or_else(|| non_empty_str("uploader")),
+        channel_id: non_empty_str("channel_id"),
+        channel_url: non_empty_str("channel_url").or_else(|| non_empty_str("uploader_url")),
+        description: non_empty_str("description"),
+        concurrent_view_count: value.get("concurrent_view_count").and_then(Value::as_u64),
     }
 }
 
@@ -1112,28 +1587,12 @@ fn fetch_resolutions(url: &str, cancellation: &Cancellation) -> Result<Vec<u32>,
     }
     let value: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("Resposta inválida do yt-dlp: {error}"))?;
-    let formats = value
-        .get("formats")
-        .and_then(Value::as_array)
-        .ok_or("O vídeo não informou as resoluções disponíveis.")?;
-    let mut heights: Vec<u32> = formats
-        .iter()
-        .filter_map(|format| {
-            let codec = format.get("vcodec").and_then(Value::as_str)?;
-            if codec == "none" || codec.is_empty() {
-                return None;
-            }
-            let height = format.get("height").and_then(Value::as_u64)?;
-            u32::try_from(height).ok().filter(|height| *height > 0)
-        })
-        .collect();
-    heights.sort_unstable_by(|first, second| second.cmp(first));
-    heights.dedup();
-    if heights.is_empty() {
-        Err("O vídeo não informou as resoluções disponíveis.".into())
-    } else {
-        Ok(heights)
+    if crate::history::youtube_video_id(url).is_some() {
+        let tracks = parse_subtitles(&value);
+        store_cached_subtitle_tracks(url, &tracks);
     }
+    store_cached_playback_extra(url, parse_playback_extra_from_json(&value));
+    parse_resolutions_from_json(&value)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1159,7 +1618,41 @@ pub enum SearchTypeFilter {
     All,
     Videos,
     Shorts,
+    Channels,
+    Playlists,
+    Movies,
     Live,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchUploadDateFilter {
+    #[default]
+    Any,
+    Today,
+    ThisWeek,
+    ThisMonth,
+    ThisYear,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SearchFeatureFilters {
+    pub live: bool,
+    pub four_k: bool,
+    pub hd: bool,
+    pub subtitles: bool,
+    pub creative_commons: bool,
+    pub three_sixty: bool,
+    pub vr180: bool,
+    pub three_d: bool,
+    pub hdr: bool,
+    pub location: bool,
+    pub purchased: bool,
+}
+
+impl SearchFeatureFilters {
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1167,11 +1660,164 @@ pub struct SearchFilters {
     pub sort: SearchSort,
     pub duration: SearchDurationFilter,
     pub kind: SearchTypeFilter,
+    pub upload_date: SearchUploadDateFilter,
+    pub features: SearchFeatureFilters,
 }
 
 impl SearchFilters {
     pub fn is_default(self) -> bool {
-        self == Self::default()
+        self.sort == SearchSort::default()
+            && self.duration == SearchDurationFilter::default()
+            && self.kind == SearchTypeFilter::default()
+            && self.upload_date == SearchUploadDateFilter::default()
+            && self.features.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchChip {
+    #[default]
+    All,
+    Shorts,
+    Unwatched,
+    Videos,
+    RecentlyUploaded,
+    Live,
+}
+
+impl SearchChip {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "Tudo",
+            Self::Shorts => "Shorts",
+            Self::Unwatched => "N\u{00e3}o assistidos",
+            Self::Videos => "V\u{00ed}deos",
+            Self::RecentlyUploaded => "Enviados recentemente",
+            Self::Live => "Ao vivo",
+        }
+    }
+}
+
+pub fn effective_search_filters(mut base: SearchFilters, chip: SearchChip) -> SearchFilters {
+    match chip {
+        SearchChip::All | SearchChip::Unwatched => {}
+        SearchChip::Shorts => {
+            base.kind = SearchTypeFilter::Shorts;
+        }
+        SearchChip::Videos => {
+            base.kind = SearchTypeFilter::Videos;
+        }
+        SearchChip::RecentlyUploaded => {
+            if base.sort == SearchSort::Relevance {
+                base.sort = SearchSort::Date;
+            }
+        }
+        SearchChip::Live => {
+            base.features.live = true;
+        }
+    }
+    base
+}
+
+fn push_proto_varint(buf: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        buf.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+fn push_proto_field_varint(buf: &mut Vec<u8>, field_number: u32, value: u64) {
+    push_proto_varint(buf, u64::from(field_number) << 3);
+    push_proto_varint(buf, value);
+}
+
+/// Encodes `SearchFilters` into YouTube's `sp` base64 protobuf query parameter.
+pub fn encode_search_sp(filters: SearchFilters) -> Option<String> {
+    use base64::Engine as _;
+
+    let mut msg = Vec::new();
+    match filters.sort {
+        SearchSort::Relevance => {}
+        SearchSort::Date => push_proto_field_varint(&mut msg, 1, 2),
+        SearchSort::Views => push_proto_field_varint(&mut msg, 1, 3),
+    }
+
+    let mut sub = Vec::new();
+    match filters.upload_date {
+        SearchUploadDateFilter::Any => {}
+        SearchUploadDateFilter::Today => push_proto_field_varint(&mut sub, 1, 2),
+        SearchUploadDateFilter::ThisWeek => push_proto_field_varint(&mut sub, 1, 3),
+        SearchUploadDateFilter::ThisMonth => push_proto_field_varint(&mut sub, 1, 4),
+        SearchUploadDateFilter::ThisYear => push_proto_field_varint(&mut sub, 1, 5),
+    }
+    match filters.kind {
+        SearchTypeFilter::All => {}
+        SearchTypeFilter::Videos => push_proto_field_varint(&mut sub, 2, 1),
+        SearchTypeFilter::Channels => push_proto_field_varint(&mut sub, 2, 2),
+        SearchTypeFilter::Playlists => push_proto_field_varint(&mut sub, 2, 3),
+        SearchTypeFilter::Movies => push_proto_field_varint(&mut sub, 2, 4),
+        SearchTypeFilter::Shorts => push_proto_field_varint(&mut sub, 2, 9),
+        SearchTypeFilter::Live => push_proto_field_varint(&mut sub, 8, 1),
+    }
+    match filters.duration {
+        SearchDurationFilter::Any => {}
+        SearchDurationFilter::Long => push_proto_field_varint(&mut sub, 3, 2),
+        SearchDurationFilter::Short => push_proto_field_varint(&mut sub, 3, 4),
+        SearchDurationFilter::Medium => push_proto_field_varint(&mut sub, 3, 5),
+    }
+
+    let features = filters.features;
+    if features.hd {
+        push_proto_field_varint(&mut sub, 4, 1);
+    }
+    if features.subtitles {
+        push_proto_field_varint(&mut sub, 5, 1);
+    }
+    if features.creative_commons {
+        push_proto_field_varint(&mut sub, 6, 1);
+    }
+    if features.three_d {
+        push_proto_field_varint(&mut sub, 7, 1);
+    }
+    if features.live && filters.kind != SearchTypeFilter::Live {
+        push_proto_field_varint(&mut sub, 8, 1);
+    }
+    if features.purchased {
+        push_proto_field_varint(&mut sub, 9, 1);
+    }
+    if features.four_k {
+        push_proto_field_varint(&mut sub, 14, 1);
+    }
+    if features.three_sixty {
+        push_proto_field_varint(&mut sub, 15, 1);
+    }
+    if features.location {
+        push_proto_field_varint(&mut sub, 23, 1);
+    }
+    if features.hdr {
+        push_proto_field_varint(&mut sub, 25, 1);
+    }
+    if features.vr180 {
+        push_proto_field_varint(&mut sub, 26, 1);
+    }
+
+    if !sub.is_empty() {
+        push_proto_varint(&mut msg, (2 << 3) | 2);
+        push_proto_varint(&mut msg, sub.len() as u64);
+        msg.extend_from_slice(&sub);
+    }
+
+    if msg.is_empty() {
+        None
+    } else {
+        Some(base64::engine::general_purpose::STANDARD.encode(msg))
     }
 }
 
@@ -1201,23 +1847,34 @@ pub fn apply_search_filters(
 ) -> Vec<SearchResult> {
     results.retain(|item| {
         let secs = parse_duration_label_secs(&item.video.duration);
-        let is_short =
-            item.video.url.contains("/shorts/") || secs.is_some_and(|s| s > 0 && s <= 60);
-        let is_live = item.video.duration.trim().is_empty();
+        let is_short = item.metadata.kind == SearchResultKind::Short
+            || item.video.url.contains("/shorts/")
+            || secs.is_some_and(|s| s > 0 && s <= 60);
+        let is_live = item.metadata.is_live
+            || (item.metadata.kind == SearchResultKind::Video
+                && item.video.duration.trim().is_empty());
 
         let kind_ok = match filters.kind {
             SearchTypeFilter::All => true,
-            SearchTypeFilter::Videos => !is_short && !is_live,
+            SearchTypeFilter::Videos => {
+                item.metadata.kind == SearchResultKind::Video && !is_short && !is_live
+            }
             SearchTypeFilter::Shorts => is_short,
+            SearchTypeFilter::Channels => item.metadata.kind == SearchResultKind::Channel,
+            SearchTypeFilter::Playlists => item.metadata.kind == SearchResultKind::Playlist,
+            SearchTypeFilter::Movies => item.metadata.kind == SearchResultKind::Movie,
             SearchTypeFilter::Live => is_live,
         };
         if !kind_ok {
             return false;
         }
+        if filters.features.live && !is_live {
+            return false;
+        }
         match filters.duration {
             SearchDurationFilter::Any => true,
-            SearchDurationFilter::Short => secs.is_some_and(|s| s < 240),
-            SearchDurationFilter::Medium => secs.is_some_and(|s| (240..=1200).contains(&s)),
+            SearchDurationFilter::Short => secs.is_some_and(|s| s < 180),
+            SearchDurationFilter::Medium => secs.is_some_and(|s| (180..=1200).contains(&s)),
             SearchDurationFilter::Long => secs.is_some_and(|s| s > 1200),
         }
     });
@@ -1290,6 +1947,7 @@ pub fn find_with_metadata(query: &str) -> Result<Vec<SearchResult>, String> {
     find_with_cancel(query, &Cancellation::default())
 }
 
+#[cfg(test)]
 pub fn find_with_cancel(
     query: &str,
     cancellation: &Cancellation,
@@ -1303,12 +1961,20 @@ pub fn find_filtered_with_cancel(
     cancellation: &Cancellation,
 ) -> Result<Vec<SearchResult>, String> {
     let is_url = query.starts_with("https://") || query.starts_with("http://");
+    if !is_url
+        && let Ok(html_results) = fetch_youtube_search_html(query, filters, cancellation)
+        && !html_results.is_empty()
+    {
+        return Ok(html_results);
+    }
+    if cancellation.cancelled() {
+        return Err("Pesquisa cancelada.".to_owned());
+    }
     let target = if is_url {
         query.to_owned()
     } else if filters.sort == SearchSort::Date {
         format!("ytsearchdate20:{query}")
-    } else if filters.duration != SearchDurationFilter::Any || filters.kind != SearchTypeFilter::All
-    {
+    } else if !filters.is_default() {
         format!("ytsearch30:{query}")
     } else {
         format!("ytsearch20:{query}")
@@ -1336,6 +2002,620 @@ pub fn find_filtered_with_cancel(
     } else {
         apply_search_filters(parsed, filters)
     })
+}
+
+fn fetch_youtube_search_html(
+    query: &str,
+    filters: SearchFilters,
+    cancellation: &Cancellation,
+) -> Result<Vec<SearchResult>, String> {
+    if cancellation.cancelled() {
+        return Err("Pesquisa cancelada.".to_owned());
+    }
+    let mut url = url::Url::parse("https://www.youtube.com/results")
+        .map_err(|_| "URL de pesquisa inválida.".to_owned())?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("search_query", query);
+        if let Some(sp) = encode_search_sp(filters) {
+            pairs.append_pair("sp", &sp);
+        }
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|error| format!("Falha ao preparar cliente HTTP: {error}"))?;
+    let response = client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, SUBTITLE_USER_AGENT)
+        .header(
+            reqwest::header::ACCEPT_LANGUAGE,
+            "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        )
+        .send()
+        .map_err(|error| format!("Falha na consulta ao YouTube: {error}"))?;
+    if cancellation.cancelled() {
+        return Err("Pesquisa cancelada.".to_owned());
+    }
+    if !response.status().is_success() {
+        return Err(format!("YouTube retornou HTTP {}", response.status()));
+    }
+    let body = response
+        .text()
+        .map_err(|error| format!("Falha ao ler resposta do YouTube: {error}"))?;
+    let data = extract_yt_initial_data(&body)
+        .ok_or_else(|| "Não foi possível ler os dados iniciais de busca do YouTube.".to_owned())?;
+    Ok(parse_yt_initial_data_search_results(&data))
+}
+
+fn extract_yt_initial_data(html: &str) -> Option<Value> {
+    for marker in [
+        "var ytInitialData = ",
+        "window[\"ytInitialData\"] = ",
+        "ytInitialData = ",
+    ] {
+        if let Some(pos) = html.find(marker) {
+            let rest = &html[pos + marker.len()..];
+            let trimmed = rest.trim_start();
+            if trimmed.starts_with('{') {
+                let mut stream = serde_json::Deserializer::from_str(trimmed).into_iter::<Value>();
+                if let Some(Ok(val)) = stream.next() {
+                    return Some(val);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn normalize_youtube_asset_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("//") {
+        format!("https:{trimmed}")
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn yt_text(value: Option<&Value>) -> String {
+    let Some(val) = value else {
+        return String::new();
+    };
+    if let Some(simple) = val.get("simpleText").and_then(Value::as_str) {
+        return simple.trim().to_owned();
+    }
+    if let Some(content) = val.get("content").and_then(Value::as_str) {
+        return content.trim().to_owned();
+    }
+    if let Some(runs) = val.get("runs").and_then(Value::as_array) {
+        let mut out = String::new();
+        for run in runs {
+            if let Some(text) = run.get("text").and_then(Value::as_str) {
+                out.push_str(text);
+            }
+        }
+        return out.trim().to_owned();
+    }
+    String::new()
+}
+
+fn select_yt_thumbnail(thumbnails: Option<&Value>, target_width: u64) -> String {
+    let Some(arr) = thumbnails.and_then(Value::as_array) else {
+        return String::new();
+    };
+    arr.iter()
+        .filter_map(|item| {
+            let url = item.get("url").and_then(Value::as_str)?;
+            let norm = normalize_youtube_asset_url(url);
+            valid_http_url(&norm)?;
+            let width = item.get("width").and_then(Value::as_u64).unwrap_or(0);
+            Some((width, norm))
+        })
+        .min_by_key(|(w, _)| w.abs_diff(target_width))
+        .map(|(_, url)| url)
+        .unwrap_or_default()
+}
+
+fn parse_pt_br_compact_count(raw: &str) -> Option<u64> {
+    let lower = raw.trim().to_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    let digits_only: String = lower
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == ',')
+        .collect();
+    if digits_only.is_empty() {
+        return None;
+    }
+    let multiplier: f64 = if lower.contains("bi") {
+        1_000_000_000.0
+    } else if lower.contains("mi") {
+        1_000_000.0
+    } else if lower.contains("mil") || lower.ends_with('k') {
+        1_000.0
+    } else {
+        1.0
+    };
+    if multiplier > 1.0 {
+        let normalized = digits_only.replace(',', ".");
+        normalized
+            .parse::<f64>()
+            .ok()
+            .map(|n| (n * multiplier).round() as u64)
+    } else {
+        let int_str: String = lower.chars().filter(char::is_ascii_digit).collect();
+        int_str.parse::<u64>().ok()
+    }
+}
+
+fn clean_pt_br_view_label(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().replace('\u{00a0}', " ");
+    if trimmed.is_empty() {
+        return None;
+    }
+    let stripped = trimmed
+        .strip_suffix(" visualizações")
+        .or_else(|| trimmed.strip_suffix(" visualização"))
+        .or_else(|| trimmed.strip_suffix(" views"))
+        .or_else(|| trimmed.strip_suffix(" view"))
+        .unwrap_or(&trimmed)
+        .trim();
+    (!stripped.is_empty()).then(|| stripped.to_owned())
+}
+
+fn channel_url_from_browse_endpoint(endpoint: Option<&Value>) -> (Option<String>, Option<String>) {
+    let Some(browse) = endpoint.and_then(|ep| ep.get("browseEndpoint")) else {
+        return (None, None);
+    };
+    let channel_id = browse
+        .get("browseId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| is_valid_channel_id(id))
+        .map(str::to_owned);
+    let canonical_base = browse
+        .get("canonicalBaseUrl")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|base| {
+            let full = if base.starts_with('/') {
+                format!("https://www.youtube.com{base}")
+            } else {
+                base.to_owned()
+            };
+            parse_youtube_channel_url(&full).map(|target| target.canonical_url())
+        });
+    let channel_url = canonical_base.or_else(|| {
+        channel_id
+            .as_ref()
+            .map(|id| format!("https://www.youtube.com/channel/{id}"))
+    });
+    (channel_id, channel_url)
+}
+
+fn has_verified_owner_badge(owner_badges: Option<&Value>) -> bool {
+    let Some(arr) = owner_badges.and_then(Value::as_array) else {
+        return false;
+    };
+    arr.iter().any(|badge| {
+        let renderer = badge.get("metadataBadgeRenderer").unwrap_or(badge);
+        let style = renderer.get("style").and_then(Value::as_str).unwrap_or("");
+        let icon = renderer
+            .pointer("/icon/iconType")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let tooltip = renderer
+            .get("tooltip")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        style.contains("VERIFIED")
+            || icon.contains("CHECK")
+            || icon.contains("OFFICIAL_ARTIST")
+            || tooltip.to_lowercase().contains("verific")
+    })
+}
+
+fn parse_yt_video_renderer(v: &Value) -> Option<SearchResult> {
+    let video_id = v
+        .get("videoId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?;
+    let title = yt_text(v.get("title"));
+    if title.is_empty() {
+        return None;
+    }
+    let nav_url = v
+        .pointer("/navigationEndpoint/commandMetadata/webCommandMetadata/url")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let is_short = nav_url.starts_with("/shorts/");
+    let url = if is_short {
+        format!("https://www.youtube.com/shorts/{video_id}")
+    } else {
+        format!("https://www.youtube.com/watch?v={video_id}")
+    };
+    let duration = yt_text(v.get("lengthText"));
+    let thumbnail = select_yt_thumbnail(v.pointer("/thumbnail/thumbnails"), 480);
+
+    let channel_text = yt_text(
+        v.get("ownerText")
+            .or_else(|| v.get("longBylineText"))
+            .or_else(|| v.get("shortBylineText")),
+    );
+
+    let (channel_id, channel_url) = channel_url_from_browse_endpoint(
+        v.pointer("/channelThumbnailSupportedRenderers/channelThumbnailWithLinkRenderer/navigationEndpoint")
+            .or_else(|| v.pointer("/ownerText/runs/0/navigationEndpoint"))
+            .or_else(|| v.pointer("/longBylineText/runs/0/navigationEndpoint")),
+    );
+    let avatar_url = select_yt_thumbnail(
+        v.pointer("/channelThumbnailSupportedRenderers/channelThumbnailWithLinkRenderer/thumbnail/thumbnails"),
+        68,
+    );
+    let channel_avatar_url = (!avatar_url.is_empty()).then_some(avatar_url);
+    let channel_verified = has_verified_owner_badge(v.get("ownerBadges"));
+
+    let mut is_live = false;
+    let mut badges = Vec::new();
+    if let Some(badge_arr) = v.get("badges").and_then(Value::as_array) {
+        for badge in badge_arr {
+            let renderer = badge.get("metadataBadgeRenderer").unwrap_or(badge);
+            let style = renderer.get("style").and_then(Value::as_str).unwrap_or("");
+            let icon = renderer
+                .pointer("/icon/iconType")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let label = renderer
+                .get("label")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("");
+            if style.contains("LIVE_NOW") || icon == "LIVE" || label.eq_ignore_ascii_case("ao vivo")
+            {
+                is_live = true;
+            } else if !label.is_empty() && !badges.iter().any(|existing: &String| existing == label)
+            {
+                badges.push(label.to_owned());
+            }
+        }
+    }
+    if duration.is_empty()
+        && let Some(overlays) = v.get("thumbnailOverlays").and_then(Value::as_array)
+        && overlays.iter().any(|ov| {
+            ov.pointer("/thumbnailOverlayTimeStatusRenderer/style")
+                .and_then(Value::as_str)
+                == Some("LIVE")
+        })
+    {
+        is_live = true;
+    }
+
+    let short_views_raw = yt_text(v.get("shortViewCountText"));
+    let full_views_raw = yt_text(v.get("viewCountText"));
+    let view_count = parse_pt_br_compact_count(&full_views_raw)
+        .or_else(|| parse_pt_br_compact_count(&short_views_raw));
+    let view_count_text = clean_pt_br_view_label(&short_views_raw)
+        .or_else(|| clean_pt_br_view_label(&full_views_raw));
+    let published_time_raw = yt_text(v.get("publishedTimeText"));
+    let published_time_text = (!published_time_raw.is_empty()).then_some(published_time_raw);
+
+    let description = v
+        .pointer("/detailedMetadataSnippets/0/snippetText")
+        .or_else(|| v.get("descriptionSnippet"))
+        .map(|val| yt_text(Some(val)))
+        .filter(|text| !text.is_empty());
+
+    Some(SearchResult {
+        video: Video {
+            title,
+            channel: channel_text,
+            url,
+            thumbnail,
+            duration: if is_live { String::new() } else { duration },
+        },
+        metadata: VideoMetadata {
+            view_count,
+            upload_date: None,
+            description,
+            channel_id,
+            channel_url,
+            kind: if is_short {
+                SearchResultKind::Short
+            } else {
+                SearchResultKind::Video
+            },
+            is_live,
+            published_time_text,
+            view_count_text,
+            channel_avatar_url,
+            channel_verified,
+            badges,
+            playlist_count: None,
+            subscriber_count_text: None,
+        },
+    })
+}
+
+fn parse_yt_shorts_lockup(s: &Value) -> Option<SearchResult> {
+    let watch_ep = s.pointer("/onTap/innertubeCommand/reelWatchEndpoint");
+    let video_id = watch_ep
+        .and_then(|ep| ep.get("videoId"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            s.get("entityId")
+                .and_then(Value::as_str)
+                .and_then(|id| id.strip_prefix("shorts-shelf-item-"))
+        })?
+        .trim();
+    if video_id.is_empty() {
+        return None;
+    }
+    let title = s
+        .pointer("/overlayMetadata/primaryText/content")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .or_else(|| {
+            s.get("accessibilityText")
+                .and_then(Value::as_str)
+                .map(str::trim)
+        })?
+        .to_owned();
+    let views_raw = s
+        .pointer("/overlayMetadata/secondaryText/content")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let view_count = parse_pt_br_compact_count(views_raw);
+    let view_count_text = clean_pt_br_view_label(views_raw);
+    let thumbnail = select_yt_thumbnail(
+        watch_ep
+            .and_then(|ep| ep.pointer("/thumbnail/thumbnails"))
+            .or_else(|| s.pointer("/thumbnail/sources")),
+        480,
+    );
+    Some(SearchResult {
+        video: Video {
+            title,
+            channel: String::new(),
+            url: format!("https://www.youtube.com/shorts/{video_id}"),
+            thumbnail,
+            duration: "0:59".to_owned(),
+        },
+        metadata: VideoMetadata {
+            view_count,
+            view_count_text,
+            kind: SearchResultKind::Short,
+            ..Default::default()
+        },
+    })
+}
+
+fn parse_yt_channel_renderer(c: &Value) -> Option<SearchResult> {
+    let channel_id = c
+        .get("channelId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| is_valid_channel_id(id))?
+        .to_owned();
+    let title = yt_text(c.get("title"));
+    if title.is_empty() {
+        return None;
+    }
+    let (_, resolved_url) = channel_url_from_browse_endpoint(c.get("navigationEndpoint"));
+    let canonical_url =
+        resolved_url.unwrap_or_else(|| format!("https://www.youtube.com/channel/{channel_id}"));
+    let avatar = select_yt_thumbnail(c.pointer("/thumbnail/thumbnails"), 176);
+    let handle_part = yt_text(c.get("subscriberCountText"));
+    let subs_part = yt_text(c.get("videoCountText"));
+    let combined_sub = match (handle_part.is_empty(), subs_part.is_empty()) {
+        (false, false) => Some(format!("{handle_part} \u{2022} {subs_part}")),
+        (false, true) => Some(handle_part),
+        (true, false) => Some(subs_part),
+        (true, true) => None,
+    };
+    let description = {
+        let text = yt_text(c.get("descriptionSnippet"));
+        (!text.is_empty()).then_some(text)
+    };
+    let verified = has_verified_owner_badge(c.get("ownerBadges"));
+    Some(SearchResult {
+        video: Video {
+            title: title.clone(),
+            channel: title,
+            url: canonical_url.clone(),
+            thumbnail: avatar.clone(),
+            duration: String::new(),
+        },
+        metadata: VideoMetadata {
+            description,
+            channel_id: Some(channel_id),
+            channel_url: Some(canonical_url),
+            kind: SearchResultKind::Channel,
+            channel_avatar_url: (!avatar.is_empty()).then_some(avatar),
+            channel_verified: verified,
+            subscriber_count_text: combined_sub,
+            ..Default::default()
+        },
+    })
+}
+
+fn parse_yt_lockup_playlist(l: &Value) -> Option<SearchResult> {
+    let content_type = l.get("contentType").and_then(Value::as_str).unwrap_or("");
+    let content_id = l
+        .get("contentId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?;
+    if content_type != "LOCKUP_CONTENT_TYPE_PLAYLIST"
+        && !content_id.starts_with("PL")
+        && !content_id.starts_with("RD")
+        && !content_id.starts_with("OL")
+    {
+        return None;
+    }
+    let title = l
+        .pointer("/metadata/lockupMetadataViewModel/title/content")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())?
+        .to_owned();
+    let first_part = l.pointer(
+        "/metadata/lockupMetadataViewModel/metadata/contentMetadataViewModel/metadataRows/0/metadataParts/0/text",
+    );
+    let channel = first_part
+        .and_then(|p| p.get("content"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("")
+        .to_owned();
+    let (channel_id, channel_url) = channel_url_from_browse_endpoint(
+        first_part.and_then(|p| p.pointer("/commandRuns/0/onTap/innertubeCommand")),
+    );
+    let playlist_count = l
+        .pointer("/contentImage/collectionThumbnailViewModel/primaryThumbnail/thumbnailViewModel/overlays")
+        .and_then(Value::as_array)
+        .and_then(|ovs| {
+            ovs.iter().find_map(|ov| {
+                ov.pointer("/thumbnailOverlayBadgeViewModel/thumbnailBadges/0/thumbnailBadgeViewModel/text")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            })
+        });
+    let thumbnail = select_yt_thumbnail(
+        l.pointer("/contentImage/collectionThumbnailViewModel/primaryThumbnail/thumbnailViewModel/image/sources"),
+        480,
+    );
+    Some(SearchResult {
+        video: Video {
+            title,
+            channel,
+            url: format!("https://www.youtube.com/playlist?list={content_id}"),
+            thumbnail,
+            duration: String::new(),
+        },
+        metadata: VideoMetadata {
+            channel_id,
+            channel_url,
+            kind: SearchResultKind::Playlist,
+            playlist_count,
+            ..Default::default()
+        },
+    })
+}
+
+fn parse_yt_playlist_renderer(p: &Value) -> Option<SearchResult> {
+    let playlist_id = p
+        .get("playlistId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?;
+    let title = yt_text(p.get("title"));
+    if title.is_empty() {
+        return None;
+    }
+    let channel = yt_text(p.get("shortBylineText").or_else(|| p.get("longBylineText")));
+    let (channel_id, channel_url) = channel_url_from_browse_endpoint(
+        p.pointer("/shortBylineText/runs/0/navigationEndpoint")
+            .or_else(|| p.pointer("/longBylineText/runs/0/navigationEndpoint")),
+    );
+    let thumbnail = select_yt_thumbnail(p.pointer("/thumbnails/0/thumbnails"), 480);
+    let count_num = p.get("videoCount").and_then(Value::as_str).map(str::trim);
+    let playlist_count = count_num
+        .filter(|c| !c.is_empty())
+        .map(|c| format!("{c} v\u{00ed}deos"));
+    Some(SearchResult {
+        video: Video {
+            title,
+            channel,
+            url: format!("https://www.youtube.com/playlist?list={playlist_id}"),
+            thumbnail,
+            duration: String::new(),
+        },
+        metadata: VideoMetadata {
+            channel_id,
+            channel_url,
+            kind: SearchResultKind::Playlist,
+            playlist_count,
+            ..Default::default()
+        },
+    })
+}
+
+fn collect_yt_search_items(
+    value: &Value,
+    out: &mut Vec<SearchResult>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    let Some(obj) = value.as_object() else {
+        if let Some(arr) = value.as_array() {
+            for item in arr {
+                collect_yt_search_items(item, out, seen);
+            }
+        }
+        return;
+    };
+    if let Some(v) = obj.get("videoRenderer") {
+        if let Some(res) = parse_yt_video_renderer(v)
+            && seen.insert(res.video.url.clone())
+        {
+            out.push(res);
+        }
+        return;
+    }
+    if let Some(s) = obj.get("shortsLockupViewModel") {
+        if let Some(res) = parse_yt_shorts_lockup(s)
+            && seen.insert(res.video.url.clone())
+        {
+            out.push(res);
+        }
+        return;
+    }
+    if let Some(c) = obj.get("channelRenderer") {
+        if let Some(res) = parse_yt_channel_renderer(c)
+            && seen.insert(res.video.url.clone())
+        {
+            out.push(res);
+        }
+        return;
+    }
+    if let Some(l) = obj.get("lockupViewModel") {
+        if let Some(res) = parse_yt_lockup_playlist(l)
+            && seen.insert(res.video.url.clone())
+        {
+            out.push(res);
+        }
+        return;
+    }
+    if let Some(p) = obj.get("playlistRenderer") {
+        if let Some(res) = parse_yt_playlist_renderer(p)
+            && seen.insert(res.video.url.clone())
+        {
+            out.push(res);
+        }
+        return;
+    }
+    for (key, child) in obj {
+        // Skip secondary side rails (e.g., ads or watch-card playlists) when primary results exist.
+        if key == "secondaryContents" {
+            continue;
+        }
+        collect_yt_search_items(child, out, seen);
+    }
+}
+
+pub fn parse_yt_initial_data_search_results(data: &Value) -> Vec<SearchResult> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let root = data
+        .pointer("/contents/twoColumnSearchResultsRenderer/primaryContents")
+        .unwrap_or(data);
+    collect_yt_search_items(root, &mut out, &mut seen);
+    out
 }
 
 #[cfg(test)]
@@ -1479,25 +2759,23 @@ fn select_video_thumbnail(value: &Value) -> String {
         .and_then(|items| {
             items
                 .iter()
-                .filter(|item| {
-                    item.get("url")
-                        .and_then(Value::as_str)
-                        .and_then(valid_http_url)
-                        .is_some()
+                .filter_map(|item| {
+                    let raw = item.get("url").and_then(Value::as_str)?;
+                    let norm = normalize_youtube_asset_url(raw);
+                    valid_http_url(&norm)?;
+                    let width = item.get("width").and_then(Value::as_u64).unwrap_or(0);
+                    Some((width, norm))
                 })
-                .min_by_key(|item| {
-                    item.get("width")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0)
-                        .abs_diff(320)
-                })
+                .min_by_key(|(w, _)| w.abs_diff(320))
+                .map(|(_, url)| url)
         })
-        .and_then(|item| item.get("url"))
-        .and_then(Value::as_str)
-        .and_then(valid_http_url)
-        .or_else(|| nonempty_str(value, "thumbnail").and_then(valid_http_url))
-        .unwrap_or("")
-        .to_owned()
+        .or_else(|| {
+            nonempty_str(value, "thumbnail").and_then(|raw| {
+                let norm = normalize_youtube_asset_url(raw);
+                valid_http_url(&norm).is_some().then_some(norm)
+            })
+        })
+        .unwrap_or_default()
 }
 
 fn extract_channel_association(
@@ -1618,6 +2896,26 @@ fn parse_video_entry(
     let (channel_id, channel_url) =
         extract_channel_association(value, fallback_channel_id, fallback_channel_url);
 
+    let live_status = nonempty("live_status");
+    let is_live = value.get("is_live").and_then(Value::as_bool) == Some(true)
+        || live_status == Some("is_live");
+    let concurrent_views = value.get("concurrent_view_count").and_then(Value::as_u64);
+    let view_count = value
+        .get("view_count")
+        .and_then(Value::as_u64)
+        .or(concurrent_views);
+    let channel_verified = value
+        .get("channel_is_verified")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let kind = if url.contains("/shorts/") {
+        SearchResultKind::Short
+    } else if url.contains("playlist?list=") {
+        SearchResultKind::Playlist
+    } else {
+        SearchResultKind::Video
+    };
+
     Some(SearchResult {
         video: Video {
             title: text("title"),
@@ -1627,11 +2925,15 @@ fn parse_video_entry(
             duration,
         },
         metadata: VideoMetadata {
-            view_count: value.get("view_count").and_then(Value::as_u64),
+            view_count,
             upload_date: nonempty("upload_date").map(str::to_owned),
             description: nonempty("description").map(str::to_owned),
             channel_id,
             channel_url,
+            kind,
+            is_live,
+            channel_verified,
+            ..Default::default()
         },
     })
 }
@@ -2479,6 +3781,37 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn home_batch_playlist_url_encoding_and_deduplication_work() {
+        assert_eq!(
+            build_playlist_search_url("The Strokes mix"),
+            "https://www.youtube.com/results?search_query=The+Strokes+mix&sp=EgIQAw%3D%3D"
+        );
+        let fallback_line = br#"{"id":"abcDEF12345","title":"Video","ie_key":"Youtube","url":"https://www.youtube.com/watch?v=abcDEF12345","playlist_channel":"Canal X","playlist_channel_id":"UC1234567890123456789012"}"#;
+        let parsed = parse_home_feed(fallback_line).unwrap();
+        assert_eq!(parsed.items.len(), 1);
+        assert_eq!(parsed.items[0].video.channel, "Canal X");
+        assert_eq!(
+            parsed.items[0].metadata.channel_id.as_deref(),
+            Some("UC1234567890123456789012")
+        );
+
+        let f1 = parse_home_feed(
+            br#"{"id":"dQw4w9WgXcQ","title":"V1","ie_key":"Youtube","url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}
+{"id":"PLabc_123","title":"Mix One","ie_key":"YoutubeTab","url":"https://www.youtube.com/playlist?list=PLabc_123"}"#,
+        )
+        .unwrap();
+        let f2 = parse_home_feed(
+            br#"{"id":"dQw4w9WgXcQ","title":"V1 dup","ie_key":"Youtube","url":"https://youtu.be/dQw4w9WgXcQ"}
+{"id":"xyz12345678","title":"V2","ie_key":"Youtube","url":"https://www.youtube.com/watch?v=xyz12345678"}
+{"id":"PLabc_123","title":"Mix One dup","ie_key":"YoutubeTab","url":"https://www.youtube.com/playlist?list=PLabc_123"}"#,
+        )
+        .unwrap();
+        let merged = merge_home_feeds(vec![f1, f2]);
+        assert_eq!(merged.items.len(), 3);
+        assert_eq!(merged.playlists.len(), 1);
+    }
+
     use std::sync::mpsc;
 
     #[test]
@@ -3009,6 +4342,7 @@ mod tests {
                     description: None,
                     channel_id: None,
                     channel_url: Some(canonical_url.clone()),
+                    ..Default::default()
                 },
             })
             .collect();
@@ -3583,10 +4917,277 @@ mod tests {
                 sort: SearchSort::Views,
                 duration: SearchDurationFilter::Medium,
                 kind: SearchTypeFilter::Videos,
+                ..Default::default()
             },
         );
         assert_eq!(medium_by_views.len(), 2);
         assert_eq!(medium_by_views[0].video.title, "Medium B");
         assert_eq!(medium_by_views[1].video.title, "Medium A");
+    }
+
+    #[test]
+    fn encode_search_sp_matches_official_youtube_tokens() {
+        assert_eq!(encode_search_sp(SearchFilters::default()), None);
+        assert_eq!(
+            encode_search_sp(SearchFilters {
+                sort: SearchSort::Views,
+                ..Default::default()
+            })
+            .as_deref(),
+            Some("CAM=")
+        );
+        assert_eq!(
+            encode_search_sp(SearchFilters {
+                sort: SearchSort::Date,
+                ..Default::default()
+            })
+            .as_deref(),
+            Some("CAI=")
+        );
+        assert_eq!(
+            encode_search_sp(SearchFilters {
+                kind: SearchTypeFilter::Shorts,
+                ..Default::default()
+            })
+            .as_deref(),
+            Some("EgIQCQ==")
+        );
+        assert_eq!(
+            encode_search_sp(SearchFilters {
+                kind: SearchTypeFilter::Channels,
+                ..Default::default()
+            })
+            .as_deref(),
+            Some("EgIQAg==")
+        );
+        assert_eq!(
+            encode_search_sp(SearchFilters {
+                kind: SearchTypeFilter::Playlists,
+                ..Default::default()
+            })
+            .as_deref(),
+            Some("EgIQAw==")
+        );
+        assert_eq!(
+            encode_search_sp(SearchFilters {
+                duration: SearchDurationFilter::Short,
+                ..Default::default()
+            })
+            .as_deref(),
+            Some("EgIYBA==")
+        );
+        assert_eq!(
+            encode_search_sp(SearchFilters {
+                upload_date: SearchUploadDateFilter::Today,
+                ..Default::default()
+            })
+            .as_deref(),
+            Some("EgIIAg==")
+        );
+        assert_eq!(
+            encode_search_sp(SearchFilters {
+                features: SearchFeatureFilters {
+                    live: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .as_deref(),
+            Some("EgJAAQ==")
+        );
+        assert_eq!(
+            encode_search_sp(SearchFilters {
+                sort: SearchSort::Views,
+                kind: SearchTypeFilter::Videos,
+                ..Default::default()
+            })
+            .as_deref(),
+            Some("CAMSAhAB")
+        );
+    }
+
+    #[test]
+    fn parse_yt_initial_data_extracts_live_video_channel_playlist_and_short() {
+        let payload = serde_json::json!({
+            "contents": {
+                "twoColumnSearchResultsRenderer": {
+                    "primaryContents": {
+                        "sectionListRenderer": {
+                            "contents": [{
+                                "itemSectionRenderer": {
+                                    "contents": [
+                                        {
+                                            "videoRenderer": {
+                                                "videoId": "live1234567",
+                                                "title": { "runs": [{ "text": "GEN 1x1 BLG | Worlds 2026" }] },
+                                                "viewCountText": { "runs": [{ "text": "64.100" }, { "text": " assistindo" }] },
+                                                "shortViewCountText": { "runs": [{ "text": "64\u{00a0}mil" }, { "text": " assistindo" }] },
+                                                "ownerText": {
+                                                    "runs": [{
+                                                        "text": "CBLOL",
+                                                        "navigationEndpoint": {
+                                                            "browseEndpoint": {
+                                                                "browseId": "UC48rkW4j4z7N8h3r1bB9wXA",
+                                                                "canonicalBaseUrl": "/@CBLOL"
+                                                            }
+                                                        }
+                                                    }]
+                                                },
+                                                "ownerBadges": [{
+                                                    "metadataBadgeRenderer": {
+                                                        "style": "BADGE_STYLE_TYPE_VERIFIED",
+                                                        "tooltip": "Verificado"
+                                                    }
+                                                }],
+                                                "badges": [
+                                                    { "metadataBadgeRenderer": { "style": "BADGE_STYLE_TYPE_LIVE_NOW", "label": "AO VIVO" } },
+                                                    { "metadataBadgeRenderer": { "style": "BADGE_STYLE_TYPE_SIMPLE", "label": "Novo" } }
+                                                ],
+                                                "detailedMetadataSnippets": [{
+                                                    "snippetText": { "runs": [{ "text": "Final do Worlds 2026 ao vivo." }] }
+                                                }],
+                                                "thumbnail": { "thumbnails": [{ "url": "https://i.ytimg.com/vi/live1234567/hq720.jpg", "width": 720 }] },
+                                                "channelThumbnailSupportedRenderers": {
+                                                    "channelThumbnailWithLinkRenderer": {
+                                                        "thumbnail": { "thumbnails": [{ "url": "//yt3.ggpht.com/cblol=s68", "width": 68 }] },
+                                                        "navigationEndpoint": {
+                                                            "browseEndpoint": {
+                                                                "browseId": "UC48rkW4j4z7N8h3r1bB9wXA",
+                                                                "canonicalBaseUrl": "/@CBLOL"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        {
+                                            "channelRenderer": {
+                                                "channelId": "UCA-UimI-hyK_YVWNgKJsJ_w",
+                                                "title": { "simpleText": "IOM Worlds 2026" },
+                                                "thumbnail": { "thumbnails": [{ "url": "//yt3.ggpht.com/iom=s176", "width": 176 }] },
+                                                "subscriberCountText": { "simpleText": "@IOMWorlds2026" },
+                                                "videoCountText": { "simpleText": "989 inscritos" }
+                                            }
+                                        },
+                                        {
+                                            "lockupViewModel": {
+                                                "contentId": "PLuiPiC1Hk8eLgTHu-INIEjm12_czwvMq4",
+                                                "contentType": "LOCKUP_CONTENT_TYPE_PLAYLIST",
+                                                "metadata": {
+                                                    "lockupMetadataViewModel": {
+                                                        "title": { "content": "Worlds 2026 Jogos" },
+                                                        "metadata": {
+                                                            "contentMetadataViewModel": {
+                                                                "metadataRows": [{
+                                                                    "metadataParts": [{
+                                                                        "text": { "content": "Ilha das Lendas" }
+                                                                    }]
+                                                                }]
+                                                            }
+                                                        }
+                                                    }
+                                                },
+                                                "contentImage": {
+                                                    "collectionThumbnailViewModel": {
+                                                        "primaryThumbnail": {
+                                                            "thumbnailViewModel": {
+                                                                "image": { "sources": [{ "url": "https://i.ytimg.com/vi/abc/hq720.jpg", "width": 720 }] },
+                                                                "overlays": [{
+                                                                    "thumbnailOverlayBadgeViewModel": {
+                                                                        "thumbnailBadges": [{
+                                                                            "thumbnailBadgeViewModel": { "text": "91 v\u{00ed}deos" }
+                                                                        }]
+                                                                    }
+                                                                }]
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        {
+                                            "shortsLockupViewModel": {
+                                                "entityId": "shorts-shelf-item-GtxjVvdMG90",
+                                                "overlayMetadata": {
+                                                    "primaryText": { "content": "Worlds 2026 Short" },
+                                                    "secondaryText": { "content": "4\u{00a0}mil visualiza\u{00e7}\u{00f5}es" }
+                                                }
+                                            }
+                                        }
+                                    ]
+                                }
+                            }]
+                        }
+                    }
+                }
+            }
+        });
+        let items = parse_yt_initial_data_search_results(&payload);
+        assert_eq!(items.len(), 4);
+
+        assert_eq!(items[0].metadata.kind, SearchResultKind::Video);
+        assert!(items[0].metadata.is_live);
+        assert!(items[0].metadata.channel_verified);
+        assert_eq!(
+            items[0].metadata.view_count_text.as_deref(),
+            Some("64 mil assistindo")
+        );
+        assert_eq!(items[0].metadata.badges, vec!["Novo"]);
+        assert_eq!(
+            items[0].metadata.channel_avatar_url.as_deref(),
+            Some("https://yt3.ggpht.com/cblol=s68")
+        );
+
+        assert_eq!(items[1].metadata.kind, SearchResultKind::Channel);
+        assert_eq!(
+            items[1].metadata.subscriber_count_text.as_deref(),
+            Some("@IOMWorlds2026 \u{2022} 989 inscritos")
+        );
+
+        assert_eq!(items[2].metadata.kind, SearchResultKind::Playlist);
+        assert_eq!(
+            items[2].metadata.playlist_count.as_deref(),
+            Some("91 v\u{00ed}deos")
+        );
+
+        assert_eq!(items[3].metadata.kind, SearchResultKind::Short);
+        assert_eq!(
+            items[3].video.url,
+            "https://www.youtube.com/shorts/GtxjVvdMG90"
+        );
+    }
+
+    #[test]
+    fn subtitle_track_cache_and_resolutions_json_parsing_work_together() {
+        let json = serde_json::json!({
+            "formats": [
+                { "vcodec": "none", "height": 0 },
+                { "vcodec": "avc1", "height": 720 },
+                { "vcodec": "vp9", "height": 1080 },
+                { "vcodec": "av01", "height": 1080 },
+                { "vcodec": "avc1", "height": 480 }
+            ],
+            "subtitles": {
+                "pt": [{ "ext": "vtt", "url": "https://www.youtube.com/api/timedtext?v=subcache123&lang=pt&fmt=vtt" }]
+            },
+            "automatic_captions": {
+                "en": [{ "ext": "vtt", "url": "https://www.youtube.com/api/timedtext?v=subcache123&lang=en&fmt=vtt" }]
+            }
+        });
+
+        let heights = parse_resolutions_from_json(&json).unwrap();
+        assert_eq!(heights, vec![1080, 720, 480]);
+
+        let tracks = parse_subtitles(&json);
+        assert_eq!(tracks.len(), 2);
+
+        let watch_url = "https://www.youtube.com/watch?v=subcache123";
+        let short_url = "https://youtu.be/subcache123?t=10";
+        store_cached_subtitle_tracks(watch_url, &tracks);
+        assert_eq!(get_cached_subtitle_tracks(short_url), Some(tracks));
+        assert_eq!(
+            get_cached_subtitle_tracks("https://example.com/not-yt"),
+            None
+        );
     }
 }

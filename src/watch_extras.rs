@@ -65,6 +65,7 @@ struct CommentStateSyncResult {
 #[derive(Default)]
 pub struct CommentTranslation {
     pub translated_text: Option<String>,
+    pub translated_lines: Vec<CachedTimestampLine>,
     pub showing_translated: bool,
     pub loading: bool,
     pub error: Option<String>,
@@ -233,9 +234,91 @@ pub fn extract_timestamps(text: &str) -> Vec<TextTimestamp> {
     found
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedTimestampLine {
+    pub text: String,
+    pub timestamps: Vec<TextTimestamp>,
+}
+
+pub fn parse_timestamp_lines(text: &str) -> Vec<CachedTimestampLine> {
+    text.lines()
+        .map(|line| CachedTimestampLine {
+            text: line.to_owned(),
+            timestamps: extract_timestamps(line),
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+pub struct CachedCommentMeta {
+    pub id: String,
+    pub text_len: usize,
+    pub published: String,
+    pub avatar_name: String,
+    pub handle: String,
+    pub relative_time: String,
+    pub lines: Vec<CachedTimestampLine>,
+    pub measured_height: Option<(i32, u64, f32)>,
+}
+
+impl CachedCommentMeta {
+    fn from_comment(comment: &oauth::Comment) -> Self {
+        let avatar_raw = comment.author.trim_start_matches('@');
+        let avatar_name = if avatar_raw.is_empty() {
+            "YT".to_owned()
+        } else {
+            avatar_raw.to_owned()
+        };
+        let handle = if comment.author.starts_with('@') {
+            comment.author.clone()
+        } else {
+            format!("@{}", comment.author)
+        };
+        let relative_time =
+            crate::recommendations::format_youtube_relative_time(&comment.published, None)
+                .unwrap_or_else(|| comment.published.clone());
+        let lines = parse_timestamp_lines(&comment.text);
+        Self {
+            id: comment.id.clone(),
+            text_len: comment.text.len(),
+            published: comment.published.clone(),
+            avatar_name,
+            handle,
+            relative_time,
+            lines,
+            measured_height: None,
+        }
+    }
+}
+
+pub fn sync_cached_comment_meta(comments: &[oauth::Comment], cache: &mut Vec<CachedCommentMeta>) {
+    let up_to_date = cache.len() == comments.len()
+        && cache.iter().zip(comments.iter()).all(|(cached, item)| {
+            cached.id == item.id
+                && cached.text_len == item.text.len()
+                && cached.published == item.published
+        });
+    if up_to_date {
+        return;
+    }
+    let mut previous_heights: HashMap<String, (i32, u64, f32)> = cache
+        .drain(..)
+        .filter_map(|entry| entry.measured_height.map(|h| (entry.id, h)))
+        .collect();
+    cache.reserve(comments.len());
+    for comment in comments {
+        let mut entry = CachedCommentMeta::from_comment(comment);
+        if let Some(height) = previous_heights.remove(&entry.id) {
+            entry.measured_height = Some(height);
+        }
+        cache.push(entry);
+    }
+}
+
 #[derive(Default)]
 pub struct CommentReplies {
     pub comments: Vec<oauth::Comment>,
+    pub render_cache: Vec<CachedCommentMeta>,
     pub next: Option<String>,
     pub error: Option<String>,
     pub loaded: bool,
@@ -279,6 +362,7 @@ pub struct WatchExtras {
     pub tab: Tab,
     pub sidebar_tab: SidebarTab,
     pub comments: Vec<oauth::Comment>,
+    pub comment_render_cache: Vec<CachedCommentMeta>,
     pub comments_next: Option<String>,
     pub comments_total: Option<u64>,
     pub comments_error: Option<String>,
@@ -569,6 +653,7 @@ impl WatchExtras {
             }
         }
         self.comments.clear();
+        self.comment_render_cache.clear();
         self.comments_next = None;
         self.comments_total = None;
         self.comments_error = None;
@@ -831,6 +916,15 @@ impl WatchExtras {
             let _ = sender.send(search::youtube_subtitles(&url, &cancel));
             ctx.request_repaint();
         });
+    }
+
+    pub fn apply_preloaded_subtitles(&mut self, tracks: Vec<search::SubtitleTrack>) {
+        if self.subtitles_loaded || self.subtitles_loading.is_some() {
+            return;
+        }
+        self.subtitles = tracks;
+        self.subtitles_loaded = true;
+        self.subtitles_error = None;
     }
 
     fn cache_vtt(&mut self, url: &str, vtt: String) {
@@ -1096,6 +1190,7 @@ impl WatchExtras {
         for translation in self.comment_translations.values_mut() {
             match translation.rx.as_ref().map(Receiver::try_recv) {
                 Some(Ok(Ok(translated))) => {
+                    translation.translated_lines = parse_timestamp_lines(&translated);
                     translation.translated_text = Some(translated);
                     translation.showing_translated = true;
                     translation.loading = false;
@@ -1764,5 +1859,65 @@ mod tests {
         assert!(extras.initial_comment_ratings.is_empty());
         assert!(extras.comment_rating_errors.is_empty());
         assert!(extras.comment_translations.is_empty());
+    }
+
+    #[test]
+    fn apply_preloaded_subtitles_populates_state_until_video_changes() {
+        let mut extras = WatchExtras::default();
+        extras.sync_video(Some("https://www.youtube.com/watch?v=video000001"));
+        extras.subtitles_error = Some("Erro anterior".into());
+
+        let tracks = vec![search::SubtitleTrack {
+            language: "en".into(),
+            url: "https://example.com/en.vtt".into(),
+            automatic: true,
+        }];
+        extras.apply_preloaded_subtitles(tracks.clone());
+        assert!(extras.subtitles_loaded);
+        assert!(extras.subtitles_error.is_none());
+        assert_eq!(extras.subtitles, tracks);
+
+        // Should not overwrite once already loaded for the current video.
+        extras.apply_preloaded_subtitles(Vec::new());
+        assert_eq!(extras.subtitles.len(), 1);
+
+        // Switching videos resets subtitle state for the next preload.
+        extras.sync_video(Some("https://www.youtube.com/watch?v=video000002"));
+        assert!(!extras.subtitles_loaded);
+        assert!(extras.subtitles.is_empty());
+    }
+
+    #[test]
+    fn parse_timestamp_lines_and_sync_cached_comment_meta_preserve_measured_heights() {
+        let lines = parse_timestamp_lines("Intro 0:00\nParte 1:25 meio e 2:30 fim");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].timestamps.len(), 1);
+        assert_eq!(lines[0].timestamps[0].seconds, 0);
+        assert_eq!(lines[1].timestamps.len(), 2);
+        assert_eq!(lines[1].timestamps[0].seconds, 85);
+        assert_eq!(lines[1].timestamps[1].seconds, 150);
+
+        let mut c1 = sample_reply("c1");
+        c1.text = "Veja 1:25 agora".into();
+        c1.published = "há 2h".into();
+        let mut cache = Vec::new();
+        sync_cached_comment_meta(std::slice::from_ref(&c1), &mut cache);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[0].lines.len(), 1);
+        assert_eq!(cache[0].lines[0].timestamps[0].seconds, 85);
+
+        cache[0].measured_height = Some((640, 42, 92.0));
+        // Unchanged comments preserve measured height.
+        sync_cached_comment_meta(std::slice::from_ref(&c1), &mut cache);
+        assert_eq!(cache[0].measured_height, Some((640, 42, 92.0)));
+
+        // Editing comment text triggers re-parse of timestamp lines; replacing id clears height.
+        c1.text = "Mudou para 0:45!".into();
+        sync_cached_comment_meta(std::slice::from_ref(&c1), &mut cache);
+        assert_eq!(cache[0].lines[0].timestamps[0].seconds, 45);
+
+        c1.id = "c2".into();
+        sync_cached_comment_meta(&[c1], &mut cache);
+        assert_eq!(cache[0].measured_height, None);
     }
 }

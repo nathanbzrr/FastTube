@@ -7,10 +7,10 @@ use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
 
-const YOUTUBE_ORIGIN: &str = "https://www.youtube.com";
-const INNERTUBE_BASE_URL: &str = "https://www.youtube.com/youtubei/v1";
-const FALLBACK_CLIENT_VERSION: &str = "2.20260901.00.00";
-const WEB_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+pub(crate) const YOUTUBE_ORIGIN: &str = "https://www.youtube.com";
+pub(crate) const INNERTUBE_BASE_URL: &str = "https://www.youtube.com/youtubei/v1";
+pub(crate) const FALLBACK_CLIENT_VERSION: &str = "2.20260901.00.00";
+pub(crate) const WEB_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const MAX_COMMENT_PAGES: usize = 12;
 const MAX_REPLY_PAGES: usize = 12;
 
@@ -218,7 +218,7 @@ fn valid_cookie_value(value: &str) -> bool {
         && !value.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0))
 }
 
-fn extract_json_string_field(text: &str, key: &str) -> Option<String> {
+pub(crate) fn extract_json_string_field(text: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\":\"");
     let start = text.find(&needle)? + needle.len();
     let rest = &text[start..];
@@ -408,7 +408,7 @@ impl InnerTubeError {
     }
 }
 
-fn http_client() -> Result<reqwest::blocking::Client, String> {
+pub(crate) fn http_client() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none())
@@ -509,7 +509,7 @@ pub fn post_innertube_at(
     Ok(json)
 }
 
-fn parse_innertube_error_json(json: &Value, http_status: u16) -> Option<InnerTubeError> {
+pub(crate) fn parse_innertube_error_json(json: &Value, http_status: u16) -> Option<InnerTubeError> {
     let error = json.get("error")?;
     let code = error
         .get("code")

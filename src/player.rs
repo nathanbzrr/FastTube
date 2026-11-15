@@ -1,4 +1,4 @@
-use crate::settings::BufferSettings;
+use crate::settings::{BufferSettings, HwdecMode};
 use eframe::egui::{self, Rect};
 use eframe::egui_glow;
 use eframe::glow;
@@ -21,6 +21,8 @@ type Initialize = unsafe extern "C" fn(*mut c_void) -> c_int;
 type Command = unsafe extern "C" fn(*mut c_void, *const *const c_char) -> c_int;
 type Terminate = unsafe extern "C" fn(*mut c_void);
 type GetProperty = unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_char;
+type GetPropertyTyped =
+    unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_void) -> c_int;
 type SetProperty = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int;
 type Free = unsafe extern "C" fn(*mut c_void);
 type WaitEvent = unsafe extern "C" fn(*mut c_void, f64) -> *const MpvEvent;
@@ -35,6 +37,9 @@ type RenderContextSetUpdateCallback =
     unsafe extern "C" fn(*mut c_void, Option<unsafe extern "C" fn(*mut c_void)>, *mut c_void);
 type GetProcAddress = unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void;
 
+const MPV_FORMAT_FLAG: c_int = 3;
+const MPV_FORMAT_INT64: c_int = 4;
+const MPV_FORMAT_DOUBLE: c_int = 5;
 const MPV_RENDER_PARAM_API_TYPE: c_int = 1;
 const MPV_RENDER_PARAM_OPENGL_INIT_PARAMS: c_int = 2;
 const MPV_RENDER_PARAM_OPENGL_FBO: c_int = 3;
@@ -157,6 +162,9 @@ impl VideoWindow {
         if !rect.is_positive() {
             return;
         }
+        if self.last_rect == Some((rect, scale)) {
+            return;
+        }
         self.last_rect = Some((rect, scale));
         if self.visible {
             self.apply_bounds(rect, scale);
@@ -200,6 +208,7 @@ struct MpvApi {
     command: Command,
     terminate: Terminate,
     get_property: GetProperty,
+    get_property_typed: Option<GetPropertyTyped>,
     set_property: SetProperty,
     free: Free,
     wait_event: WaitEvent,
@@ -234,6 +243,10 @@ impl MpvApi {
                 get_property: *library
                     .get(b"mpv_get_property_string\0")
                     .map_err(|error| error.to_string())?,
+                get_property_typed: library
+                    .get::<GetPropertyTyped>(b"mpv_get_property\0")
+                    .ok()
+                    .map(|symbol| *symbol),
                 set_property: *library
                     .get(b"mpv_set_property_string\0")
                     .map_err(|error| error.to_string())?,
@@ -589,6 +602,7 @@ pub struct Player {
     command: Command,
     terminate: Terminate,
     get_property: GetProperty,
+    get_property_typed: Option<GetPropertyTyped>,
     set_property: SetProperty,
     free: Free,
     wait_event: WaitEvent,
@@ -600,6 +614,7 @@ impl Player {
     pub fn new(
         frame: &eframe::Frame,
         buffer: BufferSettings,
+        hwdec: HwdecMode,
         ctx: &egui::Context,
     ) -> Result<Self, String> {
         let parent = match frame
@@ -612,12 +627,12 @@ impl Player {
         };
         let mut render_error = None;
         if let Some(gl) = frame.gl() {
-            match Self::new_render_api(buffer, ctx, Arc::clone(gl)) {
+            match Self::new_render_api(buffer, hwdec, ctx, Arc::clone(gl)) {
                 Ok(player) => return Ok(player),
                 Err(error) => render_error = Some(error),
             }
         }
-        Self::new_embedded(parent, buffer).map_err(|error| match render_error {
+        Self::new_embedded(parent, buffer, hwdec).map_err(|error| match render_error {
             Some(render_error) => {
                 format!("{error} (a renderização OpenGL do libmpv também falhou: {render_error})")
             }
@@ -651,6 +666,7 @@ impl Player {
 
     fn new_render_api(
         buffer: BufferSettings,
+        hwdec: HwdecMode,
         ctx: &egui::Context,
         gl: Arc<glow::Context>,
     ) -> Result<Self, String> {
@@ -668,13 +684,14 @@ impl Player {
                 command: api.command,
                 terminate: api.terminate,
                 get_property: api.get_property,
+                get_property_typed: api.get_property_typed,
                 set_property: api.set_property,
                 free: api.free,
                 wait_event: api.wait_event,
                 error_string: api.error_string,
                 _library: library,
             };
-            let options = Self::options(buffer, None, true);
+            let options = Self::options(buffer, hwdec, None, true);
             for (name, value) in options {
                 let option_name = CString::new(name).unwrap();
                 let value = CString::new(value).unwrap();
@@ -712,7 +729,11 @@ impl Player {
         }
     }
 
-    fn new_embedded(parent: HWND, buffer: BufferSettings) -> Result<Self, String> {
+    fn new_embedded(
+        parent: HWND,
+        buffer: BufferSettings,
+        hwdec: HwdecMode,
+    ) -> Result<Self, String> {
         let library = Self::load_library()?;
         unsafe {
             let api = MpvApi::load(&library)?;
@@ -729,13 +750,14 @@ impl Player {
                 command: api.command,
                 terminate: api.terminate,
                 get_property: api.get_property,
+                get_property_typed: api.get_property_typed,
                 set_property: api.set_property,
                 free: api.free,
                 wait_event: api.wait_event,
                 error_string: api.error_string,
                 _library: library,
             };
-            let options = Self::options(buffer, Some(wid), false);
+            let options = Self::options(buffer, hwdec, Some(wid), false);
             for (name, value) in options {
                 let option_name = CString::new(name).unwrap();
                 let value = CString::new(value).unwrap();
@@ -771,6 +793,7 @@ impl Player {
 
     fn options(
         buffer: BufferSettings,
+        hwdec: HwdecMode,
         wid: Option<isize>,
         render_api: bool,
     ) -> Vec<(&'static str, String)> {
@@ -786,7 +809,7 @@ impl Player {
             ("input-vo-keyboard", "no".to_owned()),
             ("osc", "no".to_owned()),
             ("terminal", "no".to_owned()),
-            ("hwdec", "auto-safe".to_owned()),
+            ("hwdec", hwdec.as_mpv_value().to_owned()),
             ("demuxer-max-bytes", format!("{}MiB", buffer.max_mib)),
             ("demuxer-max-back-bytes", format!("{}MiB", buffer.back_mib)),
             ("cache-secs", format!("{}", buffer.cache_seconds)),
@@ -874,8 +897,7 @@ impl Player {
         )
     }
 
-    pub fn property(&self, name: &str) -> Option<String> {
-        let name = CString::new(name).ok()?;
+    pub fn property_cstr(&self, name: &CStr) -> Option<String> {
         let value = unsafe { (self.get_property)(self.handle, name.as_ptr()) };
         if value.is_null() {
             return None;
@@ -889,11 +911,74 @@ impl Player {
         Some(text)
     }
 
-    pub fn number(&self, name: &str) -> Option<f64> {
-        self.property(name)?
+    pub fn property(&self, name: &str) -> Option<String> {
+        let name = CString::new(name).ok()?;
+        self.property_cstr(&name)
+    }
+
+    pub fn flag_cstr(&self, name: &CStr) -> Option<bool> {
+        if let Some(get_typed) = self.get_property_typed {
+            let mut value: c_int = 0;
+            let result = unsafe {
+                get_typed(
+                    self.handle,
+                    name.as_ptr(),
+                    MPV_FORMAT_FLAG,
+                    (&raw mut value).cast(),
+                )
+            };
+            if result >= 0 {
+                return Some(value != 0);
+            }
+            return None;
+        }
+        self.property_cstr(name).map(|text| text == "yes")
+    }
+
+    pub fn int_cstr(&self, name: &CStr) -> Option<i64> {
+        if let Some(get_typed) = self.get_property_typed {
+            let mut value: i64 = 0;
+            let result = unsafe {
+                get_typed(
+                    self.handle,
+                    name.as_ptr(),
+                    MPV_FORMAT_INT64,
+                    (&raw mut value).cast(),
+                )
+            };
+            if result >= 0 {
+                return Some(value);
+            }
+            return None;
+        }
+        self.property_cstr(name)?.parse::<i64>().ok()
+    }
+
+    pub fn double_cstr(&self, name: &CStr) -> Option<f64> {
+        if let Some(get_typed) = self.get_property_typed {
+            let mut value: f64 = 0.0;
+            let result = unsafe {
+                get_typed(
+                    self.handle,
+                    name.as_ptr(),
+                    MPV_FORMAT_DOUBLE,
+                    (&raw mut value).cast(),
+                )
+            };
+            if result >= 0 && value.is_finite() {
+                return Some(value);
+            }
+            return None;
+        }
+        self.property_cstr(name)?
             .parse()
             .ok()
             .filter(|value: &f64| value.is_finite())
+    }
+
+    pub fn number(&self, name: &str) -> Option<f64> {
+        let name = CString::new(name).ok()?;
+        self.double_cstr(&name)
     }
 
     pub fn set(&self, name: &str, value: &str) -> Result<(), String> {
@@ -919,8 +1004,13 @@ impl Player {
         url: &str,
         height: Option<u32>,
         default_format: &str,
+        preserve_position: bool,
     ) -> Result<(), String> {
-        let position = self.number("time-pos");
+        let position = if preserve_position {
+            self.number("time-pos")
+        } else {
+            None
+        };
         let format = match height {
             Some(height) => format!(
                 "bestvideo[height={height}]+bestaudio/best[height={height}]/bestvideo[height={height}]"
@@ -1149,19 +1239,29 @@ mod tests {
     #[test]
     fn render_api_options_use_libmpv_vo_and_embedded_options_use_wid() {
         let buffer = BufferProfile::Default.values();
-        let render = Player::options(buffer, None, true);
+        let render = Player::options(buffer, HwdecMode::AutoSafe, None, true);
         assert!(
             render
                 .iter()
                 .any(|(name, value)| *name == "vo" && value == "libmpv")
         );
+        assert!(
+            render
+                .iter()
+                .any(|(name, value)| *name == "hwdec" && value == "auto-safe")
+        );
         assert!(!render.iter().any(|(name, _)| *name == "wid"));
 
-        let embedded = Player::options(buffer, Some(42), false);
+        let embedded = Player::options(buffer, HwdecMode::Software, Some(42), false);
         assert!(
             embedded
                 .iter()
                 .any(|(name, value)| *name == "wid" && value == "42")
+        );
+        assert!(
+            embedded
+                .iter()
+                .any(|(name, value)| *name == "hwdec" && value == "no")
         );
         assert!(!embedded.iter().any(|(name, _)| *name == "vo"));
     }

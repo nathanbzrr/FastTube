@@ -8,7 +8,7 @@ const COMPACT_WATCH_CONTROLS_MAX_WIDTH: f32 = 760.0;
 const COMPACT_NAVIGATION_MIN_VIEWPORT_WIDTH: f32 = 760.0;
 pub(crate) const PERSISTENT_SIDEBAR_MIN_VIEWPORT_WIDTH: f32 = 1312.0;
 const TWO_ROW_HEADER_MAX_WIDTH: f32 = 760.0;
-const SINGLE_COLUMN_BROWSE_MAX_WIDTH: f32 = 680.0;
+pub(crate) const SINGLE_COLUMN_BROWSE_MAX_WIDTH: f32 = 680.0;
 pub(crate) const COMPACT_NAVIGATION_WIDTH: f32 = 72.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,11 +181,11 @@ pub(crate) fn compute_watch_page_columns(
     let content_width = (available_width - 2.0 * margin).max(1.0);
     let secondary_width = (content_width * 0.32).clamp(300.0, WATCH_RECOMMENDATIONS_WIDTH);
     let max_primary_from_width = (content_width - secondary_width - WATCH_PAGE_GAP).max(480.0);
-    let max_primary_from_height = ((available_height - 185.0).max(225.0) * 16.0 / 9.0)
-        .clamp(480.0, 1280.0);
+    let max_primary_from_height =
+        ((available_height - 185.0).max(225.0) * 16.0 / 9.0).clamp(480.0, 1280.0);
     let player_width = max_primary_from_width.min(max_primary_from_height);
-    let effective_secondary = (content_width - player_width - WATCH_PAGE_GAP)
-        .clamp(300.0, WATCH_RECOMMENDATIONS_WIDTH);
+    let effective_secondary =
+        (content_width - player_width - WATCH_PAGE_GAP).clamp(300.0, WATCH_RECOMMENDATIONS_WIDTH);
     WatchColumns {
         mode: WatchLayoutMode::SideBySide,
         primary_width: player_width,
@@ -299,10 +299,5 @@ pub(crate) fn compute_navigation_width(viewport_width: f32) -> f32 {
 }
 
 pub(crate) fn compute_youtube_sidebar_width(viewport_width: f32) -> f32 {
-    if viewport_width < 480.0 {
-        216.0
-    } else {
-        240.0
-    }
+    if viewport_width < 480.0 { 216.0 } else { 240.0 }
 }
-

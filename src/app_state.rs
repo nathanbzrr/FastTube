@@ -4,18 +4,19 @@ use crate::overlay;
 use crate::process;
 use crate::search::{self, ChannelTarget};
 use crate::settings;
+use crate::sponsorblock;
 use crate::{
     ActivePlayback, BackupImportMode, BackupPreview, BrowseSection, BufferProfile,
     ChannelAboutFetchMessage, ChannelFetchMessage, ChannelMoreVideosFetchMessage, ChannelPage,
     ChannelPlaylistVideosFetchMessage, ChannelPlaylistsFetchMessage, ChannelTab,
     ChannelTabVideosFetchMessage, DecodingDiagnostics, FeedDerivedCache, FeedFilter,
-    HISTORY_MIN_POSITION_DELTA_MS, HISTORY_SAVE_INTERVAL, HomeFetchMessage, ImportedUserData,
-    PlaybackPreferences, Queue, QueuePlaybackCorrelation, SearchFetchMessage, SearchResult, Theme,
-    ThemePalette, Video, apply_theme_visuals, buffer_profile_name, buffer_profile_summary,
-    parse_duration_ms,
+    HISTORY_MIN_POSITION_DELTA_MS, HISTORY_SAVE_INTERVAL, HomeBatchFetchMessage, HomeFetchMessage,
+    ImportedUserData, PlaybackPreferences, Queue, QueuePlaybackCorrelation, SearchFetchMessage,
+    SearchResult, Theme, ThemePalette, Video, apply_theme_visuals, buffer_profile_name,
+    buffer_profile_summary, parse_duration_ms,
 };
 use eframe::egui::{self, Color32};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
@@ -24,13 +25,27 @@ pub(crate) struct BrowseFeedState {
     pub(crate) query: String,
     pub(crate) videos: Vec<Video>,
     pub(crate) generation: u64,
+    pub(crate) signal_revision: u64,
+    pub(crate) metadata_revision: u64,
     pub(crate) filter: FeedFilter,
     pub(crate) cache_dirty: bool,
     pub(crate) cache: FeedDerivedCache,
     pub(crate) search: SearchJob,
     pub(crate) home: HomeFeedState,
     pub(crate) search_filters: search::SearchFilters,
+    pub(crate) search_chip: search::SearchChip,
     pub(crate) search_filters_open: bool,
+    pub(crate) search_save_modal_video: Option<Video>,
+    pub(crate) search_report_modal_video: Option<Video>,
+    pub(crate) search_report_reason: Option<usize>,
+    pub(crate) search_report_details: String,
+    pub(crate) search_reported_urls: HashSet<String>,
+    pub(crate) share_modal_video: Option<Video>,
+    pub(crate) share_start_at_enabled: bool,
+    pub(crate) share_start_at_text: String,
+    pub(crate) share_embed_open: bool,
+    pub(crate) share_targets_scroll_offset: f32,
+    pub(crate) share_modal_copied_at: Option<Instant>,
     pub(crate) recent_searches: Vec<String>,
 }
 
@@ -40,13 +55,27 @@ impl Default for BrowseFeedState {
             query: String::new(),
             videos: Vec::new(),
             generation: 0,
+            signal_revision: 0,
+            metadata_revision: 0,
             filter: FeedFilter::All,
             cache_dirty: true,
             cache: FeedDerivedCache::default(),
             search: SearchJob::default(),
             home: HomeFeedState::default(),
             search_filters: search::SearchFilters::default(),
+            search_chip: search::SearchChip::default(),
             search_filters_open: false,
+            search_save_modal_video: None,
+            search_report_modal_video: None,
+            search_report_reason: None,
+            search_report_details: String::new(),
+            search_reported_urls: HashSet::new(),
+            share_modal_video: None,
+            share_start_at_enabled: false,
+            share_start_at_text: "0:00".to_owned(),
+            share_embed_open: false,
+            share_targets_scroll_offset: 0.0,
+            share_modal_copied_at: None,
             recent_searches: Vec::new(),
         }
     }
@@ -60,10 +89,21 @@ pub(crate) struct SearchJob {
     pub(crate) active_request_id: Option<u64>,
 }
 
+pub(crate) type SubscriptionChannelsReceiver = Receiver<(
+    Option<crate::oauth::TokenSession>,
+    Result<Vec<search::HomeChannel>, String>,
+)>;
+
 #[derive(Default)]
 pub(crate) struct HomeFeedState {
     pub(crate) rx: Option<Receiver<HomeFetchMessage>>,
     pub(crate) cancel: Option<process::Cancellation>,
+    pub(crate) batch_rx: Option<Receiver<HomeBatchFetchMessage>>,
+    pub(crate) batch_cancel: Option<process::Cancellation>,
+    pub(crate) batch_next_request_id: u64,
+    pub(crate) batch_active_request_id: Option<u64>,
+    pub(crate) channels_rx: Option<SubscriptionChannelsReceiver>,
+    pub(crate) channels_cancel: Option<process::Cancellation>,
     pub(crate) initial_public_started: bool,
     pub(crate) playlist_urls: Vec<String>,
     pub(crate) title: Option<String>,
@@ -71,7 +111,24 @@ pub(crate) struct HomeFeedState {
     pub(crate) subscription_channels: Vec<search::HomeChannel>,
     pub(crate) subscription_channels_loaded: bool,
     pub(crate) subscription_channels_error: Option<String>,
+    pub(crate) subscriptions_cached_items: Vec<SearchResult>,
+    pub(crate) subscriptions_cached_loaded: bool,
+    pub(crate) subscriptions_cached_at: Option<Instant>,
+    pub(crate) subscriptions_disk_cache_loaded: bool,
+    pub(crate) subscriptions_disk_cache_path: Option<PathBuf>,
+    pub(crate) subscriptions_rss_cache: HashMap<String, crate::oauth::ChannelRssCacheEntry>,
+    pub(crate) subscriptions_next_request_id: u64,
+    pub(crate) subscriptions_active_request_id: Option<u64>,
+    pub(crate) subscriptions_progressive_streaming: bool,
+    pub(crate) subscriptions_refreshing_in_background: bool,
     pub(crate) pending_items: Vec<SearchResult>,
+    pub(crate) cached_items: Vec<SearchResult>,
+    pub(crate) cached_playlists: Vec<String>,
+    pub(crate) cached_loaded: bool,
+    pub(crate) page: usize,
+    pub(crate) has_more: bool,
+    pub(crate) channel_avatars: HashMap<String, String>,
+    pub(crate) shorts_shelf_hidden: bool,
 }
 
 #[derive(Default)]
@@ -205,6 +262,9 @@ pub(crate) type PlaylistActionResultReceiver = Receiver<(
     Result<(Option<(String, String)>, String), String>,
 )>;
 
+pub(crate) type ReportResultReceiver =
+    Receiver<(Option<crate::oauth::TokenSession>, Result<String, String>)>;
+
 #[derive(Default)]
 pub(crate) struct AuthState {
     pub(crate) reauth_rx: Option<Receiver<Result<crate::oauth::TokenSession, String>>>,
@@ -222,6 +282,7 @@ pub(crate) struct AuthState {
     pub(crate) my_channel: Option<ChannelTarget>,
     pub(crate) my_channel_title: Option<String>,
     pub(crate) my_channel_avatar_url: Option<String>,
+    pub(crate) my_channel_subscribers: Option<u64>,
     pub(crate) my_channel_open_when_ready: bool,
     pub(crate) my_channel_fetch_attempted: bool,
     pub(crate) my_channel_rx: Option<MyChannelResultReceiver>,
@@ -231,9 +292,18 @@ pub(crate) struct AuthState {
     pub(crate) remote_playlists_cancel: Option<process::Cancellation>,
     pub(crate) playlist_action_rx: Option<PlaylistActionResultReceiver>,
     pub(crate) playlist_action_cancel: Option<process::Cancellation>,
+    pub(crate) report_rx: Option<ReportResultReceiver>,
+    pub(crate) report_cancel: Option<process::Cancellation>,
     pub(crate) youtube_web_session: Option<crate::comment_actions::YouTubeWebSession>,
     pub(crate) youtube_web_session_checked: bool,
     pub(crate) restore_attempted: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MiniPlayerPendingApply {
+    pub(crate) target_size: egui::Vec2,
+    pub(crate) target_pos: Option<egui::Pos2>,
+    pub(crate) frames_left: u8,
 }
 
 pub(crate) struct PlaybackState {
@@ -241,12 +311,19 @@ pub(crate) struct PlaybackState {
     pub(crate) theater: bool,
     pub(crate) window_visible: bool,
     pub(crate) active_buffer: Option<BufferProfile>,
+    pub(crate) active_hwdec: Option<settings::HwdecMode>,
     pub(crate) mini_player: bool,
     pub(crate) mini_player_restore_size: Option<eframe::egui::Vec2>,
+    pub(crate) mini_player_restore_pos: Option<eframe::egui::Pos2>,
+    pub(crate) mini_player_restore_maximized: bool,
+    pub(crate) mini_player_saved_size: Option<eframe::egui::Vec2>,
+    pub(crate) mini_player_saved_pos: Option<eframe::egui::Pos2>,
+    pub(crate) mini_player_pending_enter: Option<MiniPlayerPendingApply>,
+    pub(crate) mini_player_settled: bool,
     pub(crate) active: Option<ActivePlayback>,
     pub(crate) quality: Option<u32>,
     pub(crate) qualities: Vec<u32>,
-    pub(crate) quality_rx: Option<Receiver<Result<Vec<u32>, String>>>,
+    pub(crate) quality_rx: Option<Receiver<Result<search::VideoPlaybackMetadata, String>>>,
     pub(crate) quality_cancel: Option<process::Cancellation>,
     pub(crate) quality_error: Option<String>,
     pub(crate) seek_drag: Option<f64>,
@@ -261,6 +338,9 @@ pub(crate) struct PlaybackState {
     pub(crate) pending_open_video: Option<Video>,
     pub(crate) diagnostics: DecodingDiagnostics,
     pub(crate) last_diagnostics_poll_at: Option<Instant>,
+    pub(crate) last_video_size_url: Option<String>,
+    pub(crate) last_video_size: Option<crate::VideoSize>,
+    pub(crate) auto_subtitle_attempted: bool,
 }
 
 impl Default for PlaybackState {
@@ -270,8 +350,15 @@ impl Default for PlaybackState {
             theater: false,
             window_visible: false,
             active_buffer: None,
+            active_hwdec: None,
             mini_player: false,
             mini_player_restore_size: None,
+            mini_player_restore_pos: None,
+            mini_player_restore_maximized: false,
+            mini_player_saved_size: None,
+            mini_player_saved_pos: None,
+            mini_player_pending_enter: None,
+            mini_player_settled: false,
             active: None,
             quality: None,
             qualities: Vec::new(),
@@ -290,16 +377,124 @@ impl Default for PlaybackState {
             pending_open_video: None,
             diagnostics: DecodingDiagnostics::unknown(Some(crate::DEFAULT_CONFIGURED_HWDEC)),
             last_diagnostics_poll_at: None,
+            last_video_size_url: None,
+            last_video_size: None,
+            auto_subtitle_attempted: false,
         }
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SettingsTab {
+    #[default]
+    General,
+    Playback,
+    SponsorBlock,
+    Privacy,
+    Storage,
+    BackupDiagnostics,
+}
+
+impl SettingsTab {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::General,
+        Self::Playback,
+        Self::SponsorBlock,
+        Self::Privacy,
+        Self::Storage,
+        Self::BackupDiagnostics,
+    ];
+
+    pub(crate) fn label_pt(self) -> &'static str {
+        match self {
+            Self::General => "Geral e aparência",
+            Self::Playback => "Reprodução e desempenho",
+            Self::SponsorBlock => "SponsorBlock",
+            Self::Privacy => "Conta e privacidade",
+            Self::Storage => "Cache e armazenamento",
+            Self::BackupDiagnostics => "Backup e diagnóstico",
+        }
+    }
+
+    pub(crate) fn subtitle_pt(self) -> &'static str {
+        match self {
+            Self::General => {
+                "Personalize tema, densidade dos cartões, comportamento inicial e atalhos."
+            }
+            Self::Playback => {
+                "Configure velocidade, qualidade, áudio, legendas, hardware e buffer."
+            }
+            Self::SponsorBlock => {
+                "Pule ou destaque automaticamente segmentos enviados pela comunidade."
+            }
+            Self::Privacy => {
+                "Gerencie sua conta Google, OAuth, histórico local e tópicos recomendados."
+            }
+            Self::Storage => {
+                "Escolha a pasta de cache, acompanhe o espaço usado e limpe dados temporários."
+            }
+            Self::BackupDiagnostics => {
+                "Exporte ou restaure backups locais e inspecione diagnósticos do libmpv."
+            }
+        }
+    }
+}
+
 pub(crate) struct SettingsState {
     pub(crate) buffer: BufferSettingsState,
     pub(crate) playback: TrackedSettings<PlaybackPreferences>,
     pub(crate) theme: TrackedSettings<Theme>,
+    pub(crate) prefs: TrackedSettings<settings::AppPreferences>,
     pub(crate) applied_theme: Option<Theme>,
+    pub(crate) active_tab: SettingsTab,
+    pub(crate) search_query: String,
+    pub(crate) confirm_clear_history: bool,
+    pub(crate) confirm_reset_tab: Option<SettingsTab>,
+    pub(crate) cache_dir_input: String,
+    pub(crate) cache_dir_input_synced: bool,
+    pub(crate) cache_picker_rx: Option<Receiver<Result<Option<PathBuf>, String>>>,
+    pub(crate) backup_picker_rx: Option<Receiver<(bool, Result<Option<PathBuf>, String>)>>,
+    pub(crate) oauth_picker_rx: Option<Receiver<Result<Option<PathBuf>, String>>>,
+    pub(crate) oauth_import_status: Option<(bool, String)>,
+    pub(crate) cache_status: Option<String>,
+    pub(crate) storage_action_status: Option<(bool, String)>,
+    pub(crate) cache_disk_usage: Option<(PathBuf, settings::DirUsage, Instant)>,
+    pub(crate) custom_buffer_max_mib: u32,
+    pub(crate) custom_buffer_back_mib: u32,
+    pub(crate) custom_buffer_cache_secs: u32,
+    pub(crate) custom_buffer_synced: bool,
+    pub(crate) pending_reload_video: bool,
+}
+
+impl Default for SettingsState {
+    fn default() -> Self {
+        let defaults = BufferProfile::Default.values();
+        Self {
+            buffer: BufferSettingsState::default(),
+            playback: TrackedSettings::default(),
+            theme: TrackedSettings::default(),
+            prefs: TrackedSettings::default(),
+            applied_theme: None,
+            active_tab: SettingsTab::default(),
+            search_query: String::new(),
+            confirm_clear_history: false,
+            confirm_reset_tab: None,
+            cache_dir_input: String::new(),
+            cache_dir_input_synced: false,
+            cache_picker_rx: None,
+            backup_picker_rx: None,
+            oauth_picker_rx: None,
+            oauth_import_status: None,
+            cache_status: None,
+            storage_action_status: None,
+            cache_disk_usage: None,
+            custom_buffer_max_mib: defaults.max_mib,
+            custom_buffer_back_mib: defaults.back_mib,
+            custom_buffer_cache_secs: defaults.cache_seconds,
+            custom_buffer_synced: false,
+            pending_reload_video: false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -384,6 +579,7 @@ impl Default for QueueState {
 #[derive(Default)]
 pub(crate) struct LibraryState {
     pub(crate) data: crate::library::Library,
+    pub(crate) revision: u64,
     pub(crate) path: Option<PathBuf>,
     pub(crate) error: Option<String>,
     pub(crate) bookmark_note: String,
@@ -403,18 +599,94 @@ pub(crate) struct BackupState {
 #[derive(Default)]
 pub(crate) struct NavigationUiState {
     pub(crate) navigation_open: bool,
+    pub(crate) initial_sidebar_synced: bool,
     pub(crate) search_results_mode: bool,
     pub(crate) settings_open: bool,
     pub(crate) shortcuts_open: bool,
     pub(crate) subscriptions_expanded: bool,
     pub(crate) explore_expanded: bool,
     pub(crate) browse_section: BrowseSection,
+    pub(crate) chips_scroll_offset: f32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CachedMpvSubtitleTrack {
+    pub(crate) id: String,
+    pub(crate) label: String,
+}
+
+#[derive(Default)]
+pub(crate) struct OverlayCache {
+    pub(crate) chapters_video_url: Option<String>,
+    pub(crate) chapters_count: Option<i64>,
+    pub(crate) chapters_last_poll: Option<Instant>,
+    pub(crate) chapters: Vec<overlay::OverlayChapter>,
+    pub(crate) mpv_subs_video_url: Option<String>,
+    pub(crate) mpv_subs_track_count: Option<i64>,
+    pub(crate) mpv_subs_yt_empty: bool,
+    pub(crate) mpv_subs_last_poll: Option<Instant>,
+    pub(crate) mpv_subs: Vec<CachedMpvSubtitleTrack>,
+    pub(crate) force_refresh: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CachedSidebarCard {
+    pub(crate) video: Video,
+    pub(crate) is_playlist: bool,
+    pub(crate) channel_target: Option<ChannelTarget>,
+    pub(crate) progress_ratio: Option<f32>,
+    pub(crate) in_history: bool,
+    pub(crate) is_music: bool,
+    pub(crate) is_new: bool,
+    pub(crate) title_truncated: String,
+    pub(crate) channel_label: Option<String>,
+    pub(crate) subline: Option<String>,
+    pub(crate) measured_height: Option<(i32, f32)>,
+}
+
+#[derive(Default)]
+pub(crate) struct WatchSidebarCache {
+    pub(crate) valid: bool,
+    pub(crate) feed_generation: u64,
+    pub(crate) feed_signal_revision: u64,
+    pub(crate) metadata_revision: u64,
+    pub(crate) feed_videos_len: usize,
+    pub(crate) feed_first_url: Option<String>,
+    pub(crate) channel_target_key: Option<String>,
+    pub(crate) channel_videos_len: usize,
+    pub(crate) selected_url: Option<String>,
+    pub(crate) sidebar_tab: crate::watch_extras::SidebarTab,
+    pub(crate) playlist_urls_len: usize,
+    pub(crate) cards: Vec<CachedSidebarCard>,
+}
+
+#[derive(Default)]
+pub(crate) struct WatchMetadataUiCache {
+    pub(crate) valid: bool,
+    pub(crate) video_url: Option<String>,
+    pub(crate) metadata_revision: u64,
+    pub(crate) live_info_revision: u64,
+    pub(crate) library_revision: u64,
+    pub(crate) is_live: bool,
+    pub(crate) channel_target: Option<ChannelTarget>,
+    pub(crate) channel_id_hint: Option<String>,
+    pub(crate) channel_avatar_url: Option<String>,
+    pub(crate) subscriber_count_text: Option<String>,
+    pub(crate) saved_in_library: bool,
+    pub(crate) stats: Vec<String>,
+    pub(crate) cleaned_description: Option<String>,
+    pub(crate) description_lines: Option<Vec<crate::watch_extras::CachedTimestampLine>>,
 }
 
 #[derive(Default)]
 pub(crate) struct WatchState {
     pub(crate) extras: crate::watch_extras::WatchExtras,
+    pub(crate) live: crate::live_chat::LiveWatchState,
+    pub(crate) sponsorblock: sponsorblock::SponsorBlockRuntime,
     pub(crate) share_copied_at: Option<Instant>,
+    pub(crate) sidebar_cache: WatchSidebarCache,
+    pub(crate) metadata_cache: WatchMetadataUiCache,
+    pub(crate) overlay_cache: OverlayCache,
 }
 
 pub(crate) fn load_playback_settings_from_path(path: &Path) -> Result<PlaybackPreferences, String> {
@@ -430,6 +702,17 @@ pub(crate) fn load_theme_settings_from_path(path: &Path) -> Result<Theme, String
     settings::load_theme(path).map_err(|error| {
         format!(
             "Erro ao ler tema da interface em '{}' ({error}); usando o tema Escuro padrão.",
+            path.display()
+        )
+    })
+}
+
+pub(crate) fn load_app_preferences_from_path(
+    path: &Path,
+) -> Result<settings::AppPreferences, String> {
+    settings::load_app_preferences(path).map_err(|error| {
+        format!(
+            "Erro ao ler preferências em '{}' ({error}); usando os padrões.",
             path.display()
         )
     })
@@ -653,6 +936,72 @@ impl SettingsState {
                 false
             }
         }
+    }
+
+    pub(crate) fn ensure_prefs_synchronized(&mut self) {
+        if self.prefs.loaded_path == self.prefs.path {
+            return;
+        }
+        let had_previous_path = self.prefs.loaded_path.is_some();
+        self.prefs.loaded_path = self.prefs.path.clone();
+        let Some(path) = self.prefs.path.clone() else {
+            return;
+        };
+        match load_app_preferences_from_path(&path) {
+            Ok(loaded) => {
+                if had_previous_path || self.prefs.value == settings::AppPreferences::default() {
+                    self.prefs.value = loaded;
+                    self.cache_dir_input_synced = false;
+                }
+                self.prefs.error = None;
+            }
+            Err(error) => {
+                if had_previous_path {
+                    self.prefs.value = settings::AppPreferences::default();
+                    self.cache_dir_input_synced = false;
+                }
+                self.prefs.error = Some(error);
+            }
+        }
+    }
+
+    pub(crate) fn apply_app_preferences(&mut self, next: settings::AppPreferences) {
+        self.ensure_prefs_synchronized();
+        let normalized = next.normalized();
+        if let Err(validation_err) = normalized.validate() {
+            self.prefs.error = Some(validation_err.to_owned());
+            return;
+        }
+        self.prefs.value = normalized.clone();
+        let save_result = match self.prefs.path.clone().ok_or_else(|| {
+            if cfg!(test) {
+                Err("Caminho de preferências gerais não configurado no teste".to_owned())
+            } else {
+                settings::app_preferences_path().map_err(|error| error.to_string())
+            }
+        }) {
+            Ok(path) => settings::save_app_preferences(&path, &normalized).map_err(|error| {
+                format!(
+                    "Não foi possível salvar preferências em '{}' ({error}); a escolha vale apenas nesta sessão.",
+                    path.display()
+                )
+            }),
+            Err(Ok(path)) => {
+                let res = settings::save_app_preferences(&path, &normalized).map_err(|error| {
+                    format!(
+                        "Não foi possível salvar preferências em '{}' ({error}); a escolha vale apenas nesta sessão.",
+                        path.display()
+                    )
+                });
+                self.prefs.path = Some(path.clone());
+                self.prefs.loaded_path = Some(path);
+                res
+            }
+            Err(Err(error)) => Err(format!(
+                "Não foi possível salvar preferências ({error}); a escolha vale apenas nesta sessão."
+            )),
+        };
+        self.prefs.error = save_result.err();
     }
 }
 
