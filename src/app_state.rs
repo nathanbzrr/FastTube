@@ -47,6 +47,7 @@ pub(crate) struct BrowseFeedState {
     pub(crate) share_targets_scroll_offset: f32,
     pub(crate) share_modal_copied_at: Option<Instant>,
     pub(crate) recent_searches: Vec<String>,
+    pub(crate) search_suggest: SearchSuggestState,
 }
 
 impl Default for BrowseFeedState {
@@ -77,8 +78,30 @@ impl Default for BrowseFeedState {
             share_targets_scroll_offset: 0.0,
             share_modal_copied_at: None,
             recent_searches: Vec::new(),
+            search_suggest: SearchSuggestState::default(),
         }
     }
+}
+
+pub(crate) struct SearchSuggestFetchMessage {
+    pub(crate) request_id: u64,
+    pub(crate) query: String,
+    pub(crate) result: Result<Vec<String>, String>,
+}
+
+#[derive(Default)]
+pub(crate) struct SearchSuggestState {
+    pub(crate) open: bool,
+    pub(crate) last_input_query: String,
+    pub(crate) last_input_at: Option<Instant>,
+    pub(crate) pending_fetch_query: Option<String>,
+    pub(crate) last_fetched_query: String,
+    pub(crate) remote_suggestions: Vec<String>,
+    pub(crate) highlighted_index: Option<usize>,
+    pub(crate) rx: Option<Receiver<SearchSuggestFetchMessage>>,
+    pub(crate) cancel: Option<process::Cancellation>,
+    pub(crate) next_request_id: u64,
+    pub(crate) active_request_id: Option<u64>,
 }
 
 #[derive(Default)]

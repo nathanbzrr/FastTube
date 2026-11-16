@@ -54,6 +54,44 @@ pub struct UserProfile {
     watched_states: HashMap<String, WatchedState>,
     pub active_channel: Option<String>,
     pub active_tokens: HashSet<String>,
+    pub muted_topics: HashSet<String>,
+    pub muted_channels: HashSet<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecommendationReason {
+    ContinueWatching,
+    FrequentChannel,
+    SimilarTopic(String),
+    RelatedToCurrent,
+    RecentFeed,
+    NewToYou,
+    Popular,
+    PlaylistMix,
+}
+
+impl RecommendationReason {
+    pub fn badge_label(&self) -> &'static str {
+        match self {
+            Self::ContinueWatching => "Continuar assistindo",
+            Self::FrequentChannel => "Canal frequente",
+            Self::SimilarTopic(_) => "Tópico semelhante",
+            Self::RelatedToCurrent => "Relacionado ao atual",
+            Self::RecentFeed => "Novo no feed",
+            Self::NewToYou => "Novo canal para você",
+            Self::Popular => "Em alta",
+            Self::PlaylistMix => "Mix recomendado",
+        }
+    }
+
+    pub fn detail_label(&self) -> String {
+        match self {
+            Self::SimilarTopic(topic) if !topic.is_empty() => {
+                format!("Tópico semelhante: {topic}")
+            }
+            _ => self.badge_label().to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -62,6 +100,38 @@ pub struct ScoredVideo {
     pub metadata: VideoMetadata,
     pub score: f64,
     pub is_short: bool,
+    pub reasons: Vec<RecommendationReason>,
+    pub matched_topic: Option<String>,
+}
+
+impl ScoredVideo {
+    pub fn primary_reason_label(&self) -> Option<&'static str> {
+        self.reasons.first().map(RecommendationReason::badge_label)
+    }
+
+    pub fn explanation_tooltip(&self) -> String {
+        if self.reasons.is_empty() {
+            return "Por que este vídeo?\n• Sugestão geral do feed".into();
+        }
+        let mut lines = Vec::with_capacity(self.reasons.len() + 1);
+        lines.push("Por que este vídeo?".to_owned());
+        for reason in self.reasons.iter().take(4) {
+            lines.push(format!("• {}", reason.detail_label()));
+        }
+        lines.join("\n")
+    }
+
+    pub fn primary_topic_hint(&self) -> Option<String> {
+        if let Some(topic) = &self.matched_topic
+            && !topic.trim().is_empty()
+        {
+            return Some(topic.clone());
+        }
+        extract_significant_tokens(&self.video.title)
+            .into_iter()
+            .find(|tok| tok != "shorts")
+            .map(|tok| capitalize_first(&tok))
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -153,7 +223,11 @@ impl UserProfile {
     }
 
     pub fn top_topics(&self, limit: usize) -> Vec<String> {
-        let mut items: Vec<(&String, &f64)> = self.token_weights.iter().collect();
+        let mut items: Vec<(&String, &f64)> = self
+            .token_weights
+            .iter()
+            .filter(|(token, _)| !self.muted_topics.contains(token.as_str()))
+            .collect();
         items.sort_by(|a, b| {
             b.1.partial_cmp(a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -172,8 +246,23 @@ impl UserProfile {
             if key.is_empty() {
                 continue;
             }
+            self.muted_topics.insert(key.clone());
             self.token_weights.remove(&key);
             self.active_tokens.remove(&key);
+        }
+    }
+
+    pub fn apply_muted_channels(&mut self, muted_channels: &[String]) {
+        for raw in muted_channels {
+            let key = normalize_channel_key(raw);
+            if key.is_empty() {
+                continue;
+            }
+            self.muted_channels.insert(key.clone());
+            self.channel_weights.remove(&key);
+            if self.active_channel.as_deref() == Some(key.as_str()) {
+                self.active_channel = None;
+            }
         }
     }
 }
@@ -285,13 +374,15 @@ impl RecommendationEngine {
         reference_epoch: i64,
         filter: &FeedFilter,
     ) -> ScoredVideo {
-        let (score, is_short) =
+        let (score, is_short, reasons, matched_topic) =
             Self::score_single_parts(video, metadata, profile, reference_epoch, filter);
         ScoredVideo {
             video: video.clone(),
             metadata: metadata.cloned().unwrap_or_default(),
             score,
             is_short,
+            reasons,
+            matched_topic,
         }
     }
 
@@ -301,8 +392,9 @@ impl RecommendationEngine {
         profile: &UserProfile,
         reference_epoch: i64,
         filter: &FeedFilter,
-    ) -> (f64, bool) {
+    ) -> (f64, bool, Vec<RecommendationReason>, Option<String>) {
         let mut score = 20.0;
+        let mut reasons: Vec<RecommendationReason> = Vec::new();
 
         let channel_key = normalize_channel_key(&video.channel);
         let video_tokens = extract_significant_tokens(&video.title);
@@ -323,15 +415,36 @@ impl RecommendationEngine {
         }
 
         let mut token_match_sum = 0.0;
+        let mut best_matched_token: Option<(String, f64)> = None;
+        let mut matches_muted_topic = false;
         for token in &video_tokens {
-            if let Some(&w) = profile.token_weights.get(token) {
+            if profile.muted_topics.contains(token.as_str()) {
+                matches_muted_topic = true;
+            } else if let Some(&w) = profile.token_weights.get(token) {
                 token_match_sum += w;
+                if best_matched_token.as_ref().is_none_or(|(_, bw)| w > *bw) {
+                    best_matched_token = Some((token.clone(), w));
+                }
             }
+        }
+        if !matches_muted_topic && !profile.muted_topics.is_empty() {
+            matches_muted_topic = profile.muted_topics.iter().any(|muted| {
+                contains_ignore_case(&video.title, muted)
+                    || contains_ignore_case(&video.channel, muted)
+            });
         }
         if let Some(desc) = metadata.and_then(|m| m.description.as_deref()) {
             for token in extract_significant_tokens(desc).into_iter().take(18) {
-                if let Some(&w) = profile.token_weights.get(&token) {
+                if !profile.muted_topics.contains(token.as_str())
+                    && let Some(&w) = profile.token_weights.get(&token)
+                {
                     token_match_sum += w * 0.25;
+                    if best_matched_token
+                        .as_ref()
+                        .is_none_or(|(_, bw)| w * 0.25 > *bw)
+                    {
+                        best_matched_token = Some((token, w * 0.25));
+                    }
                 }
             }
         }
@@ -340,35 +453,51 @@ impl RecommendationEngine {
             score += boost;
         }
 
-        if let Some(active_ch) = &profile.active_channel
-            && !channel_key.is_empty()
-            && &channel_key == active_ch
-        {
+        let matched_topic = best_matched_token
+            .as_ref()
+            .map(|(tok, _)| capitalize_first(tok))
+            .or_else(|| {
+                video_tokens
+                    .iter()
+                    .find(|tok| {
+                        tok.as_str() != "shorts" && !profile.muted_topics.contains(tok.as_str())
+                    })
+                    .map(|tok| capitalize_first(tok))
+            });
+
+        let active_channel_match = profile
+            .active_channel
+            .as_ref()
+            .is_some_and(|active_ch| !channel_key.is_empty() && &channel_key == active_ch);
+        if active_channel_match {
             score += 15.0;
         }
+        let mut active_shared = 0usize;
         if !profile.active_tokens.is_empty() {
-            let shared = video_tokens
+            active_shared = video_tokens
                 .iter()
                 .filter(|t| profile.active_tokens.contains(*t))
                 .count();
-            if shared > 0 {
-                let boost = (shared as f64 * 6.5).min(20.0);
+            if active_shared > 0 {
+                let boost = (active_shared as f64 * 6.5).min(20.0);
                 score += boost;
             }
         }
 
+        let mut freshness_boost = 0.0;
         if let Some(upload_raw) = metadata.and_then(|m| m.upload_date.as_deref())
             && let Some(upload_epoch) = parse_upload_date_epoch(upload_raw)
         {
             let age_hours = ((reference_epoch - upload_epoch).max(0) as f64) / 3600.0;
-            let freshness = 32.0 * (-age_hours / 84.0).exp();
-            score += freshness;
+            freshness_boost = 32.0 * (-age_hours / 84.0).exp();
+            score += freshness_boost;
         }
 
+        let mut pop_boost = 0.0;
         if let Some(views) = metadata.and_then(|m| m.view_count)
             && views > 0
         {
-            let pop_boost = ((views as f64 + 1.0).log10() * 2.2).min(13.0);
+            pop_boost = ((views as f64 + 1.0).log10() * 2.2).min(13.0);
             score += pop_boost;
         }
 
@@ -384,6 +513,7 @@ impl RecommendationEngine {
             score += ratio * 5.0;
         }
 
+        let mut in_progress = false;
         if let Some(video_id) = history::youtube_video_id(&video.url) {
             match profile.watched_states.get(&video_id) {
                 Some(WatchedState::Completed) => {
@@ -391,6 +521,7 @@ impl RecommendationEngine {
                 }
                 Some(WatchedState::InProgress(_)) => {
                     score += 14.0;
+                    in_progress = true;
                 }
                 None => {}
             }
@@ -406,22 +537,82 @@ impl RecommendationEngine {
         if matches!(filter, FeedFilter::All) && video.url.contains("playlist?list=") {
             score += 6.5;
         }
+        if matches_muted_topic && !matches!(filter, FeedFilter::Topic(_)) {
+            score -= 120.0;
+        }
 
-        (score, is_short)
+        if in_progress {
+            reasons.push(RecommendationReason::ContinueWatching);
+        }
+        if channel_affinity > 0.0 {
+            reasons.push(RecommendationReason::FrequentChannel);
+        }
+        if let Some((topic_tok, _)) = &best_matched_token
+            && token_match_sum > 0.0
+        {
+            reasons.push(RecommendationReason::SimilarTopic(capitalize_first(
+                topic_tok,
+            )));
+        }
+        if active_channel_match || active_shared > 0 {
+            reasons.push(RecommendationReason::RelatedToCurrent);
+        }
+        if freshness_boost >= 10.0 {
+            reasons.push(RecommendationReason::RecentFeed);
+        }
+        if matches!(filter, FeedFilter::NewToYou) && channel_affinity == 0.0 {
+            reasons.push(RecommendationReason::NewToYou);
+        }
+        if video.url.contains("playlist?list=") {
+            reasons.push(RecommendationReason::PlaylistMix);
+        }
+        if pop_boost >= 10.0 {
+            reasons.push(RecommendationReason::Popular);
+        }
+        if reasons.is_empty() {
+            reasons.push(RecommendationReason::RecentFeed);
+        }
+
+        (score, is_short, reasons, matched_topic)
     }
 
+    #[allow(dead_code)]
     pub fn available_chips(
         videos: &[Video],
         metadata_map: &HashMap<String, VideoMetadata>,
         profile: &UserProfile,
     ) -> Vec<FeedFilter> {
-        let mut chips = vec![
-            FeedFilter::All,
+        Self::available_chips_with_pinned(videos, metadata_map, profile, &[])
+    }
+
+    pub fn available_chips_with_pinned(
+        videos: &[Video],
+        metadata_map: &HashMap<String, VideoMetadata>,
+        profile: &UserProfile,
+        pinned_topics: &[String],
+    ) -> Vec<FeedFilter> {
+        let mut chips = vec![FeedFilter::All];
+        let mut seen_topic_keys: HashSet<String> = HashSet::new();
+
+        for raw in pinned_topics {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let key = trimmed.to_lowercase();
+            if seen_topic_keys.insert(key) {
+                chips.push(FeedFilter::Topic(trimmed.to_owned()));
+            }
+        }
+
+        for base in [
             FeedFilter::Gaming,
             FeedFilter::Podcasts,
             FeedFilter::Music,
             FeedFilter::Mixes,
-        ];
+        ] {
+            chips.push(base);
+        }
 
         let mut dynamic_topics = profile.top_topics(2);
         if dynamic_topics.is_empty() {
@@ -432,6 +623,10 @@ impl RecommendationEngine {
             }
         }
         for topic in dynamic_topics {
+            let key = topic.trim().to_lowercase();
+            if !seen_topic_keys.insert(key) {
+                continue;
+            }
             let filter = FeedFilter::Topic(topic);
             if !chips.contains(&filter) {
                 chips.push(filter);
@@ -708,7 +903,7 @@ impl RecommendationEngine {
                 .map(|(idx, orig_idx)| {
                     let video = videos[orig_idx];
                     let meta = metadata_map.get(&video.url);
-                    let (mut score, is_short) = Self::score_single_parts(
+                    let (mut score, is_short, _, _) = Self::score_single_parts(
                         video,
                         meta,
                         profile,
@@ -749,7 +944,7 @@ impl RecommendationEngine {
             .map(|(idx, orig_idx)| {
                 let video = videos[orig_idx];
                 let meta = metadata_map.get(&video.url);
-                let (mut score, is_short) = Self::score_single_parts(
+                let (mut score, is_short, _, _) = Self::score_single_parts(
                     video,
                     meta,
                     profile,
@@ -896,6 +1091,8 @@ impl RecommendationEngine {
                 metadata: metadata_map.get(&video.url).cloned().unwrap_or_default(),
                 score,
                 is_short,
+                reasons: Vec::new(),
+                matched_topic: None,
             }
         })
         .collect()
@@ -922,6 +1119,12 @@ pub fn matches_filter(
     profile: &UserProfile,
     filter: &FeedFilter,
 ) -> bool {
+    if !matches!(filter, FeedFilter::Channel(_)) && !profile.muted_channels.is_empty() {
+        let ch_key = normalize_channel_key(&video.channel);
+        if !ch_key.is_empty() && profile.muted_channels.contains(&ch_key) {
+            return false;
+        }
+    }
     match filter {
         FeedFilter::All | FeedFilter::Recommended | FeedFilter::RecentlyUploaded => true,
         FeedFilter::Shorts => is_short_video(video, metadata),
@@ -1761,5 +1964,66 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, FeedFilter::Topic(t) if t.eq_ignore_ascii_case("rust")))
         );
+    }
+
+    #[test]
+    fn muted_channels_filter_out_videos_and_muted_topics_demote_candidates() {
+        let mut profile = UserProfile {
+            channel_weights: HashMap::from([
+                ("canal chato".to_owned(), 4.0),
+                ("canal legal".to_owned(), 2.0),
+            ]),
+            token_weights: HashMap::from([("rust".to_owned(), 4.0)]),
+            ..UserProfile::default()
+        };
+        profile.apply_muted_channels(&["  Canal Chato ".to_owned()]);
+        profile.apply_muted_topics(&["cripto".to_owned()]);
+
+        let videos = vec![
+            sample_video("m_ch", "Vídeo qualquer", "Canal Chato", "8:00"),
+            sample_video("m_top", "Cripto moedas hoje", "Canal Legal", "9:00"),
+            sample_video("keep1", "Rust Async na Prática", "Canal Legal", "12:00"),
+        ];
+        let ranked =
+            RecommendationEngine::rank_videos(&videos, &HashMap::new(), &profile, &FeedFilter::All);
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].video.title, "Rust Async na Prática");
+        assert_eq!(ranked[1].video.title, "Cripto moedas hoje");
+        assert!(ranked[0].primary_reason_label().is_some());
+        assert!(
+            ranked[0]
+                .reasons
+                .contains(&RecommendationReason::FrequentChannel)
+        );
+        assert!(
+            ranked[0]
+                .reasons
+                .iter()
+                .any(|r| matches!(r, RecommendationReason::SimilarTopic(_)))
+        );
+        assert!(ranked[0].explanation_tooltip().contains("Canal frequente"));
+    }
+
+    #[test]
+    fn available_chips_with_pinned_places_pinned_topics_without_duplicates() {
+        let profile = UserProfile {
+            token_weights: HashMap::from([("rust".to_owned(), 5.0), ("linux".to_owned(), 4.0)]),
+            ..UserProfile::default()
+        };
+        let pinned = vec!["Rust".to_owned(), "  Música Indie ".to_owned()];
+        let chips = RecommendationEngine::available_chips_with_pinned(
+            &[],
+            &HashMap::new(),
+            &profile,
+            &pinned,
+        );
+        assert_eq!(chips[0], FeedFilter::All);
+        assert_eq!(chips[1], FeedFilter::Topic("Rust".to_owned()));
+        assert_eq!(chips[2], FeedFilter::Topic("Música Indie".to_owned()));
+        let rust_count = chips
+            .iter()
+            .filter(|c| matches!(c, FeedFilter::Topic(t) if t.eq_ignore_ascii_case("rust")))
+            .count();
+        assert_eq!(rust_count, 1);
     }
 }

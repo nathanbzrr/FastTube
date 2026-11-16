@@ -140,6 +140,7 @@ pub struct LiveWatchState {
     pub messages: VecDeque<LiveChatMessage>,
     pub seen_ids: HashSet<String>,
     pub auto_scroll: bool,
+    pub filter_query: String,
     pub composer_draft: String,
     pub send_error: Option<String>,
     pub sending: bool,
@@ -147,6 +148,31 @@ pub struct LiveWatchState {
     pub stream_cancel: Option<Cancellation>,
     pub send_rx: Option<Receiver<LiveChatSendEvent>>,
     pub send_cancel: Option<Cancellation>,
+}
+
+pub fn message_matches_filter(msg: &LiveChatMessage, query: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let needle = trimmed.to_lowercase();
+    let author_lower = msg.author_name.to_lowercase();
+    if author_lower.contains(&needle)
+        || needle
+            .strip_prefix('@')
+            .is_some_and(|stripped| !stripped.is_empty() && author_lower.contains(stripped))
+    {
+        return true;
+    }
+    if msg.text.to_lowercase().contains(&needle) {
+        return true;
+    }
+    if let LiveChatMessageKind::Membership { header_subtext } = &msg.kind
+        && header_subtext.to_lowercase().contains(&needle)
+    {
+        return true;
+    }
+    false
 }
 
 impl LiveWatchState {
@@ -182,11 +208,20 @@ impl LiveWatchState {
         self.messages.clear();
         self.seen_ids.clear();
         self.auto_scroll = true;
+        self.filter_query.clear();
         self.composer_draft.clear();
         self.send_error = None;
         self.sending = false;
         self.stream_rx = None;
         self.send_rx = None;
+    }
+
+    #[allow(dead_code)]
+    pub fn filtered_messages(&self) -> Vec<&LiveChatMessage> {
+        self.messages
+            .iter()
+            .filter(|msg| message_matches_filter(msg, &self.filter_query))
+            .collect()
     }
 
     pub fn stop_chat_stream(&mut self) {
@@ -1830,5 +1865,51 @@ mod tests {
         assert_eq!(sent[0].text, "gg CBLOL");
 
         server.join().unwrap();
+    }
+
+    #[test]
+    fn live_chat_message_filtering_matches_author_and_keyword_and_resets() {
+        let mut state = LiveWatchState::default();
+        state.push_message(LiveChatMessage {
+            id: "1".into(),
+            author_name: "@Tiago".into(),
+            author_channel_id: None,
+            author_avatar_url: None,
+            badges: vec![],
+            text: "Bora time!".into(),
+            timestamp_text: None,
+            kind: LiveChatMessageKind::Text,
+        });
+        state.push_message(LiveChatMessage {
+            id: "2".into(),
+            author_name: "AnaMod".into(),
+            author_channel_id: None,
+            author_avatar_url: None,
+            badges: vec![LiveChatBadgeKind::Moderator],
+            text: "Respeitem as regras do chat".into(),
+            timestamp_text: None,
+            kind: LiveChatMessageKind::Text,
+        });
+
+        assert_eq!(state.filtered_messages().len(), 2);
+
+        state.filter_query = "regras".into();
+        let by_keyword = state.filtered_messages();
+        assert_eq!(by_keyword.len(), 1);
+        assert_eq!(by_keyword[0].id, "2");
+
+        state.filter_query = "@anamod".into();
+        let by_handle = state.filtered_messages();
+        assert_eq!(by_handle.len(), 1);
+        assert_eq!(by_handle[0].id, "2");
+
+        state.filter_query = "TIAGO".into();
+        let by_author = state.filtered_messages();
+        assert_eq!(by_author.len(), 1);
+        assert_eq!(by_author[0].id, "1");
+
+        state.reset_for_video(None, None);
+        assert!(state.filter_query.is_empty());
+        assert!(state.messages.is_empty());
     }
 }

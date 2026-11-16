@@ -6735,3 +6735,830 @@ fn sign_out_clears_subscriptions_memory_rss_and_disk_cache() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn continue_watching_shelf_renders_non_shorts_excludes_near_end_and_resumes() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    app.history.data = History::default();
+    app.feed.videos = vec![Video {
+        title: "Short em Andamento".into(),
+        channel: "Shorts Canal".into(),
+        url: "https://www.youtube.com/shorts/ccccccccccc".into(),
+        thumbnail: String::new(),
+        duration: "0:30".into(),
+    }];
+    let _ = app.history.data.record(history::Entry {
+        video_id: "aaaaaaaaaaa".into(),
+        title: "Guia Completo de Rust".into(),
+        channel: "Dev Canal".into(),
+        position_ms: 120_000,
+        duration_ms: Some(300_000),
+    });
+    let _ = app.history.data.record(history::Entry {
+        video_id: "bbbbbbbbbbb".into(),
+        title: "Video Quase Terminado".into(),
+        channel: "Dev Canal".into(),
+        position_ms: 295_000,
+        duration_ms: Some(300_000),
+    });
+    let _ = app.history.data.record(history::Entry {
+        video_id: "ccccccccccc".into(),
+        title: "Short em Andamento".into(),
+        channel: "Shorts Canal".into(),
+        position_ms: 15_000,
+        duration_ms: Some(30_000),
+    });
+
+    let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(960.0, 480.0));
+    let mut out = egui::FullOutput::default();
+    for _ in 0..2 {
+        out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                let _ = app.continue_watching_ui(ui, &ctx);
+            },
+        );
+        out.textures_delta.clear();
+    }
+    let rects = collect_rendered_text_rects(&out.shapes);
+    let rendered = rects
+        .iter()
+        .map(|(t, _)| t.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("Continuar assistindo"),
+        "missing shelf title:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Guia Completo de Rust"),
+        "missing in-progress video:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Restam 3:00"),
+        "missing remaining time indicator:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Video Quase Terminado"),
+        "near-end video should be excluded:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Short em Andamento"),
+        "Shorts should be excluded from Continue Watching shelf:\n{rendered}"
+    );
+
+    let title_pos = rects
+        .iter()
+        .find(|(t, _)| t.contains("Guia Completo de Rust"))
+        .map(|(_, r)| r.center())
+        .unwrap();
+    let mut chosen = None;
+    let click_events = vec![
+        egui::Event::PointerMoved(title_pos),
+        egui::Event::PointerButton {
+            pos: title_pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        },
+        egui::Event::PointerButton {
+            pos: title_pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        },
+    ];
+    let mut click_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: click_events,
+            ..Default::default()
+        },
+        |ui| {
+            chosen = app.continue_watching_ui(ui, &ctx);
+        },
+    );
+    click_out.textures_delta.clear();
+    assert_eq!(
+        chosen.as_ref().map(|v| v.url.as_str()),
+        Some("https://www.youtube.com/watch?v=aaaaaaaaaaa")
+    );
+
+    // Click "Concluir" and verify the entry is marked watched and toast emitted.
+    let done_pos = rects
+        .iter()
+        .find(|(t, _)| t == "Concluir")
+        .map(|(_, r)| r.center())
+        .unwrap();
+    let done_events = vec![
+        egui::Event::PointerMoved(done_pos),
+        egui::Event::PointerButton {
+            pos: done_pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        },
+        egui::Event::PointerButton {
+            pos: done_pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        },
+    ];
+    let mut done_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: done_events,
+            ..Default::default()
+        },
+        |ui| {
+            let _ = app.continue_watching_ui(ui, &ctx);
+        },
+    );
+    done_out.textures_delta.clear();
+    let updated_entry = app.history.data.get("aaaaaaaaaaa").unwrap();
+    assert!(updated_entry.is_near_end());
+    assert!(!app.toasts.is_empty());
+}
+
+#[test]
+fn home_cards_show_explainability_badge_mute_actions_and_pinned_topics() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    let mut sub_video = test_sub_result(
+        "ddddddddddd",
+        "Rust Async Deep Dive",
+        "Canal Favorito",
+        "UCfavorito123456789012",
+    );
+    sub_video.metadata.description = Some("Tutorial de Rust e tecnologia".into());
+    app.feed.videos = vec![sub_video.video.clone()];
+    app.video_metadata
+        .insert(sub_video.video.url.clone(), sub_video.metadata);
+
+    let _ = app.history.data.record(history::Entry {
+        video_id: "eeeeeeeeeee".into(),
+        title: "Rust Basics".into(),
+        channel: "Canal Favorito".into(),
+        position_ms: 400_000,
+        duration_ms: Some(600_000),
+    });
+    app.toggle_pinned_topic("Rust");
+    assert!(app.is_topic_pinned("Rust"));
+
+    let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1024.0, 720.0));
+    let mut out = egui::FullOutput::default();
+    for _ in 0..2 {
+        out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                app.filter_chips_bar_ui(ui, &ctx);
+                let _ = app.home_grid_ui(ui, &ctx);
+            },
+        );
+        out.textures_delta.clear();
+    }
+    let rendered = collect_rendered_text_rects(&out.shapes)
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("Por que este vídeo?"),
+        "missing explainability badge:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("📌 Rust"),
+        "missing pinned topic chip indicator:\n{rendered}"
+    );
+
+    app.mute_channel_preference("Canal Favorito");
+    app.mute_topic_preference("Rust");
+    assert!(
+        app.settings
+            .prefs
+            .value
+            .muted_channels
+            .iter()
+            .any(|c| c == "canal favorito")
+    );
+    assert!(
+        app.settings
+            .prefs
+            .value
+            .muted_topics
+            .iter()
+            .any(|t| t == "rust")
+    );
+    app.ensure_feed_cache();
+    let rank_entry = app
+        .feed
+        .cache
+        .ranked
+        .iter()
+        .find(|s| s.video.url == sub_video.video.url);
+    assert!(
+        rank_entry.is_none_or(|s| s.score < 0.0),
+        "muted channel + topic should downrank the video"
+    );
+}
+
+#[test]
+fn search_dropdown_supports_keyboard_nav_recent_delete_and_ignores_stale_suggest() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    let palette = app.palette();
+    app.feed.recent_searches = vec!["rust egui".into(), "fastube player".into()];
+    app.feed.query = "rust".into();
+
+    // Validate stale request_id filtering in poll_search_suggestions.
+    let (tx, rx) = mpsc::channel();
+    app.feed.search_suggest.rx = Some(rx);
+    app.feed.search_suggest.active_request_id = Some(5);
+    tx.send(app_state::SearchSuggestFetchMessage {
+        request_id: 4,
+        query: "rust".into(),
+        result: Ok(vec!["stale suggestion".into()]),
+    })
+    .unwrap();
+    app.poll_search_suggestions(&ctx);
+    assert!(app.feed.search_suggest.remote_suggestions.is_empty());
+
+    let (tx2, rx2) = mpsc::channel();
+    app.feed.search_suggest.rx = Some(rx2);
+    app.feed.search_suggest.active_request_id = Some(6);
+    tx2.send(app_state::SearchSuggestFetchMessage {
+        request_id: 6,
+        query: "rust".into(),
+        result: Ok(vec!["rust tutorial".into()]),
+    })
+    .unwrap();
+    app.poll_search_suggestions(&ctx);
+    assert_eq!(
+        app.feed.search_suggest.remote_suggestions,
+        vec!["rust tutorial".to_owned()]
+    );
+
+    // Focus search box via click and verify merged suggestions render.
+    let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(960.0, 600.0));
+    let mut pre_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            app.header_search_ui(ui, &ctx, palette, 420.0);
+        },
+    );
+    pre_out.textures_delta.clear();
+    let pre_rects = collect_rendered_text_rects(&pre_out.shapes);
+    let click_input_pos = pre_rects
+        .iter()
+        .find(|(t, _)| t == "rust")
+        .map(|(_, r)| egui::pos2(r.right() + 20.0, r.center().y))
+        .expect("expected search input text rect");
+    let mut click_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(click_input_pos),
+                egui::Event::PointerButton {
+                    pos: click_input_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: click_input_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            app.header_search_ui(ui, &ctx, palette, 420.0);
+        },
+    );
+    click_out.textures_delta.clear();
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            app.header_search_ui(ui, &ctx, palette, 420.0);
+        },
+    );
+    out.textures_delta.clear();
+    let rects = collect_rendered_text_rects(&out.shapes);
+    let rendered = rects
+        .iter()
+        .map(|(t, _)| t.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("rust egui") && rendered.contains("rust tutorial"),
+        "dropdown should show merged recent + remote suggestions:\n{rendered}"
+    );
+
+    // Delete the recent search entry via its "×" button in the dropdown.
+    let del_pos = rects
+        .iter()
+        .filter(|(t, r)| t == "\u{00d7}" && r.top() > click_input_pos.y + 18.0)
+        .map(|(_, r)| r.center())
+        .next()
+        .expect("expected delete × button on recent search dropdown row");
+    let mut del_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(del_pos),
+                egui::Event::PointerButton {
+                    pos: del_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: del_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            app.header_search_ui(ui, &ctx, palette, 420.0);
+        },
+    );
+    del_out.textures_delta.clear();
+    assert!(
+        !app.feed.recent_searches.iter().any(|r| r == "rust egui"),
+        "clicking × should remove the recent search entry"
+    );
+
+    // Re-focus input, let focus settle, then press ArrowDown + Enter to submit suggestion.
+    let mut refocus_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(click_input_pos),
+                egui::Event::PointerButton {
+                    pos: click_input_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: click_input_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            app.header_search_ui(ui, &ctx, palette, 420.0);
+        },
+    );
+    refocus_out.textures_delta.clear();
+    let mut down_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::Key {
+                key: egui::Key::ArrowDown,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        },
+        |ui| {
+            app.header_search_ui(ui, &ctx, palette, 420.0);
+        },
+    );
+    down_out.textures_delta.clear();
+    assert_eq!(app.feed.search_suggest.highlighted_index, Some(0));
+
+    let mut enter_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        },
+        |ui| {
+            app.header_search_ui(ui, &ctx, palette, 420.0);
+        },
+    );
+    enter_out.textures_delta.clear();
+    assert_eq!(app.feed.query, "rust tutorial");
+    assert!(app.ui.search_results_mode);
+    if let Some(cancel) = app.feed.search.cancel.take() {
+        cancel.cancel();
+    }
+}
+
+#[test]
+fn shorts_watch_page_supports_jk_navigation_index_counter_and_loop_toggle() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    let s1 = Video {
+        title: "Short Um".into(),
+        channel: "Canal Shorts".into(),
+        url: "https://www.youtube.com/shorts/short000001".into(),
+        thumbnail: String::new(),
+        duration: "0:25".into(),
+    };
+    let s2 = Video {
+        title: "Short Dois".into(),
+        channel: "Canal Shorts".into(),
+        url: "https://www.youtube.com/shorts/short000002".into(),
+        thumbnail: String::new(),
+        duration: "0:30".into(),
+    };
+    let s3 = Video {
+        title: "Short Tres".into(),
+        channel: "Canal Shorts".into(),
+        url: "https://www.youtube.com/shorts/short000003".into(),
+        thumbnail: String::new(),
+        duration: "0:35".into(),
+    };
+    app.feed.videos = vec![s1.clone(), s2.clone(), s3.clone()];
+    app.ui.browse_section = BrowseSection::Shorts;
+    app.feed.filter = recommendations::FeedFilter::Shorts;
+    app.selected = Some(s1.clone());
+
+    let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1024.0, 760.0));
+    let mut out = egui::FullOutput::default();
+    for _ in 0..2 {
+        out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                let _ = app.shorts_watch_page_ui(ui, &ctx);
+            },
+        );
+        out.textures_delta.clear();
+    }
+    let rects = collect_rendered_text_rects(&out.shapes);
+    let rendered = rects
+        .iter()
+        .map(|(t, _)| t.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("1 / 3"),
+        "missing index pill:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Loop"),
+        "missing Loop toggle button:\n{rendered}"
+    );
+
+    // Click "🔁 Loop" button.
+    let loop_pos = rects
+        .iter()
+        .find(|(t, _)| t.contains("Loop"))
+        .map(|(_, r)| r.center())
+        .unwrap();
+    let mut loop_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(loop_pos),
+                egui::Event::PointerButton {
+                    pos: loop_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: loop_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            let _ = app.shorts_watch_page_ui(ui, &ctx);
+        },
+    );
+    loop_out.textures_delta.clear();
+    assert!(app.playback.loop_video);
+    assert!(!app.toasts.is_empty());
+
+    // Press J to advance to next Short.
+    let mut next_short = None;
+    let mut j_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::Key {
+                key: egui::Key::J,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        },
+        |ui| {
+            next_short = app.shorts_watch_page_ui(ui, &ctx);
+        },
+    );
+    j_out.textures_delta.clear();
+    assert_eq!(next_short.as_ref().map(|v| &v.url), Some(&s2.url));
+
+    // Switch to s2, verify "2 / 3" and press K to return to s1.
+    app.selected = Some(s2);
+    let mut prev_short = None;
+    let mut out2 = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::Key {
+                key: egui::Key::K,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        },
+        |ui| {
+            prev_short = app.shorts_watch_page_ui(ui, &ctx);
+        },
+    );
+    out2.textures_delta.clear();
+    let rendered2 = collect_rendered_text_rects(&out2.shapes)
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered2.contains("2 / 3"),
+        "missing 2 / 3 pill:\n{rendered2}"
+    );
+    assert_eq!(prev_short.as_ref().map(|v| &v.url), Some(&s1.url));
+}
+
+#[test]
+fn live_chat_panel_filters_messages_and_shows_scroll_paused_pill() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    let video = Video {
+        title: "Live".into(),
+        channel: "Canal".into(),
+        url: "https://www.youtube.com/watch?v=live1234567".into(),
+        thumbnail: String::new(),
+        duration: "Ao vivo".into(),
+    };
+    app.selected = Some(video.clone());
+    app.watch.live.video_url = Some(video.url);
+    app.watch.live.video_id = Some("live1234567".into());
+    app.watch.live.chat_visible = true;
+    app.watch.live.auto_scroll = true;
+    for i in 0..24 {
+        app.watch.live.push_message(live_chat::LiveChatMessage {
+            id: format!("m{i}"),
+            author_name: if i == 0 {
+                "@alice".into()
+            } else {
+                format!("@user{i}")
+            },
+            author_channel_id: None,
+            author_avatar_url: None,
+            badges: vec![],
+            text: if i == 0 {
+                "Alguem curte Rust aqui?".into()
+            } else {
+                format!("Mensagem comum numero {i}")
+            },
+            timestamp_text: None,
+            kind: live_chat::LiveChatMessageKind::Text,
+        });
+    }
+
+    // Verify keyword filtering shows only matching messages.
+    app.watch.live.filter_query = "rust".into();
+    let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(420.0, 420.0));
+    let mut out = egui::FullOutput::default();
+    for _ in 0..2 {
+        out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                app.watch_live_chat_panel_ui(ui, &ctx, 380.0, 360.0);
+            },
+        );
+        out.textures_delta.clear();
+    }
+    let filtered_text = collect_rendered_text_rects(&out.shapes)
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(filtered_text.contains("Alguem curte Rust aqui?"));
+    assert!(!filtered_text.contains("Mensagem comum numero 15"));
+
+    // Verify empty filter state message.
+    app.watch.live.filter_query = "naoexiste_xyz".into();
+    let mut out_empty = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            app.watch_live_chat_panel_ui(ui, &ctx, 380.0, 360.0);
+        },
+    );
+    out_empty.textures_delta.clear();
+    let empty_text = collect_rendered_text_rects(&out_empty.shapes)
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(empty_text.contains("Nenhuma mensagem corresponde ao filtro."));
+
+    // Clear filter and scroll away from bottom while auto_scroll is false to see the floating pill.
+    app.watch.live.filter_query.clear();
+    app.watch.live.auto_scroll = false;
+    for _ in 0..2 {
+        out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                app.watch_live_chat_panel_ui(ui, &ctx, 380.0, 360.0);
+            },
+        );
+        out.textures_delta.clear();
+    }
+    let rects = collect_rendered_text_rects(&out.shapes);
+    let pill_text: String = rects
+        .iter()
+        .map(|(t, _)| t.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        pill_text.contains("Rolagem pausada"),
+        "expected scroll-paused floating pill:\n{pill_text}"
+    );
+    let pill_pos = rects
+        .iter()
+        .find(|(t, _)| t.contains("Rolagem pausada"))
+        .map(|(_, r)| r.center())
+        .unwrap();
+    let mut pill_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(pill_pos),
+                egui::Event::PointerButton {
+                    pos: pill_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: pill_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            app.watch_live_chat_panel_ui(ui, &ctx, 380.0, 360.0);
+        },
+    );
+    pill_out.textures_delta.clear();
+    assert!(app.watch.live.auto_scroll);
+}
+
+#[test]
+fn toast_stack_renders_caps_at_three_dismisses_and_expires() {
+    let ctx = egui::Context::default();
+    let app = FastTube::default();
+    let palette = app.palette();
+    let mut mgr = toast::ToastManager::with_limits(Duration::from_secs(3), 3);
+    let t0 = Instant::now();
+
+    mgr.push_at(toast::ToastKind::Info, "Um", Duration::from_secs(3), t0);
+    mgr.push_at(
+        toast::ToastKind::Success,
+        "Dois",
+        Duration::from_secs(3),
+        t0,
+    );
+    mgr.push_at(
+        toast::ToastKind::Warning,
+        "Tres",
+        Duration::from_secs(3),
+        t0,
+    );
+    mgr.push_at(
+        toast::ToastKind::Error,
+        "Quatro",
+        Duration::from_secs(3),
+        t0,
+    );
+    assert_eq!(mgr.len(), 3);
+
+    let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+    let t_show = t0 + Duration::from_millis(200);
+    let mut out = egui::FullOutput::default();
+    for _ in 0..2 {
+        out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |_| {
+                mgr.show_at(&ctx, &palette, t_show);
+            },
+        );
+        out.textures_delta.clear();
+    }
+    let rects = collect_rendered_text_rects(&out.shapes);
+    let rendered = rects
+        .iter()
+        .map(|(t, _)| t.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!rendered.contains("Um"), "oldest toast should be evicted");
+    assert!(rendered.contains("Dois"));
+    assert!(rendered.contains("Tres"));
+    assert!(rendered.contains("Quatro"));
+
+    // Click the dismiss "×" button on the first visible toast.
+    let close_pos = rects
+        .iter()
+        .find(|(t, _)| t == "\u{00d7}")
+        .map(|(_, r)| r.center())
+        .unwrap();
+    let mut close_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(close_pos),
+                egui::Event::PointerButton {
+                    pos: close_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: close_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |_| {
+            mgr.show_at(&ctx, &palette, t_show);
+        },
+    );
+    close_out.textures_delta.clear();
+    assert_eq!(mgr.len(), 2);
+
+    // Advance past duration and verify remaining toasts auto-expire.
+    let t_expired = t0 + Duration::from_secs(4);
+    let mut exp_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |_| {
+            mgr.show_at(&ctx, &palette, t_expired);
+        },
+    );
+    exp_out.textures_delta.clear();
+    assert!(mgr.is_empty());
+}

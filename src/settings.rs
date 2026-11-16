@@ -391,6 +391,8 @@ pub struct AppPreferences {
     pub auto_subtitles: bool,
     pub preferred_subtitle_lang: String,
     pub muted_topics: Vec<String>,
+    pub muted_channels: Vec<String>,
+    pub pinned_topics: Vec<String>,
     pub pause_watch_history: bool,
     pub pause_recommendations: bool,
     pub hide_shorts_in_home: bool,
@@ -414,6 +416,8 @@ impl Default for AppPreferences {
             auto_subtitles: false,
             preferred_subtitle_lang: "pt".to_owned(),
             muted_topics: Vec::new(),
+            muted_channels: Vec::new(),
+            pinned_topics: Vec::new(),
             pause_watch_history: false,
             pause_recommendations: false,
             hide_shorts_in_home: false,
@@ -435,6 +439,28 @@ impl AppPreferences {
             .map(|topic| topic.trim().to_lowercase())
             .filter(|topic| !topic.is_empty() && seen_topics.insert(topic.clone()))
             .take(100)
+            .collect();
+        let mut seen_channels = std::collections::HashSet::new();
+        self.muted_channels = self
+            .muted_channels
+            .into_iter()
+            .map(|ch| ch.trim().to_lowercase())
+            .filter(|ch| !ch.is_empty() && seen_channels.insert(ch.clone()))
+            .take(100)
+            .collect();
+        let mut seen_pinned = std::collections::HashSet::new();
+        self.pinned_topics = self
+            .pinned_topics
+            .into_iter()
+            .filter_map(|topic| {
+                let trimmed = topic.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                let key = trimmed.to_lowercase();
+                seen_pinned.insert(key).then(|| trimmed.to_owned())
+            })
+            .take(24)
             .collect();
         self.cache_dir_override = self
             .cache_dir_override
@@ -463,6 +489,22 @@ impl AppPreferences {
                 .any(|topic| topic.trim().is_empty() || topic.len() > 64)
         {
             return Err("lista de tópicos silenciados inválida");
+        }
+        if self.muted_channels.len() > 100
+            || self
+                .muted_channels
+                .iter()
+                .any(|ch| ch.trim().is_empty() || ch.len() > 128)
+        {
+            return Err("lista de canais silenciados inválida");
+        }
+        if self.pinned_topics.len() > 24
+            || self
+                .pinned_topics
+                .iter()
+                .any(|topic| topic.trim().is_empty() || topic.len() > 64)
+        {
+            return Err("lista de tópicos fixados inválida");
         }
         if let Some(dir) = &self.cache_dir_override {
             let trimmed = dir.trim();
@@ -1146,6 +1188,8 @@ mod tests {
         assert!(!legacy.auto_subtitles);
         assert_eq!(legacy.preferred_subtitle_lang, "pt");
         assert!(legacy.muted_topics.is_empty());
+        assert!(legacy.muted_channels.is_empty());
+        assert!(legacy.pinned_topics.is_empty());
 
         let invalid_vol = AppPreferences {
             default_volume_percent: 101,
@@ -1160,6 +1204,8 @@ mod tests {
             auto_subtitles: true,
             preferred_subtitle_lang: " EN ".into(),
             muted_topics: vec!["  Rust ".into(), "rust".into(), "Gaming".into()],
+            muted_channels: vec!["  Canal X ".into(), "canal x".into(), "Canal Y".into()],
+            pinned_topics: vec!["  Rust ".into(), "rust".into(), "Música".into()],
             ..AppPreferences::default()
         };
         save_app_preferences(&path, &custom).unwrap();
@@ -1170,6 +1216,8 @@ mod tests {
         assert!(loaded.auto_subtitles);
         assert_eq!(loaded.preferred_subtitle_lang, "en");
         assert_eq!(loaded.muted_topics, vec!["rust", "gaming"]);
+        assert_eq!(loaded.muted_channels, vec!["canal x", "canal y"]);
+        assert_eq!(loaded.pinned_topics, vec!["Rust", "Música"]);
 
         let _ = fs::remove_dir_all(&dir);
     }
