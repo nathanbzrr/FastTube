@@ -275,6 +275,29 @@ impl ThumbnailCache {
         size: Vec2,
         corner_radius: f32,
     ) -> egui::Response {
+        self.show_rounded_mode(ui, ctx, uri, size, corner_radius, false)
+    }
+
+    pub fn show_cover_rounded(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        uri: &str,
+        size: Vec2,
+        corner_radius: f32,
+    ) -> egui::Response {
+        self.show_rounded_mode(ui, ctx, uri, size, corner_radius, true)
+    }
+
+    fn show_rounded_mode(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        uri: &str,
+        size: Vec2,
+        corner_radius: f32,
+        cover: bool,
+    ) -> egui::Response {
         let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
         response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
 
@@ -315,7 +338,11 @@ impl ThumbnailCache {
                 texture_id: Some(texture_id),
             }) => {
                 if is_visible {
-                    paint_fitted_texture_rounded(ui, rect, texture_id, size, corner_radius);
+                    if cover {
+                        paint_cover_texture_rounded(ui, rect, texture_id, size, corner_radius);
+                    } else {
+                        paint_fitted_texture_rounded(ui, rect, texture_id, size, corner_radius);
+                    }
                 }
             }
             Some(EntryState::Ready { .. } | EntryState::Loading { .. }) => {
@@ -329,13 +356,23 @@ impl ThumbnailCache {
                                 };
                             }
                             if is_visible {
-                                paint_fitted_texture_rounded(
-                                    ui,
-                                    rect,
-                                    texture_id,
-                                    size,
-                                    corner_radius,
-                                );
+                                if cover {
+                                    paint_cover_texture_rounded(
+                                        ui,
+                                        rect,
+                                        texture_id,
+                                        size,
+                                        corner_radius,
+                                    );
+                                } else {
+                                    paint_fitted_texture_rounded(
+                                        ui,
+                                        rect,
+                                        texture_id,
+                                        size,
+                                        corner_radius,
+                                    );
+                                }
                             }
                         }
                         PollOutcome::Pending => {
@@ -549,8 +586,8 @@ impl ThumbnailCache {
 
     fn poll_texture(ctx: &egui::Context, uri: &str) -> PollOutcome {
         let size_hint = egui::SizeHint::Size {
-            width: 720,
-            height: 405,
+            width: 1280,
+            height: 720,
             maintain_aspect_ratio: true,
         };
         match ctx.try_load_texture(uri, egui::TextureOptions::LINEAR, size_hint) {
@@ -622,6 +659,40 @@ fn paint_fitted_texture_rounded(
     } else {
         let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
         ui.painter().image(texture_id, target, uv, Color32::WHITE);
+    }
+}
+
+fn paint_cover_texture_rounded(
+    ui: &mut egui::Ui,
+    bounds: Rect,
+    texture_id: egui::TextureId,
+    intrinsic_size: [u32; 2],
+    corner_radius: f32,
+) {
+    let tex_w = intrinsic_size[0].max(1) as f32;
+    let tex_h = intrinsic_size[1].max(1) as f32;
+    let bounds_w = bounds.width().max(1.0);
+    let bounds_h = bounds.height().max(1.0);
+    let tex_aspect = tex_w / tex_h;
+    let bounds_aspect = bounds_w / bounds_h;
+    let uv = if (tex_aspect - bounds_aspect).abs() < 1e-4 {
+        Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0))
+    } else if tex_aspect > bounds_aspect {
+        let visible_fraction = (bounds_aspect / tex_aspect).clamp(0.0, 1.0);
+        let pad = (1.0 - visible_fraction) * 0.5;
+        Rect::from_min_max(Pos2::new(pad, 0.0), Pos2::new(1.0 - pad, 1.0))
+    } else {
+        let visible_fraction = (tex_aspect / bounds_aspect).clamp(0.0, 1.0);
+        let pad = (1.0 - visible_fraction) * 0.5;
+        Rect::from_min_max(Pos2::new(0.0, pad), Pos2::new(1.0, 1.0 - pad))
+    };
+    if corner_radius > 0.0 {
+        egui::Image::from_texture((texture_id, bounds.size()))
+            .uv(uv)
+            .corner_radius(corner_radius)
+            .paint_at(ui, bounds);
+    } else {
+        ui.painter().image(texture_id, bounds, uv, Color32::WHITE);
     }
 }
 
@@ -755,8 +826,8 @@ impl AvatarCache {
         }
 
         let size_hint = egui::SizeHint::Size {
-            width: 96,
-            height: 96,
+            width: 176,
+            height: 176,
             maintain_aspect_ratio: true,
         };
         match ctx.try_load_texture(trimmed, egui::TextureOptions::LINEAR, size_hint) {

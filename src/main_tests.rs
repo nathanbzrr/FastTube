@@ -2457,6 +2457,7 @@ fn channel_page_displays_real_data_without_inventing_missing_fields() {
         verified: Some(true),
         tags: Vec::new(),
         videos: Vec::new(),
+        ..Default::default()
     };
     assert_eq!(channel_page_display_title(&full_page), "Blender Foundation");
     assert_eq!(
@@ -2482,6 +2483,7 @@ fn channel_page_displays_real_data_without_inventing_missing_fields() {
         verified: None,
         tags: Vec::new(),
         videos: Vec::new(),
+        ..Default::default()
     };
     assert_eq!(channel_page_display_title(&sparse_page), "@SparseCreator");
     assert_eq!(
@@ -2588,6 +2590,7 @@ fn concurrent_searches_and_channel_fetches_ignore_stale_results_and_handle_error
             video: videos[0].clone(),
             metadata: VideoMetadata::default(),
         }],
+        ..Default::default()
     };
     let page_b = ChannelPage {
         target: valid_b.clone(),
@@ -2613,6 +2616,7 @@ fn concurrent_searches_and_channel_fetches_ignore_stale_results_and_handle_error
                 ..Default::default()
             },
         }],
+        ..Default::default()
     };
 
     // Stale response A must be ignored.
@@ -2723,6 +2727,7 @@ fn starting_a_search_cancels_in_flight_channel_request() {
         verified: None,
         tags: Vec::new(),
         videos: Vec::new(),
+        ..Default::default()
     };
     let _ = tx_channel.send(ChannelFetchMessage {
         request_id: channel_request,
@@ -2891,6 +2896,7 @@ fn channel_view_preserves_navigation_queue_player_themes_history_and_thumbnail_c
                 ..Default::default()
             },
         }],
+        ..Default::default()
     };
     assert!(app.complete_channel_request(req_id, &valid_target, Ok(channel_page), &ctx));
     assert!(!app.is_channel_loading());
@@ -3018,6 +3024,7 @@ fn channel_progressive_videos_pagination_playlists_and_about_tabs_work_and_prese
         verified: Some(true),
         tags: Vec::new(),
         videos: vec![v1.clone(), v2.clone()],
+        ..Default::default()
     };
     assert!(app.complete_channel_request(req_id, &valid_target, Ok(initial_page), &ctx));
     assert!(app.channels.videos.has_more);
@@ -3168,6 +3175,7 @@ fn channel_progressive_videos_pagination_playlists_and_about_tabs_work_and_prese
         banner_url: Some("https://yt3.googleusercontent.com/banner.jpg".into()),
         verified: Some(true),
         tags: vec!["blender".into(), "3d".into(), "open source".into()],
+        ..Default::default()
     };
     assert!(app.complete_channel_about(about_req_id, &valid_target, Ok(about_info)));
     assert!(!app.is_channel_about_loading());
@@ -3181,9 +3189,17 @@ fn channel_progressive_videos_pagination_playlists_and_about_tabs_work_and_prese
         Some("Blender Foundation is the non-profit organization behind Blender 3D.")
     );
 
-    // Render all three tabs in headless UI (Dark and Light themes).
+    // Render all channel tabs in headless UI.
     let base_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
-    for tab in [ChannelTab::Videos, ChannelTab::Playlists, ChannelTab::About] {
+    for tab in [
+        ChannelTab::Home,
+        ChannelTab::Videos,
+        ChannelTab::Shorts,
+        ChannelTab::Streams,
+        ChannelTab::Playlists,
+        ChannelTab::Search,
+        ChannelTab::About,
+    ] {
         app.channels.tab = tab;
         let mut output = ctx.run_ui(
             egui::RawInput {
@@ -3236,6 +3252,246 @@ fn channel_progressive_videos_pagination_playlists_and_about_tabs_work_and_prese
         }),
     ));
     assert!(app.channels.videos.has_more);
+}
+
+#[test]
+fn channel_home_shelves_sort_chips_inline_search_and_about_modal_work_headless() {
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+
+    let target = ChannelTarget::Handle("@Thebausffs".into());
+    let (req_id, valid_target) = app.begin_channel_request(target, &ctx).unwrap();
+
+    let featured = SearchResult {
+        video: Video {
+            title: "THE ULTIMATE SION GUIDE | Thebausffs".into(),
+            channel: "Thebausffs".into(),
+            url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+            thumbnail: "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg".into(),
+            duration: "33:44".into(),
+        },
+        metadata: VideoMetadata {
+            channel_id: Some("UC38IQsAvIsxxjztdMZQtwHA".into()),
+            channel_url: Some("https://www.youtube.com/@Thebausffs".into()),
+            view_count: Some(2_500_000),
+            upload_date: Some("20201106".into()),
+            description: Some("Sion matchup sheet and guide.".into()),
+            ..Default::default()
+        },
+    };
+    let latest_low = SearchResult {
+        video: Video {
+            title: "THE BEST GRAGAS YOU WILL EVER SEE!".into(),
+            channel: "Thebausffs".into(),
+            url: "https://www.youtube.com/watch?v=9bZkp7q19f0".into(),
+            thumbnail: "https://i.ytimg.com/vi/9bZkp7q19f0/hqdefault.jpg".into(),
+            duration: "14:39".into(),
+        },
+        metadata: VideoMetadata {
+            view_count: Some(314_000),
+            upload_date: Some("20261110".into()),
+            ..Default::default()
+        },
+    };
+    let popular_high = SearchResult {
+        video: Video {
+            title: "EUW CHALLENGER SION MONTAGE".into(),
+            channel: "Thebausffs".into(),
+            url: "https://www.youtube.com/watch?v=3JZ_D3ELwOQ".into(),
+            thumbnail: "https://i.ytimg.com/vi/3JZ_D3ELwOQ/hqdefault.jpg".into(),
+            duration: "12:05".into(),
+        },
+        metadata: VideoMetadata {
+            view_count: Some(1_850_000),
+            upload_date: Some("20240101".into()),
+            ..Default::default()
+        },
+    };
+    let short_item = SearchResult {
+        video: Video {
+            title: "SOLOBOLO! #shorts".into(),
+            channel: "Thebausffs".into(),
+            url: "https://www.youtube.com/shorts/abcdefghijk".into(),
+            thumbnail: "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg".into(),
+            duration: "0:35".into(),
+        },
+        metadata: VideoMetadata {
+            view_count: Some(420_000),
+            ..Default::default()
+        },
+    };
+
+    let page = ChannelPage {
+        target: valid_target.clone(),
+        channel_id: Some("UC38IQsAvIsxxjztdMZQtwHA".into()),
+        title: Some("Thebausffs".into()),
+        handle: Some("@Thebausffs".into()),
+        canonical_url: "https://www.youtube.com/@Thebausffs".into(),
+        description: Some("Hey guys it's me Thebausffs EUW challenger OTP full AD Sion.".into()),
+        description_preview: Some(
+            "Hey guys it's me Thebausffs EUW challenger OTP full AD Sion.".into(),
+        ),
+        subscriber_count: Some(1_120_000),
+        subscriber_count_text: Some("1,12 mi de inscritos".into()),
+        video_count_text: Some("1,2 mil vídeos".into()),
+        view_count_text: Some("420.000.000 visualizações".into()),
+        country: Some("Suécia".into()),
+        joined_date_text: Some("Inscreveu-se em 15 de mar. de 2016".into()),
+        links: vec![
+            search::ChannelExternalLink {
+                title: "Twitch".into(),
+                url: "https://www.twitch.tv/thebausffs".into(),
+            },
+            search::ChannelExternalLink {
+                title: "Discord".into(),
+                url: "https://discord.gg/thebausffs".into(),
+            },
+        ],
+        more_links_label: Some("e mais 1 link".into()),
+        featured_video: Some(featured.clone()),
+        home_shelves: vec![
+            search::ChannelHomeShelf {
+                title: "Vídeos".into(),
+                subtitle: None,
+                kind: search::ChannelShelfKind::Videos,
+                playlist_id: None,
+                items: vec![latest_low.clone(), popular_high.clone()],
+            },
+            search::ChannelHomeShelf {
+                title: "Shorts".into(),
+                subtitle: None,
+                kind: search::ChannelShelfKind::Shorts,
+                playlist_id: None,
+                items: vec![short_item.clone()],
+            },
+        ],
+        has_shorts_tab: true,
+        has_streams_tab: true,
+        has_playlists_tab: true,
+        banner_url: Some("https://yt3.googleusercontent.com/baus_banner.jpg".into()),
+        avatar_url: Some("https://yt3.googleusercontent.com/baus_avatar.jpg".into()),
+        verified: Some(true),
+        videos: vec![latest_low.clone(), popular_high.clone()],
+        ..Default::default()
+    };
+
+    assert!(app.complete_channel_request(req_id, &valid_target, Ok(page), &ctx));
+    assert_eq!(app.channels.tab, ChannelTab::Home);
+    assert_eq!(
+        app.metadata_for(&featured.video.url)
+            .and_then(|m| m.view_count),
+        Some(2_500_000)
+    );
+    assert_eq!(
+        app.metadata_for(&short_item.video.url)
+            .and_then(|m| m.view_count),
+        Some(420_000)
+    );
+    assert!(app.channels.about.info.is_some());
+
+    // Local fallback sorting when continuation tokens are absent.
+    assert!(!app.start_channel_sorted_videos(search::ChannelVideosSort::Popular, &ctx));
+    assert_eq!(app.channels.videos.sort, search::ChannelVideosSort::Popular);
+    assert_eq!(app.channels.videos.sorted_items.len(), 2);
+    assert_eq!(
+        app.channels.videos.sorted_items[0].video.url,
+        popular_high.video.url
+    );
+
+    assert!(!app.start_channel_sorted_videos(search::ChannelVideosSort::Oldest, &ctx));
+    assert_eq!(app.channels.videos.sort, search::ChannelVideosSort::Oldest);
+    assert_eq!(
+        app.channels.videos.sorted_items[0].video.url,
+        popular_high.video.url
+    );
+    assert_eq!(
+        app.channels.videos.sorted_items[1].video.url,
+        latest_low.video.url
+    );
+
+    assert!(!app.start_channel_sorted_videos(search::ChannelVideosSort::Latest, &ctx));
+    assert_eq!(app.channels.videos.sort, search::ChannelVideosSort::Latest);
+
+    // Remote continuation sort lifecycle & stale rejection.
+    if let Some(p) = app.channels.page.as_mut() {
+        p.videos_popular_continuation = Some("CONT_POPULAR_TOKEN".into());
+    }
+    assert!(app.start_channel_sorted_videos(search::ChannelVideosSort::Popular, &ctx));
+    let active_sort_req = app.channels.videos.active_sorted_request_id.unwrap();
+    assert!(!app.complete_channel_sorted_videos(
+        active_sort_req + 99,
+        &valid_target,
+        search::ChannelVideosSort::Popular,
+        Ok(vec![latest_low.clone()]),
+    ));
+    assert!(app.complete_channel_sorted_videos(
+        active_sort_req,
+        &valid_target,
+        search::ChannelVideosSort::Popular,
+        Ok(vec![popular_high.clone()]),
+    ));
+    assert_eq!(app.channels.videos.sorted_items.len(), 1);
+    assert_eq!(
+        app.channels.videos.sorted_items[0].video.url,
+        popular_high.video.url
+    );
+
+    // Inline channel search lifecycle (empty query cancels, valid query opens Search tab).
+    assert!(!app.start_channel_search("   ", &ctx));
+    assert!(app.start_channel_search("sion", &ctx));
+    assert_eq!(app.channels.tab, ChannelTab::Search);
+    assert_eq!(app.channels.search.query, "sion");
+    let search_req_id = app.channels.search.active_request_id.unwrap();
+    assert!(!app.complete_channel_search(
+        search_req_id + 1,
+        &valid_target,
+        "sion".into(),
+        Ok(Vec::new()),
+    ));
+    assert!(app.complete_channel_search(
+        search_req_id,
+        &valid_target,
+        "sion".into(),
+        Ok(vec![featured.clone()]),
+    ));
+    assert!(app.channels.search.loaded);
+    assert_eq!(app.channels.search.items.len(), 1);
+
+    // Render Home, Videos, Search, and the About modal in both Dark and Light themes.
+    app.channels.about_modal_open = true;
+    let base_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1360.0, 900.0));
+    for theme in [Theme::Dark, Theme::Light] {
+        app.apply_theme(theme);
+        app.sync_theme_visuals(&ctx);
+        for tab in [ChannelTab::Home, ChannelTab::Videos, ChannelTab::Search] {
+            app.channels.tab = tab;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(base_rect),
+                    ..Default::default()
+                },
+                |ui| {
+                    let ctx = ui.ctx().clone();
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let _ = app.channel_section_ui(
+                            ui,
+                            &ctx,
+                            "test_baus_channel_ui",
+                            false,
+                            Some(BROWSE_MAX_CONTENT_WIDTH),
+                        );
+                    });
+                    app.channel_about_modal_ui(&ctx);
+                },
+            );
+            output.textures_delta.clear();
+        }
+    }
+
+    // Closing channel view resets modal state cleanly.
+    app.close_channel_view();
+    assert!(!app.channels.about_modal_open);
 }
 
 #[test]

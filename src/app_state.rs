@@ -8,12 +8,12 @@ use crate::sponsorblock;
 use crate::{
     ActivePlayback, BackupImportMode, BackupPreview, BrowseSection, BufferProfile,
     ChannelAboutFetchMessage, ChannelFetchMessage, ChannelMoreVideosFetchMessage, ChannelPage,
-    ChannelPlaylistVideosFetchMessage, ChannelPlaylistsFetchMessage, ChannelTab,
-    ChannelTabVideosFetchMessage, DecodingDiagnostics, FeedDerivedCache, FeedFilter,
-    HISTORY_MIN_POSITION_DELTA_MS, HISTORY_SAVE_INTERVAL, HomeBatchFetchMessage, HomeFetchMessage,
-    ImportedUserData, PlaybackPreferences, Queue, QueuePlaybackCorrelation, SearchFetchMessage,
-    SearchResult, Theme, ThemePalette, Video, apply_theme_visuals, buffer_profile_name,
-    buffer_profile_summary, parse_duration_ms,
+    ChannelPlaylistVideosFetchMessage, ChannelPlaylistsFetchMessage, ChannelSearchFetchMessage,
+    ChannelSortedVideosFetchMessage, ChannelTab, ChannelTabVideosFetchMessage, DecodingDiagnostics,
+    FeedDerivedCache, FeedFilter, HISTORY_MIN_POSITION_DELTA_MS, HISTORY_SAVE_INTERVAL,
+    HomeBatchFetchMessage, HomeFetchMessage, ImportedUserData, PlaybackPreferences, Queue,
+    QueuePlaybackCorrelation, SearchFetchMessage, SearchResult, Theme, ThemePalette, Video,
+    apply_theme_visuals, buffer_profile_name, buffer_profile_summary, parse_duration_ms,
 };
 use eframe::egui::{self, Color32};
 use std::collections::{HashMap, HashSet};
@@ -141,6 +141,7 @@ pub(crate) struct ChannelState {
     pub(crate) page: Option<ChannelPage>,
     pub(crate) view_open: bool,
     pub(crate) tab: ChannelTab,
+    pub(crate) about_modal_open: bool,
     pub(crate) next_request_id: u64,
     pub(crate) loading_target: Option<crate::ChannelTarget>,
     pub(crate) last_target: Option<crate::ChannelTarget>,
@@ -153,6 +154,7 @@ pub(crate) struct ChannelState {
     pub(crate) playlists: ChannelPlaylistsState,
     pub(crate) playlist_detail: ChannelPlaylistDetailState,
     pub(crate) about: ChannelAboutState,
+    pub(crate) search: ChannelSearchState,
 }
 
 impl ChannelState {
@@ -160,7 +162,8 @@ impl ChannelState {
         Self {
             page: None,
             view_open: false,
-            tab: ChannelTab::Videos,
+            tab: ChannelTab::Home,
+            about_modal_open: false,
             next_request_id: 0,
             loading_target: None,
             last_target: None,
@@ -173,6 +176,7 @@ impl ChannelState {
             playlists: ChannelPlaylistsState::default(),
             playlist_detail: ChannelPlaylistDetailState::default(),
             about: ChannelAboutState::default(),
+            search: ChannelSearchState::default(),
         }
     }
 }
@@ -194,6 +198,24 @@ pub(crate) struct ChannelVideosState {
     pub(crate) more_error: Option<String>,
     pub(crate) has_more: bool,
     pub(crate) reached_max: bool,
+    pub(crate) sort: search::ChannelVideosSort,
+    pub(crate) sorted_items: Vec<SearchResult>,
+    pub(crate) sorted_rx: Option<Receiver<ChannelSortedVideosFetchMessage>>,
+    pub(crate) sorted_cancel: Option<process::Cancellation>,
+    pub(crate) active_sorted_request_id: Option<u64>,
+    pub(crate) sorted_error: Option<String>,
+}
+
+#[derive(Default)]
+pub(crate) struct ChannelSearchState {
+    pub(crate) input_open: bool,
+    pub(crate) query: String,
+    pub(crate) items: Vec<SearchResult>,
+    pub(crate) loaded: bool,
+    pub(crate) rx: Option<Receiver<ChannelSearchFetchMessage>>,
+    pub(crate) cancel: Option<process::Cancellation>,
+    pub(crate) active_request_id: Option<u64>,
+    pub(crate) error: Option<String>,
 }
 
 #[derive(Default)]
@@ -1221,6 +1243,14 @@ impl ChannelState {
         self.about.active_request_id.is_some()
     }
 
+    pub(crate) fn is_sorted_videos_loading(&self) -> bool {
+        self.videos.active_sorted_request_id.is_some()
+    }
+
+    pub(crate) fn is_channel_search_loading(&self) -> bool {
+        self.search.active_request_id.is_some()
+    }
+
     pub(crate) fn current_target(&self) -> Option<ChannelTarget> {
         self.loading_target
             .clone()
@@ -1234,8 +1264,10 @@ impl ChannelState {
         }
         self.videos.more_rx = None;
         self.videos.active_more_request_id = None;
+        self.cancel_sorted_videos();
         self.cancel_shorts();
         self.cancel_streams();
+        self.cancel_channel_search();
         if let Some(cancel) = self.playlists.cancel.take() {
             cancel.cancel();
         }
@@ -1269,6 +1301,7 @@ impl ChannelState {
         }
         self.cancel_subrequests();
         self.view_open = false;
+        self.about_modal_open = false;
         self.videos.active_request_id = None;
         self.loading_target = None;
         self.videos.rx = None;
@@ -1280,6 +1313,22 @@ impl ChannelState {
         }
         self.videos.more_rx = None;
         self.videos.active_more_request_id = None;
+    }
+
+    pub(crate) fn cancel_sorted_videos(&mut self) {
+        if let Some(cancel) = self.videos.sorted_cancel.take() {
+            cancel.cancel();
+        }
+        self.videos.sorted_rx = None;
+        self.videos.active_sorted_request_id = None;
+    }
+
+    pub(crate) fn cancel_channel_search(&mut self) {
+        if let Some(cancel) = self.search.cancel.take() {
+            cancel.cancel();
+        }
+        self.search.rx = None;
+        self.search.active_request_id = None;
     }
 
     pub(crate) fn cancel_shorts(&mut self) {
@@ -1320,6 +1369,34 @@ impl ChannelState {
         }
         self.about.rx = None;
         self.about.active_request_id = None;
+    }
+
+    pub(crate) fn begin_sorted_videos_request(&mut self) -> Option<(u64, ChannelTarget)> {
+        self.cancel_sorted_videos();
+        let target = self
+            .page
+            .as_ref()
+            .map(|page| page.target.clone())
+            .or_else(|| self.current_target())?;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        let request_id = self.next_request_id;
+        self.videos.active_sorted_request_id = Some(request_id);
+        self.videos.sorted_error = None;
+        Some((request_id, target))
+    }
+
+    pub(crate) fn begin_channel_search_request(&mut self) -> Option<(u64, ChannelTarget)> {
+        self.cancel_channel_search();
+        let target = self
+            .page
+            .as_ref()
+            .map(|page| page.target.clone())
+            .or_else(|| self.current_target())?;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        let request_id = self.next_request_id;
+        self.search.active_request_id = Some(request_id);
+        self.search.error = None;
+        Some((request_id, target))
     }
 
     pub(crate) fn begin_more_videos_request(
