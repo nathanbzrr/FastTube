@@ -848,6 +848,18 @@ fn valid_youtube_videos() -> Vec<Video> {
     ]
 }
 
+fn three_youtube_videos() -> Vec<Video> {
+    let mut videos = valid_youtube_videos();
+    videos.push(Video {
+        title: "Vídeo YouTube Três".into(),
+        channel: "Canal Gama".into(),
+        url: "https://www.youtube.com/watch?v=aqz-KE-bpKQ".into(),
+        thumbnail: String::new(),
+        duration: "4:10".into(),
+    });
+    videos
+}
+
 fn render_history_section(
     ctx: &egui::Context,
     app: &mut FastTube,
@@ -936,6 +948,7 @@ fn compact_history_queue_button_enqueues_the_matching_video_data() {
             channel: videos[0].channel.clone(),
             position_ms: 42_000,
             duration_ms: Some(200_000),
+            watched_at_ms: None,
         })
         .unwrap();
     let ctx = egui::Context::default();
@@ -969,6 +982,7 @@ fn compact_history_queue_button_preserves_full_queue_and_reports_rejected_video(
             channel: videos[0].channel.clone(),
             position_ms: 0,
             duration_ms: None,
+            watched_at_ms: None,
         })
         .unwrap();
     let ctx = egui::Context::default();
@@ -3560,6 +3574,7 @@ fn youtube_layout_and_custom_recommendation_engine_work_across_filters_and_shelv
             channel: "5 Alguma Coisa".into(),
             position_ms: 210_000,
             duration_ms: Some(220_000),
+            watched_at_ms: None,
         })
         .unwrap();
 
@@ -5115,6 +5130,7 @@ fn search_unwatched_chip_filters_watched_history_videos() {
             channel: "Canal A".into(),
             position_ms: 95_000,
             duration_ms: Some(300_000),
+            watched_at_ms: None,
         })
         .unwrap();
 
@@ -5577,6 +5593,7 @@ fn live_stream_skips_resume_and_records_zero_position_without_duration() {
             channel: live_video.channel.clone(),
             position_ms: 480_000,
             duration_ms: Some(3_600_000),
+            watched_at_ms: None,
         })
         .unwrap();
 
@@ -7226,6 +7243,7 @@ fn continue_watching_shelf_renders_non_shorts_excludes_near_end_and_resumes() {
         channel: "Dev Canal".into(),
         position_ms: 120_000,
         duration_ms: Some(300_000),
+        watched_at_ms: None,
     });
     let _ = app.history.data.record(history::Entry {
         video_id: "bbbbbbbbbbb".into(),
@@ -7233,6 +7251,7 @@ fn continue_watching_shelf_renders_non_shorts_excludes_near_end_and_resumes() {
         channel: "Dev Canal".into(),
         position_ms: 295_000,
         duration_ms: Some(300_000),
+        watched_at_ms: None,
     });
     let _ = app.history.data.record(history::Entry {
         video_id: "ccccccccccc".into(),
@@ -7240,6 +7259,7 @@ fn continue_watching_shelf_renders_non_shorts_excludes_near_end_and_resumes() {
         channel: "Shorts Canal".into(),
         position_ms: 15_000,
         duration_ms: Some(30_000),
+        watched_at_ms: None,
     });
 
     let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(960.0, 480.0));
@@ -7378,6 +7398,7 @@ fn home_cards_show_explainability_badge_mute_actions_and_pinned_topics() {
         channel: "Canal Favorito".into(),
         position_ms: 400_000,
         duration_ms: Some(600_000),
+        watched_at_ms: None,
     });
     app.toggle_pinned_topic("Rust");
     assert!(app.is_topic_pinned("Rust"));
@@ -8033,4 +8054,654 @@ fn toast_stack_renders_caps_at_three_dismisses_and_expires() {
     );
     exp_out.textures_delta.clear();
     assert!(mgr.is_empty());
+}
+
+fn find_text_center_recursive(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+    match shape {
+        egui::Shape::Text(text) => {
+            if text.galley.job.text == needle || text.galley.job.text.contains(needle) {
+                let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                return Some(rect.center());
+            }
+            None
+        }
+        egui::Shape::Vec(items) => items
+            .iter()
+            .find_map(|item| find_text_center_recursive(item, needle)),
+        _ => None,
+    }
+}
+
+fn find_rendered_text_center(
+    shapes: &[egui::epaint::ClippedShape],
+    needle: &str,
+) -> Option<egui::Pos2> {
+    shapes
+        .iter()
+        .find_map(|clipped| find_text_center_recursive(&clipped.shape, needle))
+}
+
+fn find_last_text_center_recursive(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+    match shape {
+        egui::Shape::Text(text) => {
+            if text.galley.job.text == needle || text.galley.job.text.contains(needle) {
+                let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                return Some(rect.center());
+            }
+            None
+        }
+        egui::Shape::Vec(items) => items
+            .iter()
+            .rev()
+            .find_map(|item| find_last_text_center_recursive(item, needle)),
+        _ => None,
+    }
+}
+
+fn find_last_rendered_text_center(
+    shapes: &[egui::epaint::ClippedShape],
+    needle: &str,
+) -> Option<egui::Pos2> {
+    shapes
+        .iter()
+        .rev()
+        .find_map(|clipped| find_last_text_center_recursive(&clipped.shape, needle))
+}
+
+fn headless_pointer_click<F>(
+    ctx: &egui::Context,
+    size: egui::Vec2,
+    pos: egui::Pos2,
+    mut draw: F,
+) -> egui::FullOutput
+where
+    F: FnMut(&mut egui::Ui),
+{
+    for pressed in [true, false] {
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+                ..Default::default()
+            },
+            &mut draw,
+        );
+        out.textures_delta.clear();
+        if !pressed {
+            return out;
+        }
+    }
+    unreachable!()
+}
+
+#[test]
+fn library_play_all_and_enqueue_all_preserve_order_and_persist() {
+    let dir = std::env::temp_dir().join(format!("fasttube-lib-playall-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let queue_path = dir.join("queue.json");
+
+    let mut app = FastTube::default();
+    app.queue.path = Some(queue_path.clone());
+    app.queue.read_failed = false;
+    app.queue.data = Queue::new(10);
+
+    let videos = three_youtube_videos();
+    let first = app.play_all_videos(&videos).expect("first video to play");
+    assert_eq!(first.url, videos[0].url);
+    assert_eq!(app.queue.data.len(), 2);
+    assert_eq!(app.queue.data.videos()[0].url, videos[1].url);
+    assert_eq!(app.queue.data.videos()[1].url, videos[2].url);
+    assert!(app.library.notice.as_deref().unwrap_or("").contains("fila"));
+
+    let reloaded = Queue::load(&queue_path, 10).expect("queue persisted");
+    assert_eq!(reloaded.len(), 2);
+    assert_eq!(reloaded.videos()[0].url, videos[1].url);
+
+    let mut app2 = FastTube::default();
+    app2.queue.path = Some(queue_path.clone());
+    app2.queue.read_failed = false;
+    app2.queue.data = Queue::new(10);
+    let (added, rejected) = app2.enqueue_all_videos(&videos);
+    assert_eq!((added, rejected), (3, 0));
+    assert_eq!(app2.queue.data.len(), 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn library_collections_crud_rename_delete_filter_and_remove_headless() {
+    let dir = std::env::temp_dir().join(format!("fasttube-lib-ui-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let lib_path = dir.join("library.json");
+
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    app.library.path = Some(lib_path.clone());
+    let videos = three_youtube_videos();
+    app.library.data.toggle_watch_later(videos[0].clone());
+    app.library.data.toggle_favorite(videos[1].clone());
+    app.library.collection_name = "Estudos Rust".into();
+
+    let size = egui::vec2(1000.0, 900.0);
+    let palette = app.palette();
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        },
+        |ui| {
+            let _ = app.browse_library_ui(ui, &ctx, palette);
+        },
+    );
+    out.textures_delta.clear();
+    let create_pos =
+        find_rendered_text_center(&out.shapes, "Criar").expect("Criar button rendered");
+    let _ = headless_pointer_click(&ctx, size, create_pos, |ui| {
+        let _ = app.browse_library_ui(ui, &ctx, palette);
+    });
+    assert_eq!(app.library.data.collections.len(), 1);
+    assert_eq!(app.library.data.collections[0].name, "Estudos Rust");
+    app.library.data.collections[0]
+        .videos
+        .push(library::VideoRecord {
+            video: videos[2].clone(),
+        });
+
+    // Trigger inline rename
+    out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        },
+        |ui| {
+            let _ = app.browse_library_ui(ui, &ctx, palette);
+        },
+    );
+    out.textures_delta.clear();
+    let rename_pos =
+        find_rendered_text_center(&out.shapes, "Renomear").expect("Renomear button rendered");
+    let _ = headless_pointer_click(&ctx, size, rename_pos, |ui| {
+        let _ = app.browse_library_ui(ui, &ctx, palette);
+    });
+    assert_eq!(app.library.renaming_collection, Some(0));
+    app.library.rename_draft = "Rust Avançado".into();
+    out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        },
+        |ui| {
+            let _ = app.browse_library_ui(ui, &ctx, palette);
+        },
+    );
+    out.textures_delta.clear();
+    let save_pos = find_rendered_text_center(&out.shapes, "Salvar").expect("Salvar button");
+    let _ = headless_pointer_click(&ctx, size, save_pos, |ui| {
+        let _ = app.browse_library_ui(ui, &ctx, palette);
+    });
+    assert_eq!(app.library.data.collections[0].name, "Rust Avançado");
+
+    // Library search filter isolates matching collection/video
+    app.library.search_query = "Rust Avançado".into();
+    let mut filtered_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        },
+        |ui| {
+            let _ = app.browse_library_ui(ui, &ctx, palette);
+        },
+    );
+    let filtered_texts = collect_rendered_text(&filtered_out.shapes);
+    filtered_out.textures_delta.clear();
+    assert!(filtered_texts.iter().any(|t| t.contains("Rust Avançado")));
+    assert!(
+        filtered_texts
+            .iter()
+            .any(|t| t.contains("Nenhum item em Assistir depois corresponde"))
+    );
+    app.library.search_query.clear();
+
+    // Remove individual item from Watch Later via button
+    out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        },
+        |ui| {
+            let _ = app.browse_library_ui(ui, &ctx, palette);
+        },
+    );
+    out.textures_delta.clear();
+    let remove_pos =
+        find_rendered_text_center(&out.shapes, "✕ Remover").expect("Remover button rendered");
+    let _ = headless_pointer_click(&ctx, size, remove_pos, |ui| {
+        let _ = app.browse_library_ui(ui, &ctx, palette);
+    });
+    assert!(app.library.data.watch_later.is_empty());
+
+    // Inline delete collection with confirmation
+    out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        },
+        |ui| {
+            let _ = app.browse_library_ui(ui, &ctx, palette);
+        },
+    );
+    out.textures_delta.clear();
+    let del_pos =
+        find_rendered_text_center(&out.shapes, "Excluir coleção").expect("Excluir coleção button");
+    let _ = headless_pointer_click(&ctx, size, del_pos, |ui| {
+        let _ = app.browse_library_ui(ui, &ctx, palette);
+    });
+    assert_eq!(app.library.confirm_delete_collection, Some(0));
+    out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        },
+        |ui| {
+            let _ = app.browse_library_ui(ui, &ctx, palette);
+        },
+    );
+    out.textures_delta.clear();
+    let confirm_pos = find_rendered_text_center(&out.shapes, "Confirmar exclusão")
+        .expect("Confirmar exclusão button");
+    let _ = headless_pointer_click(&ctx, size, confirm_pos, |ui| {
+        let _ = app.browse_library_ui(ui, &ctx, palette);
+    });
+    assert!(app.library.data.collections.is_empty());
+    let persisted = library::load(&lib_path).expect("library saved on disk");
+    assert!(persisted.collections.is_empty());
+    assert!(persisted.watch_later.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn library_bookmark_seek_without_reload_and_markdown_export_headless() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    let videos = valid_youtube_videos();
+    app.selected = Some(videos[0].clone());
+    app.activate_video_playback(&videos[0], None, None, Instant::now());
+
+    app.library
+        .data
+        .add_bookmark(library::Bookmark {
+            video_id: "dQw4w9WgXcQ".into(),
+            title: videos[0].title.clone(),
+            time_ms: 65_000,
+            note: "Refrão".into(),
+        })
+        .unwrap();
+    app.library
+        .data
+        .add_bookmark(library::Bookmark {
+            video_id: "M7lc1UVf-VE".into(),
+            title: videos[1].title.clone(),
+            time_ms: 12_000,
+            note: "Demo API".into(),
+        })
+        .unwrap();
+
+    // Clicking bookmark for currently playing video seeks immediately without reload
+    let same_mark = app.library.data.bookmarks[0].clone();
+    assert!(app.open_library_bookmark(&same_mark).is_none());
+    assert!(app.library.pending_bookmark_seek.is_none());
+    assert_eq!(
+        app.playback.active.as_ref().map(|a| a.position_ms),
+        Some(65_000)
+    );
+
+    // Clicking bookmark for a different video queues pending_bookmark_seek & returns Video
+    let other_mark = app.library.data.bookmarks[1].clone();
+    let chosen = app
+        .open_library_bookmark(&other_mark)
+        .expect("should return target video");
+    assert_eq!(
+        history::youtube_video_id(&chosen.url).as_deref(),
+        Some("M7lc1UVf-VE")
+    );
+    assert_eq!(
+        app.library.pending_bookmark_seek,
+        Some(("M7lc1UVf-VE".into(), 12_000))
+    );
+
+    // Filter bookmarks + copy Markdown button in Library UI
+    app.library.bookmark_filter = "Refrão".into();
+    let size = egui::vec2(1000.0, 900.0);
+    let palette = app.palette();
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        },
+        |ui| {
+            let _ = app.browse_library_ui(ui, &ctx, palette);
+        },
+    );
+    let texts = collect_rendered_text(&out.shapes);
+    out.textures_delta.clear();
+    assert!(texts.iter().any(|t| t.contains("Refrão")));
+    assert!(!texts.iter().any(|t| t.contains("Demo API")));
+
+    let copy_pos = find_rendered_text_center(&out.shapes, "Copiar marcadores (Markdown)")
+        .expect("Copiar marcadores button");
+    let _ = headless_pointer_click(&ctx, size, copy_pos, |ui| {
+        let _ = app.browse_library_ui(ui, &ctx, palette);
+    });
+    assert!(
+        app.library
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("1 marcador(es) copiado(s)")
+    );
+}
+
+#[test]
+fn queue_power_controls_play_now_move_top_shuffle_dedupe_clear_and_save_collection() {
+    let dir = std::env::temp_dir().join(format!("fasttube-queue-power-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let queue_path = dir.join("queue.json");
+    let lib_path = dir.join("library.json");
+
+    let mut app = FastTube::default();
+    app.queue.path = Some(queue_path.clone());
+    app.queue.read_failed = false;
+    app.library.path = Some(lib_path.clone());
+    app.queue.data = Queue::new(10);
+
+    let videos = three_youtube_videos();
+    app.enqueue_video(videos[0].clone()).unwrap();
+    app.enqueue_video(videos[1].clone()).unwrap();
+    app.enqueue_video(videos[0].clone()).unwrap(); // duplicate of videos[0]
+    app.enqueue_video(videos[2].clone()).unwrap();
+
+    // Header duration summary renders in queue_section_ui and watch_sidebar_queue_section_ui
+    let ctx = egui::Context::default();
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        },
+        |ui| {
+            app.queue_section_ui(ui, "test_queue_hdr", false, None, None);
+            app.watch_sidebar_queue_section_ui(ui, "test_sidebar_q");
+        },
+    );
+    let rendered = collect_rendered_text(&out.shapes);
+    out.textures_delta.clear();
+    assert!(
+        rendered
+            .iter()
+            .any(|t| t.contains("4 vídeos") && t.contains("~")),
+        "Queue header must display total count and approximate duration: {rendered:?}"
+    );
+    assert!(
+        rendered
+            .iter()
+            .any(|t| t.contains("Salvar fila como coleção"))
+    );
+
+    // Move last item (videos[2]) to top
+    app.move_queue_item_to_top(3);
+    assert_eq!(app.queue.data.videos()[0].url, videos[2].url);
+
+    // Deduplicate removes second occurrence of videos[0]
+    let removed = app.deduplicate_queue();
+    assert_eq!(removed, 1);
+    assert_eq!(app.queue.data.len(), 3);
+
+    // Save queue as collection in 1 click (blank name auto-generates "Fila salva")
+    let col_name = app.save_queue_as_collection("").expect("save queue");
+    assert_eq!(col_name, "Fila salva");
+    assert_eq!(app.library.data.collections.len(), 1);
+    assert_eq!(app.library.data.collections[0].videos.len(), 3);
+    let saved_lib = library::load(&lib_path).expect("library persisted");
+    assert_eq!(saved_lib.collections[0].name, "Fila salva");
+
+    // Play Now promotes specific middle entry_id cleanly with QueuePlaybackCorrelation
+    let mid_id = app.queue.data.entry_id(1).unwrap();
+    let mid_url = app.queue.data.videos()[1].url.clone();
+    let now = Instant::now();
+    let played = app
+        .play_queue_entry_at(mid_id, now)
+        .expect("play_queue_entry_at returns matching video");
+    assert_eq!(played.url, mid_url);
+    assert_eq!(app.queue.pending_entry_id, Some(mid_id));
+    assert!(app.queue.pending_video.is_some());
+
+    // Confirm StartFile/FileLoaded consumes only that entry_id
+    app.handle_queue_player_event(PlaybackEvent::StartFile {
+        playlist_entry_id: 101,
+    });
+    app.handle_queue_player_event(PlaybackEvent::FileLoaded);
+    assert_eq!(app.queue.data.len(), 2);
+    assert!(app.queue.data.index_of_entry(mid_id).is_none());
+
+    // Shuffle + Clear queue
+    app.shuffle_queue();
+    assert_eq!(app.queue.data.len(), 2);
+    app.clear_queue();
+    assert!(app.queue.data.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn history_search_filter_date_grouping_stats_and_remove_headless() {
+    let dir = std::env::temp_dir().join(format!("fasttube-hist-ui-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let hist_path = dir.join("history.json");
+
+    let mut app = FastTube::default();
+    app.history.path = Some(hist_path.clone());
+    app.history.loaded_path = Some(hist_path.clone());
+    app.history.read_failed = false;
+    app.history.data = history::History::default();
+
+    let now_ms = history::current_unix_epoch_ms();
+    let day_ms = 86_400_000u64;
+    let videos = three_youtube_videos();
+
+    app.history
+        .data
+        .record(history::Entry {
+            video_id: "dQw4w9WgXcQ".into(),
+            title: "Aula Rust Hoje".into(),
+            channel: "Canal Alfa".into(),
+            position_ms: 50_000,
+            duration_ms: Some(200_000), // InProgress
+            watched_at_ms: Some(now_ms),
+        })
+        .unwrap();
+    app.history
+        .data
+        .record(history::Entry {
+            video_id: "M7lc1UVf-VE".into(),
+            title: "Tutorial Ontem Concluído".into(),
+            channel: "Canal Alfa".into(),
+            position_ms: 195_000,
+            duration_ms: Some(200_000), // Completed (near end)
+            watched_at_ms: Some(now_ms.saturating_sub(day_ms)),
+        })
+        .unwrap();
+    app.history
+        .data
+        .record(history::Entry {
+            video_id: "aqz-KE-bpKQ".into(),
+            title: videos[2].title.clone(),
+            channel: "Canal Beta".into(),
+            position_ms: 10_000,
+            duration_ms: Some(200_000),
+            watched_at_ms: Some(now_ms.saturating_sub(14 * day_ms)), // Mais antigos
+        })
+        .unwrap();
+
+    let ctx = egui::Context::default();
+    let size = egui::vec2(900.0, 800.0);
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        },
+        |ui| {
+            let _ = app.history_section_ui(ui, "hist_full_test", false, None, None);
+        },
+    );
+    let texts = collect_rendered_text(&out.shapes);
+    out.textures_delta.clear();
+
+    assert!(texts.iter().any(|t| t == "Hoje"));
+    assert!(texts.iter().any(|t| t == "Ontem"));
+    assert!(texts.iter().any(|t| t == "Mais antigos"));
+    assert!(
+        texts.iter().any(|t| t.contains("Total: 3")
+            && t.contains("Concluídos: 1")
+            && t.contains("Canal Alfa (2)")),
+        "Expected local stats banner in {texts:?}"
+    );
+
+    // Filter chip "Concluídos" + search query
+    app.history.filter = history::HistoryFilter::Completed;
+    let mut completed_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        },
+        |ui| {
+            let _ = app.history_section_ui(ui, "hist_full_test", false, None, None);
+        },
+    );
+    let completed_texts = collect_rendered_text(&completed_out.shapes);
+    completed_out.textures_delta.clear();
+    assert!(
+        completed_texts
+            .iter()
+            .any(|t| t.contains("Tutorial Ontem Concluído"))
+    );
+    assert!(!completed_texts.iter().any(|t| t.contains("Aula Rust Hoje")));
+
+    app.history.filter = history::HistoryFilter::All;
+    app.history.search_query = "Canal Beta".into();
+    let mut search_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        },
+        |ui| {
+            let _ = app.history_section_ui(ui, "hist_full_test", false, None, None);
+        },
+    );
+    let search_texts = collect_rendered_text(&search_out.shapes);
+    search_out.textures_delta.clear();
+    assert!(search_texts.iter().any(|t| t.contains(&videos[2].title)));
+    assert!(!search_texts.iter().any(|t| t.contains("Aula Rust Hoje")));
+
+    // Remove visible entry via ✕ button
+    let remove_pos =
+        find_last_rendered_text_center(&search_out.shapes, "✕").expect("remove button on entry");
+    let _ = headless_pointer_click(&ctx, size, remove_pos, |ui| {
+        let _ = app.history_section_ui(ui, "hist_full_test", false, None, None);
+    });
+    assert!(app.history.data.get("aqz-KE-bpKQ").is_none());
+    assert_eq!(app.history.data.entries().len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn watch_description_chapters_and_transcript_export_headless() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    let video = valid_youtube_videos()[0].clone();
+    app.selected = Some(video.clone());
+    app.video_metadata.insert(
+        video.url.clone(),
+        VideoMetadata {
+            description: Some(
+                "Guia completo:\n00:00 Abertura\n01:30 Configuração inicial\n04:45 Conclusão"
+                    .into(),
+            ),
+            ..Default::default()
+        },
+    );
+    app.ensure_watch_metadata_cache(&video);
+    assert_eq!(app.watch.metadata_cache.description_chapters.len(), 3);
+
+    // Fallback to description chapters when libmpv has no embedded chapters
+    let collected = app.collect_player_chapters();
+    assert_eq!(collected.len(), 3);
+    assert_eq!(collected[1].title, "Configuração inicial");
+    assert_eq!(collected[1].time_secs, 90.0);
+
+    // Subtitles UI renders description chapters, Copy & Export buttons, and copies formatted text
+    app.watch.extras.transcript = vec![
+        transcript::Cue {
+            start_ms: 5_000,
+            end_ms: 9_000,
+            text: "Bem-vindo ao vídeo".into(),
+        },
+        transcript::Cue {
+            start_ms: 65_000,
+            end_ms: 70_000,
+            text: "Segundo trecho".into(),
+        },
+    ];
+    let size = egui::vec2(900.0, 900.0);
+    let palette = app.palette();
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        },
+        |ui| {
+            app.watch_sidebar_tabs_ui(ui, &ctx, &palette);
+            app.watch_metadata_description_ui(ui, &video.url, 600.0, &palette);
+            app.subtitles_ui(ui, &ctx, "test_transcript_export");
+        },
+    );
+    let texts = collect_rendered_text(&out.shapes);
+    out.textures_delta.clear();
+
+    assert!(texts.iter().any(|t| t == "Transcrição"));
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("Capítulos da descrição (3)"))
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("01:30  Configuração inicial"))
+    );
+    assert!(texts.iter().any(|t| t == "Copiar transcrição"));
+    assert!(texts.iter().any(|t| t == "Exportar (.txt / .md)"));
+
+    let copy_pos =
+        find_rendered_text_center(&out.shapes, "Copiar transcrição").expect("Copy button");
+    let _ = headless_pointer_click(&ctx, size, copy_pos, |ui| {
+        app.watch_sidebar_tabs_ui(ui, &ctx, &palette);
+        app.watch_metadata_description_ui(ui, &video.url, 600.0, &palette);
+        app.subtitles_ui(ui, &ctx, "test_transcript_export");
+    });
+    assert!(matches!(
+        &app.watch.extras.transcript_export_status,
+        Some((true, msg)) if msg.contains("2 trecho(s) copiados")
+    ));
 }

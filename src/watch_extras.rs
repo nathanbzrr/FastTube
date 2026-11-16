@@ -37,6 +37,7 @@ pub enum SidebarTab {
     FromChannel,
     Related,
     ForYou,
+    Transcript,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -249,6 +250,73 @@ pub fn parse_timestamp_lines(text: &str) -> Vec<CachedTimestampLine> {
         .collect()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DescriptionChapter {
+    pub title: String,
+    pub label: String,
+    pub seconds: u64,
+}
+
+fn clean_chapter_piece(raw: &str) -> String {
+    raw.trim()
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '-' | '–' | '—' | ':' | '|' | '•' | '*' | '[' | ']' | '(' | ')' | '/' | '\\'
+            ) || c.is_whitespace()
+        })
+        .trim()
+        .to_owned()
+}
+
+pub fn extract_description_chapters(description: &str) -> Vec<DescriptionChapter> {
+    let mut chapters = Vec::new();
+    let mut seen_seconds = HashSet::new();
+    for raw_line in description.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let timestamps = extract_timestamps(trimmed);
+        let Some(first) = timestamps.first() else {
+            continue;
+        };
+        let before_raw = trimmed[..first.byte_start].trim();
+        let before_clean = clean_chapter_piece(before_raw);
+        let prefix_words = before_clean.split_whitespace().count();
+        if prefix_words > 4 || before_clean.len() > 36 {
+            continue;
+        }
+        let after_start = if timestamps.len() >= 2 {
+            let between = clean_chapter_piece(&trimmed[first.byte_end..timestamps[1].byte_start]);
+            if between.is_empty() || matches!(between.to_lowercase().as_str(), "a" | "to" | "até")
+            {
+                timestamps[1].byte_end
+            } else {
+                first.byte_end
+            }
+        } else {
+            first.byte_end
+        };
+        let after_clean = clean_chapter_piece(&trimmed[after_start..]);
+        let title = match (before_clean.is_empty(), after_clean.is_empty()) {
+            (false, false) => format!("{before_clean} — {after_clean}"),
+            (false, true) => before_clean,
+            (true, false) => after_clean,
+            (true, true) => continue,
+        };
+        if title.is_empty() || !seen_seconds.insert(first.seconds) {
+            continue;
+        }
+        chapters.push(DescriptionChapter {
+            title,
+            label: first.label.clone(),
+            seconds: first.seconds,
+        });
+    }
+    chapters
+}
+
 #[derive(Clone, Debug)]
 pub struct CachedCommentMeta {
     pub id: String,
@@ -402,7 +470,6 @@ pub struct WatchExtras {
     subtitle_apply_cancel: Option<process::Cancellation>,
     ready_subtitle: Option<ReadySubtitle>,
     pub transcript: Vec<crate::transcript::Cue>,
-    #[cfg_attr(not(test), allow(dead_code))]
     pub transcript_query: String,
     pub transcript_error: Option<String>,
     pub transcript_loading: bool,
@@ -411,6 +478,8 @@ pub struct WatchExtras {
     pub transcript_high_contrast: bool,
     transcript_rx: Option<Receiver<Result<TranscriptPayload, String>>>,
     transcript_cancel: Option<process::Cancellation>,
+    pub transcript_export_status: Option<(bool, String)>,
+    transcript_export_rx: Option<Receiver<Result<Option<PathBuf>, String>>>,
 }
 
 impl WatchExtras {
@@ -1079,6 +1148,73 @@ impl WatchExtras {
         });
     }
 
+    pub fn is_exporting_transcript(&self) -> bool {
+        self.transcript_export_rx.is_some()
+    }
+
+    pub fn start_transcript_export(
+        &mut self,
+        video_title: &str,
+        cues: &[crate::transcript::Cue],
+        ctx: &egui::Context,
+    ) {
+        if self.transcript_export_rx.is_some() || cues.is_empty() {
+            return;
+        }
+        self.transcript_export_status = None;
+        let title_owned = video_title.trim().to_owned();
+        let safe_stem: String = title_owned
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '-' | '_') {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+            .trim()
+            .chars()
+            .take(48)
+            .collect();
+        let default_name = if safe_stem.is_empty() {
+            "transcricao.txt".to_owned()
+        } else {
+            format!("{safe_stem}-transcricao.txt")
+        };
+        let cues_owned = cues.to_vec();
+        let (tx, rx) = mpsc::channel();
+        self.transcript_export_rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result =
+                crate::settings::pick_text_export_dialog("Exportar transcrição", &default_name)
+                    .and_then(|maybe_path| {
+                        let Some(path) = maybe_path else {
+                            return Ok(None);
+                        };
+                        let is_markdown = path
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+                        let body = if is_markdown {
+                            crate::transcript::format_markdown(&title_owned, &cues_owned)
+                        } else {
+                            crate::transcript::format_txt(&cues_owned)
+                        };
+                        history::write_atomic(&path, body.as_bytes()).map_err(|error| {
+                            format!(
+                                "Não foi possível salvar a transcrição em '{}': {error}",
+                                path.display()
+                            )
+                        })?;
+                        Ok(Some(path))
+                    });
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+    }
+
     pub fn poll(&mut self) {
         let subtitle_apply_result = self.subtitle_apply_rx.as_ref().map(Receiver::try_recv);
         match subtitle_apply_result {
@@ -1286,6 +1422,26 @@ impl WatchExtras {
                 self.subtitles_cancel = None;
             }
             _ => {}
+        }
+        match self.transcript_export_rx.as_ref().map(Receiver::try_recv) {
+            Some(Ok(Ok(Some(path)))) => {
+                self.transcript_export_status =
+                    Some((true, format!("Transcrição salva em '{}'.", path.display())));
+                self.transcript_export_rx = None;
+            }
+            Some(Ok(Ok(None))) => {
+                self.transcript_export_rx = None;
+            }
+            Some(Ok(Err(error))) => {
+                self.transcript_export_status = Some((false, error));
+                self.transcript_export_rx = None;
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.transcript_export_status =
+                    Some((false, "Exportação de transcrição interrompida.".into()));
+                self.transcript_export_rx = None;
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
         }
     }
 
@@ -1919,5 +2075,40 @@ mod tests {
         c1.id = "c2".into();
         sync_cached_comment_meta(&[c1], &mut cache);
         assert_eq!(cache[0].measured_height, None);
+    }
+
+    #[test]
+    fn extract_description_chapters_parses_standard_formats_and_skips_prose() {
+        let description = "\
+Inscreva-se no canal!
+0:00 Introdução
+01:25 - Configuração inicial
+[1:02:03] Conclusão e próximos passos
+Parte 2: 05:10 Detalhes avançados
+02:00 - 03:15 Intervalo técnico
+No vídeo anterior que gravamos lá pelas 12:30 falamos bastante sobre isso.
+0:00
+";
+        let chapters = extract_description_chapters(description);
+        assert_eq!(chapters.len(), 5);
+        assert_eq!(chapters[0].label, "0:00");
+        assert_eq!(chapters[0].seconds, 0);
+        assert_eq!(chapters[0].title, "Introdução");
+
+        assert_eq!(chapters[1].label, "01:25");
+        assert_eq!(chapters[1].seconds, 85);
+        assert_eq!(chapters[1].title, "Configuração inicial");
+
+        assert_eq!(chapters[2].label, "1:02:03");
+        assert_eq!(chapters[2].seconds, 3723);
+        assert_eq!(chapters[2].title, "Conclusão e próximos passos");
+
+        assert_eq!(chapters[3].label, "05:10");
+        assert_eq!(chapters[3].seconds, 310);
+        assert_eq!(chapters[3].title, "Parte 2 — Detalhes avançados");
+
+        assert_eq!(chapters[4].label, "02:00");
+        assert_eq!(chapters[4].seconds, 120);
+        assert_eq!(chapters[4].title, "Intervalo técnico");
     }
 }

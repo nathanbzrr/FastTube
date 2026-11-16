@@ -19,6 +19,7 @@ pub struct Entry {
     pub channel: String,
     pub position_ms: u64,
     pub duration_ms: Option<u64>,
+    pub watched_at_ms: Option<u64>,
 }
 
 pub fn is_valid_video_id(video_id: &str) -> bool {
@@ -210,14 +211,20 @@ impl History {
         let mut merged = self.clone();
         let mut summary = MergeSummary::default();
         for entry in imported.entries.iter().rev() {
-            match merged.get(&entry.video_id) {
-                Some(current) if current.position_ms >= entry.position_ms => {
+            match merged.get(&entry.video_id).cloned() {
+                Some(mut current) if current.position_ms >= entry.position_ms => {
                     summary.conflicts += 1;
+                    if entry.watched_at_ms > current.watched_at_ms {
+                        current.watched_at_ms = entry.watched_at_ms;
+                        let _ = merged.record(current);
+                    }
                 }
-                Some(_) => {
+                Some(current) => {
                     summary.conflicts += 1;
                     summary.progress_updated += 1;
-                    let _ = merged.record(entry.clone());
+                    let mut updated = entry.clone();
+                    updated.watched_at_ms = current.watched_at_ms.max(entry.watched_at_ms);
+                    let _ = merged.record(updated);
                 }
                 None => {
                     if merged.record(entry.clone()).is_ok() {
@@ -304,6 +311,169 @@ impl History {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HistoryFilter {
+    #[default]
+    All,
+    InProgress,
+    Completed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DateGroup {
+    Today,
+    Yesterday,
+    ThisWeek,
+    Older,
+}
+
+impl DateGroup {
+    pub fn label_pt(self) -> &'static str {
+        match self {
+            Self::Today => "Hoje",
+            Self::Yesterday => "Ontem",
+            Self::ThisWeek => "Esta semana",
+            Self::Older => "Mais antigos",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WatchStats {
+    pub total_videos: usize,
+    pub completed_count: usize,
+    pub top_channels: Vec<(String, usize)>,
+}
+
+pub fn filter_entries<'a>(
+    entries: &'a [Entry],
+    query: &str,
+    filter: HistoryFilter,
+) -> Vec<&'a Entry> {
+    let q = query.trim().to_lowercase();
+    entries
+        .iter()
+        .filter(|entry| {
+            let matches_filter = match filter {
+                HistoryFilter::All => true,
+                HistoryFilter::InProgress => !entry.is_near_end(),
+                HistoryFilter::Completed => entry.is_near_end(),
+            };
+            if !matches_filter {
+                return false;
+            }
+            if q.is_empty() {
+                return true;
+            }
+            entry.title.to_lowercase().contains(&q) || entry.channel.to_lowercase().contains(&q)
+        })
+        .collect()
+}
+
+pub fn date_group_at(
+    watched_at_ms: Option<u64>,
+    now_ms: u64,
+    utc_offset_minutes: i32,
+) -> DateGroup {
+    let Some(ts_ms) = watched_at_ms.filter(|&ts| ts > 0) else {
+        return DateGroup::Older;
+    };
+    const DAY_MS: i128 = 86_400_000;
+    let offset_ms = i128::from(utc_offset_minutes) * 60_000;
+    let now_day = (i128::from(now_ms) + offset_ms).div_euclid(DAY_MS);
+    let entry_day = (i128::from(ts_ms) + offset_ms).div_euclid(DAY_MS);
+    let diff = now_day - entry_day;
+    if diff <= 0 {
+        DateGroup::Today
+    } else if diff == 1 {
+        DateGroup::Yesterday
+    } else if diff <= 6 {
+        DateGroup::ThisWeek
+    } else {
+        DateGroup::Older
+    }
+}
+
+pub fn compute_watch_stats(entries: &[Entry]) -> WatchStats {
+    use std::collections::HashMap;
+
+    let total_videos = entries.len();
+    let completed_count = entries.iter().filter(|entry| entry.is_near_end()).count();
+    let mut channel_counts: HashMap<String, (String, usize)> = HashMap::new();
+    for entry in entries {
+        let trimmed = entry.channel.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let key = trimmed.to_lowercase();
+        let slot = channel_counts
+            .entry(key)
+            .or_insert_with(|| (trimmed.to_owned(), 0));
+        slot.1 += 1;
+    }
+    let mut ranked: Vec<(String, usize)> = channel_counts.into_values().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked.truncate(3);
+    WatchStats {
+        total_videos,
+        completed_count,
+        top_channels: ranked,
+    }
+}
+
+pub fn current_unix_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+#[cfg(windows)]
+pub fn local_utc_offset_minutes() -> i32 {
+    #[repr(C)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        milliseconds: u16,
+    }
+    #[repr(C)]
+    struct TimeZoneInformation {
+        bias: i32,
+        standard_name: [u16; 32],
+        standard_date: SystemTime,
+        standard_bias: i32,
+        daylight_name: [u16; 32],
+        daylight_date: SystemTime,
+        daylight_bias: i32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetTimeZoneInformation(lp_time_zone_information: *mut TimeZoneInformation) -> u32;
+    }
+    let mut info = std::mem::MaybeUninit::<TimeZoneInformation>::zeroed();
+    let mode = unsafe { GetTimeZoneInformation(info.as_mut_ptr()) };
+    if mode == u32::MAX {
+        return 0;
+    }
+    let info = unsafe { info.assume_init() };
+    let extra = match mode {
+        1 => info.standard_bias,
+        2 => info.daylight_bias,
+        _ => 0,
+    };
+    -(info.bias.saturating_add(extra))
+}
+
+#[cfg(not(windows))]
+pub fn local_utc_offset_minutes() -> i32 {
+    0
+}
+
 /// Suggested local path; no directory is created until save.
 pub fn history_path() -> io::Result<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA")
@@ -357,6 +527,10 @@ pub fn load(path: &Path) -> io::Result<History> {
             Some(value) => Some(value.as_u64().ok_or_else(invalid_data)?),
             None => None,
         };
+        let watched_at_ms = match value.get("watched_at_ms") {
+            Some(Value::Null) | None => None,
+            Some(value) => Some(value.as_u64().ok_or_else(invalid_data)?),
+        };
         let entry = Entry {
             video_id: text("video_id")?,
             title: text("title")?,
@@ -366,6 +540,7 @@ pub fn load(path: &Path) -> io::Result<History> {
                 .and_then(Value::as_u64)
                 .ok_or_else(invalid_data)?,
             duration_ms,
+            watched_at_ms,
         };
         if !entry.valid() || !seen.insert(entry.video_id.clone()) {
             return Err(invalid_data());
@@ -388,6 +563,7 @@ pub fn save(path: &Path, history: &History) -> io::Result<()> {
             json!({
                 "video_id": entry.video_id, "title": entry.title, "channel": entry.channel,
                 "position_ms": entry.position_ms, "duration_ms": entry.duration_ms,
+                "watched_at_ms": entry.watched_at_ms,
             })
         })
         .collect();
@@ -468,6 +644,7 @@ mod tests {
             channel: "Channel".into(),
             position_ms: 12,
             duration_ms: Some(100),
+            watched_at_ms: None,
         }
     }
     fn test_path() -> PathBuf {
@@ -484,7 +661,9 @@ mod tests {
         let path = test_path();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, r#"{"version":1,"entries":[{"video_id":"00000000001","title":"Video","channel":"","position_ms":42}]}"#).unwrap();
-        assert_eq!(load(&path).unwrap().entries()[0].duration_ms, None);
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.entries()[0].duration_ms, None);
+        assert_eq!(loaded.entries()[0].watched_at_ms, None);
         assert_eq!(youtube_video_id("aaaaaaaéaaaa"), None);
         assert_eq!(youtube_video_id("aaaaaaéaaaa"), None);
         assert!(!is_near_end(u64::MAX / 2, Some(u64::MAX)));
@@ -519,7 +698,9 @@ mod tests {
         let path = test_path();
         assert_eq!(load(&path).unwrap(), History::default());
         let mut history = History::default();
-        history.record(entry(1)).unwrap();
+        let mut e1 = entry(1);
+        e1.watched_at_ms = Some(1_700_000_000_000);
+        history.record(e1).unwrap();
         save(&path, &history).unwrap();
         history.record(entry(2)).unwrap();
         save(&path, &history).unwrap();
@@ -661,5 +842,84 @@ mod tests {
         let completed = history.record_active_tick(e).unwrap();
         assert!(completed.changed);
         assert!(completed.ranking_changed);
+    }
+
+    #[test]
+    fn filters_entries_groups_dates_and_computes_stats() {
+        const DAY: u64 = 86_400_000;
+        let now = 20 * DAY + 12 * 3_600_000;
+        assert_eq!(
+            date_group_at(Some(now - 3_600_000), now, 0),
+            DateGroup::Today
+        );
+        assert_eq!(date_group_at(Some(now - DAY), now, 0), DateGroup::Yesterday);
+        assert_eq!(
+            date_group_at(Some(now - 4 * DAY), now, 0),
+            DateGroup::ThisWeek
+        );
+        assert_eq!(
+            date_group_at(Some(now - 10 * DAY), now, 0),
+            DateGroup::Older
+        );
+        assert_eq!(date_group_at(None, now, 0), DateGroup::Older);
+
+        let entries = vec![
+            Entry {
+                video_id: "aaaaaaaaaaa".into(),
+                title: "Rust Async".into(),
+                channel: "Canal A".into(),
+                position_ms: 98,
+                duration_ms: Some(100),
+                watched_at_ms: Some(now),
+            },
+            Entry {
+                video_id: "bbbbbbbbbbb".into(),
+                title: "Outro Vídeo".into(),
+                channel: "Canal B".into(),
+                position_ms: 40,
+                duration_ms: Some(100),
+                watched_at_ms: Some(now - DAY),
+            },
+            Entry {
+                video_id: "ccccccccccc".into(),
+                title: "Tokio Guia".into(),
+                channel: "canal a".into(),
+                position_ms: 99,
+                duration_ms: Some(100),
+                watched_at_ms: Some(now - 3 * DAY),
+            },
+            Entry {
+                video_id: "ddddddddddd".into(),
+                title: "Podcast".into(),
+                channel: "Canal C".into(),
+                position_ms: 10,
+                duration_ms: Some(100),
+                watched_at_ms: None,
+            },
+        ];
+
+        assert_eq!(filter_entries(&entries, "", HistoryFilter::All).len(), 4);
+        assert_eq!(
+            filter_entries(&entries, "", HistoryFilter::Completed).len(),
+            2
+        );
+        assert_eq!(
+            filter_entries(&entries, "", HistoryFilter::InProgress).len(),
+            2
+        );
+        assert_eq!(
+            filter_entries(&entries, "canal b", HistoryFilter::All).len(),
+            1
+        );
+        assert_eq!(
+            filter_entries(&entries, "tokio", HistoryFilter::Completed).len(),
+            1
+        );
+
+        let stats = compute_watch_stats(&entries);
+        assert_eq!(stats.total_videos, 4);
+        assert_eq!(stats.completed_count, 2);
+        assert_eq!(stats.top_channels[0], ("Canal A".into(), 2));
+        assert_eq!(stats.top_channels.len(), 3);
     }
 }

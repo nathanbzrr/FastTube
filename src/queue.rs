@@ -228,6 +228,118 @@ impl Queue {
         true
     }
 
+    pub fn move_to_top(&mut self, index: usize) -> bool {
+        self.reorder(index, 0)
+    }
+
+    pub fn index_of_entry(&self, entry_id: u64) -> Option<usize> {
+        self.entry_ids.iter().position(|id| *id == entry_id)
+    }
+
+    pub fn shuffle(&mut self) -> bool {
+        let mut buf = [0u8; 8];
+        let seed = if getrandom::fill(&mut buf).is_ok() {
+            u64::from_le_bytes(buf)
+        } else {
+            self.next_entry_id ^ ((self.videos.len() as u64) << 32)
+        };
+        self.shuffle_with_seed(seed)
+    }
+
+    pub fn shuffle_with_seed(&mut self, seed: u64) -> bool {
+        let len = self.videos.len();
+        if len <= 1 {
+            return false;
+        }
+        let before_ids = self.entry_ids.clone();
+        let mut state = if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        };
+        for i in (1..len).rev() {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let rand = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            let j = (rand as usize) % (i + 1);
+            if i != j {
+                self.videos.swap(i, j);
+                self.entry_ids.swap(i, j);
+            }
+        }
+        if self.entry_ids == before_ids {
+            self.videos.swap(0, len - 1);
+            self.entry_ids.swap(0, len - 1);
+        }
+        true
+    }
+
+    /// Removes later duplicate occurrences of the same video while preserving entry IDs.
+    pub fn deduplicate(&mut self) -> usize {
+        let mut seen = HashSet::with_capacity(self.videos.len());
+        let mut kept_videos = Vec::with_capacity(self.videos.len());
+        let mut kept_ids = Vec::with_capacity(self.entry_ids.len());
+        let original_len = self.videos.len();
+        for (video, entry_id) in self.videos.drain(..).zip(self.entry_ids.drain(..)) {
+            let key =
+                crate::history::youtube_video_id(&video.url).unwrap_or_else(|| video.url.clone());
+            if seen.insert(key) {
+                kept_videos.push(video);
+                kept_ids.push(entry_id);
+            }
+        }
+        self.videos = kept_videos;
+        self.entry_ids = kept_ids;
+        original_len - self.videos.len()
+    }
+
+    pub fn clear(&mut self) -> usize {
+        let count = self.videos.len();
+        self.videos.clear();
+        self.entry_ids.clear();
+        count
+    }
+
+    pub fn total_duration_ms(&self) -> (u64, usize) {
+        let mut total_ms = 0u64;
+        let mut known_count = 0usize;
+        for video in &self.videos {
+            if let Some(ms) = crate::parse_duration_ms(&video.duration) {
+                total_ms = total_ms.saturating_add(ms);
+                known_count += 1;
+            }
+        }
+        (total_ms, known_count)
+    }
+
+    pub fn format_duration_summary(&self) -> String {
+        let len = self.videos.len();
+        let count_label = if len == 1 {
+            "1 vídeo".to_owned()
+        } else {
+            format!("{len} vídeos")
+        };
+        let (total_ms, known_count) = self.total_duration_ms();
+        if len == 0 || known_count == 0 || total_ms == 0 {
+            return count_label;
+        }
+        if total_ms < 60_000 {
+            return format!("{count_label} • ~<1m");
+        }
+        let total_mins = (total_ms + 30_000) / 60_000;
+        let hours = total_mins / 60;
+        let mins = total_mins % 60;
+        let dur_text = if hours > 0 && mins > 0 {
+            format!("~{hours}h {mins}m")
+        } else if hours > 0 {
+            format!("~{hours}h")
+        } else {
+            format!("~{mins}m")
+        };
+        format!("{count_label} • {dur_text}")
+    }
+
     #[cfg(test)]
     pub fn next(&mut self) -> Option<Video> {
         self.remove(0)
@@ -394,6 +506,55 @@ mod tests {
         assert!(!super::should_advance(true, &mut handled, true));
         assert!(!super::should_advance(false, &mut handled, true));
         assert!(super::should_advance(true, &mut handled, true));
+    }
+
+    #[test]
+    fn move_to_top_shuffle_deduplicate_clear_and_duration_summary_work() {
+        let mut queue = Queue::new(10);
+        let mut v1 = video('a');
+        v1.url = "https://www.youtube.com/watch?v=abcdefghijk".into();
+        v1.duration = "1:00:00".into();
+        let mut v2 = video('b');
+        v2.url = "https://youtu.be/lmnopqrstuv".into();
+        v2.duration = "24:00".into();
+        let mut v3 = video('c');
+        v3.url = "https://youtu.be/abcdefghijk".into();
+        v3.duration = "10:00".into();
+        let mut v4 = video('d');
+        v4.url = "https://www.youtube.com/watch?v=zzzzzzzzzzz".into();
+        v4.duration = "AO VIVO".into();
+
+        queue.add(v1).unwrap();
+        queue.add(v2).unwrap();
+        queue.add(v3).unwrap();
+        queue.add(v4).unwrap();
+
+        let id_b = queue.entry_id(1).unwrap();
+        let id_d = queue.entry_id(3).unwrap();
+        assert_eq!(queue.deduplicate(), 1);
+        assert_eq!(titles(&queue), ['a', 'b', 'd']);
+        assert_eq!(queue.entry_id(1), Some(id_b));
+        assert_eq!(queue.entry_id(2), Some(id_d));
+        assert_eq!(queue.format_duration_summary(), "3 vídeos • ~1h 24m");
+
+        assert!(queue.move_to_top(2));
+        assert_eq!(titles(&queue), ['d', 'a', 'b']);
+        assert_eq!(queue.entry_id(0), Some(id_d));
+
+        let ids_before: Vec<u64> = (0..queue.len()).filter_map(|i| queue.entry_id(i)).collect();
+        assert!(queue.shuffle_with_seed(42));
+        let ids_after: Vec<u64> = (0..queue.len()).filter_map(|i| queue.entry_id(i)).collect();
+        assert_ne!(ids_before, ids_after);
+        let mut sorted_before = ids_before;
+        let mut sorted_after = ids_after;
+        sorted_before.sort_unstable();
+        sorted_after.sort_unstable();
+        assert_eq!(sorted_before, sorted_after);
+
+        assert_eq!(queue.clear(), 3);
+        assert!(queue.is_empty());
+        assert!(!queue.shuffle_with_seed(1));
+        assert_eq!(queue.format_duration_summary(), "0 vídeos");
     }
 }
 

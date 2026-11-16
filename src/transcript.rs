@@ -108,7 +108,54 @@ fn strip_tags(s: &str) -> String {
         .replace("&lt;", "<")
         .replace("&gt;", ">")
 }
-#[cfg_attr(not(test), allow(dead_code))]
+pub fn format_timestamp_ms(ms: u64) -> String {
+    let total_secs = ms / 1000;
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+pub fn format_txt(cues: &[Cue]) -> String {
+    cues.iter()
+        .map(|cue| {
+            format!(
+                "[{}] {}",
+                format_timestamp_ms(cue.start_ms),
+                cue.text.trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn format_markdown(title: &str, cues: &[Cue]) -> String {
+    let mut out = String::new();
+    let trimmed_title = title.trim();
+    if !trimmed_title.is_empty() {
+        out.push_str("# ");
+        out.push_str(trimmed_title);
+        out.push_str("\n\n");
+    }
+    let body = cues
+        .iter()
+        .map(|cue| {
+            format!(
+                "- **[{}]** {}",
+                format_timestamp_ms(cue.start_ms),
+                cue.text.trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    out.push_str(&body);
+    out
+}
+
 pub fn search<'a>(cues: &'a [Cue], query: &str) -> Vec<&'a Cue> {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
@@ -159,5 +206,26 @@ mod tests {
         assert_eq!(active_cue_index(&cues, 1500), None);
         assert_eq!(active_cue_index(&cues, 2000), Some(2));
         assert_eq!(active_cue_index(&cues, 2500), None);
+    }
+
+    #[test]
+    fn formats_transcript_as_txt_and_markdown() {
+        let cues = vec![
+            Cue {
+                start_ms: 5_000,
+                end_ms: 10_000,
+                text: "Introdução".into(),
+            },
+            Cue {
+                start_ms: 3_665_000,
+                end_ms: 3_670_000,
+                text: "Conclusão".into(),
+            },
+        ];
+        assert_eq!(format_txt(&cues), "[00:05] Introdução\n[1:01:05] Conclusão");
+        assert_eq!(
+            format_markdown("Meu Vídeo", &cues),
+            "# Meu Vídeo\n\n- **[00:05]** Introdução\n- **[1:01:05]** Conclusão"
+        );
     }
 }
