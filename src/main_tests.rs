@@ -3885,6 +3885,7 @@ fn integrated_overlay_actions_update_menu_theater_fullscreen_miniplayer_and_app_
         muted: false,
         position: 42.0,
         duration: Some(180.0),
+        buffered_secs: None,
         raw_volume: 85.0,
         speed: 1.0,
         current_height: Some(1080),
@@ -5939,6 +5940,7 @@ fn handle_player_overlay_action_live_non_dvr_disables_loop_autoplay_and_restores
         muted: false,
         position: 100.0,
         duration: None,
+        buffered_secs: None,
         raw_volume: 80.0,
         speed: 1.0,
         current_height: Some(1080),
@@ -6734,4 +6736,387 @@ fn sign_out_clears_subscriptions_memory_rss_and_disk_cache() {
         cancel.cancel();
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ab_loop_overlay_actions_and_auto_seek_enforcer() {
+    let mut app = FastTube::default();
+    let ctx = egui::Context::default();
+    let mut video = sample_videos().remove(0);
+    video.url = "https://www.youtube.com/watch?v=abLoopTest1".into();
+    let now = Instant::now();
+    app.selected = Some(video.clone());
+    app.activate_video_playback(&video, Some(0), None, now);
+
+    let mut overlay_ctx = OverlayPlaybackContext {
+        video: video.clone(),
+        paused: false,
+        ended: false,
+        muted: false,
+        position: 20.0,
+        duration: Some(180.0),
+        buffered_secs: Some(30.0),
+        raw_volume: 100.0,
+        speed: 1.0,
+        current_height: Some(1080),
+        selected_quality: None,
+        qualities: vec![1080, 720],
+        qualities_loading: false,
+        has_queued: false,
+        has_active_subtitle: false,
+        subtitles: Vec::new(),
+        subtitles_loading: false,
+        chapters: Vec::new(),
+        theater: false,
+        fullscreen: false,
+        mini_player: false,
+        autoplay: false,
+        loop_video: false,
+        can_bookmark: true,
+        is_live: false,
+        is_live_dvr: false,
+        at_live_edge: false,
+        live_behind_secs: 0.0,
+        raw_path: Some(video.url.clone()),
+        raw_position: Some(20.0),
+        now,
+    };
+
+    app.handle_player_overlay_action(overlay::OverlayAction::SetLoopA, &overlay_ctx, &ctx);
+    assert_eq!(app.playback.loop_a_secs, Some(20.0));
+    assert_eq!(app.playback.ab_loop_active(), None);
+
+    // Setting B <= A clears A so an invalid inverted range cannot stay active.
+    overlay_ctx.position = 10.0;
+    app.handle_player_overlay_action(overlay::OverlayAction::SetLoopB, &overlay_ctx, &ctx);
+    assert_eq!(app.playback.loop_a_secs, None);
+    assert_eq!(app.playback.loop_b_secs, Some(10.0));
+
+    // Proper A < B activates the loop and auto-seeks back to A when reaching B.
+    overlay_ctx.position = 15.0;
+    app.handle_player_overlay_action(overlay::OverlayAction::SetLoopA, &overlay_ctx, &ctx);
+    overlay_ctx.position = 45.0;
+    app.handle_player_overlay_action(overlay::OverlayAction::SetLoopB, &overlay_ctx, &ctx);
+    assert_eq!(app.playback.ab_loop_active(), Some((15.0, 45.0)));
+
+    assert!(!app.enforce_ab_loop_seek(30.0, Some(180.0), false, now));
+    assert!(!app.enforce_ab_loop_seek(45.0, Some(180.0), true, now));
+    assert!(app.enforce_ab_loop_seek(45.2, Some(180.0), false, now));
+    assert_eq!(app.playback.active.as_ref().unwrap().position_ms, 15_000);
+    // Debounce prevents immediate re-trigger within 350ms.
+    assert!(!app.enforce_ab_loop_seek(
+        45.2,
+        Some(180.0),
+        false,
+        now + std::time::Duration::from_millis(100)
+    ));
+    // Re-triggers once cooldown elapses.
+    assert!(app.enforce_ab_loop_seek(
+        46.0,
+        Some(180.0),
+        false,
+        now + std::time::Duration::from_millis(450)
+    ));
+
+    app.handle_player_overlay_action(overlay::OverlayAction::ClearLoopAB, &overlay_ctx, &ctx);
+    assert_eq!(app.playback.loop_a_secs, None);
+    assert_eq!(app.playback.loop_b_secs, None);
+}
+
+#[test]
+fn audio_only_mode_toggles_visibility_and_paints_placeholder() {
+    let mut app = FastTube::default();
+    let ctx = egui::Context::default();
+    let video = Video {
+        title: "Podcast Rust Ao Vivo".into(),
+        channel: "Canal Dev".into(),
+        ..sample_videos().remove(0)
+    };
+    app.selected = Some(video.clone());
+    assert!(app.should_show_video_window());
+
+    let overlay_ctx = OverlayPlaybackContext {
+        video: video.clone(),
+        paused: false,
+        ended: false,
+        muted: false,
+        position: 5.0,
+        duration: Some(300.0),
+        buffered_secs: None,
+        raw_volume: 100.0,
+        speed: 1.0,
+        current_height: None,
+        selected_quality: None,
+        qualities: Vec::new(),
+        qualities_loading: false,
+        has_queued: false,
+        has_active_subtitle: false,
+        subtitles: Vec::new(),
+        subtitles_loading: false,
+        chapters: Vec::new(),
+        theater: false,
+        fullscreen: false,
+        mini_player: false,
+        autoplay: false,
+        loop_video: false,
+        can_bookmark: true,
+        is_live: false,
+        is_live_dvr: false,
+        at_live_edge: false,
+        live_behind_secs: 0.0,
+        raw_path: None,
+        raw_position: None,
+        now: Instant::now(),
+    };
+
+    app.handle_player_overlay_action(overlay::OverlayAction::ToggleAudioOnly, &overlay_ctx, &ctx);
+    assert!(app.playback.audio_only);
+    assert!(!app.should_show_video_window());
+    assert!(app.message.contains("somente"));
+
+    let mut rendered = Vec::new();
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(720.0, 405.0),
+            )),
+            ..Default::default()
+        },
+        |ui| {
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 405.0));
+            FastTube::paint_audio_only_placeholder(ui.painter(), rect, app.selected.as_ref());
+        },
+    );
+    for clipped in &out.shapes {
+        if let egui::Shape::Text(t) = &clipped.shape {
+            rendered.push(t.galley.text().to_owned());
+        }
+    }
+    out.textures_delta.clear();
+    assert!(rendered.iter().any(|t| t.contains("Modo somente áudio")));
+    assert!(rendered.iter().any(|t| t.contains("Podcast Rust Ao Vivo")));
+    assert!(rendered.iter().any(|t| t.contains("Canal Dev")));
+
+    app.handle_player_overlay_action(overlay::OverlayAction::ToggleAudioOnly, &overlay_ctx, &ctx);
+    assert!(!app.playback.audio_only);
+    assert!(app.should_show_video_window());
+}
+
+#[test]
+fn screenshot_helpers_resolve_dirs_and_sanitize_filenames() {
+    assert_eq!(
+        resolve_screenshot_dir_from(
+            Some("C:\\Users\\Alice"),
+            Some("C:\\Users\\Alice\\AppData\\Local")
+        ),
+        std::path::PathBuf::from("C:\\Users\\Alice")
+            .join("Pictures")
+            .join("FastTube")
+    );
+    assert_eq!(
+        resolve_screenshot_dir_from(Some("  "), Some("C:\\LocalAppData")),
+        std::path::PathBuf::from("C:\\LocalAppData")
+            .join("FastTube")
+            .join("screenshots")
+    );
+
+    let video = Video {
+        title: "Guia <Rust>: Dicas/Truques?".into(),
+        url: "https://www.youtube.com/watch?v=shotVideo01".into(),
+        ..sample_videos().remove(0)
+    };
+    let name = build_screenshot_filename(&video, 125.7, 1_700_000_000);
+    assert!(name.ends_with("_2m05s_1700000000.png"));
+    assert!(!name.contains(['<', '>', ':', '"', '/', '\\', '|', '?', '*']));
+
+    let mut app = FastTube {
+        selected: Some(video.clone()),
+        ..Default::default()
+    };
+    app.playback.audio_only = true;
+    app.capture_player_screenshot(&video, 10.0);
+    assert!(app.message.contains("somente"));
+}
+
+#[test]
+fn player_shortcuts_cover_youtube_keys_ab_loop_speed_and_ignore_text_input() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    let mut videos = sample_videos();
+    let first = videos.remove(0);
+    let next_video = videos.remove(0);
+    app.selected = Some(first.clone());
+    app.queue.data.add(next_video.clone()).unwrap();
+    let now = Instant::now();
+    app.activate_video_playback(&first, Some(30_000), None, now);
+    if let Some(active) = &mut app.playback.active {
+        active.duration_ms = Some(200_000);
+        active.position_ms = 30_000;
+    }
+
+    fn send_key(
+        ctx: &egui::Context,
+        app: &mut FastTube,
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+        text: Option<&str>,
+    ) {
+        let mut events = vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }];
+        if let Some(t) = text {
+            events.push(egui::Event::Text(t.to_owned()));
+        }
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                app.handle_player_shortcuts(ui.ctx(), true);
+            },
+        );
+        out.textures_delta.clear();
+    }
+
+    // L seeks +10s regardless of custom seek step, J seeks -10s.
+    app.settings.prefs.value.seek_step_secs = 15;
+    send_key(&ctx, &mut app, egui::Key::L, egui::Modifiers::NONE, None);
+    assert_eq!(app.playback.active.as_ref().unwrap().position_ms, 40_000);
+    send_key(&ctx, &mut app, egui::Key::J, egui::Modifiers::NONE, None);
+    assert_eq!(app.playback.active.as_ref().unwrap().position_ms, 30_000);
+
+    // 0..9 jump to 0%..90%.
+    send_key(&ctx, &mut app, egui::Key::Num5, egui::Modifiers::NONE, None);
+    assert_eq!(app.playback.active.as_ref().unwrap().position_ms, 100_000);
+    send_key(&ctx, &mut app, egui::Key::Num0, egui::Modifiers::NONE, None);
+    assert_eq!(app.playback.active.as_ref().unwrap().position_ms, 0);
+
+    // [ / ] / \ configure and clear A-B loop.
+    if let Some(active) = &mut app.playback.active {
+        active.position_ms = 12_000;
+    }
+    send_key(
+        &ctx,
+        &mut app,
+        egui::Key::OpenBracket,
+        egui::Modifiers::NONE,
+        Some("["),
+    );
+    if let Some(active) = &mut app.playback.active {
+        active.position_ms = 55_000;
+    }
+    send_key(
+        &ctx,
+        &mut app,
+        egui::Key::CloseBracket,
+        egui::Modifiers::NONE,
+        Some("]"),
+    );
+    assert_eq!(app.playback.ab_loop_active(), Some((12.0, 55.0)));
+    send_key(
+        &ctx,
+        &mut app,
+        egui::Key::Backslash,
+        egui::Modifiers::NONE,
+        Some("\\"),
+    );
+    assert_eq!(app.playback.ab_loop_active(), None);
+
+    // < / > step playback speed up to 3.0x and down again.
+    app.playback.speed = 2.0;
+    send_key(
+        &ctx,
+        &mut app,
+        egui::Key::Period,
+        egui::Modifiers::SHIFT,
+        Some(">"),
+    );
+    assert_eq!(app.playback.speed, 2.5);
+    send_key(
+        &ctx,
+        &mut app,
+        egui::Key::Period,
+        egui::Modifiers::SHIFT,
+        Some(">"),
+    );
+    assert_eq!(app.playback.speed, 3.0);
+    send_key(
+        &ctx,
+        &mut app,
+        egui::Key::Comma,
+        egui::Modifiers::SHIFT,
+        Some("<"),
+    );
+    assert_eq!(app.playback.speed, 2.5);
+
+    // N triggers next queued video without needing Shift.
+    app.in_app_ui_pass = true;
+    send_key(&ctx, &mut app, egui::Key::N, egui::Modifiers::NONE, None);
+    assert!(app.queue.pending_advance);
+    app.queue.pending_advance = false;
+    let _ = app.queue.data.remove(0);
+    app.feed.videos = vec![next_video.clone()];
+    app.feed.cache_dirty = true;
+    send_key(&ctx, &mut app, egui::Key::N, egui::Modifiers::NONE, None);
+    assert_eq!(app.playback.pending_open_video, Some(next_video));
+
+    // When a text input holds keyboard focus, player shortcuts must NOT trigger.
+    if let Some(active) = &mut app.playback.active {
+        active.position_ms = 60_000;
+    }
+    let mut query = String::new();
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let resp = ui.text_edit_singleline(&mut query);
+        resp.request_focus();
+    });
+    out.textures_delta.clear();
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::J,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        },
+        |ui| {
+            let _ = ui.text_edit_singleline(&mut query);
+            assert!(ui.ctx().egui_wants_keyboard_input());
+            app.handle_player_shortcuts(ui.ctx(), true);
+        },
+    );
+    out.textures_delta.clear();
+    assert_eq!(app.playback.active.as_ref().unwrap().position_ms, 60_000);
+}
+
+#[test]
+fn shortcuts_window_lists_new_player_controls_in_pt_br() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    app.ui.shortcuts_open = true;
+    let raw = || egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(900.0, 900.0),
+        )),
+        ..Default::default()
+    };
+    let mut warmup = ctx.run_ui(raw(), |ui| app.shortcuts_window_ui(ui.ctx()));
+    warmup.textures_delta.clear();
+    let mut out = ctx.run_ui(raw(), |ui| app.shortcuts_window_ui(ui.ctx()));
+    let texts = collect_rendered_text(&out.shapes);
+    out.textures_delta.clear();
+    assert!(texts.iter().any(|t| t.contains("J / L")));
+    assert!(texts.iter().any(|t| t.contains(", / .")));
+    assert!(texts.iter().any(|t| t.contains("< / >")));
+    assert!(texts.iter().any(|t| t.contains("[ / ] / \\")));
+    assert!(texts.iter().any(|t| t.contains("capturar quadro")));
 }

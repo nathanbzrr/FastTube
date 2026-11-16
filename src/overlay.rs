@@ -5,9 +5,30 @@ use eframe::egui::{
 
 pub const OVERLAY_HEIGHT: f32 = 64.0;
 pub const OVERLAY_HIDE_DELAY_SECS: f64 = 2.5;
+pub const SPEED_PRESETS: [f64; 10] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
 const BAR_SIDE_PADDING: f32 = 12.0;
 const PROGRESS_HIT_HEIGHT: f32 = 16.0;
 const BUTTON_ROW_HEIGHT: f32 = 38.0;
+
+pub fn step_speed_preset(current_speed: f64, increase: bool) -> f64 {
+    if !current_speed.is_finite() || current_speed <= 0.0 {
+        return 1.0;
+    }
+    if increase {
+        SPEED_PRESETS
+            .iter()
+            .copied()
+            .find(|&preset| preset > current_speed + 0.01)
+            .unwrap_or(*SPEED_PRESETS.last().unwrap_or(&3.0))
+    } else {
+        SPEED_PRESETS
+            .iter()
+            .rev()
+            .copied()
+            .find(|&preset| preset < current_speed - 0.01)
+            .unwrap_or(SPEED_PRESETS[0])
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OverlayMenu {
@@ -47,6 +68,7 @@ pub struct OverlayTelemetry {
     pub muted: bool,
     pub position_secs: f64,
     pub duration_secs: Option<f64>,
+    pub buffered_secs: Option<f64>,
     pub volume_percent: f32,
     pub speed: f64,
     pub seek_step_secs: u32,
@@ -68,6 +90,9 @@ pub struct OverlayTelemetry {
     pub mini_player: bool,
     pub autoplay: bool,
     pub loop_video: bool,
+    pub loop_a_secs: Option<f64>,
+    pub loop_b_secs: Option<f64>,
+    pub audio_only: bool,
     pub can_bookmark: bool,
     pub is_live: bool,
     pub is_live_dvr: bool,
@@ -85,6 +110,7 @@ impl Default for OverlayTelemetry {
             muted: false,
             position_secs: 0.0,
             duration_secs: None,
+            buffered_secs: None,
             volume_percent: 100.0,
             speed: 1.0,
             seek_step_secs: 10,
@@ -106,6 +132,9 @@ impl Default for OverlayTelemetry {
             mini_player: false,
             autoplay: false,
             loop_video: false,
+            loop_a_secs: None,
+            loop_b_secs: None,
+            audio_only: false,
             can_bookmark: false,
             is_live: false,
             is_live_dvr: false,
@@ -137,6 +166,11 @@ pub enum OverlayAction {
     Next,
     ToggleAutoplay,
     ToggleLoop,
+    SetLoopA,
+    SetLoopB,
+    ClearLoopAB,
+    ToggleAudioOnly,
+    CaptureScreenshot,
     ToggleCaptions,
     SelectSubtitle(Option<String>),
     SetSpeed(f64),
@@ -258,6 +292,72 @@ fn action_for_live_progress_click(
     Some(OverlayAction::SeekTo(clamped * duration))
 }
 
+pub(crate) fn buffered_progress_ratio(
+    position_secs: f64,
+    buffered_ahead_secs: Option<f64>,
+    duration_secs: Option<f64>,
+) -> f32 {
+    let Some(duration) = duration_secs.filter(|d| d.is_finite() && *d > 0.0) else {
+        return 0.0;
+    };
+    let Some(ahead) = buffered_ahead_secs.filter(|a| a.is_finite() && *a > 0.0) else {
+        return 0.0;
+    };
+    let pos = if position_secs.is_finite() && position_secs > 0.0 {
+        position_secs
+    } else {
+        0.0
+    };
+    ((pos + ahead) / duration).clamp(0.0, 1.0) as f32
+}
+
+pub(crate) fn ab_loop_marker_fractions(
+    loop_a_secs: Option<f64>,
+    loop_b_secs: Option<f64>,
+    duration_secs: Option<f64>,
+) -> (Option<f32>, Option<f32>, Option<(f32, f32)>) {
+    let Some(duration) = duration_secs.filter(|d| d.is_finite() && *d > 0.0) else {
+        return (None, None, None);
+    };
+    let a = loop_a_secs
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|v| (v / duration).clamp(0.0, 1.0) as f32);
+    let b = loop_b_secs
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|v| (v / duration).clamp(0.0, 1.0) as f32);
+    let range = match (loop_a_secs, loop_b_secs, a, b) {
+        (Some(av), Some(bv), Some(af), Some(bf))
+            if av.is_finite() && bv.is_finite() && av < bv && af < bf =>
+        {
+            Some((af, bf))
+        }
+        _ => None,
+    };
+    (a, b, range)
+}
+
+pub(crate) fn compute_hover_pill_rect(
+    pointer_x: f32,
+    strip_top: f32,
+    pill_size: Vec2,
+    video_rect: Rect,
+) -> Rect {
+    let margin = 6.0;
+    let clamped_w = pill_size
+        .x
+        .min((video_rect.width() - margin * 2.0).max(20.0));
+    let clamped_h = pill_size
+        .y
+        .min((video_rect.height() - margin * 2.0).max(16.0));
+    let size = Vec2::new(clamped_w, clamped_h);
+    let min_cx = video_rect.min.x + size.x * 0.5 + margin;
+    let max_cx = (video_rect.max.x - size.x * 0.5 - margin).max(min_cx);
+    let cx = pointer_x.clamp(min_cx, max_cx);
+    let min_cy = video_rect.min.y + size.y * 0.5 + margin;
+    let cy = (strip_top - size.y * 0.5 - 6.0).max(min_cy);
+    Rect::from_center_size(Pos2::new(cx, cy), size)
+}
+
 fn paint_vertical_gradient(
     painter: &egui::Painter,
     rect: Rect,
@@ -301,6 +401,8 @@ enum VectorGlyph {
     SkipForward(u32),
     Volume(bool, f32),
     Autoplay(bool),
+    AudioOnly(bool),
+    Screenshot,
     Captions(bool),
     Settings(bool),
     MiniPlayer(bool),
@@ -508,6 +610,44 @@ fn icon_button(
                         Stroke::new(1.3, Color32::from_rgb(24, 24, 28)),
                     );
                 }
+            }
+            VectorGlyph::AudioOnly(is_on) => {
+                let color = if is_on { style.accent } else { fg };
+                let r = 6.5_f32;
+                let segments = 10;
+                let arc: Vec<Pos2> = (0..=segments)
+                    .map(|i| {
+                        let a = std::f32::consts::PI
+                            + (i as f32 / segments as f32) * std::f32::consts::PI;
+                        Pos2::new(c.x + a.cos() * r, c.y + 0.5 + a.sin() * r)
+                    })
+                    .collect();
+                painter.add(Shape::line(arc, Stroke::new(1.8, color)));
+                let left_cup = Rect::from_min_max(
+                    Pos2::new(c.x - 8.0, c.y - 0.5),
+                    Pos2::new(c.x - 4.5, c.y + 6.0),
+                );
+                let right_cup = Rect::from_min_max(
+                    Pos2::new(c.x + 4.5, c.y - 0.5),
+                    Pos2::new(c.x + 8.0, c.y + 6.0),
+                );
+                painter.rect_filled(left_cup, 1.5, color);
+                painter.rect_filled(right_cup, 1.5, color);
+            }
+            VectorGlyph::Screenshot => {
+                let body = Rect::from_center_size(Pos2::new(c.x, c.y + 1.0), Vec2::new(17.0, 11.5));
+                painter.rect_stroke(
+                    body,
+                    CornerRadius::same(2),
+                    Stroke::new(1.5, fg),
+                    egui::StrokeKind::Inside,
+                );
+                let top_bump = Rect::from_min_max(
+                    Pos2::new(c.x - 3.5, body.top() - 2.5),
+                    Pos2::new(c.x + 3.5, body.top() + 0.5),
+                );
+                painter.rect_filled(top_bump, 1.0, fg);
+                painter.circle_stroke(body.center(), 3.0, Stroke::new(1.5, fg));
             }
             VectorGlyph::Captions(is_on) => {
                 let box_rect = Rect::from_center_size(c, Vec2::new(18.0, 13.0));
@@ -792,6 +932,54 @@ fn menu_row(
     response
 }
 
+fn compact_pill_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    active: bool,
+    enabled: bool,
+    style: &OverlayStyle,
+    tooltip: &str,
+) -> egui::Response {
+    let text_color = if !enabled {
+        style.text.gamma_multiply(0.35)
+    } else if active {
+        Color32::WHITE
+    } else {
+        style.text
+    };
+    let fill = if active && enabled {
+        Color32::from_rgba_unmultiplied(62, 166, 255, 190)
+    } else if enabled {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 24)
+    } else {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 10)
+    };
+    let resp = ui.add_enabled(
+        enabled,
+        egui::Button::new(RichText::new(label).size(11.0).color(text_color))
+            .fill(fill)
+            .corner_radius(5)
+            .min_size(Vec2::new(0.0, 24.0)),
+    );
+    if enabled {
+        resp.on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text(tooltip)
+    } else {
+        resp.on_hover_text(tooltip)
+    }
+}
+
+fn ab_loop_summary(telemetry: &OverlayTelemetry) -> String {
+    match (telemetry.loop_a_secs, telemetry.loop_b_secs) {
+        (Some(a), Some(b)) if a.is_finite() && b.is_finite() && a < b => {
+            format!("{} – {}", format_time(a), format_time(b))
+        }
+        (Some(a), _) if a.is_finite() => format!("A: {}", format_time(a)),
+        (_, Some(b)) if b.is_finite() => format!("B: {}", format_time(b)),
+        _ => "Desativado".to_owned(),
+    }
+}
+
 fn show_settings_popup(
     ui: &mut egui::Ui,
     video_rect: Rect,
@@ -801,16 +989,16 @@ fn show_settings_popup(
     style: &OverlayStyle,
 ) -> (Option<OverlayAction>, bool) {
     let popup_w = (video_rect.width() - 16.0).clamp(180.0, 276.0);
-    let max_h = (bar_rect.min.y - video_rect.min.y - 12.0).clamp(110.0, 330.0);
+    let max_h = (bar_rect.min.y - video_rect.min.y - 12.0).clamp(110.0, 360.0);
     let est_h = match menu {
         OverlayMenu::Root => {
-            let base_rows = if telemetry.is_live { 4 } else { 6 };
+            let base_rows = if telemetry.is_live { 6 } else { 10 };
             let rows = base_rows
                 + usize::from(!telemetry.chapters.is_empty())
                 + usize::from(telemetry.can_bookmark);
             (rows as f32 * 34.0 + 18.0).min(max_h)
         }
-        OverlayMenu::Speed => (9.0_f32 * 32.0 + 44.0).min(max_h),
+        OverlayMenu::Speed => ((SPEED_PRESETS.len() as f32 + 1.0) * 32.0 + 44.0).min(max_h),
         OverlayMenu::Quality => {
             let rows = telemetry.qualities.len().max(1) + 2;
             (rows as f32 * 32.0 + 44.0).min(max_h)
@@ -860,105 +1048,227 @@ fn show_settings_popup(
             ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
             match menu {
                 OverlayMenu::Root => {
-                    if !telemetry.is_live {
-                        if menu_row(
-                            ui,
-                            "Reprodu\u{00e7}\u{00e3}o autom\u{00e1}tica",
-                            Some(if telemetry.autoplay {
-                                "Ativada"
-                            } else {
-                                "Desativada"
-                            }),
-                            telemetry.autoplay,
-                            false,
-                            style,
-                        )
-                        .clicked()
-                        {
-                            action = Some(OverlayAction::ToggleAutoplay);
-                        }
-                        if menu_row(
-                            ui,
-                            "Repetir v\u{00ed}deo",
-                            Some(if telemetry.loop_video {
-                                "Ativado"
-                            } else {
-                                "Desativado"
-                            }),
-                            telemetry.loop_video,
-                            false,
-                            style,
-                        )
-                        .clicked()
-                        {
-                            action = Some(OverlayAction::ToggleLoop);
-                        }
-                    }
-                    if menu_row(
-                        ui,
-                        "Velocidade",
-                        Some(&speed_label(telemetry.speed)),
-                        false,
-                        true,
-                        style,
-                    )
-                    .clicked()
-                    {
-                        action = Some(OverlayAction::SetMenu(Some(OverlayMenu::Speed)));
-                    }
-                    if menu_row(
-                        ui,
-                        "Qualidade",
-                        Some(&quality_summary(telemetry)),
-                        false,
-                        true,
-                        style,
-                    )
-                    .clicked()
-                    {
-                        action = Some(OverlayAction::SetMenu(Some(OverlayMenu::Quality)));
-                    }
-                    if menu_row(
-                        ui,
-                        "Legendas",
-                        Some(&subtitle_summary(telemetry)),
-                        false,
-                        true,
-                        style,
-                    )
-                    .clicked()
-                    {
-                        action = Some(OverlayAction::SetMenu(Some(OverlayMenu::Subtitles)));
-                    }
-                    if !telemetry.chapters.is_empty() {
-                        let ch_count = format!("{}", telemetry.chapters.len());
-                        if menu_row(ui, "Capítulos", Some(&ch_count), false, true, style).clicked()
-                        {
-                            action = Some(OverlayAction::SetMenu(Some(OverlayMenu::Chapters)));
-                        }
-                    }
-                    if telemetry.can_bookmark {
-                        let ts = format_time(telemetry.position_secs);
-                        if menu_row(ui, "Adicionar marcador", Some(&ts), false, false, style)
+                    egui::ScrollArea::vertical()
+                        .id_salt("overlay_root_scroll")
+                        .max_height(inner.height().max(40.0))
+                        .show(ui, |ui| {
+                            if !telemetry.is_live {
+                                if menu_row(
+                                    ui,
+                                    "Reprodu\u{00e7}\u{00e3}o autom\u{00e1}tica",
+                                    Some(if telemetry.autoplay {
+                                        "Ativada"
+                                    } else {
+                                        "Desativada"
+                                    }),
+                                    telemetry.autoplay,
+                                    false,
+                                    style,
+                                )
+                                .clicked()
+                                {
+                                    action = Some(OverlayAction::ToggleAutoplay);
+                                }
+                                if menu_row(
+                                    ui,
+                                    "Repetir v\u{00ed}deo",
+                                    Some(if telemetry.loop_video {
+                                        "Ativado"
+                                    } else {
+                                        "Desativado"
+                                    }),
+                                    telemetry.loop_video,
+                                    false,
+                                    style,
+                                )
+                                .clicked()
+                                {
+                                    action = Some(OverlayAction::ToggleLoop);
+                                }
+                                ui.add_space(2.0);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(10.0);
+                                    ui.label(
+                                        RichText::new("Loop A-B").size(12.0).color(style.text),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.add_space(8.0);
+                                            ui.label(
+                                                RichText::new(ab_loop_summary(telemetry))
+                                                    .size(11.0)
+                                                    .color(style.text.gamma_multiply(0.75)),
+                                            );
+                                        },
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.add_space(10.0);
+                                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 0.0);
+                                    if compact_pill_button(
+                                        ui,
+                                        "Definir A",
+                                        telemetry.loop_a_secs.is_some(),
+                                        true,
+                                        style,
+                                        "Definir ponto A ([)",
+                                    )
+                                    .clicked()
+                                    {
+                                        action = Some(OverlayAction::SetLoopA);
+                                    }
+                                    if compact_pill_button(
+                                        ui,
+                                        "Definir B",
+                                        telemetry.loop_b_secs.is_some(),
+                                        true,
+                                        style,
+                                        "Definir ponto B (])",
+                                    )
+                                    .clicked()
+                                    {
+                                        action = Some(OverlayAction::SetLoopB);
+                                    }
+                                    let has_ab = telemetry.loop_a_secs.is_some()
+                                        || telemetry.loop_b_secs.is_some();
+                                    if compact_pill_button(
+                                        ui,
+                                        "Limpar",
+                                        false,
+                                        has_ab,
+                                        style,
+                                        "Limpar loop A-B (\\)",
+                                    )
+                                    .clicked()
+                                    {
+                                        action = Some(OverlayAction::ClearLoopAB);
+                                    }
+                                });
+                                ui.add_space(2.0);
+                            }
+                            if menu_row(
+                                ui,
+                                "Modo somente \u{00e1}udio",
+                                Some(if telemetry.audio_only {
+                                    "Ativado"
+                                } else {
+                                    "Desativado"
+                                }),
+                                telemetry.audio_only,
+                                false,
+                                style,
+                            )
                             .clicked()
-                        {
-                            action = Some(OverlayAction::AddBookmark);
-                        }
-                    }
-                    ui.add_space(2.0);
-                    let sep_y = ui.cursor().top();
-                    ui.painter().line_segment(
-                        [
-                            Pos2::new(inner.left(), sep_y),
-                            Pos2::new(inner.right(), sep_y),
-                        ],
-                        Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 24)),
-                    );
-                    ui.add_space(4.0);
-                    if menu_row(ui, "Configurações do app...", None, false, false, style).clicked()
-                    {
-                        action = Some(OverlayAction::OpenAppSettings);
-                    }
+                            {
+                                action = Some(OverlayAction::ToggleAudioOnly);
+                            }
+                            if !telemetry.audio_only
+                                && menu_row(
+                                    ui,
+                                    "Capturar quadro",
+                                    Some("PNG (S)"),
+                                    false,
+                                    false,
+                                    style,
+                                )
+                                .clicked()
+                            {
+                                action = Some(OverlayAction::CaptureScreenshot);
+                            }
+                            if menu_row(
+                                ui,
+                                "Velocidade",
+                                Some(&speed_label(telemetry.speed)),
+                                false,
+                                true,
+                                style,
+                            )
+                            .clicked()
+                            {
+                                action = Some(OverlayAction::SetMenu(Some(OverlayMenu::Speed)));
+                            }
+                            if menu_row(
+                                ui,
+                                "Qualidade",
+                                Some(&quality_summary(telemetry)),
+                                false,
+                                true,
+                                style,
+                            )
+                            .clicked()
+                            {
+                                action = Some(OverlayAction::SetMenu(Some(OverlayMenu::Quality)));
+                            }
+                            if menu_row(
+                                ui,
+                                "Legendas",
+                                Some(&subtitle_summary(telemetry)),
+                                false,
+                                true,
+                                style,
+                            )
+                            .clicked()
+                            {
+                                action = Some(OverlayAction::SetMenu(Some(OverlayMenu::Subtitles)));
+                            }
+                            if !telemetry.chapters.is_empty() {
+                                let ch_count = format!("{}", telemetry.chapters.len());
+                                if menu_row(
+                                    ui,
+                                    "Cap\u{00ed}tulos",
+                                    Some(&ch_count),
+                                    false,
+                                    true,
+                                    style,
+                                )
+                                .clicked()
+                                {
+                                    action =
+                                        Some(OverlayAction::SetMenu(Some(OverlayMenu::Chapters)));
+                                }
+                            }
+                            if telemetry.can_bookmark {
+                                let ts = format_time(telemetry.position_secs);
+                                if menu_row(
+                                    ui,
+                                    "Adicionar marcador",
+                                    Some(&ts),
+                                    false,
+                                    false,
+                                    style,
+                                )
+                                .clicked()
+                                {
+                                    action = Some(OverlayAction::AddBookmark);
+                                }
+                            }
+                            ui.add_space(2.0);
+                            let sep_y = ui.cursor().top();
+                            ui.painter().line_segment(
+                                [
+                                    Pos2::new(inner.left(), sep_y),
+                                    Pos2::new(inner.right(), sep_y),
+                                ],
+                                Stroke::new(
+                                    1.0,
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, 24),
+                                ),
+                            );
+                            ui.add_space(4.0);
+                            if menu_row(
+                                ui,
+                                "Configura\u{00e7}\u{00f5}es do app...",
+                                None,
+                                false,
+                                false,
+                                style,
+                            )
+                            .clicked()
+                            {
+                                action = Some(OverlayAction::OpenAppSettings);
+                            }
+                        });
                 }
                 OverlayMenu::Speed => {
                     if menu_row(ui, "‹  Velocidade da reprodução", None, false, false, style)
@@ -970,7 +1280,7 @@ fn show_settings_popup(
                         .id_salt("overlay_speed_scroll")
                         .max_height((inner.height() - 36.0).max(40.0))
                         .show(ui, |ui| {
-                            for choice in [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0] {
+                            for choice in SPEED_PRESETS {
                                 let is_cur = (telemetry.speed - choice).abs() < 0.02;
                                 let label = if (choice - 1.0).abs() < 0.01 {
                                     "Normal (1x)".to_owned()
@@ -1284,6 +1594,8 @@ pub fn show(
     let mut action_live_pill: Option<OverlayAction> = None;
     let mut action_chapter_pill: Option<OverlayAction> = None;
     let mut action_autoplay: Option<OverlayAction> = None;
+    let mut action_audio_only: Option<OverlayAction> = None;
+    let mut action_screenshot: Option<OverlayAction> = None;
     let mut action_captions: Option<OverlayAction> = None;
     let mut action_settings: Option<OverlayAction> = None;
     let mut action_mini: Option<OverlayAction> = None;
@@ -1518,6 +1830,25 @@ pub fn show(
                 Color32::from_rgba_unmultiplied(255, 255, 255, 72),
             );
 
+            if !telemetry.is_live || live_seekable {
+                let buf_ratio = buffered_progress_ratio(
+                    telemetry.position_secs,
+                    telemetry.buffered_secs,
+                    telemetry.duration_secs,
+                );
+                let buf_w = line_rect.width() * buf_ratio;
+                if buf_w > 0.0 {
+                    ui.painter().rect_filled(
+                        Rect::from_min_max(
+                            line_rect.min,
+                            Pos2::new(line_rect.min.x + buf_w, line_rect.max.y),
+                        ),
+                        track_h * 0.5,
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 118),
+                    );
+                }
+            }
+
             let hover_fraction = if is_progress_hot && strip_rect.width() > 0.0 {
                 pointer_pos.map(|p| ((p.x - strip_rect.min.x) / strip_rect.width()).clamp(0.0, 1.0))
             } else {
@@ -1533,7 +1864,7 @@ pub fn show(
                             Pos2::new(line_rect.min.x + hover_w, line_rect.max.y),
                         ),
                         track_h * 0.5,
-                        Color32::from_rgba_unmultiplied(255, 255, 255, 115),
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 138),
                     );
                 }
             }
@@ -1584,6 +1915,61 @@ pub fn show(
                             ui.painter().rect_filled(seg_rect, 0.0, seg.color);
                         }
                     }
+
+                    let (ab_a, ab_b, ab_range) = ab_loop_marker_fractions(
+                        telemetry.loop_a_secs,
+                        telemetry.loop_b_secs,
+                        telemetry.duration_secs,
+                    );
+                    let ab_color = Color32::from_rgb(66, 200, 255);
+                    if let Some((af, bf)) = ab_range {
+                        let sx = line_rect.min.x + line_rect.width() * af;
+                        let ex = (line_rect.min.x + line_rect.width() * bf).max(sx + 2.0);
+                        ui.painter().rect_filled(
+                            Rect::from_min_max(
+                                Pos2::new(sx, line_rect.min.y),
+                                Pos2::new(ex.min(line_rect.max.x), line_rect.max.y),
+                            ),
+                            0.0,
+                            Color32::from_rgba_unmultiplied(66, 200, 255, 200),
+                        );
+                    }
+                    for (marker_frac, tag) in [(ab_a, "A"), (ab_b, "B")] {
+                        if let Some(frac) = marker_frac {
+                            let mx = (line_rect.min.x + line_rect.width() * frac)
+                                .clamp(line_rect.min.x + 1.0, line_rect.max.x - 1.0);
+                            ui.painter().rect_filled(
+                                Rect::from_center_size(
+                                    Pos2::new(mx, track_cy),
+                                    Vec2::new(2.5, track_h + 7.0),
+                                ),
+                                CornerRadius::same(1),
+                                ab_color,
+                            );
+                            let tag_rect = Rect::from_center_size(
+                                Pos2::new(mx, track_cy - track_h * 0.5 - 9.0),
+                                Vec2::new(13.0, 12.0),
+                            );
+                            ui.painter().rect_filled(
+                                tag_rect,
+                                CornerRadius::same(3),
+                                Color32::from_rgba_unmultiplied(15, 20, 28, 232),
+                            );
+                            ui.painter().rect_stroke(
+                                tag_rect,
+                                CornerRadius::same(3),
+                                Stroke::new(1.0, ab_color),
+                                egui::StrokeKind::Inside,
+                            );
+                            ui.painter().text(
+                                tag_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                tag,
+                                FontId::proportional(8.5),
+                                ab_color,
+                            );
+                        }
+                    }
                 }
                 for chapter in &telemetry.chapters {
                     if chapter.time_secs > 1.0 && chapter.time_secs < duration - 1.0 {
@@ -1609,59 +1995,85 @@ pub fn show(
                     && let Some(p) = pointer_pos
                 {
                     let preview_secs = f64::from(hf) * duration;
-                    let tooltip_text = if telemetry.is_live {
+                    let chapter_title = current_chapter_title(&telemetry.chapters, preview_secs)
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty());
+                    let mut time_line = if telemetry.is_live {
                         if f64::from(hf) >= LIVE_EDGE_SNAP_FRACTION {
                             "Ao vivo".to_owned()
                         } else {
                             let behind = (duration - preview_secs).max(0.0);
-                            let lag_text = format_live_behind(behind);
-                            match current_chapter_title(&telemetry.chapters, preview_secs) {
-                                Some(ch) if !ch.is_empty() => format!("{lag_text} • {ch}"),
-                                _ => lag_text,
-                            }
+                            format_live_behind(behind)
                         }
                     } else {
-                        let ts_text = format_time(preview_secs);
-                        let mut parts = vec![ts_text];
-                        if let Some(ch) = current_chapter_title(&telemetry.chapters, preview_secs)
-                            && !ch.is_empty()
-                        {
-                            parts.push(ch.to_owned());
-                        }
-                        if let Some(seg) = telemetry.sponsor_segments.iter().find(|seg| {
-                            preview_secs >= seg.start_secs && preview_secs <= seg.end_secs
-                        }) {
-                            parts.push(format!("[SponsorBlock: {}]", seg.category_label));
-                        }
-                        parts.join(" • ")
+                        format_time(preview_secs)
                     };
-                    let font = FontId::proportional(11.5);
-                    let galley = ui
-                        .painter()
-                        .layout_no_wrap(tooltip_text, font, Color32::WHITE);
-                    let pad = Vec2::new(8.0, 4.0);
-                    let pill_size = galley.size() + pad * 2.0;
-                    let pill_x = p.x.clamp(
-                        video_rect.min.x + pill_size.x * 0.5 + 6.0,
-                        (video_rect.max.x - pill_size.x * 0.5 - 6.0)
-                            .max(video_rect.min.x + pill_size.x * 0.5 + 6.0),
+                    if !telemetry.is_live
+                        && let Some(seg) = telemetry.sponsor_segments.iter().find(|seg| {
+                            preview_secs >= seg.start_secs && preview_secs <= seg.end_secs
+                        })
+                    {
+                        time_line.push_str(&format!(" • [SponsorBlock: {}]", seg.category_label));
+                    }
+
+                    let max_text_w = (video_rect.width() - 32.0).clamp(64.0, 280.0);
+                    let chapter_galley = chapter_title.map(|ch| {
+                        ui.painter().layout(
+                            ch.to_owned(),
+                            FontId::proportional(11.0),
+                            Color32::from_gray(230),
+                            max_text_w,
+                        )
+                    });
+                    let time_galley = ui.painter().layout(
+                        time_line,
+                        FontId::proportional(11.5),
+                        Color32::WHITE,
+                        max_text_w,
                     );
-                    let pill_rect = Rect::from_center_size(
-                        Pos2::new(
-                            pill_x,
-                            (strip_rect.min.y - pill_size.y * 0.5 - 6.0)
-                                .max(video_rect.min.y + 12.0),
-                        ),
-                        pill_size,
-                    );
-                    ui.painter().rect_filled(
+
+                    let pad = Vec2::new(9.0, 5.0);
+                    let line_gap = if chapter_galley.is_some() { 2.0 } else { 0.0 };
+                    let content_w = chapter_galley
+                        .as_ref()
+                        .map_or(0.0, |g| g.size().x)
+                        .max(time_galley.size().x);
+                    let content_h = chapter_galley
+                        .as_ref()
+                        .map_or(0.0, |g| g.size().y + line_gap)
+                        + time_galley.size().y;
+                    let pill_size = Vec2::new(content_w + pad.x * 2.0, content_h + pad.y * 2.0);
+                    let pill_rect =
+                        compute_hover_pill_rect(p.x, strip_rect.min.y, pill_size, video_rect);
+                    let pill_painter = ui.painter().with_clip_rect(clipped_video);
+                    pill_painter.rect_filled(
                         pill_rect,
                         CornerRadius::same(6),
-                        Color32::from_rgba_unmultiplied(15, 15, 18, 232),
+                        Color32::from_rgba_unmultiplied(15, 15, 18, 236),
                     );
-                    ui.painter().galley(
-                        Pos2::new(pill_rect.left() + pad.x, pill_rect.top() + pad.y),
-                        galley,
+                    pill_painter.rect_stroke(
+                        pill_rect,
+                        CornerRadius::same(6),
+                        Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 28)),
+                        egui::StrokeKind::Inside,
+                    );
+                    let mut text_y = pill_rect.top() + pad.y;
+                    if let Some(ch_galley) = chapter_galley {
+                        let ch_x = (pill_rect.center().x - ch_galley.size().x * 0.5)
+                            .max(pill_rect.left() + pad.x);
+                        let ch_h = ch_galley.size().y;
+                        pill_painter.with_clip_rect(pill_rect).galley(
+                            Pos2::new(ch_x, text_y),
+                            ch_galley,
+                            Color32::from_gray(230),
+                        );
+                        text_y += ch_h + line_gap;
+                    }
+                    let time_x = (pill_rect.center().x - time_galley.size().x * 0.5)
+                        .max(pill_rect.left() + pad.x);
+                    pill_painter.with_clip_rect(pill_rect).galley(
+                        Pos2::new(time_x, text_y),
+                        time_galley,
                         Color32::WHITE,
                     );
                 }
@@ -1680,6 +2092,8 @@ pub fn show(
             let vw = bar_rect.width();
             let show_seek_10 = !telemetry.is_live && vw >= 440.0;
             let show_autoplay = !telemetry.is_live && vw >= 420.0;
+            let show_audio_only = vw >= 480.0;
+            let show_screenshot = vw >= 520.0 && !telemetry.audio_only;
             let show_mini = vw >= 360.0 || telemetry.mini_player;
             let show_theater = vw >= 320.0 && !telemetry.fullscreen && !telemetry.mini_player;
             let slider_w = if vw >= 400.0 {
@@ -1690,8 +2104,12 @@ pub fn show(
                 0.0
             };
 
-            let right_slots =
-                3 + usize::from(show_autoplay) + usize::from(show_mini) + usize::from(show_theater);
+            let right_slots = 3
+                + usize::from(show_autoplay)
+                + usize::from(show_audio_only)
+                + usize::from(show_screenshot)
+                + usize::from(show_mini)
+                + usize::from(show_theater);
             let max_right_ratio = if telemetry.mini_player && vw < 320.0 {
                 0.68
             } else {
@@ -2075,6 +2493,40 @@ pub fn show(
                     {
                         action_autoplay = Some(OverlayAction::ToggleAutoplay);
                     }
+
+                    if show_audio_only
+                        && icon_button(
+                            ui,
+                            Vec2::new(32.0, 30.0),
+                            VectorGlyph::AudioOnly(telemetry.audio_only),
+                            style,
+                            true,
+                            telemetry.audio_only,
+                            if telemetry.audio_only {
+                                "Voltar ao vídeo (somente áudio ativo)"
+                            } else {
+                                "Modo somente áudio"
+                            },
+                        )
+                        .clicked()
+                    {
+                        action_audio_only = Some(OverlayAction::ToggleAudioOnly);
+                    }
+
+                    if show_screenshot
+                        && icon_button(
+                            ui,
+                            Vec2::new(32.0, 30.0),
+                            VectorGlyph::Screenshot,
+                            style,
+                            true,
+                            false,
+                            "Capturar quadro (S)",
+                        )
+                        .clicked()
+                    {
+                        action_screenshot = Some(OverlayAction::CaptureScreenshot);
+                    }
                 });
             });
         });
@@ -2093,6 +2545,8 @@ pub fn show(
         .or(action_live_pill)
         .or(action_chapter_pill)
         .or(action_autoplay)
+        .or(action_audio_only)
+        .or(action_screenshot)
         .or(action_captions)
         .or(action_settings)
         .or(action_mini)
@@ -2498,6 +2952,155 @@ mod tests {
             texts.iter().any(|t| t.contains("15")),
             "expected custom seek step 15 in {:?}",
             texts
+        );
+    }
+
+    #[test]
+    fn buffered_progress_ratio_clamps_invalid_and_overshoot_values() {
+        assert_eq!(buffered_progress_ratio(10.0, None, Some(100.0)), 0.0);
+        assert_eq!(buffered_progress_ratio(10.0, Some(20.0), None), 0.0);
+        assert_eq!(buffered_progress_ratio(10.0, Some(20.0), Some(0.0)), 0.0);
+        assert_eq!(buffered_progress_ratio(10.0, Some(-5.0), Some(100.0)), 0.0);
+        assert_eq!(
+            buffered_progress_ratio(10.0, Some(f64::NAN), Some(100.0)),
+            0.0
+        );
+        assert!((buffered_progress_ratio(-5.0, Some(25.0), Some(100.0)) - 0.25).abs() < 1e-4);
+        assert!((buffered_progress_ratio(30.0, Some(20.0), Some(100.0)) - 0.5).abs() < 1e-4);
+        assert_eq!(buffered_progress_ratio(90.0, Some(50.0), Some(100.0)), 1.0);
+    }
+
+    #[test]
+    fn ab_loop_marker_fractions_handles_valid_and_invalid_ranges() {
+        assert_eq!(
+            ab_loop_marker_fractions(Some(10.0), Some(30.0), None),
+            (None, None, None)
+        );
+        assert_eq!(
+            ab_loop_marker_fractions(Some(10.0), None, Some(100.0)),
+            (Some(0.1), None, None)
+        );
+        assert_eq!(
+            ab_loop_marker_fractions(None, Some(40.0), Some(100.0)),
+            (None, Some(0.4), None)
+        );
+        assert_eq!(
+            ab_loop_marker_fractions(Some(50.0), Some(20.0), Some(100.0)),
+            (Some(0.5), Some(0.2), None)
+        );
+        assert_eq!(
+            ab_loop_marker_fractions(Some(25.0), Some(75.0), Some(100.0)),
+            (Some(0.25), Some(0.75), Some((0.25, 0.75)))
+        );
+    }
+
+    #[test]
+    fn compute_hover_pill_rect_stays_inside_video_bounds() {
+        let video_rect = Rect::from_min_max(Pos2::new(100.0, 50.0), Pos2::new(320.0, 200.0));
+        let left_pill = compute_hover_pill_rect(101.0, 140.0, Vec2::new(120.0, 28.0), video_rect);
+        assert!(left_pill.left() >= video_rect.left() + 5.9);
+        assert!(left_pill.right() <= video_rect.right() - 5.9);
+
+        let right_pill = compute_hover_pill_rect(319.0, 140.0, Vec2::new(120.0, 28.0), video_rect);
+        assert!(right_pill.right() <= video_rect.right() - 5.9);
+        assert!(right_pill.left() >= video_rect.left() + 5.9);
+
+        let top_pill = compute_hover_pill_rect(210.0, 52.0, Vec2::new(100.0, 32.0), video_rect);
+        assert!(top_pill.top() >= video_rect.top() + 5.9);
+    }
+
+    #[test]
+    fn speed_presets_reach_3x_and_step_cleanly() {
+        assert_eq!(SPEED_PRESETS.last(), Some(&3.0));
+        assert_eq!(step_speed_preset(1.0, true), 1.25);
+        assert_eq!(step_speed_preset(2.0, true), 2.5);
+        assert_eq!(step_speed_preset(2.5, true), 3.0);
+        assert_eq!(step_speed_preset(3.0, true), 3.0);
+        assert_eq!(step_speed_preset(1.0, false), 0.75);
+        assert_eq!(step_speed_preset(0.25, false), 0.25);
+    }
+
+    #[test]
+    fn ab_loop_markers_buffer_and_hover_chapter_pill_render_without_clipping() {
+        let rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(720.0, 405.0));
+        let style = sample_style();
+        let telemetry = OverlayTelemetry {
+            position_secs: 60.0,
+            duration_secs: Some(200.0),
+            buffered_secs: Some(40.0),
+            loop_a_secs: Some(20.0),
+            loop_b_secs: Some(100.0),
+            chapters: vec![OverlayChapter {
+                title: "Capítulo de Testes Muito Longo".into(),
+                time_secs: 30.0,
+            }],
+            ..OverlayTelemetry::default()
+        };
+        let bar_rect = compute_bar_rect(rect).expect("bar_rect válido");
+        let ctx = egui::Context::default();
+        let hover_pos = Pos2::new(bar_rect.min.x + 12.0 + 180.0, bar_rect.min.y + 6.0);
+        let mut raw = egui::RawInput::default();
+        raw.events.push(egui::Event::PointerMoved(hover_pos));
+
+        let mut texts = Vec::new();
+        let mut out = ctx.run_ui(raw, |ui| {
+            let _ = show(ui, rect, &telemetry, &style, true);
+        });
+        for clipped in &out.shapes {
+            match &clipped.shape {
+                Shape::Text(t) => texts.push(t.galley.text().to_owned()),
+                Shape::Vec(vec) => {
+                    for s in vec {
+                        if let Shape::Text(t) = s {
+                            texts.push(t.galley.text().to_owned());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.textures_delta.clear();
+        assert!(
+            texts.iter().any(|t| t == "A"),
+            "expected A marker in {:?}",
+            texts
+        );
+        assert!(
+            texts.iter().any(|t| t == "B"),
+            "expected B marker in {:?}",
+            texts
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("Capítulo de Testes")),
+            "expected chapter title in hover pill: {:?}",
+            texts
+        );
+    }
+
+    #[test]
+    fn audio_only_and_screenshot_toolbar_buttons_emit_actions() {
+        let rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(720.0, 405.0));
+        let style = sample_style();
+        let bar_rect = compute_bar_rect(rect).expect("bar_rect válido");
+        let ctx = egui::Context::default();
+
+        // Right toolbar slot order (each slot 32px + 2px spacing = 34px from right_rect.max.x):
+        // 0: Fullscreen, 1: Theater, 2: Mini, 3: Settings, 4: Captions, 5: Autoplay, 6: AudioOnly, 7: Screenshot
+        let telemetry = OverlayTelemetry {
+            duration_secs: Some(300.0),
+            ..OverlayTelemetry::default()
+        };
+        let row_cy = bar_rect.min.y + 36.0;
+        let audio_click = Pos2::new(bar_rect.max.x - 12.0 - 6.0 * 34.0 - 16.0, row_cy);
+        assert_eq!(
+            click_at(&ctx, rect, &telemetry, &style, audio_click),
+            (Some(OverlayAction::ToggleAudioOnly), true)
+        );
+
+        let screenshot_click = Pos2::new(bar_rect.max.x - 12.0 - 7.0 * 34.0 - 16.0, row_cy);
+        assert_eq!(
+            click_at(&ctx, rect, &telemetry, &style, screenshot_click),
+            (Some(OverlayAction::CaptureScreenshot), true)
         );
     }
 }

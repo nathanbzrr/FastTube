@@ -979,6 +979,7 @@ struct PlayerTelemetry {
     raw_path: Option<String>,
     raw_position: Option<f64>,
     raw_duration: Option<f64>,
+    buffered_secs: Option<f64>,
     raw_volume: f64,
     speed: f64,
     current_height: Option<u32>,
@@ -1021,6 +1022,7 @@ struct OverlayPlaybackContext {
     muted: bool,
     position: f64,
     duration: Option<f64>,
+    buffered_secs: Option<f64>,
     raw_volume: f64,
     speed: f64,
     current_height: Option<u32>,
@@ -1357,6 +1359,11 @@ impl Default for FastTube {
                 mini_player_settled: false,
                 autoplay: app_prefs.default_autoplay,
                 loop_video: app_prefs.default_loop,
+                loop_a_secs: None,
+                loop_b_secs: None,
+                ab_loop_last_seek_at: None,
+                audio_only: false,
+                speed: 1.0,
                 autoplay_eof_handled: false,
                 save_menu_open: false,
                 new_remote_playlist_title: String::new(),
@@ -2913,7 +2920,8 @@ impl FastTube {
         {
             return self.selected.is_some();
         }
-        should_show_video_window(self.selected.is_some(), self.ui.settings_open)
+        !self.playback.audio_only
+            && should_show_video_window(self.selected.is_some(), self.ui.settings_open)
     }
 
     fn sync_player_window_visibility(&mut self) {
@@ -7309,19 +7317,17 @@ impl FastTube {
             }
             self.playback.autoplay = self.settings.prefs.value.default_autoplay;
             self.playback.loop_video = self.settings.prefs.value.default_loop;
+            self.playback.clear_ab_loop();
+            let initial_speed = f64::from(self.settings.playback.value.speed_quarters) / 4.0;
+            self.playback.speed = initial_speed;
             let is_live_initial = self.is_video_known_live(&video);
             if let Some(player) = &mut self.player {
                 let _ = player.set(
                     "options/ytdl-format",
                     &self.settings.playback.value.format(),
                 );
-                let _ = player.set(
-                    "speed",
-                    &format!(
-                        "{}",
-                        f64::from(self.settings.playback.value.speed_quarters) / 4.0
-                    ),
-                );
+                let _ = player.set("speed", &format!("{initial_speed}"));
+                let _ = player.set_audio_only(self.playback.audio_only);
                 if player_created || !self.settings.prefs.value.remember_volume {
                     let volume = self.settings.prefs.value.default_volume_percent.min(100);
                     let _ = player.set("volume", &format!("{volume}"));
@@ -7443,6 +7449,9 @@ impl FastTube {
         self.playback.quality_error = None;
         self.playback.active_buffer = None;
         self.playback.active_hwdec = None;
+        self.playback.clear_ab_loop();
+        self.playback.audio_only = false;
+        self.playback.speed = 1.0;
         self.reset_decoding_diagnostics();
         #[cfg(windows)]
         {
@@ -7778,13 +7787,18 @@ impl FastTube {
                 let seek_label = format!("voltar ou avan\u{00e7}ar {} segundos", self.seek_step_secs());
                 for (key, action) in [
                     ("Espa\u{00e7}o ou K", "reproduzir/pausar"),
-                    ("\u{2190} / \u{2192} ou J / L", seek_label.as_str()),
+                    ("\u{2190} / \u{2192}", seek_label.as_str()),
+                    ("J / L", "voltar ou avan\u{00e7}ar 10 segundos"),
+                    (", / .", "recuar ou avan\u{00e7}ar 1 quadro (quando pausado)"),
+                    ("< / >", "diminuir ou aumentar velocidade (0.25x \u{2013} 3x)"),
+                    ("[ / ] / \\", "definir ponto A, ponto B ou limpar loop A-B"),
+                    ("S", "capturar quadro do v\u{00ed}deo (PNG)"),
                     ("M", "silenciar"),
                     ("C", "ativar ou desativar legendas"),
                     ("T", "modo teatro"),
                     ("F", "tela cheia"),
                     ("I", "alternar miniplayer"),
-                    ("Shift+N", "pr\u{00f3}ximo v\u{00ed}deo"),
+                    ("N / Shift+N", "pr\u{00f3}ximo v\u{00ed}deo"),
                     ("0 \u{2013} 9", "ir para 0% \u{2013} 90% do v\u{00ed}deo"),
                     ("\u{2191} / \u{2193}", "Short anterior / pr\u{00f3}ximo (no modo Shorts)"),
                     ("Esc", "fechar tela cheia, ajustes ou painel"),
@@ -7835,6 +7849,412 @@ impl FastTube {
         }
         if escape_pressed && self.ui.shortcuts_open {
             self.ui.shortcuts_open = false;
+        }
+    }
+
+    fn handle_player_shortcuts(&mut self, ctx: &egui::Context, allow_escape_exit_fullscreen: bool) {
+        if self.selected.is_none() || self.ui.settings_open || ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let short_mode = self.is_watch_short_mode();
+        let default_seek_step = f64::from(self.seek_step_secs());
+        let (
+            toggle,
+            back_step,
+            forward_step,
+            mute,
+            captions,
+            theater,
+            fullscreen,
+            escape_pressed,
+            mini_player,
+            next_shortcut,
+            short_prev,
+            short_next,
+            pct_seek,
+            frame_back,
+            frame_forward,
+            speed_down,
+            speed_up,
+            set_loop_a,
+            set_loop_b,
+            clear_loop_ab,
+            screenshot,
+        ) = ctx.input(|input| {
+            let no_alt_ctrl = !input.modifiers.alt && !input.modifiers.ctrl;
+            let no_mods = no_alt_ctrl && !input.modifiers.shift;
+            let mut text_comma = false;
+            let mut text_period = false;
+            let mut text_lt = false;
+            let mut text_gt = false;
+            let mut text_open_bracket = false;
+            let mut text_close_bracket = false;
+            let mut text_backslash = false;
+            if no_alt_ctrl {
+                for ev in &input.events {
+                    if let egui::Event::Text(text) = ev {
+                        match text.as_str() {
+                            "," if no_mods => text_comma = true,
+                            "." if no_mods => text_period = true,
+                            "<" => text_lt = true,
+                            ">" => text_gt = true,
+                            "[" => text_open_bracket = true,
+                            "]" => text_close_bracket = true,
+                            "\\" => text_backslash = true,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let pct = if no_alt_ctrl {
+                [
+                    (egui::Key::Num0, 0.0),
+                    (egui::Key::Num1, 0.1),
+                    (egui::Key::Num2, 0.2),
+                    (egui::Key::Num3, 0.3),
+                    (egui::Key::Num4, 0.4),
+                    (egui::Key::Num5, 0.5),
+                    (egui::Key::Num6, 0.6),
+                    (egui::Key::Num7, 0.7),
+                    (egui::Key::Num8, 0.8),
+                    (egui::Key::Num9, 0.9),
+                ]
+                .into_iter()
+                .find_map(|(k, p)| input.key_pressed(k).then_some(p))
+            } else {
+                None
+            };
+            let back = if no_alt_ctrl && input.key_pressed(egui::Key::J) {
+                Some(10.0)
+            } else if no_alt_ctrl && input.key_pressed(egui::Key::ArrowLeft) {
+                Some(default_seek_step)
+            } else {
+                None
+            };
+            let forward = if no_alt_ctrl && input.key_pressed(egui::Key::L) {
+                Some(10.0)
+            } else if no_alt_ctrl && input.key_pressed(egui::Key::ArrowRight) {
+                Some(default_seek_step)
+            } else {
+                None
+            };
+            (
+                no_alt_ctrl
+                    && (input.key_pressed(egui::Key::Space) || input.key_pressed(egui::Key::K)),
+                back,
+                forward,
+                no_alt_ctrl && input.key_pressed(egui::Key::M),
+                no_alt_ctrl && input.key_pressed(egui::Key::C),
+                no_alt_ctrl && input.key_pressed(egui::Key::T),
+                no_alt_ctrl && input.key_pressed(egui::Key::F),
+                input.key_pressed(egui::Key::Escape),
+                no_alt_ctrl && input.key_pressed(egui::Key::I),
+                no_alt_ctrl && input.key_pressed(egui::Key::N),
+                short_mode && no_alt_ctrl && input.key_pressed(egui::Key::ArrowUp),
+                short_mode && no_alt_ctrl && input.key_pressed(egui::Key::ArrowDown),
+                pct,
+                no_mods && (input.key_pressed(egui::Key::Comma) || text_comma),
+                no_mods && (input.key_pressed(egui::Key::Period) || text_period),
+                (no_alt_ctrl && input.modifiers.shift && input.key_pressed(egui::Key::Comma))
+                    || text_lt,
+                (no_alt_ctrl && input.modifiers.shift && input.key_pressed(egui::Key::Period))
+                    || text_gt,
+                (no_mods && input.key_pressed(egui::Key::OpenBracket)) || text_open_bracket,
+                (no_mods && input.key_pressed(egui::Key::CloseBracket)) || text_close_bracket,
+                (no_mods && input.key_pressed(egui::Key::Backslash)) || text_backslash,
+                no_mods && input.key_pressed(egui::Key::S),
+            )
+        });
+
+        let any_activity = toggle
+            || back_step.is_some()
+            || forward_step.is_some()
+            || mute
+            || captions
+            || theater
+            || fullscreen
+            || mini_player
+            || next_shortcut
+            || short_prev
+            || short_next
+            || pct_seek.is_some()
+            || frame_back
+            || frame_forward
+            || speed_down
+            || speed_up
+            || set_loop_a
+            || set_loop_b
+            || clear_loop_ab
+            || screenshot;
+        if any_activity {
+            self.playback.overlay_last_activity = Instant::now();
+        }
+
+        if toggle || back_step.is_some() || forward_step.is_some() || mute || pct_seek.is_some() {
+            let is_live = self.active_video_is_live();
+            let live_dvr = self
+                .playback
+                .active
+                .as_ref()
+                .is_some_and(|active| active.live_dvr);
+            let mut key_seek_pos: Option<f64> = None;
+            let mut key_seek_dur: Option<f64> = None;
+            let mut key_flush_pause = false;
+            let mut trigger_go_live = false;
+            let fallback_pos = self
+                .playback
+                .active
+                .as_ref()
+                .map_or(0.0, |active| active.position_ms as f64 / 1000.0);
+            let fallback_dur = self
+                .playback
+                .active
+                .as_ref()
+                .and_then(|a| a.duration_ms)
+                .filter(|&d| d > 0)
+                .map(|d| d as f64 / 1000.0);
+
+            #[cfg(windows)]
+            if let Some(player) = &self.player {
+                let was_ended = toggle && player.flag_cstr(c"eof-reached") == Some(true);
+                let was_paused = toggle && player.flag_cstr(c"pause") == Some(true);
+                let cur_pos = if back_step.is_some() || forward_step.is_some() {
+                    player
+                        .double_cstr(c"time-pos")
+                        .filter(|&pos| pos >= 0.0)
+                        .unwrap_or(fallback_pos)
+                } else {
+                    0.0
+                };
+                let cur_dur = if back_step.is_some() || forward_step.is_some() || pct_seek.is_some()
+                {
+                    player
+                        .double_cstr(c"duration")
+                        .filter(|&d| d > 0.0)
+                        .or(fallback_dur)
+                } else {
+                    None
+                };
+                key_seek_dur = cur_dur;
+                let pct_target = pct_seek.and_then(|pct| cur_dur.map(|dur| (pct, dur * pct)));
+                let result = if toggle {
+                    if was_ended && is_live {
+                        trigger_go_live = true;
+                        Ok(())
+                    } else if was_ended {
+                        player
+                            .seek(0.0, "absolute+exact")
+                            .and_then(|()| player.set("pause", "no"))
+                    } else {
+                        player.set("pause", if was_paused { "no" } else { "yes" })
+                    }
+                } else if let Some(step) = back_step {
+                    if is_live && !live_dvr {
+                        Ok(())
+                    } else {
+                        player.seek(-step, "relative")
+                    }
+                } else if let Some(step) = forward_step {
+                    if is_live && !live_dvr {
+                        Ok(())
+                    } else if is_live {
+                        let target = cur_pos + step;
+                        if cur_dur.is_some_and(|dur| dur <= 1.5 || target >= (dur - 1.5).max(0.0)) {
+                            trigger_go_live = true;
+                            Ok(())
+                        } else {
+                            let clamped =
+                                cur_dur.map_or(target, |dur| target.min((dur - 1.5).max(0.0)));
+                            key_seek_pos = Some(clamped);
+                            player.seek(clamped, "absolute+exact")
+                        }
+                    } else {
+                        player.seek(step, "relative")
+                    }
+                } else if let Some((pct, target)) = pct_target {
+                    if is_live && !live_dvr {
+                        Ok(())
+                    } else if is_live {
+                        if pct >= 0.985
+                            || cur_dur
+                                .is_some_and(|dur| dur <= 1.5 || target >= (dur - 1.5).max(0.0))
+                        {
+                            trigger_go_live = true;
+                            Ok(())
+                        } else {
+                            let clamped =
+                                cur_dur.map_or(target, |dur| target.min((dur - 1.5).max(0.0)));
+                            key_seek_pos = Some(clamped);
+                            player.seek(clamped, "absolute+exact")
+                        }
+                    } else {
+                        player.seek(target, "absolute+exact")
+                    }
+                } else if mute {
+                    player.set(
+                        "mute",
+                        if player.flag_cstr(c"mute") == Some(true) {
+                            "no"
+                        } else {
+                            "yes"
+                        },
+                    )
+                } else {
+                    Ok(())
+                };
+                match result {
+                    Ok(()) => {
+                        if toggle && !trigger_go_live {
+                            if was_ended {
+                                key_seek_pos = Some(0.0);
+                            } else if !was_paused {
+                                key_flush_pause = true;
+                            }
+                        } else if let Some(step) = back_step
+                            && (!is_live || live_dvr)
+                        {
+                            key_seek_pos = Some((cur_pos - step).max(0.0));
+                        } else if let Some(step) = forward_step
+                            && !is_live
+                        {
+                            key_seek_pos =
+                                Some(cur_dur.map_or(cur_pos + step, |d| (cur_pos + step).min(d)));
+                        } else if let Some((_, target)) = pct_target
+                            && !is_live
+                        {
+                            key_seek_pos = Some(target);
+                        }
+                    }
+                    Err(error) => self.message = error,
+                }
+            } else if !is_live || live_dvr {
+                key_seek_dur = fallback_dur;
+                if let Some(step) = back_step {
+                    key_seek_pos = Some((fallback_pos - step).max(0.0));
+                } else if let Some(step) = forward_step {
+                    if is_live
+                        && fallback_dur.is_some_and(|dur| {
+                            dur <= 1.5 || fallback_pos + step >= (dur - 1.5).max(0.0)
+                        })
+                    {
+                        trigger_go_live = true;
+                    } else {
+                        let target = fallback_pos + step;
+                        key_seek_pos = Some(if is_live {
+                            fallback_dur.map_or(target, |dur| target.min((dur - 1.5).max(0.0)))
+                        } else {
+                            fallback_dur.map_or(target, |dur| target.min(dur))
+                        });
+                    }
+                } else if let Some(pct) = pct_seek
+                    && let Some(dur) = fallback_dur
+                {
+                    let target = dur * pct;
+                    if is_live && (pct >= 0.985 || dur <= 1.5 || target >= (dur - 1.5).max(0.0)) {
+                        trigger_go_live = true;
+                    } else {
+                        key_seek_pos = Some(if is_live {
+                            target.min((dur - 1.5).max(0.0))
+                        } else {
+                            target
+                        });
+                    }
+                }
+            }
+
+            if trigger_go_live {
+                if let Some(video) = self.selected.clone() {
+                    self.go_live_edge(&video);
+                }
+            } else if let Some(pos) = key_seek_pos {
+                self.record_manual_seek(pos, key_seek_dur, Instant::now());
+            } else if key_flush_pause {
+                self.flush_playback_history_at(Instant::now());
+            }
+        }
+
+        #[cfg(windows)]
+        if (frame_back || frame_forward)
+            && !self.active_video_is_live()
+            && let Some(player) = &self.player
+            && player.flag_cstr(c"pause") == Some(true)
+        {
+            let res = if frame_back {
+                player.frame_back_step()
+            } else {
+                player.frame_step()
+            };
+            if let Err(error) = res {
+                self.message = error;
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = (frame_back, frame_forward);
+
+        if speed_up != speed_down {
+            #[cfg(windows)]
+            let current_speed = self
+                .player
+                .as_ref()
+                .and_then(|p| p.double_cstr(c"speed"))
+                .filter(|s| s.is_finite() && *s > 0.0)
+                .unwrap_or(self.playback.speed);
+            #[cfg(not(windows))]
+            let current_speed = self.playback.speed;
+            let next_speed = overlay::step_speed_preset(current_speed, speed_up);
+            self.set_player_speed(next_speed);
+            self.message = format!("Velocidade: {:.2}x", next_speed);
+        }
+
+        if set_loop_a {
+            let pos = self.current_playback_position_for_ab(None);
+            self.set_ab_loop_point_a(pos);
+        }
+        if set_loop_b {
+            let pos = self.current_playback_position_for_ab(None);
+            self.set_ab_loop_point_b(pos);
+        }
+        if clear_loop_ab {
+            self.clear_ab_loop_points();
+        }
+        if screenshot && let Some(video) = self.selected.clone() {
+            let pos = self.current_playback_position_for_ab(None);
+            self.capture_player_screenshot(&video, pos);
+        }
+
+        if captions {
+            self.toggle_player_captions(ctx);
+        }
+        if theater && !self.playback.fullscreen {
+            self.toggle_theater_mode();
+        }
+        if fullscreen
+            || (escape_pressed && allow_escape_exit_fullscreen && self.playback.fullscreen)
+        {
+            self.toggle_fullscreen(ctx);
+        }
+        if mini_player {
+            self.toggle_mini_player(ctx);
+        }
+        if next_shortcut {
+            if !self.queue.data.is_empty() {
+                self.request_queue_advance();
+            } else {
+                let next = if short_mode {
+                    self.next_or_prev_short(true)
+                } else {
+                    self.next_recommended_video()
+                };
+                if let Some(video) = next {
+                    self.playback.pending_open_video = Some(video);
+                }
+            }
+        } else if short_prev {
+            if let Some(video) = self.next_or_prev_short(false) {
+                self.playback.pending_open_video = Some(video);
+            }
+        } else if short_next && let Some(video) = self.next_or_prev_short(true) {
+            self.playback.pending_open_video = Some(video);
         }
     }
 
@@ -9002,15 +9422,126 @@ impl FastTube {
             });
     }
 
+    fn paint_audio_only_placeholder(
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        selected: Option<&Video>,
+    ) {
+        if rect.width() <= 20.0 || rect.height() <= 20.0 {
+            return;
+        }
+        let clipped = painter.with_clip_rect(rect);
+        clipped.rect_filled(rect, 0.0, Color32::from_rgb(16, 18, 24));
+        let glow_r = (rect.width().min(rect.height()) * 0.38).clamp(40.0, 170.0);
+        clipped.circle_filled(
+            rect.center(),
+            glow_r,
+            Color32::from_rgba_unmultiplied(62, 166, 255, 22),
+        );
+        clipped.circle_stroke(
+            rect.center(),
+            glow_r * 0.72,
+            egui::Stroke::new(1.2, Color32::from_rgba_unmultiplied(62, 166, 255, 65)),
+        );
+
+        let badge_r = (rect.height() * 0.13).clamp(18.0, 34.0);
+        let icon_center = if rect.height() >= 190.0 {
+            egui::pos2(rect.center().x, rect.center().y - 34.0)
+        } else {
+            egui::pos2(rect.center().x, rect.center().y - 12.0)
+        };
+        clipped.circle_filled(
+            icon_center,
+            badge_r,
+            Color32::from_rgba_unmultiplied(30, 44, 66, 235),
+        );
+        clipped.circle_stroke(
+            icon_center,
+            badge_r,
+            egui::Stroke::new(1.5, Color32::from_rgb(90, 190, 255)),
+        );
+        let s = badge_r * 0.45;
+        let note_color = Color32::from_rgb(235, 246, 255);
+        clipped.circle_filled(
+            egui::pos2(icon_center.x - s * 0.45, icon_center.y + s * 0.48),
+            s * 0.34,
+            note_color,
+        );
+        clipped.circle_filled(
+            egui::pos2(icon_center.x + s * 0.55, icon_center.y + s * 0.32),
+            s * 0.34,
+            note_color,
+        );
+        clipped.line_segment(
+            [
+                egui::pos2(icon_center.x - s * 0.20, icon_center.y + s * 0.42),
+                egui::pos2(icon_center.x - s * 0.20, icon_center.y - s * 0.58),
+            ],
+            egui::Stroke::new(2.0, note_color),
+        );
+        clipped.line_segment(
+            [
+                egui::pos2(icon_center.x + s * 0.80, icon_center.y + s * 0.26),
+                egui::pos2(icon_center.x + s * 0.80, icon_center.y - s * 0.72),
+            ],
+            egui::Stroke::new(2.0, note_color),
+        );
+        clipped.line_segment(
+            [
+                egui::pos2(icon_center.x - s * 0.24, icon_center.y - s * 0.58),
+                egui::pos2(icon_center.x + s * 0.84, icon_center.y - s * 0.72),
+            ],
+            egui::Stroke::new(3.0, note_color),
+        );
+
+        let badge_y = icon_center.y + badge_r + 16.0;
+        clipped.text(
+            egui::pos2(rect.center().x, badge_y),
+            egui::Align2::CENTER_CENTER,
+            "Modo somente \u{00e1}udio",
+            egui::FontId::proportional(13.5),
+            Color32::from_rgb(130, 210, 255),
+        );
+
+        if let Some(video) = selected {
+            let max_text_w = (rect.width() - 48.0).max(80.0);
+            if rect.height() >= 170.0 && !video.title.trim().is_empty() {
+                let title_galley = clipped.layout(
+                    video.title.clone(),
+                    egui::FontId::proportional(15.0),
+                    Color32::from_rgb(242, 244, 248),
+                    max_text_w,
+                );
+                let title_pos = egui::pos2(
+                    rect.center().x - title_galley.size().x * 0.5,
+                    badge_y + 14.0,
+                );
+                let title_h = title_galley.size().y;
+                clipped.galley(title_pos, title_galley, Color32::from_rgb(242, 244, 248));
+                if !video.channel.trim().is_empty() && rect.height() >= 210.0 {
+                    clipped.text(
+                        egui::pos2(rect.center().x, title_pos.y + title_h + 12.0),
+                        egui::Align2::CENTER_CENTER,
+                        video.channel.trim(),
+                        egui::FontId::proportional(12.5),
+                        Color32::from_rgb(168, 174, 186),
+                    );
+                }
+            }
+        }
+    }
+
     fn paint_hidden_video_notice(&self, ui: &egui::Ui, rect: egui::Rect) {
         if self.ui.settings_open {
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "Vídeo oculto temporariamente enquanto o menu de configurações está aberto",
+                "V\u{00ed}deo oculto temporariamente enquanto o menu de configura\u{00e7}\u{00f5}es est\u{00e1} aberto",
                 egui::FontId::proportional(13.0),
                 Color32::from_rgb(165, 165, 175),
             );
+        } else if self.playback.audio_only {
+            Self::paint_audio_only_placeholder(ui.painter(), rect, self.selected.as_ref());
         }
     }
 
@@ -9023,33 +9554,42 @@ impl FastTube {
         settings_open: bool,
     ) -> Option<(Option<(egui::Rect, egui::Response)>, PlayerTelemetry)> {
         let mut video_area: Option<(egui::Rect, egui::Response)> = None;
+        let audio_only = self.playback.audio_only;
+        let selected = self.selected.as_ref();
+        let fullscreen = self.playback.fullscreen;
+        let theater = self.playback.theater;
+        let mini_player = self.playback.mini_player;
         let player = self.player.as_mut()?;
         let (events, poll_error) = player.poll_events();
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
 
-        let sense = if self.playback.mini_player {
+        let sense = if mini_player {
             egui::Sense::click_and_drag()
         } else {
             egui::Sense::click()
         };
         let (rect, response) = ui.allocate_exact_size(size, sense);
         response.surrender_focus();
-        let corner_radius =
-            if self.playback.fullscreen || self.playback.theater || self.playback.mini_player {
-                0.0
-            } else {
-                4.0
-            };
+        let corner_radius = if fullscreen || theater || mini_player {
+            0.0
+        } else {
+            4.0
+        };
         ui.painter()
             .rect_filled(rect, corner_radius, Color32::BLACK);
         if settings_open {
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "Vídeo oculto temporariamente enquanto o menu de configurações está aberto",
+                "V\u{00ed}deo oculto temporariamente enquanto o menu de configura\u{00e7}\u{00f5}es est\u{00e1} aberto",
                 egui::FontId::proportional(13.0),
                 Color32::from_rgb(165, 165, 175),
             );
+        } else if audio_only {
+            Self::paint_audio_only_placeholder(ui.painter(), rect, selected);
+            if player.is_render_api() {
+                video_area = Some((rect, response));
+            }
         } else if player.paint_into(ui.painter(), rect) {
             // Render API paints directly into egui, so the overlay stays above video without a native HWND.
             video_area = Some((rect, response));
@@ -9069,6 +9609,7 @@ impl FastTube {
             raw_path: player.property_cstr(c"path"),
             raw_position: player.double_cstr(c"time-pos").filter(|&pos| pos >= 0.0),
             raw_duration: player.double_cstr(c"duration").filter(|&dur| dur > 0.0),
+            buffered_secs: player.buffered_duration_secs(),
             raw_volume: player
                 .double_cstr(c"volume")
                 .unwrap_or(100.0)
@@ -9750,13 +10291,15 @@ impl FastTube {
                 format!("Velocidade {speed:.2}x")
             })
             .show_ui(ui, |ui| {
-                for choice in [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0] {
+                for choice in overlay::SPEED_PRESETS {
                     if ui
-                        .selectable_value(&mut speed, choice, format!("{choice:.2}×"))
+                        .selectable_value(&mut speed, choice, format!("{choice:.2}\u{00d7}"))
                         .changed()
-                        && let Err(error) = player.set("speed", &format!("{choice}"))
                     {
-                        self.message = error;
+                        self.playback.speed = choice;
+                        if let Err(error) = player.set("speed", &format!("{choice}")) {
+                            self.message = error;
+                        }
                     }
                 }
             })
@@ -10149,6 +10692,9 @@ impl FastTube {
         if clear_start_option && let Some(player) = &self.player {
             let _ = player.set("options/start", "none");
         }
+        if telemetry.speed.is_finite() && telemetry.speed > 0.0 {
+            self.playback.speed = telemetry.speed;
+        }
         if let Some(target_secs) = pending_seek {
             if let Some(player) = &self.player
                 && let Err(error) = player.seek(target_secs, "absolute+exact")
@@ -10159,6 +10705,7 @@ impl FastTube {
                 self.message = error;
             }
         } else if self.playback.seek_drag.is_none()
+            && !self.enforce_ab_loop_seek(position, duration, is_live, now)
             && let Some(skip_target) =
                 self.try_auto_skip_sponsor_segment(position, duration, is_live, now)
             && let Some(player) = &self.player
@@ -10241,6 +10788,7 @@ impl FastTube {
             muted: telemetry.muted,
             position,
             duration,
+            buffered_secs: telemetry.buffered_secs,
             raw_volume: telemetry.raw_volume,
             speed: telemetry.speed,
             current_height: telemetry.current_height,
@@ -10473,6 +11021,7 @@ impl FastTube {
                 muted: playback.muted,
                 position_secs: playback.position,
                 duration_secs: playback.duration,
+                buffered_secs: playback.buffered_secs,
                 volume_percent: playback.raw_volume as f32,
                 speed: playback.speed,
                 seek_step_secs: self.seek_step_secs(),
@@ -10494,6 +11043,9 @@ impl FastTube {
                 mini_player: playback.mini_player,
                 autoplay: playback.autoplay,
                 loop_video: playback.loop_video,
+                loop_a_secs: self.playback.loop_a_secs,
+                loop_b_secs: self.playback.loop_b_secs,
+                audio_only: self.playback.audio_only,
                 can_bookmark: playback.can_bookmark,
                 is_live: playback.is_live,
                 is_live_dvr: playback.is_live_dvr,
@@ -10773,20 +11325,31 @@ impl FastTube {
                     }
                 }
             }
+            OverlayAction::SetLoopA => {
+                if !playback.is_live {
+                    self.set_ab_loop_point_a(playback.position);
+                }
+            }
+            OverlayAction::SetLoopB => {
+                if !playback.is_live {
+                    self.set_ab_loop_point_b(playback.position);
+                }
+            }
+            OverlayAction::ClearLoopAB => {
+                self.clear_ab_loop_points();
+            }
+            OverlayAction::ToggleAudioOnly => {
+                self.toggle_audio_only_mode();
+            }
+            OverlayAction::CaptureScreenshot => {
+                self.capture_player_screenshot(&playback.video, playback.position);
+            }
             OverlayAction::ToggleCaptions => self.toggle_player_captions(ctx),
             OverlayAction::SelectSubtitle(id) => {
                 self.select_overlay_subtitle(id.as_deref(), ctx);
             }
             OverlayAction::SetSpeed(speed) => {
-                let clamped = speed.clamp(0.25, 2.0);
-                #[cfg(windows)]
-                if let Some(player) = &self.player
-                    && let Err(error) = player.set("speed", &format!("{clamped}"))
-                {
-                    self.message = error;
-                }
-                #[cfg(not(windows))]
-                let _ = clamped;
+                self.set_player_speed(speed);
             }
             OverlayAction::SelectQuality(quality) => {
                 #[cfg(windows)]
@@ -10846,6 +11409,179 @@ impl FastTube {
             OverlayAction::ToggleTheater => self.toggle_theater_mode(),
             OverlayAction::ToggleFullscreen => self.toggle_fullscreen(ctx),
             OverlayAction::Close => self.close_video(ctx),
+        }
+    }
+
+    fn set_player_speed(&mut self, speed: f64) {
+        let clamped = speed.clamp(0.25, 3.0);
+        self.playback.speed = clamped;
+        #[cfg(windows)]
+        if let Some(player) = &self.player
+            && let Err(error) = player.set("speed", &format!("{clamped}"))
+        {
+            self.message = error;
+        }
+    }
+
+    fn toggle_audio_only_mode(&mut self) {
+        let next = !self.playback.audio_only;
+        self.playback.audio_only = next;
+        #[cfg(windows)]
+        if let Some(player) = &self.player
+            && let Err(error) = player.set_audio_only(next)
+        {
+            self.message = error;
+            return;
+        }
+        self.sync_player_window_visibility();
+        self.message = if next {
+            "Modo somente \u{00e1}udio ativado.".into()
+        } else {
+            "Modo somente \u{00e1}udio desativado.".into()
+        };
+    }
+
+    fn current_playback_position_for_ab(&self, fallback: Option<f64>) -> f64 {
+        #[cfg(windows)]
+        if let Some(player) = &self.player
+            && let Some(pos) = player
+                .double_cstr(c"time-pos")
+                .filter(|&p| p.is_finite() && p >= 0.0)
+        {
+            return pos;
+        }
+        if let Some(pos) = fallback.filter(|&p| p.is_finite() && p >= 0.0) {
+            return pos;
+        }
+        self.playback
+            .active
+            .as_ref()
+            .map_or(0.0, |active| active.position_ms as f64 / 1000.0)
+    }
+
+    fn set_ab_loop_point_a(&mut self, pos_secs: f64) {
+        if self.active_video_is_live() {
+            self.message = "Loop A-B indispon\u{00ed}vel em transmiss\u{00f5}es ao vivo.".into();
+            return;
+        }
+        self.playback.set_loop_a(pos_secs);
+        self.message = match self.playback.ab_loop_active() {
+            Some((a, b)) => format!(
+                "Loop A-B ativo: {} \u{2013} {}",
+                overlay::format_time(a),
+                overlay::format_time(b)
+            ),
+            None => format!("Ponto A definido em {}", overlay::format_time(pos_secs)),
+        };
+    }
+
+    fn set_ab_loop_point_b(&mut self, pos_secs: f64) {
+        if self.active_video_is_live() {
+            self.message = "Loop A-B indispon\u{00ed}vel em transmiss\u{00f5}es ao vivo.".into();
+            return;
+        }
+        self.playback.set_loop_b(pos_secs);
+        self.message = match self.playback.ab_loop_active() {
+            Some((a, b)) => format!(
+                "Loop A-B ativo: {} \u{2013} {}",
+                overlay::format_time(a),
+                overlay::format_time(b)
+            ),
+            None => format!(
+                "Ponto B definido em {} (defina A antes de B)",
+                overlay::format_time(pos_secs)
+            ),
+        };
+    }
+
+    fn clear_ab_loop_points(&mut self) {
+        self.playback.clear_ab_loop();
+        self.message = "Loop A-B limpo.".into();
+    }
+
+    fn enforce_ab_loop_seek(
+        &mut self,
+        position: f64,
+        duration: Option<f64>,
+        is_live: bool,
+        now: Instant,
+    ) -> bool {
+        if is_live || !position.is_finite() {
+            return false;
+        }
+        let Some((a, b)) = self.playback.ab_loop_active() else {
+            return false;
+        };
+        if position < b {
+            return false;
+        }
+        if let Some(last) = self.playback.ab_loop_last_seek_at
+            && now.duration_since(last) < std::time::Duration::from_millis(350)
+        {
+            return false;
+        }
+        self.playback.ab_loop_last_seek_at = Some(now);
+        #[cfg(windows)]
+        if let Some(player) = &self.player
+            && let Err(error) = player.seek(a, "absolute+exact")
+        {
+            self.message = error;
+            return false;
+        }
+        self.record_manual_seek(a, duration, now);
+        true
+    }
+
+    fn capture_player_screenshot(&mut self, video: &Video, position_secs: f64) {
+        if self.playback.audio_only {
+            self.message =
+                "Captura de quadro indispon\u{00ed}vel no modo somente \u{00e1}udio.".into();
+            return;
+        }
+        let candidates = screenshot_dir_candidates(
+            std::env::var("USERPROFILE").ok().as_deref(),
+            std::env::var("LOCALAPPDATA").ok().as_deref(),
+        );
+        let mut target_dir = None;
+        let mut last_dir_err: Option<std::io::Error> = None;
+        for dir in candidates {
+            match std::fs::create_dir_all(&dir) {
+                Ok(()) => {
+                    target_dir = Some(dir);
+                    break;
+                }
+                Err(err) => last_dir_err = Some(err),
+            }
+        }
+        let Some(dir) = target_dir else {
+            self.message = format!(
+                "N\u{00e3}o foi poss\u{00ed}vel criar pasta de capturas: {}",
+                last_dir_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "diret\u{00f3}rio indispon\u{00ed}vel".into())
+            );
+            return;
+        };
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let filename = build_screenshot_filename(video, position_secs, now_secs);
+        let path = dir.join(&filename);
+        #[cfg(windows)]
+        {
+            let Some(player) = &self.player else {
+                self.message = format!("Player n\u{00e3}o inicializado para capturar {filename}.");
+                return;
+            };
+            match player.screenshot_to_file(&path) {
+                Ok(()) => self.message = format!("Captura salva: {filename}"),
+                Err(error) => self.message = error,
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = path;
+            self.message = format!("Captura salva: {filename}");
         }
     }
 
@@ -24664,258 +25400,10 @@ impl eframe::App for FastTube {
                 self.navigate_from_shortcut(&ctx, BrowseSection::Library);
             }
         }
-        if self.selected.is_some() && !ctx.egui_wants_keyboard_input() {
-            let short_mode = self.is_watch_short_mode();
-            let (
-                toggle,
-                back,
-                forward,
-                mute,
-                captions,
-                theater,
-                fullscreen,
-                mini_player,
-                next_shortcut,
-                short_prev,
-                short_next,
-                pct_seek,
-            ) = ctx.input(|input| {
-                let no_alt_ctrl = !input.modifiers.alt && !input.modifiers.ctrl;
-                let pct = if no_alt_ctrl {
-                    [
-                        (egui::Key::Num0, 0.0),
-                        (egui::Key::Num1, 0.1),
-                        (egui::Key::Num2, 0.2),
-                        (egui::Key::Num3, 0.3),
-                        (egui::Key::Num4, 0.4),
-                        (egui::Key::Num5, 0.5),
-                        (egui::Key::Num6, 0.6),
-                        (egui::Key::Num7, 0.7),
-                        (egui::Key::Num8, 0.8),
-                        (egui::Key::Num9, 0.9),
-                    ]
-                    .into_iter()
-                    .find_map(|(k, p)| input.key_pressed(k).then_some(p))
-                } else {
-                    None
-                };
-                (
-                    input.key_pressed(egui::Key::Space) || input.key_pressed(egui::Key::K),
-                    input.key_pressed(egui::Key::ArrowLeft) || input.key_pressed(egui::Key::J),
-                    input.key_pressed(egui::Key::ArrowRight) || input.key_pressed(egui::Key::L),
-                    input.key_pressed(egui::Key::M),
-                    input.key_pressed(egui::Key::C),
-                    input.key_pressed(egui::Key::T),
-                    input.key_pressed(egui::Key::F),
-                    input.key_pressed(egui::Key::I),
-                    input.modifiers.shift && input.key_pressed(egui::Key::N),
-                    short_mode && input.key_pressed(egui::Key::ArrowUp),
-                    short_mode && input.key_pressed(egui::Key::ArrowDown),
-                    pct,
-                )
-            });
-            if toggle
-                || back
-                || forward
-                || mute
-                || captions
-                || theater
-                || fullscreen
-                || mini_player
-                || next_shortcut
-                || short_prev
-                || short_next
-                || pct_seek.is_some()
-            {
-                self.playback.overlay_last_activity = Instant::now();
-            }
-            #[cfg(windows)]
-            if toggle || back || forward || mute || pct_seek.is_some() {
-                let is_live = self.active_video_is_live();
-                let live_dvr = self
-                    .playback
-                    .active
-                    .as_ref()
-                    .is_some_and(|active| active.live_dvr);
-                let step = f64::from(self.seek_step_secs());
-                let mut key_seek_pos: Option<f64> = None;
-                let mut key_seek_dur: Option<f64> = None;
-                let mut key_flush_pause = false;
-                let mut trigger_go_live = false;
-                if let Some(player) = &self.player {
-                    let was_ended = toggle && player.flag_cstr(c"eof-reached") == Some(true);
-                    let was_paused = toggle && player.flag_cstr(c"pause") == Some(true);
-                    let cur_pos = if back || forward {
-                        player
-                            .double_cstr(c"time-pos")
-                            .filter(|&pos| pos >= 0.0)
-                            .or_else(|| {
-                                self.playback
-                                    .active
-                                    .as_ref()
-                                    .map(|active| active.position_ms as f64 / 1000.0)
-                            })
-                            .unwrap_or(0.0)
-                    } else {
-                        0.0
-                    };
-                    let cur_dur = if back || forward || pct_seek.is_some() {
-                        player
-                            .double_cstr(c"duration")
-                            .filter(|&d| d > 0.0)
-                            .or_else(|| {
-                                self.playback
-                                    .active
-                                    .as_ref()
-                                    .and_then(|a| a.duration_ms)
-                                    .filter(|&d| d > 0)
-                                    .map(|d| d as f64 / 1000.0)
-                            })
-                    } else {
-                        None
-                    };
-                    key_seek_dur = cur_dur;
-                    let pct_target = pct_seek.and_then(|pct| cur_dur.map(|dur| (pct, dur * pct)));
-                    let result = if toggle {
-                        if was_ended && is_live {
-                            trigger_go_live = true;
-                            Ok(())
-                        } else if was_ended {
-                            player
-                                .seek(0.0, "absolute+exact")
-                                .and_then(|()| player.set("pause", "no"))
-                        } else {
-                            player.set("pause", if was_paused { "no" } else { "yes" })
-                        }
-                    } else if back {
-                        if is_live && !live_dvr {
-                            Ok(())
-                        } else {
-                            player.seek(-step, "relative")
-                        }
-                    } else if forward {
-                        if is_live && !live_dvr {
-                            Ok(())
-                        } else if is_live {
-                            let target = cur_pos + step;
-                            if cur_dur
-                                .is_some_and(|dur| dur <= 1.5 || target >= (dur - 1.5).max(0.0))
-                            {
-                                trigger_go_live = true;
-                                Ok(())
-                            } else {
-                                let clamped =
-                                    cur_dur.map_or(target, |dur| target.min((dur - 1.5).max(0.0)));
-                                key_seek_pos = Some(clamped);
-                                player.seek(clamped, "absolute+exact")
-                            }
-                        } else {
-                            player.seek(step, "relative")
-                        }
-                    } else if let Some((pct, target)) = pct_target {
-                        if is_live && !live_dvr {
-                            Ok(())
-                        } else if is_live {
-                            if pct >= 0.985
-                                || cur_dur
-                                    .is_some_and(|dur| dur <= 1.5 || target >= (dur - 1.5).max(0.0))
-                            {
-                                trigger_go_live = true;
-                                Ok(())
-                            } else {
-                                let clamped =
-                                    cur_dur.map_or(target, |dur| target.min((dur - 1.5).max(0.0)));
-                                key_seek_pos = Some(clamped);
-                                player.seek(clamped, "absolute+exact")
-                            }
-                        } else {
-                            player.seek(target, "absolute+exact")
-                        }
-                    } else if mute {
-                        player.set(
-                            "mute",
-                            if player.flag_cstr(c"mute") == Some(true) {
-                                "no"
-                            } else {
-                                "yes"
-                            },
-                        )
-                    } else {
-                        Ok(())
-                    };
-                    match result {
-                        Ok(()) => {
-                            if toggle && !trigger_go_live {
-                                if was_ended {
-                                    key_seek_pos = Some(0.0);
-                                } else if !was_paused {
-                                    key_flush_pause = true;
-                                }
-                            } else if back && (!is_live || live_dvr) {
-                                key_seek_pos = Some((cur_pos - step).max(0.0));
-                            } else if forward && !is_live {
-                                key_seek_pos = Some(cur_pos + step);
-                            } else if let Some((_, target)) = pct_target
-                                && !is_live
-                            {
-                                key_seek_pos = Some(target);
-                            }
-                        }
-                        Err(error) => self.message = error,
-                    }
-                }
-                if trigger_go_live {
-                    if let Some(video) = self.selected.clone() {
-                        self.go_live_edge(&video);
-                    }
-                } else if let Some(pos) = key_seek_pos {
-                    self.record_manual_seek(pos, key_seek_dur, Instant::now());
-                } else if key_flush_pause {
-                    self.flush_playback_history_at(Instant::now());
-                }
-            }
-            #[cfg(not(windows))]
-            let _ = (toggle, back, forward, mute, pct_seek);
-            if captions {
-                self.toggle_player_captions(&ctx);
-            }
-            if theater && !self.playback.fullscreen {
-                self.toggle_theater_mode();
-            }
-            if fullscreen
-                || (escape_pressed
-                    && !closed_search_modal
-                    && !closed_settings
-                    && !closed_player_menu
-                    && !closed_shortcuts
-                    && self.playback.fullscreen)
-            {
-                self.toggle_fullscreen(&ctx);
-            }
-            if mini_player {
-                self.toggle_mini_player(&ctx);
-            }
-            if next_shortcut {
-                if !self.queue.data.is_empty() {
-                    self.request_queue_advance();
-                } else {
-                    let next = if short_mode {
-                        self.next_or_prev_short(true)
-                    } else {
-                        self.next_recommended_video()
-                    };
-                    if let Some(video) = next {
-                        self.playback.pending_open_video = Some(video);
-                    }
-                }
-            } else if short_prev {
-                if let Some(video) = self.next_or_prev_short(false) {
-                    self.playback.pending_open_video = Some(video);
-                }
-            } else if short_next && let Some(video) = self.next_or_prev_short(true) {
-                self.playback.pending_open_video = Some(video);
-            }
-        }
+        self.handle_player_shortcuts(
+            &ctx,
+            !closed_search_modal && !closed_settings && !closed_player_menu && !closed_shortcuts,
+        );
         let viewport_width = ui.available_width();
         let chromeless_video =
             self.playback.fullscreen || (self.playback.mini_player && self.selected.is_some());
@@ -25725,6 +26213,77 @@ fn format_subscribers_pt(count: u64) -> String {
             format!("{whole},{frac} mi inscritos")
         }
     }
+}
+
+fn screenshot_dir_candidates(
+    user_profile: Option<&str>,
+    local_app_data: Option<&str>,
+) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(profile) = user_profile.map(str::trim).filter(|s| !s.is_empty()) {
+        dirs.push(
+            std::path::PathBuf::from(profile)
+                .join("Pictures")
+                .join("FastTube"),
+        );
+    }
+    if let Some(local) = local_app_data.map(str::trim).filter(|s| !s.is_empty()) {
+        let fallback = std::path::PathBuf::from(local)
+            .join("FastTube")
+            .join("screenshots");
+        if !dirs.contains(&fallback) {
+            dirs.push(fallback);
+        }
+    }
+    if dirs.is_empty() {
+        dirs.push(std::env::temp_dir().join("FastTube").join("screenshots"));
+    }
+    dirs
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn resolve_screenshot_dir_from(
+    user_profile: Option<&str>,
+    local_app_data: Option<&str>,
+) -> std::path::PathBuf {
+    screenshot_dir_candidates(user_profile, local_app_data)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| std::env::temp_dir().join("FastTube").join("screenshots"))
+}
+
+fn build_screenshot_filename(video: &Video, position_secs: f64, now_epoch_secs: u64) -> String {
+    let mut slug = String::new();
+    let mut prev_sep = false;
+    for ch in video.title.trim().chars() {
+        if slug.len() >= 48 {
+            break;
+        }
+        let valid = !ch.is_control()
+            && !matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+            && !ch.is_whitespace();
+        if valid {
+            slug.push(ch);
+            prev_sep = false;
+        } else if !slug.is_empty() && !prev_sep {
+            slug.push('_');
+            prev_sep = true;
+        }
+    }
+    let slug = slug.trim_matches('_');
+    let base = if slug.is_empty() {
+        history::youtube_video_id(&video.url).unwrap_or_else(|| "video".to_owned())
+    } else {
+        slug.to_owned()
+    };
+    let clamped_secs = if position_secs.is_finite() && position_secs > 0.0 {
+        position_secs.floor() as u64
+    } else {
+        0
+    };
+    let mins = clamped_secs / 60;
+    let secs = clamped_secs % 60;
+    format!("fasttube_{base}_{mins}m{secs:02}s_{now_epoch_secs}.png")
 }
 
 fn main() -> eframe::Result {
