@@ -386,6 +386,7 @@ pub(crate) struct PlaybackState {
     pub(crate) save_menu_open: bool,
     pub(crate) new_remote_playlist_title: String,
     pub(crate) pending_open_video: Option<Video>,
+    pub(crate) pending_open_seek_ms: Option<u64>,
     pub(crate) diagnostics: DecodingDiagnostics,
     pub(crate) last_diagnostics_poll_at: Option<Instant>,
     pub(crate) last_video_size_url: Option<String>,
@@ -430,6 +431,7 @@ impl Default for PlaybackState {
             save_menu_open: false,
             new_remote_playlist_title: String::new(),
             pending_open_video: None,
+            pending_open_seek_ms: None,
             diagnostics: DecodingDiagnostics::unknown(Some(crate::DEFAULT_CONFIGURED_HWDEC)),
             last_diagnostics_poll_at: None,
             last_video_size_url: None,
@@ -711,6 +713,17 @@ pub(crate) struct BackupState {
     pub(crate) pending_import: Option<ImportedUserData>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NavigationRoute {
+    Browse {
+        section: BrowseSection,
+        search_query: Option<String>,
+    },
+    Channel(ChannelTarget),
+    Watch(Video),
+    Settings(SettingsTab),
+}
+
 #[derive(Default)]
 pub(crate) struct NavigationUiState {
     pub(crate) navigation_open: bool,
@@ -722,6 +735,32 @@ pub(crate) struct NavigationUiState {
     pub(crate) explore_expanded: bool,
     pub(crate) browse_section: BrowseSection,
     pub(crate) chips_scroll_offset: f32,
+    pub(crate) nav_back_stack: Vec<NavigationRoute>,
+    pub(crate) nav_forward_stack: Vec<NavigationRoute>,
+    pub(crate) nav_last_route: Option<NavigationRoute>,
+    pub(crate) nav_suppress_record: bool,
+    pub(crate) command_palette: crate::command_palette::CommandPaletteState,
+    pub(crate) clipboard_last_checked_at: Option<Instant>,
+    pub(crate) clipboard_last_raw: Option<String>,
+    pub(crate) clipboard_youtube_target: Option<crate::command_palette::DirectYouTubeTarget>,
+    pub(crate) clipboard_dismissed_raw: Option<String>,
+}
+
+impl NavigationUiState {
+    pub(crate) fn can_go_back(&self) -> bool {
+        !self.nav_back_stack.is_empty()
+    }
+
+    pub(crate) fn can_go_forward(&self) -> bool {
+        !self.nav_forward_stack.is_empty()
+    }
+
+    pub(crate) fn dismiss_clipboard_target(&mut self) {
+        if let Some(raw) = self.clipboard_last_raw.clone() {
+            self.clipboard_dismissed_raw = Some(raw);
+        }
+        self.clipboard_youtube_target = None;
+    }
 }
 
 #[derive(Clone, Debug)]
