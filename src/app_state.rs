@@ -354,6 +354,11 @@ pub(crate) struct PlaybackState {
     pub(crate) last_subtitle_id: Option<String>,
     pub(crate) autoplay: bool,
     pub(crate) loop_video: bool,
+    pub(crate) loop_a_secs: Option<f64>,
+    pub(crate) loop_b_secs: Option<f64>,
+    pub(crate) ab_loop_last_seek_at: Option<Instant>,
+    pub(crate) audio_only: bool,
+    pub(crate) speed: f64,
     pub(crate) autoplay_eof_handled: bool,
     pub(crate) save_menu_open: bool,
     pub(crate) new_remote_playlist_title: String,
@@ -393,6 +398,11 @@ impl Default for PlaybackState {
             last_subtitle_id: None,
             autoplay: true,
             loop_video: false,
+            loop_a_secs: None,
+            loop_b_secs: None,
+            ab_loop_last_seek_at: None,
+            audio_only: false,
+            speed: 1.0,
             autoplay_eof_handled: false,
             save_menu_open: false,
             new_remote_playlist_title: String::new(),
@@ -402,6 +412,49 @@ impl Default for PlaybackState {
             last_video_size_url: None,
             last_video_size: None,
             auto_subtitle_attempted: false,
+        }
+    }
+}
+
+impl PlaybackState {
+    pub(crate) fn set_loop_a(&mut self, pos_secs: f64) {
+        let a = if pos_secs.is_finite() && pos_secs >= 0.0 {
+            pos_secs
+        } else {
+            0.0
+        };
+        self.loop_a_secs = Some(a);
+        if self.loop_b_secs.is_some_and(|b| !b.is_finite() || b <= a) {
+            self.loop_b_secs = None;
+        }
+        self.ab_loop_last_seek_at = None;
+    }
+
+    pub(crate) fn set_loop_b(&mut self, pos_secs: f64) {
+        let b = if pos_secs.is_finite() && pos_secs >= 0.0 {
+            pos_secs
+        } else {
+            0.0
+        };
+        self.loop_b_secs = Some(b);
+        if self.loop_a_secs.is_some_and(|a| !a.is_finite() || b <= a) {
+            self.loop_a_secs = None;
+        }
+        self.ab_loop_last_seek_at = None;
+    }
+
+    pub(crate) fn clear_ab_loop(&mut self) {
+        self.loop_a_secs = None;
+        self.loop_b_secs = None;
+        self.ab_loop_last_seek_at = None;
+    }
+
+    pub(crate) fn ab_loop_active(&self) -> Option<(f64, f64)> {
+        match (self.loop_a_secs, self.loop_b_secs) {
+            (Some(a), Some(b)) if a.is_finite() && b.is_finite() && a >= 0.0 && a < b => {
+                Some((a, b))
+            }
+            _ => None,
         }
     }
 }

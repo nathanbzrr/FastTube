@@ -813,6 +813,7 @@ impl Player {
             ("demuxer-max-bytes", format!("{}MiB", buffer.max_mib)),
             ("demuxer-max-back-bytes", format!("{}MiB", buffer.back_mib)),
             ("cache-secs", format!("{}", buffer.cache_seconds)),
+            ("screenshot-format", "png".to_owned()),
             (
                 "ytdl-format",
                 "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best".to_owned(),
@@ -828,6 +829,31 @@ impl Player {
 
     pub fn play(&mut self, url: &str) -> Result<(), String> {
         self.run(&["loadfile", url, "replace"])
+    }
+
+    pub fn set_audio_only(&self, audio_only: bool) -> Result<(), String> {
+        self.set("vid", if audio_only { "no" } else { "auto" })
+    }
+
+    pub fn buffered_duration_secs(&self) -> Option<f64> {
+        self.double_cstr(c"demuxer-cache-duration")
+            .filter(|&duration| duration.is_finite() && duration >= 0.0)
+    }
+
+    pub fn screenshot_to_file(&self, path: &std::path::Path) -> Result<(), String> {
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| "Caminho de captura inválido.".to_owned())?;
+        let _ = self.set("screenshot-format", "png");
+        self.run(&["screenshot-to-file", path_str])
+    }
+
+    pub fn frame_step(&self) -> Result<(), String> {
+        self.run(&["frame-step"])
+    }
+
+    pub fn frame_back_step(&self) -> Result<(), String> {
+        self.run(&["frame-back-step"])
     }
 
     pub fn add_subtitle(
@@ -1250,6 +1276,11 @@ mod tests {
                 .iter()
                 .any(|(name, value)| *name == "hwdec" && value == "auto-safe")
         );
+        assert!(
+            render
+                .iter()
+                .any(|(name, value)| *name == "screenshot-format" && value == "png")
+        );
         assert!(!render.iter().any(|(name, _)| *name == "wid"));
 
         let embedded = Player::options(buffer, HwdecMode::Software, Some(42), false);
@@ -1262,6 +1293,11 @@ mod tests {
             embedded
                 .iter()
                 .any(|(name, value)| *name == "hwdec" && value == "no")
+        );
+        assert!(
+            embedded
+                .iter()
+                .any(|(name, value)| *name == "screenshot-format" && value == "png")
         );
         assert!(!embedded.iter().any(|(name, _)| *name == "vo"));
     }
