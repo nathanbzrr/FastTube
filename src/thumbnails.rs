@@ -1,9 +1,18 @@
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::time::{Duration, Instant, SystemTime};
 
+#[cfg(test)]
 pub const THUMBNAIL_WIDTH: f32 = 160.0;
+#[cfg(test)]
 pub const THUMBNAIL_HEIGHT: f32 = 90.0;
+#[cfg(test)]
 pub const THUMBNAIL_SIZE: Vec2 = egui::vec2(THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT);
 
 pub const MAX_RETAINED_THUMBNAILS: usize = 48;
@@ -12,6 +21,379 @@ pub const MAX_NEW_LOADS_PER_PASS: usize = 3;
 pub const LOAD_START_INTERVAL: Duration = Duration::from_millis(20);
 pub const VIEWPORT_OVERSCAN_PX: f32 = 110.0;
 pub const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub const DEFAULT_DISK_CACHE_MAX_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_CACHED_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_THUMBNAIL_DECODE_WIDTH: u32 = 1280;
+const MAX_THUMBNAIL_DECODE_HEIGHT: u32 = 720;
+const MAX_AVATAR_DECODE_SIZE: u32 = 256;
+const IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(12);
+const MTIME_TOUCH_INTERVAL: Duration = Duration::from_secs(60);
+
+static CACHE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+pub enum DiskCacheError {
+    Io,
+    Corrupt,
+}
+
+#[derive(Clone, Debug)]
+struct DiskEntryMeta {
+    size: u64,
+    last_used: SystemTime,
+    seq: u64,
+}
+
+#[derive(Default)]
+struct DiskIndex {
+    initialized: bool,
+    entries: HashMap<String, DiskEntryMeta>,
+    total_bytes: u64,
+    next_seq: u64,
+}
+
+pub struct DiskImageCache {
+    root: PathBuf,
+    max_bytes: u64,
+    index: Mutex<DiskIndex>,
+    http_client: OnceLock<reqwest::blocking::Client>,
+}
+
+pub fn default_disk_cache_dir() -> io::Result<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA is not set"))?;
+    let path = PathBuf::from(local);
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "LOCALAPPDATA must be absolute",
+        ));
+    }
+    Ok(path.join("FastTube").join("cache").join("thumbnails"))
+}
+
+pub fn uri_cache_key(uri: &str) -> String {
+    let digest = Sha256::digest(uri.as_bytes());
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+fn is_valid_cache_stem(stem: &str) -> bool {
+    stem.len() == 64
+        && stem
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn decode_color_image(
+    bytes: &[u8],
+    max_width: u32,
+    max_height: u32,
+) -> Result<egui::ColorImage, image::ImageError> {
+    let mut img = image::load_from_memory(bytes)?;
+    if img.width() > max_width || img.height() > max_height {
+        img = img.resize(max_width, max_height, image::imageops::FilterType::Triangle);
+    }
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        size,
+        rgba.as_raw(),
+    ))
+}
+
+impl DiskImageCache {
+    pub fn new(root: PathBuf, max_bytes: u64) -> Self {
+        Self {
+            root,
+            max_bytes,
+            index: Mutex::new(DiskIndex::default()),
+            http_client: OnceLock::new(),
+        }
+    }
+
+    pub fn default_production() -> Option<Arc<Self>> {
+        default_disk_cache_dir()
+            .ok()
+            .map(|dir| Arc::new(Self::new(dir, DEFAULT_DISK_CACHE_MAX_BYTES)))
+    }
+
+    #[cfg(test)]
+    pub fn entry_path_for_uri(&self, uri: &str) -> PathBuf {
+        self.entry_path(&uri_cache_key(uri))
+    }
+
+    fn entry_path(&self, key: &str) -> PathBuf {
+        self.root.join(format!("{key}.img"))
+    }
+
+    fn ensure_initialized(&self, index: &mut DiskIndex) {
+        if index.initialized {
+            return;
+        }
+        index.initialized = true;
+        if !self.root.is_dir() {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if file_name.starts_with('.') && file_name.ends_with(".tmp") {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+            let Some(stem) = file_name.strip_suffix(".img") else {
+                continue;
+            };
+            if !is_valid_cache_stem(stem) {
+                continue;
+            }
+            let size = meta.len();
+            let last_used = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            index.total_bytes = index.total_bytes.saturating_add(size);
+            index.entries.insert(
+                stem.to_owned(),
+                DiskEntryMeta {
+                    size,
+                    last_used,
+                    seq: 0,
+                },
+            );
+        }
+        self.evict_excess_locked(index, None);
+    }
+
+    fn evict_excess_locked(&self, index: &mut DiskIndex, protected_key: Option<&str>) {
+        while index.total_bytes > self.max_bytes {
+            let victim = index
+                .entries
+                .iter()
+                .filter(|(key, _)| protected_key != Some(key.as_str()))
+                .min_by_key(|(_, meta)| (meta.last_used, meta.seq))
+                .map(|(key, _)| key.clone());
+            let Some(victim_key) = victim else {
+                break;
+            };
+            if let Some(meta) = index.entries.remove(&victim_key) {
+                index.total_bytes = index.total_bytes.saturating_sub(meta.size);
+            }
+            let _ = fs::remove_file(self.entry_path(&victim_key));
+        }
+    }
+
+    pub fn write_bytes(&self, uri: &str, bytes: &[u8]) -> io::Result<()> {
+        if bytes.is_empty() || bytes.len() > MAX_CACHED_IMAGE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid cached image payload size",
+            ));
+        }
+        let size = bytes.len() as u64;
+        if size > self.max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "image exceeds disk cache capacity",
+            ));
+        }
+        fs::create_dir_all(&self.root)?;
+        let key = uri_cache_key(uri);
+        let target = self.entry_path(&key);
+        let (temp_path, mut file) = loop {
+            let id = CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            let candidate = self
+                .root
+                .join(format!(".{key}.{}.{id}.tmp", std::process::id()));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => break (candidate, file),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        };
+        let write_result = (|| {
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temp_path, &target)
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+            return write_result;
+        }
+        let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
+        self.ensure_initialized(&mut index);
+        if let Some(previous) = index.entries.remove(&key) {
+            index.total_bytes = index.total_bytes.saturating_sub(previous.size);
+        }
+        index.next_seq = index.next_seq.wrapping_add(1);
+        let seq = index.next_seq;
+        index.total_bytes = index.total_bytes.saturating_add(size);
+        index.entries.insert(
+            key.clone(),
+            DiskEntryMeta {
+                size,
+                last_used: SystemTime::now(),
+                seq,
+            },
+        );
+        self.evict_excess_locked(&mut index, Some(&key));
+        Ok(())
+    }
+
+    pub fn read_bytes(&self, uri: &str) -> io::Result<Option<Vec<u8>>> {
+        let key = uri_cache_key(uri);
+        let path = self.entry_path(&key);
+        let file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
+                if index.initialized
+                    && let Some(prev) = index.entries.remove(&key)
+                {
+                    index.total_bytes = index.total_bytes.saturating_sub(prev.size);
+                }
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let mut bytes = Vec::new();
+        file.take((MAX_CACHED_IMAGE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.is_empty() || bytes.len() > MAX_CACHED_IMAGE_BYTES {
+            self.remove(uri);
+            return Ok(None);
+        }
+        let now = SystemTime::now();
+        let should_touch_mtime = {
+            let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
+            self.ensure_initialized(&mut index);
+            index.next_seq = index.next_seq.wrapping_add(1);
+            let seq = index.next_seq;
+            if let Some(entry) = index.entries.get_mut(&key) {
+                let stale = now
+                    .duration_since(entry.last_used)
+                    .unwrap_or(Duration::ZERO)
+                    >= MTIME_TOUCH_INTERVAL;
+                entry.last_used = now;
+                entry.seq = seq;
+                stale
+            } else {
+                let size = bytes.len() as u64;
+                index.total_bytes = index.total_bytes.saturating_add(size);
+                index.entries.insert(
+                    key,
+                    DiskEntryMeta {
+                        size,
+                        last_used: now,
+                        seq,
+                    },
+                );
+                false
+            }
+        };
+        if should_touch_mtime && let Ok(file) = OpenOptions::new().write(true).open(&path) {
+            let _ = file.set_modified(now);
+        }
+        Ok(Some(bytes))
+    }
+
+    pub fn remove(&self, uri: &str) {
+        let key = uri_cache_key(uri);
+        let _ = fs::remove_file(self.entry_path(&key));
+        let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
+        if index.initialized
+            && let Some(prev) = index.entries.remove(&key)
+        {
+            index.total_bytes = index.total_bytes.saturating_sub(prev.size);
+        }
+    }
+
+    pub fn decode_cached_image(
+        &self,
+        uri: &str,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<Option<egui::ColorImage>, DiskCacheError> {
+        let Some(bytes) = self.read_bytes(uri).map_err(|_| DiskCacheError::Io)? else {
+            return Ok(None);
+        };
+        match decode_color_image(&bytes, max_width, max_height) {
+            Ok(image) => Ok(Some(image)),
+            Err(_) => {
+                self.remove(uri);
+                Err(DiskCacheError::Corrupt)
+            }
+        }
+    }
+
+    fn fetch_and_cache(
+        &self,
+        uri: &str,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<egui::ColorImage, ()> {
+        let client = self.http_client.get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(IMAGE_FETCH_TIMEOUT)
+                .build()
+                .unwrap_or_else(|_| reqwest::blocking::Client::new())
+        });
+        let response = client.get(uri).send().map_err(|_| ())?;
+        if !response.status().is_success() {
+            return Err(());
+        }
+        let mut bytes = Vec::new();
+        response
+            .take((MAX_CACHED_IMAGE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| ())?;
+        if bytes.is_empty() || bytes.len() > MAX_CACHED_IMAGE_BYTES {
+            return Err(());
+        }
+        let image = decode_color_image(&bytes, max_width, max_height).map_err(|_| ())?;
+        let _ = self.write_bytes(uri, &bytes);
+        Ok(image)
+    }
+
+    #[cfg(test)]
+    pub fn total_bytes(&self) -> u64 {
+        let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
+        self.ensure_initialized(&mut index);
+        index.total_bytes
+    }
+
+    #[cfg(test)]
+    pub fn entry_count(&self) -> usize {
+        let mut index = self.index.lock().unwrap_or_else(|e| e.into_inner());
+        self.ensure_initialized(&mut index);
+        index.entries.len()
+    }
+}
+
+struct LoadedImage {
+    uri: String,
+    image: Result<egui::ColorImage, ()>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EntryState {
@@ -25,9 +407,10 @@ enum EntryState {
     Failed,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct CacheEntry {
     state: EntryState,
+    texture: Option<egui::TextureHandle>,
     last_visible_pass: u64,
     last_access_tick: u64,
 }
@@ -57,6 +440,9 @@ pub struct ThumbnailCache {
     max_new_loads_per_pass: usize,
     load_start_interval: Duration,
     allow_burst_loads: bool,
+    disk_cache: Option<Arc<DiskImageCache>>,
+    result_tx: mpsc::Sender<LoadedImage>,
+    result_rx: mpsc::Receiver<LoadedImage>,
 }
 
 impl Default for ThumbnailCache {
@@ -68,6 +454,10 @@ impl Default for ThumbnailCache {
             LOAD_START_INTERVAL,
         );
         cache.allow_burst_loads = true;
+        #[cfg(not(test))]
+        {
+            cache.disk_cache = DiskImageCache::default_production();
+        }
         cache
     }
 }
@@ -82,6 +472,7 @@ impl ThumbnailCache {
         let max_retained = max_retained.max(1);
         let max_concurrent_loads = max_concurrent_loads.clamp(1, max_retained);
         let max_new_loads_per_pass = max_new_loads_per_pass.clamp(1, max_concurrent_loads);
+        let (result_tx, result_rx) = mpsc::channel();
         Self {
             entries: HashMap::with_capacity(max_retained),
             candidates: Vec::new(),
@@ -94,7 +485,20 @@ impl ThumbnailCache {
             max_new_loads_per_pass,
             load_start_interval,
             allow_burst_loads: false,
+            disk_cache: None,
+            result_tx,
+            result_rx,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_disk_cache(mut self, disk_cache: Option<Arc<DiskImageCache>>) -> Self {
+        self.disk_cache = disk_cache;
+        self
+    }
+
+    pub fn set_disk_cache(&mut self, disk_cache: Option<Arc<DiskImageCache>>) {
+        self.disk_cache = disk_cache;
     }
 
     #[cfg(test)]
@@ -107,6 +511,12 @@ impl ThumbnailCache {
             .values()
             .filter(|entry| matches!(entry.state, EntryState::Loading { .. }))
             .count()
+    }
+
+    pub fn has_pending_work(&self) -> bool {
+        self.in_flight_count() > 0
+            || !self.retired_in_flight.is_empty()
+            || !self.candidates.is_empty()
     }
 
     fn bump_tick(&mut self) -> u64 {
@@ -192,7 +602,39 @@ impl ThumbnailCache {
         });
     }
 
+    fn drain_loaded(&mut self, ctx: &egui::Context) {
+        while let Ok(loaded) = self.result_rx.try_recv() {
+            self.retired_in_flight.retain(|item| item.uri != loaded.uri);
+            let Some(entry) = self.entries.get_mut(&loaded.uri) else {
+                continue;
+            };
+            if !matches!(entry.state, EntryState::Loading { .. }) {
+                continue;
+            }
+            match loaded.image {
+                Ok(color_image) => {
+                    let size = [color_image.width() as u32, color_image.height() as u32];
+                    let texture = ctx.load_texture(
+                        format!("thumb:{}", loaded.uri),
+                        color_image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    entry.state = EntryState::Ready {
+                        size,
+                        texture_id: Some(texture.id()),
+                    };
+                    entry.texture = Some(texture);
+                }
+                Err(()) => {
+                    entry.state = EntryState::Failed;
+                    entry.texture = None;
+                }
+            }
+        }
+    }
+
     pub fn maintain(&mut self, ctx: &egui::Context) {
+        self.drain_loaded(ctx);
         if self.retired_in_flight.is_empty()
             && !self
                 .entries
@@ -226,6 +668,7 @@ impl ThumbnailCache {
         for uri in timed_out {
             if let Some(entry) = self.entries.get_mut(&uri) {
                 entry.state = EntryState::Failed;
+                entry.texture = None;
             }
             self.push_retired_in_flight(&uri, now);
             to_forget.push(uri);
@@ -251,20 +694,6 @@ impl ThumbnailCache {
     pub fn begin_pass(&mut self) {
         self.pass_index = self.pass_index.wrapping_add(1);
         self.candidates.clear();
-    }
-
-    pub fn show(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, uri: &str) -> egui::Response {
-        self.show_sized(ui, ctx, uri, THUMBNAIL_SIZE)
-    }
-
-    pub fn show_sized(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        uri: &str,
-        size: Vec2,
-    ) -> egui::Response {
-        self.show_rounded(ui, ctx, uri, size, 8.0)
     }
 
     pub fn show_rounded(
@@ -316,7 +745,7 @@ impl ThumbnailCache {
 
         if uri.is_empty() {
             if is_visible {
-                paint_placeholder(ui, rect, PlaceholderKind::Empty);
+                paint_placeholder(ui, rect, PlaceholderKind::Empty, corner_radius);
                 paint_hover_outline_rounded(ui, rect, response.hovered(), corner_radius);
             }
             return response;
@@ -331,6 +760,7 @@ impl ThumbnailCache {
             }
         }
 
+        let uses_disk_worker = self.disk_cache.is_some() && uri_uses_disk_worker(uri);
         let state = self.entries.get(uri).map(|entry| entry.state);
         match state {
             Some(EntryState::Ready {
@@ -346,7 +776,11 @@ impl ThumbnailCache {
                 }
             }
             Some(EntryState::Ready { .. } | EntryState::Loading { .. }) => {
-                if is_near_viewport || matches!(state, Some(EntryState::Loading { .. })) {
+                if uses_disk_worker && matches!(state, Some(EntryState::Loading { .. })) {
+                    if is_visible {
+                        paint_placeholder(ui, rect, PlaceholderKind::Loading, corner_radius);
+                    }
+                } else if is_near_viewport || matches!(state, Some(EntryState::Loading { .. })) {
                     match Self::poll_texture(ctx, uri) {
                         PollOutcome::Ready { texture_id, size } => {
                             if let Some(entry) = self.entries.get_mut(uri) {
@@ -377,7 +811,12 @@ impl ThumbnailCache {
                         }
                         PollOutcome::Pending => {
                             if is_visible {
-                                paint_placeholder(ui, rect, PlaceholderKind::Loading);
+                                paint_placeholder(
+                                    ui,
+                                    rect,
+                                    PlaceholderKind::Loading,
+                                    corner_radius,
+                                );
                             }
                         }
                         PollOutcome::Failed => {
@@ -386,17 +825,17 @@ impl ThumbnailCache {
                             }
                             ctx.forget_image(uri);
                             if is_visible {
-                                paint_placeholder(ui, rect, PlaceholderKind::Failed);
+                                paint_placeholder(ui, rect, PlaceholderKind::Failed, corner_radius);
                             }
                         }
                     }
                 } else if is_visible {
-                    paint_placeholder(ui, rect, PlaceholderKind::Pending);
+                    paint_placeholder(ui, rect, PlaceholderKind::Pending, corner_radius);
                 }
             }
             Some(EntryState::Failed) => {
                 if is_visible {
-                    paint_placeholder(ui, rect, PlaceholderKind::Failed);
+                    paint_placeholder(ui, rect, PlaceholderKind::Failed, corner_radius);
                 }
             }
             None => {
@@ -404,7 +843,7 @@ impl ThumbnailCache {
                     self.record_candidate(uri, is_visible, rect.top() - viewport.top());
                 }
                 if is_visible {
-                    paint_placeholder(ui, rect, PlaceholderKind::Pending);
+                    paint_placeholder(ui, rect, PlaceholderKind::Pending, corner_radius);
                 }
             }
         }
@@ -433,6 +872,7 @@ impl ThumbnailCache {
     }
 
     pub fn end_pass(&mut self, ctx: &egui::Context) {
+        self.drain_loaded(ctx);
         let now = Instant::now();
         let (admitted, evicted) = self.schedule_pass(now);
 
@@ -441,6 +881,19 @@ impl ThumbnailCache {
         }
 
         for uri in admitted {
+            if let Some(disk_cache) = self.disk_cache.clone()
+                && uri_uses_disk_worker(&uri)
+            {
+                spawn_image_load(
+                    disk_cache,
+                    uri,
+                    MAX_THUMBNAIL_DECODE_WIDTH,
+                    MAX_THUMBNAIL_DECODE_HEIGHT,
+                    self.result_tx.clone(),
+                    ctx.clone(),
+                );
+                continue;
+            }
             match Self::poll_texture(ctx, &uri) {
                 PollOutcome::Ready { texture_id, size } => {
                     if let Some(entry) = self.entries.get_mut(&uri) {
@@ -550,6 +1003,7 @@ impl ThumbnailCache {
                 candidate.uri.clone(),
                 CacheEntry {
                     state: EntryState::Loading { started_at: now },
+                    texture: None,
                     last_visible_pass: self.pass_index,
                     last_access_tick: tick,
                 },
@@ -603,6 +1057,28 @@ impl ThumbnailCache {
             Err(_) => PollOutcome::Failed,
         }
     }
+}
+
+fn uri_uses_disk_worker(uri: &str) -> bool {
+    uri.starts_with("http://") || uri.starts_with("https://")
+}
+
+fn spawn_image_load(
+    disk_cache: Arc<DiskImageCache>,
+    uri: String,
+    max_width: u32,
+    max_height: u32,
+    tx: mpsc::Sender<LoadedImage>,
+    ctx: egui::Context,
+) {
+    std::thread::spawn(move || {
+        let image = match disk_cache.decode_cached_image(&uri, max_width, max_height) {
+            Ok(Some(img)) => Ok(img),
+            Ok(None) | Err(_) => disk_cache.fetch_and_cache(&uri, max_width, max_height),
+        };
+        let _ = tx.send(LoadedImage { uri, image });
+        ctx.request_repaint();
+    });
 }
 
 enum PollOutcome {
@@ -710,9 +1186,10 @@ enum AvatarEntryState {
     Failed,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct AvatarEntry {
     state: AvatarEntryState,
+    texture: Option<egui::TextureHandle>,
     last_access_tick: u64,
 }
 
@@ -720,21 +1197,86 @@ pub struct AvatarCache {
     entries: HashMap<String, AvatarEntry>,
     access_counter: u64,
     max_retained: usize,
+    disk_cache: Option<Arc<DiskImageCache>>,
+    result_tx: mpsc::Sender<LoadedImage>,
+    result_rx: mpsc::Receiver<LoadedImage>,
 }
 
 impl Default for AvatarCache {
     fn default() -> Self {
-        Self::with_limit(MAX_RETAINED_AVATARS)
+        #[cfg(not(test))]
+        {
+            let mut cache = Self::with_limit(MAX_RETAINED_AVATARS);
+            cache.disk_cache = DiskImageCache::default_production();
+            cache
+        }
+        #[cfg(test)]
+        {
+            Self::with_limit(MAX_RETAINED_AVATARS)
+        }
     }
 }
 
 impl AvatarCache {
     pub fn with_limit(max_retained: usize) -> Self {
         let max_retained = max_retained.max(1);
+        let (result_tx, result_rx) = mpsc::channel();
         Self {
             entries: HashMap::with_capacity(max_retained),
             access_counter: 0,
             max_retained,
+            disk_cache: None,
+            result_tx,
+            result_rx,
+        }
+    }
+
+    pub fn set_disk_cache(&mut self, disk_cache: Option<Arc<DiskImageCache>>) {
+        self.disk_cache = disk_cache;
+    }
+
+    pub fn has_pending_work(&self) -> bool {
+        self.entries
+            .values()
+            .any(|entry| matches!(entry.state, AvatarEntryState::Loading { .. }))
+    }
+
+    pub fn maintain(&mut self, ctx: &egui::Context) {
+        while let Ok(loaded) = self.result_rx.try_recv() {
+            let Some(entry) = self.entries.get_mut(&loaded.uri) else {
+                continue;
+            };
+            if !matches!(entry.state, AvatarEntryState::Loading { .. }) {
+                continue;
+            }
+            match loaded.image {
+                Ok(color_image) => {
+                    let size = [color_image.width() as u32, color_image.height() as u32];
+                    let texture = ctx.load_texture(
+                        format!("avatar:{}", loaded.uri),
+                        color_image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    entry.state = AvatarEntryState::Ready {
+                        size,
+                        texture_id: Some(texture.id()),
+                    };
+                    entry.texture = Some(texture);
+                }
+                Err(()) => {
+                    entry.state = AvatarEntryState::Failed;
+                    entry.texture = None;
+                }
+            }
+        }
+        let now = Instant::now();
+        for entry in self.entries.values_mut() {
+            if let AvatarEntryState::Loading { started_at } = entry.state
+                && now.saturating_duration_since(started_at) >= IN_FLIGHT_TIMEOUT
+            {
+                entry.state = AvatarEntryState::Failed;
+                entry.texture = None;
+            }
         }
     }
 
@@ -764,6 +1306,7 @@ impl AvatarCache {
             uri.to_owned(),
             AvatarEntry {
                 state: AvatarEntryState::Loading { started_at: now },
+                texture: None,
                 last_access_tick: tick,
             },
         );
@@ -789,6 +1332,7 @@ impl AvatarCache {
             return false;
         }
 
+        let uses_disk_worker = self.disk_cache.is_some() && uri_uses_disk_worker(trimmed);
         let now = Instant::now();
         if let Some(entry) = self.entries.get_mut(trimmed) {
             match entry.state {
@@ -814,15 +1358,36 @@ impl AvatarCache {
                     if now.saturating_duration_since(started_at) >= IN_FLIGHT_TIMEOUT =>
                 {
                     entry.state = AvatarEntryState::Failed;
+                    entry.texture = None;
                     ctx.forget_image(trimmed);
+                    return false;
+                }
+                AvatarEntryState::Loading { .. } if uses_disk_worker => {
+                    self.access_counter = self.access_counter.wrapping_add(1);
+                    entry.last_access_tick = self.access_counter;
                     return false;
                 }
                 _ => {}
             }
         }
 
+        let is_new = !already_tracked;
         if let Some(evicted) = self.touch_or_insert(trimmed, now) {
             ctx.forget_image(&evicted);
+        }
+
+        if uses_disk_worker {
+            if is_new && let Some(disk_cache) = self.disk_cache.clone() {
+                spawn_image_load(
+                    disk_cache,
+                    trimmed.to_owned(),
+                    MAX_AVATAR_DECODE_SIZE,
+                    MAX_AVATAR_DECODE_SIZE,
+                    self.result_tx.clone(),
+                    ctx.clone(),
+                );
+            }
+            return false;
         }
 
         let size_hint = egui::SizeHint::Size {
@@ -868,23 +1433,36 @@ impl AvatarCache {
     }
 }
 
-fn paint_placeholder(ui: &egui::Ui, rect: Rect, kind: PlaceholderKind) {
+fn paint_placeholder(ui: &egui::Ui, rect: Rect, kind: PlaceholderKind, corner_radius: f32) {
+    let painter = ui.painter();
+    if matches!(kind, PlaceholderKind::Loading) {
+        let time = ui.input(|i| i.time);
+        let phase = (time * 1.4).fract() as f32;
+        let pulse = 0.5 + 0.5 * (phase * std::f32::consts::TAU).sin();
+        let sheen_alpha = (10.0 + 12.0 * pulse).round() as u8;
+        painter.rect_filled(
+            rect,
+            corner_radius,
+            Color32::from_rgba_unmultiplied(255, 255, 255, sheen_alpha),
+        );
+    }
+
     let center = rect.center();
     let accent = match kind {
         PlaceholderKind::Empty => Color32::from_rgb(62, 62, 68),
         PlaceholderKind::Pending => Color32::from_rgb(76, 76, 84),
-        PlaceholderKind::Loading => Color32::from_rgb(120, 92, 96),
+        PlaceholderKind::Loading => Color32::from_rgb(138, 102, 106),
         PlaceholderKind::Failed => Color32::from_rgb(96, 58, 58),
     };
-    ui.painter()
-        .circle_stroke(center, 13.0, Stroke::new(1.2, accent));
-    let triangle = vec![
-        Pos2::new(center.x - 4.0, center.y - 6.0),
-        Pos2::new(center.x - 4.0, center.y + 6.0),
-        Pos2::new(center.x + 6.0, center.y),
-    ];
-    ui.painter()
-        .add(egui::Shape::convex_polygon(triangle, accent, Stroke::NONE));
+    painter.circle_stroke(center, 13.0, Stroke::new(1.2, accent));
+
+    let p0 = Pos2::new(center.x - 4.0, center.y - 5.5);
+    let p1 = Pos2::new(center.x - 4.0, center.y + 5.5);
+    let p2 = Pos2::new(center.x + 5.5, center.y);
+    let stroke = Stroke::new(1.4, accent);
+    painter.line_segment([p0, p1], stroke);
+    painter.line_segment([p1, p2], stroke);
+    painter.line_segment([p2, p0], stroke);
 }
 
 fn paint_hover_outline_rounded(ui: &egui::Ui, rect: Rect, hovered: bool, corner_radius: f32) {
@@ -933,6 +1511,7 @@ mod tests {
             "https://img/shared.jpg".into(),
             CacheEntry {
                 state: EntryState::Loading { started_at: now },
+                texture: None,
                 last_visible_pass: 0,
                 last_access_tick: 1,
             },
@@ -944,6 +1523,7 @@ mod tests {
                     size: [320, 180],
                     texture_id: None,
                 },
+                texture: None,
                 last_visible_pass: 0,
                 last_access_tick: 2,
             },
@@ -1189,5 +1769,163 @@ mod tests {
         assert!(cache.entries.contains_key("https://a/1.jpg"));
         assert!(!cache.entries.contains_key("https://a/2.jpg"));
         assert!(cache.entries.contains_key("https://a/3.jpg"));
+    }
+
+    struct TempCacheDir(PathBuf);
+
+    impl TempCacheDir {
+        fn new(label: &str) -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let id = SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "fastube_thumb_test_{label}_{}_{id}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("create temp test cache dir");
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempCacheDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn encode_test_png(width: u32, height: u32) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(width, height, image::Rgba([220, 48, 48, 255]));
+        let mut cursor = io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .expect("encode test png");
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn disk_cache_write_and_read_hit() {
+        let dir = TempCacheDir::new("hit");
+        let cache = DiskImageCache::new(dir.0.clone(), 1024 * 1024);
+        let uri = "https://i.ytimg.com/vi/abc123/hqdefault.jpg";
+        let payload = encode_test_png(16, 9);
+
+        cache
+            .write_bytes(uri, &payload)
+            .expect("write cached image bytes");
+
+        assert!(cache.entry_path_for_uri(uri).is_file());
+        assert_eq!(cache.entry_count(), 1);
+        assert_eq!(cache.total_bytes(), payload.len() as u64);
+
+        let read_back = cache.read_bytes(uri).expect("read cached image bytes");
+        assert_eq!(read_back.as_deref(), Some(payload.as_slice()));
+
+        // Re-opening from disk reconstructs the index accurately without HTTP calls.
+        let reopened = DiskImageCache::new(dir.0.clone(), 1024 * 1024);
+        assert_eq!(reopened.entry_count(), 1);
+        assert_eq!(reopened.total_bytes(), payload.len() as u64);
+        let decoded = reopened
+            .decode_cached_image(uri, 1280, 720)
+            .expect("decode cached image")
+            .expect("cached image present");
+        assert_eq!(decoded.size, [16, 9]);
+    }
+
+    #[test]
+    fn disk_cache_corrupt_file_safety() {
+        let dir = TempCacheDir::new("corrupt");
+        let cache = DiskImageCache::new(dir.0.clone(), 1024 * 1024);
+        let uri = "https://i.ytimg.com/vi/corrupt/hqdefault.jpg";
+
+        cache
+            .write_bytes(uri, b"not-a-valid-image-header")
+            .expect("write corrupt payload");
+        let path = cache.entry_path_for_uri(uri);
+        assert!(path.is_file());
+
+        let result = cache.decode_cached_image(uri, 1280, 720);
+        assert!(matches!(result, Err(DiskCacheError::Corrupt)));
+        assert!(!path.exists());
+        assert_eq!(cache.entry_count(), 0);
+        assert_eq!(cache.total_bytes(), 0);
+    }
+
+    #[test]
+    fn disk_cache_evicts_oldest_entries_when_exceeding_capacity() {
+        let dir = TempCacheDir::new("evict");
+        let cache = DiskImageCache::new(dir.0.clone(), 20);
+        let uri_a = "https://i.ytimg.com/vi/a/hqdefault.jpg";
+        let uri_b = "https://i.ytimg.com/vi/b/hqdefault.jpg";
+        let uri_c = "https://i.ytimg.com/vi/c/hqdefault.jpg";
+
+        cache.write_bytes(uri_a, &[1u8; 8]).expect("write a");
+        cache.write_bytes(uri_b, &[2u8; 8]).expect("write b");
+        // Touch a so b becomes the least recently used entry.
+        assert_eq!(
+            cache.read_bytes(uri_a).expect("read a").as_deref(),
+            Some(&[1u8; 8][..])
+        );
+
+        // Writing c (8 bytes) pushes total to 24 > 20, evicting b first.
+        cache.write_bytes(uri_c, &[3u8; 8]).expect("write c");
+
+        assert!(cache.total_bytes() <= 20);
+        assert_eq!(cache.entry_count(), 2);
+        assert!(cache.entry_path_for_uri(uri_a).is_file());
+        assert!(!cache.entry_path_for_uri(uri_b).exists());
+        assert!(cache.entry_path_for_uri(uri_c).is_file());
+    }
+
+    #[test]
+    fn thumbnail_cache_loads_from_injected_disk_cache() {
+        let dir = TempCacheDir::new("thumb_load");
+        let disk_cache = Arc::new(DiskImageCache::new(dir.0.clone(), 1024 * 1024));
+        let uri = "https://i.ytimg.com/vi/disk_hit/hqdefault.jpg";
+        let png = encode_test_png(32, 18);
+        disk_cache.write_bytes(uri, &png).expect("seed disk cache");
+
+        let ctx = egui::Context::default();
+        let mut cache =
+            ThumbnailCache::with_limits(4, 2, 2, Duration::ZERO).with_disk_cache(Some(disk_cache));
+
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            cache.begin_pass();
+            let _ = cache.show_rounded(ui, &ctx, uri, Vec2::new(160.0, 90.0), 8.0);
+            cache.end_pass(&ctx);
+        });
+        output.textures_delta.clear();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut ready = false;
+        while Instant::now() < deadline {
+            cache.maintain(&ctx);
+            if matches!(
+                cache.entries.get(uri).map(|e| e.state),
+                Some(EntryState::Ready {
+                    size: [32, 18],
+                    texture_id: Some(_),
+                })
+            ) {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut final_output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            cache.begin_pass();
+            let _ = cache.show_rounded(ui, &ctx, uri, Vec2::new(160.0, 90.0), 8.0);
+            cache.end_pass(&ctx);
+        });
+        final_output.textures_delta.clear();
+
+        assert!(ready, "expected disk-cached thumbnail to become Ready");
+        assert!(
+            cache
+                .entries
+                .get(uri)
+                .and_then(|e| e.texture.as_ref())
+                .is_some()
+        );
     }
 }
