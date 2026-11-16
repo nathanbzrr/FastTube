@@ -727,6 +727,49 @@ pub fn pick_json_file_dialog(
 }
 
 #[cfg(windows)]
+pub fn pick_text_export_dialog(title: &str, default_name: &str) -> Result<Option<PathBuf>, String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+
+    let mut command = Command::new("powershell");
+    command.creation_flags(0x08000000);
+    command.env("FASTTUBE_PICKER_TITLE", title);
+    command.env("FASTTUBE_PICKER_NAME", default_name);
+    let script = concat!(
+        "Add-Type -AssemblyName System.Windows.Forms; ",
+        "$d = New-Object System.Windows.Forms.SaveFileDialog; ",
+        "$d.Title = $env:FASTTUBE_PICKER_TITLE; ",
+        "$d.Filter = 'Arquivo de Texto (*.txt)|*.txt|Markdown (*.md)|*.md|Todos os arquivos (*.*)|*.*'; ",
+        "$d.DefaultExt = 'txt'; ",
+        "$d.AddExtension = $true; ",
+        "if ($env:FASTTUBE_PICKER_NAME) { $d.FileName = $env:FASTTUBE_PICKER_NAME }; ",
+        "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Write-Output $d.FileName }"
+    );
+    let output = command
+        .args(["-NoProfile", "-STA", "-NonInteractive", "-Command", script])
+        .output()
+        .map_err(|error| format!("Não foi possível abrir o seletor de arquivos: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Seletor de arquivos falhou: {}", stderr.trim()));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if stdout.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(PathBuf::from(stdout)))
+    }
+}
+
+#[cfg(not(windows))]
+pub fn pick_text_export_dialog(
+    _title: &str,
+    _default_name: &str,
+) -> Result<Option<PathBuf>, String> {
+    Err("Seletor nativo de arquivos disponível apenas no Windows.".into())
+}
+
+#[cfg(windows)]
 pub fn open_in_explorer(path: &Path) -> Result<(), String> {
     use std::process::Command;
 

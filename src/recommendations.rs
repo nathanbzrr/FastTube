@@ -767,7 +767,8 @@ impl RecommendationEngine {
                     || (current_is_podcast && is_podcast_video(video, meta));
 
                 match tab {
-                    crate::watch_extras::SidebarTab::All => {
+                    crate::watch_extras::SidebarTab::All
+                    | crate::watch_extras::SidebarTab::Transcript => {
                         score -= (idx as f64) * 0.04;
                     }
                     crate::watch_extras::SidebarTab::FromChannel => {}
@@ -1455,6 +1456,7 @@ mod tests {
                 channel: "Canal Rust Brasil".into(),
                 position_ms: 540_000,
                 duration_ms: Some(600_000),
+                watched_at_ms: None,
             })
             .unwrap();
         let mut queue = Queue::new(10);
@@ -1498,6 +1500,7 @@ mod tests {
                 channel: "RustDev".into(),
                 position_ms: 595_000,
                 duration_ms: Some(600_000),
+                watched_at_ms: None,
             })
             .unwrap();
         let queue = Queue::new(10);
@@ -1593,6 +1596,7 @@ mod tests {
                 channel: "RustLab".into(),
                 position_ms: 400_000,
                 duration_ms: Some(500_000),
+                watched_at_ms: None,
             })
             .unwrap();
         let queue = Queue::new(10);

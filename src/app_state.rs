@@ -555,6 +555,8 @@ pub(crate) struct HistoryState {
     pub(crate) notice: Option<String>,
     pub(crate) dirty: bool,
     pub(crate) save: HistorySaveState,
+    pub(crate) search_query: String,
+    pub(crate) filter: history::HistoryFilter,
 }
 
 #[derive(Default)]
@@ -577,6 +579,8 @@ pub(crate) struct QueueState {
     pub(crate) pending_entry_id: Option<u64>,
     pub(crate) correlation: QueuePlaybackCorrelation,
     pub(crate) pending_advance: bool,
+    pub(crate) pending_play_entry_id: Option<u64>,
+    pub(crate) save_collection_name: String,
 }
 
 impl Default for QueueState {
@@ -594,6 +598,8 @@ impl Default for QueueState {
             pending_entry_id: None,
             correlation: QueuePlaybackCorrelation::default(),
             pending_advance: false,
+            pending_play_entry_id: None,
+            save_collection_name: String::new(),
         }
     }
 }
@@ -604,8 +610,17 @@ pub(crate) struct LibraryState {
     pub(crate) revision: u64,
     pub(crate) path: Option<PathBuf>,
     pub(crate) error: Option<String>,
+    pub(crate) notice: Option<String>,
     pub(crate) bookmark_note: String,
     pub(crate) collection_name: String,
+    pub(crate) search_query: String,
+    pub(crate) bookmark_filter: String,
+    pub(crate) renaming_collection: Option<usize>,
+    pub(crate) rename_draft: String,
+    pub(crate) confirm_delete_collection: Option<usize>,
+    pub(crate) editing_bookmark_idx: Option<usize>,
+    pub(crate) editing_bookmark_note: String,
+    pub(crate) pending_bookmark_seek: Option<(String, u64)>,
 }
 
 #[derive(Default)]
@@ -698,6 +713,7 @@ pub(crate) struct WatchMetadataUiCache {
     pub(crate) stats: Vec<String>,
     pub(crate) cleaned_description: Option<String>,
     pub(crate) description_lines: Option<Vec<crate::watch_extras::CachedTimestampLine>>,
+    pub(crate) description_chapters: Vec<crate::watch_extras::DescriptionChapter>,
 }
 
 #[derive(Default)]
@@ -1203,6 +1219,7 @@ impl HistoryState {
             channel: crate::sanitize_history_channel(&video.channel),
             position_ms,
             duration_ms,
+            watched_at_ms: Some(crate::history::current_unix_epoch_ms()),
         };
         match self.data.record(entry) {
             Ok(()) => {
