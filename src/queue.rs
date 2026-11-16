@@ -215,6 +215,11 @@ impl Queue {
         self.remove(index)
     }
 
+    pub fn clear(&mut self) {
+        self.videos.clear();
+        self.entry_ids.clear();
+    }
+
     pub fn reorder(&mut self, from: usize, to: usize) -> bool {
         if from >= self.videos.len() || to >= self.videos.len() {
             return false;

@@ -4711,6 +4711,7 @@ fn record_active_playback_ticks_keep_feed_signal_revision_stable_until_completio
         duration_ms: Some(120_000),
         resume_target_ms: None,
         resume_seek_pending: false,
+        explicit_seek_pending: false,
         start_option_cleared: true,
         has_live_sample: true,
         stale_guard_pos_ms: None,
@@ -6734,4 +6735,748 @@ fn sign_out_clears_subscriptions_memory_rss_and_disk_cache() {
         cancel.cancel();
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn command_palette_ctrl_shortcuts_filter_and_execute_actions() {
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+    let sample_video = Video {
+        title: "Rust Async Internals".into(),
+        channel: "Ferris Talks".into(),
+        duration: "12:34".into(),
+        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+        thumbnail: String::new(),
+    };
+    app.feed.videos = vec![sample_video.clone()];
+    app.queue.data.add(sample_video.clone()).unwrap();
+    app.library.data.watch_later.push(library::VideoRecord {
+        video: sample_video.clone(),
+    });
+    app.library.data.bookmarks.push(library::Bookmark {
+        video_id: "dQw4w9WgXcQ".into(),
+        title: sample_video.title.clone(),
+        time_ms: 95_000,
+        note: "Pinpoint Async".into(),
+    });
+    app.feed
+        .home
+        .subscription_channels
+        .push(search::HomeChannel {
+            channel_id: "UC_x5XG1OV2P6uZZ5FSM9Ttw".into(),
+            title: "Google Developers".into(),
+            avatar_url: None,
+        });
+    app.record_video_in_history(&sample_video, 30_000, Some(754_000))
+        .unwrap();
+
+    // Ctrl+K opens palette, Ctrl+P closes it, Ctrl+K re-opens it.
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+    let ctrl_key = |key: egui::Key| egui::RawInput {
+        screen_rect: Some(screen),
+        events: vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        }],
+        ..Default::default()
+    };
+
+    let mut toggled = false;
+    ctx.run_ui(ctrl_key(egui::Key::K), |ui| {
+        toggled = app.handle_command_palette_global_shortcut(ui.ctx());
+    })
+    .textures_delta
+    .clear();
+    assert!(toggled);
+    assert!(app.ui.command_palette.open);
+
+    ctx.run_ui(ctrl_key(egui::Key::P), |ui| {
+        toggled = app.handle_command_palette_global_shortcut(ui.ctx());
+    })
+    .textures_delta
+    .clear();
+    assert!(toggled);
+    assert!(!app.ui.command_palette.open);
+
+    ctx.run_ui(ctrl_key(egui::Key::K), |ui| {
+        toggled = app.handle_command_palette_global_shortcut(ui.ctx());
+    })
+    .textures_delta
+    .clear();
+    assert!(toggled);
+    assert!(app.ui.command_palette.open);
+
+    // Filter to SponsorBlock settings tab and execute via Enter key headlessly.
+    app.ui.command_palette.query = "sponsorblock".into();
+    let mut rendered = String::new();
+    for step in 0..3 {
+        let events = if step == 2 {
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]
+        } else {
+            Vec::new()
+        };
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                let c = ui.ctx().clone();
+                app.command_palette_ui(&c);
+            },
+        );
+        if step == 1 {
+            rendered = collect_rendered_text(&out.shapes).join("\n");
+        }
+        out.textures_delta.clear();
+    }
+    assert!(
+        rendered.contains("SponsorBlock"),
+        "palette missing match:\n{rendered}"
+    );
+    assert!(!app.ui.command_palette.open);
+    assert!(app.ui.settings_open);
+    assert_eq!(
+        app.settings.active_tab,
+        app_state::SettingsTab::SponsorBlock
+    );
+
+    // Quick actions & bookmark jump-to-timestamp when unopened vs already playing.
+    app.execute_palette_action(command_palette::PaletteAction::ToggleTheme, &ctx);
+    assert_eq!(app.settings.theme.value, Theme::Light);
+
+    app.execute_palette_action(
+        command_palette::PaletteAction::OpenBookmark {
+            bookmark: app.library.data.bookmarks[0].clone(),
+        },
+        &ctx,
+    );
+    assert!(!app.ui.settings_open);
+    assert_eq!(app.playback.pending_open_seek_ms, Some(95_000));
+    assert_eq!(
+        app.playback
+            .pending_open_video
+            .as_ref()
+            .map(|v| v.url.as_str()),
+        Some(sample_video.url.as_str())
+    );
+
+    // When the same video is already selected, opening a bookmark seeks immediately.
+    app.selected = Some(sample_video.clone());
+    app.playback.pending_open_video = None;
+    app.playback.pending_open_seek_ms = None;
+    app.playback.active = Some(ActivePlayback {
+        video_id: Some("dQw4w9WgXcQ".into()),
+        url: sample_video.url.clone(),
+        title: sample_video.title.clone(),
+        channel: sample_video.channel.clone(),
+        position_ms: 10_000,
+        duration_ms: Some(754_000),
+        resume_target_ms: None,
+        resume_seek_pending: false,
+        explicit_seek_pending: false,
+        start_option_cleared: true,
+        has_live_sample: true,
+        stale_guard_pos_ms: None,
+        is_live: false,
+        live_dvr: false,
+        at_live_edge: false,
+        live_paused_since: None,
+        live_paused_accumulated_secs: 0.0,
+        live_behind_secs: 0.0,
+    });
+    app.execute_palette_action(
+        command_palette::PaletteAction::OpenBookmark {
+            bookmark: app.library.data.bookmarks[0].clone(),
+        },
+        &ctx,
+    );
+    assert_eq!(
+        app.playback.active.as_ref().map(|a| a.position_ms),
+        Some(95_000)
+    );
+
+    app.execute_palette_action(command_palette::PaletteAction::ClearQueue, &ctx);
+    assert!(app.queue.data.is_empty());
+
+    app.execute_palette_action(command_palette::PaletteAction::OpenShortcuts, &ctx);
+    assert!(app.ui.shortcuts_open);
+
+    // Backdrop click outside modal closes the palette.
+    app.ui.command_palette.open_palette();
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(egui::pos2(10.0, 10.0)),
+                egui::Event::PointerButton {
+                    pos: egui::pos2(10.0, 10.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: egui::pos2(10.0, 10.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.command_palette_ui(&c);
+        },
+    );
+    out.textures_delta.clear();
+    assert!(!app.ui.command_palette.open);
+}
+
+#[test]
+fn navigation_back_forward_stack_records_and_renders_header_buttons() {
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+
+    // Baseline: Home
+    app.sync_navigation_history();
+    assert!(!app.ui.can_go_back());
+    assert!(!app.ui.can_go_forward());
+
+    // Transition to Library
+    app.ui.browse_section = BrowseSection::Library;
+    app.sync_navigation_history();
+    assert!(app.ui.can_go_back());
+    assert!(!app.ui.can_go_forward());
+
+    // Transition to Settings(Privacy)
+    app.ui.settings_open = true;
+    app.settings.active_tab = app_state::SettingsTab::Privacy;
+    app.sync_navigation_history();
+    assert_eq!(app.ui.nav_back_stack.len(), 2);
+
+    // Back -> Library, Back -> Home, Forward -> Library
+    assert!(app.navigate_back(&ctx));
+    app.sync_navigation_history();
+    assert!(!app.ui.settings_open);
+    assert_eq!(app.ui.browse_section, BrowseSection::Library);
+    assert!(app.ui.can_go_forward());
+
+    assert!(app.navigate_back(&ctx));
+    app.sync_navigation_history();
+    assert_eq!(app.ui.browse_section, BrowseSection::Home);
+    assert_eq!(app.ui.nav_forward_stack.len(), 2);
+
+    assert!(app.navigate_forward(&ctx));
+    app.sync_navigation_history();
+    assert_eq!(app.ui.browse_section, BrowseSection::Library);
+
+    // Visiting a new route clears forward history.
+    app.ui.browse_section = BrowseSection::Queue;
+    app.sync_navigation_history();
+    assert!(!app.ui.can_go_forward());
+
+    // Header UI renders ← and → buttons and clicking ← navigates back to Library.
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 220.0));
+    let mut header_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.header_ui(ui, &c);
+        },
+    );
+    let rects = collect_rendered_text_rects(&header_out.shapes);
+    header_out.textures_delta.clear();
+    let back_pos = rects
+        .iter()
+        .find(|(text, _)| text == "\u{2190}")
+        .expect("header back button")
+        .1
+        .center();
+
+    let mut click_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(back_pos),
+                egui::Event::PointerButton {
+                    pos: back_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: back_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.header_ui(ui, &c);
+        },
+    );
+    click_out.textures_delta.clear();
+    app.sync_navigation_history();
+    assert_eq!(app.ui.browse_section, BrowseSection::Library);
+    assert!(app.ui.can_go_forward());
+}
+
+#[test]
+fn clipboard_quick_open_pill_opens_target_and_dismisses_cleanly() {
+    assert_eq!(
+        decode_utf16_clipboard_words(&[b'h' as u16, b'i' as u16, 0, b'x' as u16]),
+        "hi"
+    );
+    assert_eq!(
+        decode_utf16_clipboard_words(&[b'o' as u16, b'k' as u16]),
+        "ok"
+    );
+
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+    app.set_clipboard_preview_text(Some("https://youtu.be/dQw4w9WgXcQ?t=1m30s"));
+    assert!(app.ui.clipboard_last_checked_at.is_some());
+    assert!(app.ui.clipboard_youtube_target.is_some());
+
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 220.0));
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.header_ui(ui, &c);
+        },
+    );
+    let rects = collect_rendered_text_rects(&out.shapes);
+    let joined = collect_rendered_text(&out.shapes).join("\n");
+    out.textures_delta.clear();
+    assert!(
+        joined.contains("Link copiado: Vídeo dQw4w9WgXcQ (1:30)"),
+        "{joined}"
+    );
+
+    let open_pos = rects
+        .iter()
+        .find(|(text, _)| text == "Abrir")
+        .expect("Abrir button in clipboard pill")
+        .1
+        .center();
+    let mut click_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(open_pos),
+                egui::Event::PointerButton {
+                    pos: open_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: open_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.header_ui(ui, &c);
+        },
+    );
+    click_out.textures_delta.clear();
+    assert_eq!(app.playback.pending_open_seek_ms, Some(90_000));
+    assert_eq!(
+        app.playback
+            .pending_open_video
+            .as_ref()
+            .map(|v| v.url.as_str()),
+        Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    );
+    assert!(app.ui.clipboard_youtube_target.is_none());
+
+    // Same clipboard URL stays dismissed until clipboard changes.
+    app.set_clipboard_preview_text(Some("https://youtu.be/dQw4w9WgXcQ?t=1m30s"));
+    assert!(app.ui.clipboard_youtube_target.is_none());
+
+    // A new clipboard URL triggers pill again and can be dismissed via ✕.
+    app.set_clipboard_preview_text(Some("https://www.youtube.com/@rustlang"));
+    assert!(app.ui.clipboard_youtube_target.is_some());
+    let mut out2 = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.header_ui(ui, &c);
+        },
+    );
+    let rects2 = collect_rendered_text_rects(&out2.shapes);
+    out2.textures_delta.clear();
+    let dismiss_pos = rects2
+        .iter()
+        .find(|(text, _)| text == "\u{2715}")
+        .expect("Dismiss button in clipboard pill")
+        .1
+        .center();
+    let mut dismiss_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(dismiss_pos),
+                egui::Event::PointerButton {
+                    pos: dismiss_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: dismiss_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.header_ui(ui, &c);
+        },
+    );
+    dismiss_out.textures_delta.clear();
+    assert!(app.ui.clipboard_youtube_target.is_none());
+}
+
+#[test]
+fn header_search_bar_opens_direct_video_url_and_channel_handle() {
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+    let palette = app.palette();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 120.0));
+
+    // Direct video URL with timestamp
+    app.feed.query = "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=75".into();
+    let mut search_btn_rect = egui::Rect::NOTHING;
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.header_search_ui(ui, &c, palette, 520.0);
+            search_btn_rect = ui.min_rect();
+        },
+    );
+    out.textures_delta.clear();
+    let click_pos = egui::pos2(search_btn_rect.right() - 24.0, search_btn_rect.center().y);
+    let mut click_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(click_pos),
+                egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.header_search_ui(ui, &c, palette, 520.0);
+        },
+    );
+    click_out.textures_delta.clear();
+    assert!(!app.ui.search_results_mode);
+    assert_eq!(app.playback.pending_open_seek_ms, Some(75_000));
+    assert_eq!(
+        app.playback
+            .pending_open_video
+            .as_ref()
+            .map(|v| v.url.as_str()),
+        Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    );
+
+    // Direct @handle opens channel directly
+    app.playback.pending_open_video = None;
+    app.feed.query = "@rustlang".into();
+    let mut click_handle = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(click_pos),
+                egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.header_search_ui(ui, &c, palette, 520.0);
+        },
+    );
+    click_handle.textures_delta.clear();
+    if let Some(cancel) = app.channels.videos.cancel.take() {
+        cancel.cancel();
+    }
+    assert!(!app.ui.search_results_mode);
+    assert!(app.channels.view_open);
+    assert_eq!(
+        app.channels.last_target,
+        Some(ChannelTarget::Handle("@rustlang".to_owned()))
+    );
+}
+
+#[test]
+fn grid_card_hover_quick_actions_trigger_without_opening_video() {
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+    let scored = ScoredVideo {
+        video: Video {
+            title: "FastTube UI Walkthrough".into(),
+            channel: "Rust Channel".into(),
+            url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+            thumbnail: String::new(),
+            duration: "8:20".into(),
+        },
+        score: 100.0,
+        metadata: VideoMetadata::default(),
+        is_short: false,
+    };
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 340.0));
+    let hover_pos = egui::pos2(160.0, 60.0);
+
+    // Frame 1: hover over thumbnail reveals quick actions.
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![egui::Event::PointerMoved(hover_pos)],
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            let _ = app.youtube_grid_card_ui(ui, &c, &scored, 300.0);
+        },
+    );
+    let rects = collect_rendered_text_rects(&out.shapes);
+    out.textures_delta.clear();
+
+    let fila_pos = rects
+        .iter()
+        .find(|(text, _)| text == "+ Fila")
+        .expect("+ Fila hover button")
+        .1
+        .center();
+    let wl_pos = rects
+        .iter()
+        .find(|(text, _)| text == "Assistir depois")
+        .expect("Assistir depois hover button")
+        .1
+        .center();
+
+    // Click "+ Fila"
+    let mut fila_actions = HomeCardActions::default();
+    let mut out_fila = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(fila_pos),
+                egui::Event::PointerButton {
+                    pos: fila_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: fila_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            fila_actions = app.youtube_grid_card_ui(ui, &c, &scored, 300.0);
+        },
+    );
+    out_fila.textures_delta.clear();
+    assert!(fila_actions.enqueue_clicked);
+    assert!(!fila_actions.open_clicked);
+
+    // Click "Assistir depois"
+    let mut wl_actions = HomeCardActions::default();
+    let mut out_wl = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(wl_pos),
+                egui::Event::PointerButton {
+                    pos: wl_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: wl_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            wl_actions = app.youtube_grid_card_ui(ui, &c, &scored, 300.0);
+        },
+    );
+    out_wl.textures_delta.clear();
+    assert!(wl_actions.toggle_watch_later);
+    assert!(!wl_actions.open_clicked);
+}
+
+#[test]
+fn filter_chips_bar_scrolls_horizontally_via_left_and_right_buttons() {
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+    app.feed.videos = (0..12)
+        .map(|i| Video {
+            title: format!("Video de Musica Rock Ao Vivo {i}"),
+            channel: format!("Canal Muito Longo Numero {i}"),
+            url: format!("https://www.youtube.com/watch?v=vid000000{i:02}"),
+            thumbnail: String::new(),
+            duration: "10:00".into(),
+        })
+        .collect();
+    app.invalidate_feed_cache();
+
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(260.0, 80.0));
+    let mut bar_rect = egui::Rect::NOTHING;
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.filter_chips_bar_ui(ui, &c);
+            bar_rect = ui.min_rect();
+        },
+    );
+    out.textures_delta.clear();
+    assert_eq!(app.ui.chips_scroll_offset, 0.0);
+
+    // Click right chevron (last 32x32 button inside bar_rect)
+    let right_pos = egui::pos2(bar_rect.right() - 16.0, bar_rect.center().y);
+    let mut out_right = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(right_pos),
+                egui::Event::PointerButton {
+                    pos: right_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: right_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.filter_chips_bar_ui(ui, &c);
+        },
+    );
+    out_right.textures_delta.clear();
+    assert!(
+        app.ui.chips_scroll_offset > 0.0,
+        "expected chips_scroll_offset > 0 after clicking right arrow, got {}",
+        app.ui.chips_scroll_offset
+    );
+
+    // Click left chevron (first 32x32 button inside bar_rect)
+    let left_pos = egui::pos2(bar_rect.left() + 16.0, bar_rect.center().y);
+    let mut out_left = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(left_pos),
+                egui::Event::PointerButton {
+                    pos: left_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: left_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.filter_chips_bar_ui(ui, &c);
+        },
+    );
+    out_left.textures_delta.clear();
+    assert_eq!(app.ui.chips_scroll_offset, 0.0);
 }
