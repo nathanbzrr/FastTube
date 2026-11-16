@@ -2918,6 +2918,49 @@ impl FastTube {
                             }
                         });
                     }
+
+                    if !prefs.muted_channels.is_empty() {
+                        ui.add_space(10.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new("Canais silenciados:")
+                                    .size(12.0)
+                                    .strong()
+                                    .color(palette.snippet_fg),
+                            );
+                            let mut restore_channel: Option<String> = None;
+                            for muted in &prefs.muted_channels {
+                                let btn = egui::Button::new(
+                                    RichText::new(format!("+ {muted}"))
+                                        .size(11.5)
+                                        .color(palette.header_button_fg),
+                                )
+                                .fill(palette.header_button_bg)
+                                .stroke(Stroke::new(1.0, palette.card_alt_stroke))
+                                .corner_radius(CornerRadius::same(12))
+                                .min_size(Vec2::new(0.0, 24.0));
+                                if ui
+                                    .add(btn)
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .on_hover_text("Restaurar canal nas recomendações")
+                                    .clicked()
+                                {
+                                    restore_channel = Some(muted.clone());
+                                }
+                            }
+                            if let Some(ch) = restore_channel {
+                                prefs.muted_channels.retain(|c| c != &ch);
+                                changed = true;
+                                invalidate = true;
+                            }
+                            if pill_choice_button(ui, "Restaurar canais", false, palette).clicked()
+                            {
+                                prefs.muted_channels.clear();
+                                changed = true;
+                                invalidate = true;
+                            }
+                        });
+                    }
                 });
                 paint_row_divider(ui, palette);
 

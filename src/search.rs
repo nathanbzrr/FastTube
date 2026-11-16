@@ -5067,6 +5067,185 @@ fn parse_channel_about(
     })
 }
 
+pub const YOUTUBE_SUGGEST_ENDPOINT: &str = "https://suggestqueries.google.com/complete/search";
+const SEARCH_SUGGEST_TIMEOUT: Duration = Duration::from_secs(4);
+const MAX_SEARCH_SUGGEST_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchSuggestionItem {
+    pub text: String,
+    pub is_recent: bool,
+}
+
+pub fn parse_youtube_suggest_json(body: &str) -> Result<Vec<String>, String> {
+    let parsed: Value = serde_json::from_str(body)
+        .map_err(|err| format!("Resposta inválida de sugestões de busca: {err}"))?;
+    let suggestions = parsed
+        .as_array()
+        .and_then(|arr| arr.get(1))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Formato inesperado nas sugestões do YouTube.".to_owned())?;
+
+    let mut out = Vec::new();
+    let mut seen_lower = std::collections::HashSet::new();
+    for entry in suggestions {
+        let Some(raw) = entry.as_str() else {
+            continue;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_lowercase();
+        if seen_lower.insert(lower) {
+            out.push(trimmed.to_owned());
+            if out.len() >= 10 {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub fn merge_search_suggestions(
+    query: &str,
+    recent_searches: &[String],
+    remote_suggestions: &[String],
+    max_items: usize,
+) -> Vec<SearchSuggestionItem> {
+    if max_items == 0 {
+        return Vec::new();
+    }
+    let trimmed = query.trim();
+    let needle = trimmed.to_lowercase();
+    let mut merged = Vec::new();
+    let mut seen_lower = std::collections::HashSet::new();
+
+    let mut matching_recent: Vec<(&str, bool)> = recent_searches
+        .iter()
+        .filter_map(|raw| {
+            let clean = raw.trim();
+            if clean.is_empty() {
+                return None;
+            }
+            if needle.is_empty() {
+                return Some((clean, true));
+            }
+            let lower = clean.to_lowercase();
+            if lower.starts_with(&needle) {
+                Some((clean, true))
+            } else if lower.contains(&needle) {
+                Some((clean, false))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if !needle.is_empty() {
+        matching_recent.sort_by_key(|(_, is_prefix)| !*is_prefix);
+    }
+
+    for (recent, _) in matching_recent {
+        if merged.len() >= max_items {
+            break;
+        }
+        let lower = recent.to_lowercase();
+        if seen_lower.insert(lower) {
+            merged.push(SearchSuggestionItem {
+                text: recent.to_owned(),
+                is_recent: true,
+            });
+        }
+    }
+
+    if !needle.is_empty() {
+        for suggestion in remote_suggestions {
+            if merged.len() >= max_items {
+                break;
+            }
+            let clean = suggestion.trim();
+            if clean.is_empty() {
+                continue;
+            }
+            let lower = clean.to_lowercase();
+            if seen_lower.insert(lower) {
+                merged.push(SearchSuggestionItem {
+                    text: clean.to_owned(),
+                    is_recent: false,
+                });
+            }
+        }
+    }
+
+    merged
+}
+
+pub fn fetch_search_suggestions_at(
+    endpoint: &str,
+    query: &str,
+    cancellation: &Cancellation,
+) -> Result<Vec<String>, String> {
+    if cancellation.cancelled() {
+        return Err("Consulta de sugestões cancelada.".to_owned());
+    }
+    let trimmed = query.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with(':')
+    {
+        return Ok(Vec::new());
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(SEARCH_SUGGEST_TIMEOUT)
+        .build()
+        .map_err(|err| format!("Falha ao preparar cliente HTTP de sugestões: {err}"))?;
+    let response = client
+        .get(endpoint)
+        .query(&[
+            ("client", "firefox"),
+            ("ds", "yt"),
+            ("hl", "pt"),
+            ("q", trimmed),
+        ])
+        .header(reqwest::header::USER_AGENT, SUBTITLE_USER_AGENT)
+        .header(
+            reqwest::header::ACCEPT_LANGUAGE,
+            "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        )
+        .send()
+        .map_err(|err| format!("Falha ao buscar sugestões: {err}"))?;
+    if cancellation.cancelled() {
+        return Err("Consulta de sugestões cancelada.".to_owned());
+    }
+    if !response.status().is_success() {
+        return Err(format!(
+            "Servidor de sugestões retornou HTTP {}",
+            response.status().as_u16()
+        ));
+    }
+    let mut limited = response.take((MAX_SEARCH_SUGGEST_BYTES + 1) as u64);
+    let mut bytes = Vec::new();
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|err| format!("Falha ao ler sugestões: {err}"))?;
+    if cancellation.cancelled() {
+        return Err("Consulta de sugestões cancelada.".to_owned());
+    }
+    if bytes.len() > MAX_SEARCH_SUGGEST_BYTES {
+        return Err("Resposta de sugestões excedeu o limite permitido.".to_owned());
+    }
+    let body = String::from_utf8_lossy(&bytes);
+    parse_youtube_suggest_json(&body)
+}
+
+pub fn fetch_search_suggestions(
+    query: &str,
+    cancellation: &Cancellation,
+) -> Result<Vec<String>, String> {
+    fetch_search_suggestions_at(YOUTUBE_SUGGEST_ENDPOINT, query, cancellation)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6603,5 +6782,81 @@ mod tests {
             get_cached_subtitle_tracks("https://example.com/not-yt"),
             None
         );
+    }
+
+    #[test]
+    fn parse_youtube_suggest_json_deduplicates_and_validates_shape() {
+        let raw = r#"["rust",["rust tutorial","  Rust Tutorial ","rust egui","","cargo clippy"]]"#;
+        let parsed = parse_youtube_suggest_json(raw).unwrap();
+        assert_eq!(parsed, vec!["rust tutorial", "rust egui", "cargo clippy"]);
+
+        assert!(parse_youtube_suggest_json("{}").is_err());
+        assert!(parse_youtube_suggest_json("[\"rust\"]").is_err());
+    }
+
+    #[test]
+    fn merge_search_suggestions_prioritizes_recent_prefix_and_deduplicates_remote() {
+        let recent = vec![
+            "aprender rust".to_owned(),
+            "rust egui".to_owned(),
+            "mpv player".to_owned(),
+        ];
+        let remote = vec![
+            "Rust Egui".to_owned(),
+            "rust async tokio".to_owned(),
+            "rust lang brasil".to_owned(),
+        ];
+        let merged = merge_search_suggestions("rust", &recent, &remote, 5);
+        assert_eq!(
+            merged,
+            vec![
+                SearchSuggestionItem {
+                    text: "rust egui".into(),
+                    is_recent: true,
+                },
+                SearchSuggestionItem {
+                    text: "aprender rust".into(),
+                    is_recent: true,
+                },
+                SearchSuggestionItem {
+                    text: "rust async tokio".into(),
+                    is_recent: false,
+                },
+                SearchSuggestionItem {
+                    text: "rust lang brasil".into(),
+                    is_recent: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_search_suggestions_respects_cancellation_and_parses_local_http_response() {
+        let cancelled = Cancellation::default();
+        cancelled.cancel();
+        assert!(fetch_search_suggestions_at("http://127.0.0.1:9", "rust", &cancelled).is_err());
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = r#"["rust egui",["rust egui tutorial","rust egui table"]]"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let endpoint = format!("http://{addr}/complete/search");
+        let cancel = Cancellation::default();
+        let results = fetch_search_suggestions_at(&endpoint, "rust egui", &cancel).unwrap();
+        assert_eq!(results, vec!["rust egui tutorial", "rust egui table"]);
+        let _ = handle.join();
     }
 }
