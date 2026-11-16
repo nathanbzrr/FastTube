@@ -779,15 +779,6 @@ fn parse_comments(json: &Value) -> Result<CommentsPage, String> {
     })
 }
 
-pub fn comments_page(
-    token: &str,
-    video_id: &str,
-    page: Option<&str>,
-    cancel: &Cancellation,
-) -> Result<CommentsPage, String> {
-    comments_page_ordered(token, video_id, CommentOrder::Relevance, page, cancel)
-}
-
 pub fn comments_page_ordered(
     token: &str,
     video_id: &str,

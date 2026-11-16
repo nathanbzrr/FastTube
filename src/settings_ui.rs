@@ -3077,10 +3077,9 @@ impl FastTube {
                     }
                     if let Some(dir) = ytdlp_subdir.as_deref().or(effective_base.as_deref())
                         && pill_choice_button(ui, "Abrir no Explorer", false, palette).clicked()
+                        && let Err(err) = settings::open_in_explorer(dir)
                     {
-                        if let Err(err) = settings::open_in_explorer(dir) {
-                            self.settings.cache_status = Some(err);
-                        }
+                        self.settings.cache_status = Some(err);
                     }
                 });
                 if let Some(subdir) = &ytdlp_subdir {
@@ -3565,11 +3564,10 @@ impl FastTube {
                                                 Err(err) => Some((false, err)),
                                             };
                                     }
-                                    if pill_choice_button(ui, "Abrir", false, palette).clicked() {
-                                        if let Err(err) = settings::open_in_explorer(path) {
-                                            self.settings.storage_action_status =
-                                                Some((false, err));
-                                        }
+                                    if pill_choice_button(ui, "Abrir", false, palette).clicked()
+                                        && let Err(err) = settings::open_in_explorer(path)
+                                    {
+                                        self.settings.storage_action_status = Some((false, err));
                                     }
                                 },
                             );

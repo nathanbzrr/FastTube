@@ -25,6 +25,7 @@ pub(crate) fn compute_header_layout_mode(viewport_width: f32) -> HeaderLayoutMod
     }
 }
 
+#[cfg(test)]
 pub(crate) fn compute_header_height(viewport_width: f32, fullscreen: bool) -> f32 {
     if fullscreen {
         return 0.0;

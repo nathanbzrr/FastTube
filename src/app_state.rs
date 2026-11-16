@@ -462,6 +462,8 @@ impl SettingsTab {
     }
 }
 
+pub(crate) type BackupPickerResult = (bool, Result<Option<PathBuf>, String>);
+
 pub(crate) struct SettingsState {
     pub(crate) buffer: BufferSettingsState,
     pub(crate) playback: TrackedSettings<PlaybackPreferences>,
@@ -475,7 +477,7 @@ pub(crate) struct SettingsState {
     pub(crate) cache_dir_input: String,
     pub(crate) cache_dir_input_synced: bool,
     pub(crate) cache_picker_rx: Option<Receiver<Result<Option<PathBuf>, String>>>,
-    pub(crate) backup_picker_rx: Option<Receiver<(bool, Result<Option<PathBuf>, String>)>>,
+    pub(crate) backup_picker_rx: Option<Receiver<BackupPickerResult>>,
     pub(crate) oauth_picker_rx: Option<Receiver<Result<Option<PathBuf>, String>>>,
     pub(crate) oauth_import_status: Option<(bool, String)>,
     pub(crate) cache_status: Option<String>,

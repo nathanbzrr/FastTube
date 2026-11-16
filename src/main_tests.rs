@@ -3769,7 +3769,6 @@ fn encode_utf16_clipboard_words_appends_null_terminator_for_ascii_and_unicode() 
 
 #[test]
 fn poll_rating_updates_ratings_refreshed_session_and_status_messages() {
-    let ctx = egui::Context::default();
     let mut app = FastTube::default();
     app.auth.authenticated = true;
     app.auth.session = Some(oauth::TokenSession::test_session("old-token"));
@@ -3781,7 +3780,7 @@ fn poll_rating_updates_ratings_refreshed_session_and_status_messages() {
         Ok(("dQw4w9WgXcQ".into(), Some(oauth::VideoRating::Like))),
     ))
     .unwrap();
-    app.poll_rating(&ctx);
+    app.poll_rating();
     assert_eq!(
         app.auth
             .session
@@ -3803,7 +3802,7 @@ fn poll_rating_updates_ratings_refreshed_session_and_status_messages() {
         Ok(("dQw4w9WgXcQ".into(), Some(oauth::VideoRating::Dislike))),
     ))
     .unwrap();
-    app.poll_rating(&ctx);
+    app.poll_rating();
     assert_eq!(
         app.auth.ratings.get("dQw4w9WgXcQ").copied(),
         Some(oauth::VideoRating::Dislike)
@@ -3813,7 +3812,7 @@ fn poll_rating_updates_ratings_refreshed_session_and_status_messages() {
     let (tx, rx) = mpsc::channel();
     app.auth.rating_rx = Some(rx);
     tx.send((None, Ok(("dQw4w9WgXcQ".into(), None)))).unwrap();
-    app.poll_rating(&ctx);
+    app.poll_rating();
     assert!(!app.auth.ratings.contains_key("dQw4w9WgXcQ"));
     assert_eq!(app.message, "Avaliação removida.");
 
@@ -3824,7 +3823,7 @@ fn poll_rating_updates_ratings_refreshed_session_and_status_messages() {
         Err("Sua sessão Google expirou ou foi revogada. Entre novamente.".into()),
     ))
     .unwrap();
-    app.poll_rating(&ctx);
+    app.poll_rating();
     assert!(app.auth.session.is_some());
     assert!(app.message.contains("sessão Google expirou"));
 }
@@ -6733,5 +6732,93 @@ fn sign_out_clears_subscriptions_memory_rss_and_disk_cache() {
     if let Some(cancel) = app.feed.home.batch_cancel.take() {
         cancel.cancel();
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compute_repaint_interval_throttles_idle_and_prioritizes_active_states() {
+    assert_eq!(
+        compute_repaint_interval(RepaintScheduleInput::default()),
+        None
+    );
+
+    assert_eq!(
+        compute_repaint_interval(RepaintScheduleInput {
+            minimized: true,
+            user_interacting: true,
+            video_actively_playing: true,
+            thumbnails_loading: true,
+            async_jobs_active: true,
+            ..Default::default()
+        }),
+        None
+    );
+
+    assert_eq!(
+        compute_repaint_interval(RepaintScheduleInput {
+            user_interacting: true,
+            video_actively_playing: true,
+            ..Default::default()
+        }),
+        Some(Duration::from_millis(16))
+    );
+
+    assert_eq!(
+        compute_repaint_interval(RepaintScheduleInput {
+            video_actively_playing: true,
+            toast_or_animation_active: true,
+            ..Default::default()
+        }),
+        Some(Duration::from_millis(100))
+    );
+
+    assert_eq!(
+        compute_repaint_interval(RepaintScheduleInput {
+            toast_or_animation_active: true,
+            ..Default::default()
+        }),
+        Some(Duration::from_millis(80))
+    );
+
+    assert_eq!(
+        compute_repaint_interval(RepaintScheduleInput {
+            thumbnails_loading: true,
+            async_jobs_active: true,
+            ..Default::default()
+        }),
+        Some(Duration::from_millis(80))
+    );
+
+    assert_eq!(
+        compute_repaint_interval(RepaintScheduleInput {
+            async_jobs_active: true,
+            ..Default::default()
+        }),
+        Some(Duration::from_millis(150))
+    );
+
+    assert_eq!(
+        compute_repaint_interval(RepaintScheduleInput {
+            native_hwnd_fallback_active: true,
+            ..Default::default()
+        }),
+        Some(Duration::from_millis(150))
+    );
+}
+
+#[test]
+fn disk_image_cache_for_override_ignores_default_in_tests_and_uses_explicit_override() {
+    assert!(FastTube::disk_image_cache_for_override(None).is_none());
+
+    let dir = std::env::temp_dir().join(format!("fasttube-main-disk-cache-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let override_str = dir.to_string_lossy().into_owned();
+    let cache = FastTube::disk_image_cache_for_override(Some(&override_str))
+        .expect("explicit override should produce a DiskImageCache");
+    let expected_path = cache.entry_path_for_uri("https://i.ytimg.com/vi/abc/hqdefault.jpg");
+    assert!(expected_path.starts_with(dir.join("thumbnails")));
+
     let _ = std::fs::remove_dir_all(&dir);
 }
