@@ -101,6 +101,8 @@ pub(crate) fn scaled_window_bounds(rect: Rect, scale: f32) -> (i32, i32, i32, i3
     )
 }
 
+pub use crate::overlay::{AspectZoomMode, AudioEqPreset, OverlayAudioTrack as AudioTrackOption};
+
 pub(crate) struct VideoWindow {
     hwnd: HWND,
     visible: bool,
@@ -819,9 +821,14 @@ impl Player {
                 "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best".to_owned(),
             ),
         ]);
-        if let Ok(executable) = std::env::current_exe()
-            && let Some(yt_dlp) = crate::search::bundled_yt_dlp(&executable)
-        {
+        let yt_dlp_override = crate::updater::local_bin_yt_dlp_path()
+            .filter(|path| path.is_file())
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|executable| crate::search::bundled_yt_dlp(&executable))
+            });
+        if let Some(yt_dlp) = yt_dlp_override {
             options.push(("script-opts", crate::search::ytdl_hook_path_option(&yt_dlp)));
         }
         options
@@ -872,6 +879,103 @@ impl Player {
 
     pub fn disable_subtitles(&self) -> Result<(), String> {
         self.set("sid", "no")
+    }
+
+    pub fn audio_tracks(&self) -> Vec<AudioTrackOption> {
+        let count = self.number("track-list/count").unwrap_or(0.0).max(0.0) as usize;
+        let mut tracks = Vec::new();
+        for index in 0..count {
+            if self
+                .property(&format!("track-list/{index}/type"))
+                .as_deref()
+                != Some("audio")
+            {
+                continue;
+            }
+            let Some(id) = self.property(&format!("track-list/{index}/id")) else {
+                continue;
+            };
+            let title = self
+                .property(&format!("track-list/{index}/title"))
+                .unwrap_or_default();
+            let lang = self
+                .property(&format!("track-list/{index}/lang"))
+                .unwrap_or_default();
+            let codec = self
+                .property(&format!("track-list/{index}/codec"))
+                .unwrap_or_default();
+            let selected = self
+                .property(&format!("track-list/{index}/selected"))
+                .as_deref()
+                == Some("yes");
+            let mut label_parts = Vec::new();
+            if !title.trim().is_empty() {
+                label_parts.push(title.trim().to_owned());
+            }
+            if !lang.trim().is_empty() {
+                label_parts.push(lang.trim().to_ascii_uppercase());
+            }
+            if !codec.trim().is_empty() {
+                label_parts.push(codec.trim().to_owned());
+            }
+            let label = if label_parts.is_empty() {
+                format!("Faixa #{id}")
+            } else {
+                label_parts.join(" · ")
+            };
+            tracks.push(AudioTrackOption {
+                id,
+                label,
+                selected,
+            });
+        }
+        tracks
+    }
+
+    pub fn set_audio_track(&self, id: &str) -> Result<(), String> {
+        self.set("aid", id)
+    }
+
+    pub fn set_aspect_zoom(&self, mode: AspectZoomMode) -> Result<(), String> {
+        let (aspect, panscan) = match mode {
+            AspectZoomMode::Auto => ("-1", "0.0"),
+            AspectZoomMode::Ratio16_9 => ("16:9", "0.0"),
+            AspectZoomMode::Ratio21_9 => ("21:9", "0.0"),
+            AspectZoomMode::FillZoom => ("-1", "1.0"),
+        };
+        self.set("video-aspect-override", aspect)?;
+        self.set("panscan", panscan)
+    }
+
+    pub fn set_video_eq(
+        &self,
+        brightness: i32,
+        contrast: i32,
+        saturation: i32,
+    ) -> Result<(), String> {
+        self.set("brightness", &brightness.clamp(-50, 50).to_string())?;
+        self.set("contrast", &contrast.clamp(-50, 50).to_string())?;
+        self.set("saturation", &saturation.clamp(-50, 50).to_string())
+    }
+
+    pub fn apply_audio_filters(&self, normalize: bool, eq: AudioEqPreset) -> Result<(), String> {
+        let mut filters: Vec<&str> = Vec::new();
+        if normalize {
+            filters.push("lavfi=[loudnorm=I=-16:TP=-1.5:LRA=11]");
+        }
+        match eq {
+            AudioEqPreset::Flat => {}
+            AudioEqPreset::Voice => {
+                filters.push("lavfi=[equalizer=f=120:width_type=h:width=100:g=-4,equalizer=f=2200:width_type=h:width=1200:g=4]");
+            }
+            AudioEqPreset::BassBoost => {
+                filters.push("lavfi=[equalizer=f=90:width_type=h:width=80:g=5]");
+            }
+            AudioEqPreset::Night => {
+                filters.push("lavfi=[acompressor=threshold=-20dB:ratio=4:attack=10:release=150]");
+            }
+        }
+        self.set("af", &filters.join(","))
     }
 
     fn find_subtitle_track_by_path(&self, path_or_url: &str) -> Option<String> {

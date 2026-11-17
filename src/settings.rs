@@ -376,6 +376,242 @@ impl HwdecMode {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Keybindings {
+    pub play_pause: String,
+    pub seek_back: String,
+    pub seek_forward: String,
+    pub mute: String,
+    pub theater: String,
+    pub fullscreen: String,
+    pub mini_player: String,
+    pub audio_only: String,
+    pub screenshot: String,
+    pub ab_loop_a: String,
+    pub ab_loop_b: String,
+    pub ab_loop_clear: String,
+    pub command_palette: String,
+}
+
+impl Default for Keybindings {
+    fn default() -> Self {
+        Self {
+            play_pause: "K".to_owned(),
+            seek_back: "ArrowLeft".to_owned(),
+            seek_forward: "ArrowRight".to_owned(),
+            mute: "M".to_owned(),
+            theater: "T".to_owned(),
+            fullscreen: "F".to_owned(),
+            mini_player: "I".to_owned(),
+            audio_only: "A".to_owned(),
+            screenshot: "S".to_owned(),
+            ab_loop_a: "[".to_owned(),
+            ab_loop_b: "]".to_owned(),
+            ab_loop_clear: "\\".to_owned(),
+            command_palette: "Ctrl+K".to_owned(),
+        }
+    }
+}
+
+impl Keybindings {
+    pub fn normalized(mut self) -> Self {
+        let norm = |value: &mut String, fallback: &str| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() || trimmed.len() > 32 {
+                *value = fallback.to_owned();
+            } else {
+                *value = trimmed.to_owned();
+            }
+        };
+        let defaults = Self::default();
+        norm(&mut self.play_pause, &defaults.play_pause);
+        norm(&mut self.seek_back, &defaults.seek_back);
+        norm(&mut self.seek_forward, &defaults.seek_forward);
+        norm(&mut self.mute, &defaults.mute);
+        norm(&mut self.theater, &defaults.theater);
+        norm(&mut self.fullscreen, &defaults.fullscreen);
+        norm(&mut self.mini_player, &defaults.mini_player);
+        norm(&mut self.audio_only, &defaults.audio_only);
+        norm(&mut self.screenshot, &defaults.screenshot);
+        norm(&mut self.ab_loop_a, &defaults.ab_loop_a);
+        norm(&mut self.ab_loop_b, &defaults.ab_loop_b);
+        norm(&mut self.ab_loop_clear, &defaults.ab_loop_clear);
+        norm(&mut self.command_palette, &defaults.command_palette);
+        self
+    }
+
+    pub fn valid(&self) -> bool {
+        [
+            &self.play_pause,
+            &self.seek_back,
+            &self.seek_forward,
+            &self.mute,
+            &self.theater,
+            &self.fullscreen,
+            &self.mini_player,
+            &self.audio_only,
+            &self.screenshot,
+            &self.ab_loop_a,
+            &self.ab_loop_b,
+            &self.ab_loop_clear,
+            &self.command_palette,
+        ]
+        .into_iter()
+        .all(|s| !s.trim().is_empty() && s.len() <= 32)
+    }
+
+    pub fn parse_egui_key(name: &str) -> Option<(bool, bool, bool, eframe::egui::Key)> {
+        use eframe::egui::Key;
+        let parts: Vec<&str> = name.split('+').map(str::trim).collect();
+        let key_token = parts.last().copied()?;
+        let mut ctrl = false;
+        let mut alt = false;
+        let mut shift = false;
+        for modifier in &parts[..parts.len() - 1] {
+            if modifier.eq_ignore_ascii_case("ctrl") {
+                ctrl = true;
+            } else if modifier.eq_ignore_ascii_case("alt") {
+                alt = true;
+            } else if modifier.eq_ignore_ascii_case("shift") {
+                shift = true;
+            }
+        }
+        let key = match key_token.to_ascii_lowercase().as_str() {
+            "a" => Key::A,
+            "b" => Key::B,
+            "c" => Key::C,
+            "d" => Key::D,
+            "e" => Key::E,
+            "f" => Key::F,
+            "g" => Key::G,
+            "h" => Key::H,
+            "i" => Key::I,
+            "j" => Key::J,
+            "k" => Key::K,
+            "l" => Key::L,
+            "m" => Key::M,
+            "n" => Key::N,
+            "o" => Key::O,
+            "p" => Key::P,
+            "q" => Key::Q,
+            "r" => Key::R,
+            "s" => Key::S,
+            "t" => Key::T,
+            "u" => Key::U,
+            "v" => Key::V,
+            "w" => Key::W,
+            "x" => Key::X,
+            "y" => Key::Y,
+            "z" => Key::Z,
+            "0" => Key::Num0,
+            "1" => Key::Num1,
+            "2" => Key::Num2,
+            "3" => Key::Num3,
+            "4" => Key::Num4,
+            "5" => Key::Num5,
+            "6" => Key::Num6,
+            "7" => Key::Num7,
+            "8" => Key::Num8,
+            "9" => Key::Num9,
+            "space" => Key::Space,
+            "arrowleft" => Key::ArrowLeft,
+            "arrowright" => Key::ArrowRight,
+            "arrowup" => Key::ArrowUp,
+            "arrowdown" => Key::ArrowDown,
+            "[" | "openbracket" => Key::OpenBracket,
+            "]" | "closebracket" => Key::CloseBracket,
+            "\\" | "backslash" => Key::Backslash,
+            "," | "comma" => Key::Comma,
+            "." | "period" => Key::Period,
+            "/" | "slash" => Key::Slash,
+            _ => return None,
+        };
+        Some((ctrl, alt, shift, key))
+    }
+
+    pub fn format_egui_key(
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+        key: eframe::egui::Key,
+    ) -> Option<String> {
+        use eframe::egui::Key;
+        let name = match key {
+            Key::A => "A",
+            Key::B => "B",
+            Key::C => "C",
+            Key::D => "D",
+            Key::E => "E",
+            Key::F => "F",
+            Key::G => "G",
+            Key::H => "H",
+            Key::I => "I",
+            Key::J => "J",
+            Key::K => "K",
+            Key::L => "L",
+            Key::M => "M",
+            Key::N => "N",
+            Key::O => "O",
+            Key::P => "P",
+            Key::Q => "Q",
+            Key::R => "R",
+            Key::S => "S",
+            Key::T => "T",
+            Key::U => "U",
+            Key::V => "V",
+            Key::W => "W",
+            Key::X => "X",
+            Key::Y => "Y",
+            Key::Z => "Z",
+            Key::Num0 => "0",
+            Key::Num1 => "1",
+            Key::Num2 => "2",
+            Key::Num3 => "3",
+            Key::Num4 => "4",
+            Key::Num5 => "5",
+            Key::Num6 => "6",
+            Key::Num7 => "7",
+            Key::Num8 => "8",
+            Key::Num9 => "9",
+            Key::Space => "Space",
+            Key::ArrowLeft => "ArrowLeft",
+            Key::ArrowRight => "ArrowRight",
+            Key::ArrowUp => "ArrowUp",
+            Key::ArrowDown => "ArrowDown",
+            Key::OpenBracket => "[",
+            Key::CloseBracket => "]",
+            Key::Backslash => "\\",
+            Key::Comma => ",",
+            Key::Period => ".",
+            Key::Slash => "/",
+            _ => return None,
+        };
+        let mut parts = Vec::new();
+        if ctrl {
+            parts.push("Ctrl");
+        }
+        if alt {
+            parts.push("Alt");
+        }
+        if shift {
+            parts.push("Shift");
+        }
+        parts.push(name);
+        Some(parts.join("+"))
+    }
+
+    pub fn matches_input(input: &eframe::egui::InputState, binding: &str) -> bool {
+        let Some((ctrl, alt, shift, key)) = Self::parse_egui_key(binding) else {
+            return false;
+        };
+        input.key_pressed(key)
+            && (input.modifiers.ctrl || input.modifiers.command) == ctrl
+            && input.modifiers.alt == alt
+            && input.modifiers.shift == shift
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct AppPreferences {
@@ -399,6 +635,17 @@ pub struct AppPreferences {
     pub keep_awake_during_playback: bool,
     pub compact_card_density: bool,
     pub cache_dir_override: Option<String>,
+    pub language: crate::i18n::UiLanguage,
+    pub auto_mini_player: bool,
+    pub ryd_enabled: bool,
+    pub dearrow_enabled: bool,
+    pub download_dir_override: Option<String>,
+    pub minimize_to_tray: bool,
+    pub close_to_tray: bool,
+    pub start_minimized_to_tray: bool,
+    pub auto_check_updates: bool,
+    pub skipped_app_update_version: Option<String>,
+    pub keybindings: Keybindings,
 }
 
 impl Default for AppPreferences {
@@ -424,6 +671,17 @@ impl Default for AppPreferences {
             keep_awake_during_playback: true,
             compact_card_density: false,
             cache_dir_override: None,
+            language: crate::i18n::UiLanguage::default(),
+            auto_mini_player: false,
+            ryd_enabled: false,
+            dearrow_enabled: false,
+            download_dir_override: None,
+            minimize_to_tray: false,
+            close_to_tray: false,
+            start_minimized_to_tray: false,
+            auto_check_updates: true,
+            skipped_app_update_version: None,
+            keybindings: Keybindings::default(),
         }
     }
 }
@@ -431,6 +689,7 @@ impl Default for AppPreferences {
 impl AppPreferences {
     pub fn normalized(mut self) -> Self {
         self.sponsorblock = self.sponsorblock.normalized();
+        self.keybindings = self.keybindings.normalized();
         self.preferred_subtitle_lang = self.preferred_subtitle_lang.trim().to_ascii_lowercase();
         let mut seen_topics = std::collections::HashSet::new();
         self.muted_topics = self
@@ -466,12 +725,23 @@ impl AppPreferences {
             .cache_dir_override
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty());
+        self.download_dir_override = self
+            .download_dir_override
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        self.skipped_app_update_version = self
+            .skipped_app_update_version
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty() && s.len() <= 64);
         self
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
         if !self.sponsorblock.valid() {
             return Err("configuração inválida do SponsorBlock");
+        }
+        if !self.keybindings.valid() {
+            return Err("configuração de atalhos inválida");
         }
         if !matches!(self.seek_step_secs, 5 | 10 | 15 | 30) {
             return Err("passo de avanço deve ser 5, 10, 15 ou 30 segundos");
@@ -513,6 +783,15 @@ impl AppPreferences {
             }
             if !Path::new(trimmed).is_absolute() {
                 return Err("o diretório de cache personalizado deve ser um caminho absoluto");
+            }
+        }
+        if let Some(dir) = &self.download_dir_override {
+            let trimmed = dir.trim();
+            if trimmed.is_empty() || trimmed.len() > 1024 {
+                return Err("caminho de downloads inválido");
+            }
+            if !Path::new(trimmed).is_absolute() {
+                return Err("o diretório de downloads personalizado deve ser um caminho absoluto");
             }
         }
         Ok(())

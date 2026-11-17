@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Validate formatting, tests, and clippy
+        run: |
+          cargo fmt --check
+          cargo test --locked --target-dir target\ci-validate
+          cargo clippy --all-targets --locked --target-dir target\ci-validate -- -D warnings
+
+      - name: Read Cargo version
+        id: meta
+        shell: pwsh
+        run: |
+          $cargoToml = Get-Content -LiteralPath Cargo.toml -Raw
+          if ($cargoToml -match "(?m)^version\s*=\s*['""]([^'""]+)['""]") {
+            "version=$($Matches[1])" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            throw "Failed to parse version from Cargo.toml"
+          }
+
+      - name: Fetch yt-dlp and libmpv runtime dependencies
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path target\deps\mpv -Force | Out-Null
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe' -OutFile target\deps\yt-dlp.exe
+
+          $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest'
+          $asset = $release.assets | Where-Object { $_.name -match '^mpv-dev-x86_64-.*\.7z$' } | Select-Object -First 1
+          if (-not $asset) {
+            throw "Could not find mpv-dev-x86_64 7z asset in shinchiro/mpv-winbuild-cmake latest release"
+          }
+          $archive = Join-Path $env:RUNNER_TEMP $asset.name
+          Invoke-WebRequest -UseBasicParsing -Uri $asset.browser_download_url -OutFile $archive
+          7z x $archive -o"target\deps\mpv-extract" -y | Out-Null
+          $dlls = Get-ChildItem -Path target\deps\mpv-extract -Recurse -Filter '*mpv*.dll'
+          if (-not $dlls) {
+            throw "No *mpv*.dll found inside extracted archive"
+          }
+          foreach ($dll in $dlls) {
+            Copy-Item -LiteralPath $dll.FullName -Destination target\deps\mpv\ -Force
+          }
+
+      - name: Build portable zip bundle
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.meta.outputs.version }}"
+          $bundleDir = "target\portable\FastTube-v$ver-x64"
+          ./scripts/build-portable.ps1 `
+            -LibMpvDirectory target\deps\mpv `
+            -YtDlpPath target\deps\yt-dlp.exe `
+            -BundleDirectory $bundleDir
+          New-Item -ItemType Directory -Path target\release-assets -Force | Out-Null
+          $zipPath = "target\release-assets\FastTube-v$ver-x64-portable.zip"
+          Compress-Archive -Path "$bundleDir\*" -DestinationPath $zipPath -Force
+
+      - name: Build Inno Setup installer
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $ver = "${{ steps.meta.outputs.version }}"
+          ./scripts/build-installer.ps1 `
+            -LibMpvDirectory target\deps\mpv `
+            -YtDlpPath target\deps\yt-dlp.exe `
+            -ExecutablePath target\portable-build\release\fasttube.exe `
+            -OutputDirectory target\release-assets `
+            -AppVersion $ver
+
+      - name: Generate SHA256SUMS
+        shell: pwsh
+        run: |
+          $lines = Get-ChildItem -LiteralPath target\release-assets -File | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          }
+          $lines | Set-Content -LiteralPath target\release-assets\SHA256SUMS.txt -Encoding ascii
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fasttube-windows-x64-${{ steps.meta.outputs.version }}
+          path: target/release-assets/*
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release-assets/*
+          generate_release_notes: true

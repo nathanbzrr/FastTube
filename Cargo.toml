@@ -1,6 +1,6 @@
 [package]
 name = 'fasttube'
-version = '0.2.0'
+version = '0.3.0'
 edition = '2024'
 rust-version = '1.98'
 
@@ -16,6 +16,7 @@ fastframe-now-playing = { git = 'https://github.com/crmne/fastframe.git', tag = 
 fastframe-power = { git = 'https://github.com/crmne/fastframe.git', tag = 'v0.17.0' }
 fastframe-scroll = { git = 'https://github.com/crmne/fastframe.git', tag = 'v0.17.0' }
 fastframe-text = { git = 'https://github.com/crmne/fastframe.git', tag = 'v0.17.0' }
+fastframe-tray = { git = 'https://github.com/crmne/fastframe.git', tag = 'v0.17.0' }
 image = { version = '0.25', default-features = false, features = ['jpeg', 'png', 'webp'] }
 libloading = '0.8'
 raw-window-handle = '0.6'

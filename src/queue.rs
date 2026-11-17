@@ -19,6 +19,40 @@ pub fn should_advance(ended: bool, handled: &mut bool, has_items: bool) -> bool 
     has_items
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RepeatMode {
+    #[default]
+    Off,
+    All,
+    One,
+}
+
+impl RepeatMode {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Off => Self::All,
+            Self::All => Self::One,
+            Self::One => Self::Off,
+        }
+    }
+
+    pub fn label_pt(self) -> &'static str {
+        match self {
+            Self::Off => "Repetir: Desligado",
+            Self::All => "Repetir: Fila toda",
+            Self::One => "Repetir: Vídeo atual",
+        }
+    }
+
+    pub fn label_en(self) -> &'static str {
+        match self {
+            Self::Off => "Repeat: Off",
+            Self::All => "Repeat: All",
+            Self::One => "Repeat: One",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Queue {
     videos: Vec<Video>,

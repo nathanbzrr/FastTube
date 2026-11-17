@@ -1,10 +1,15 @@
+use crate::community_apis;
+use crate::downloads;
 use crate::feed_prefs;
+use crate::followed_channels;
 use crate::history::{self, History};
 use crate::overlay;
 use crate::process;
+use crate::queue;
 use crate::search::{self, ChannelTarget};
 use crate::settings;
 use crate::sponsorblock;
+use crate::updater;
 use crate::{
     ActivePlayback, BackupImportMode, BackupPreview, BrowseSection, BufferProfile,
     ChannelAboutFetchMessage, ChannelFetchMessage, ChannelMoreVideosFetchMessage, ChannelPage,
@@ -392,6 +397,16 @@ pub(crate) struct PlaybackState {
     pub(crate) last_video_size_url: Option<String>,
     pub(crate) last_video_size: Option<crate::VideoSize>,
     pub(crate) auto_subtitle_attempted: bool,
+    pub(crate) aspect_zoom: overlay::AspectZoomMode,
+    pub(crate) audio_eq: overlay::AudioEqPreset,
+    pub(crate) brightness: i32,
+    pub(crate) contrast: i32,
+    pub(crate) saturation: i32,
+    pub(crate) audio_tracks: Vec<overlay::OverlayAudioTrack>,
+    pub(crate) audio_tracks_video_url: Option<String>,
+    pub(crate) audio_tracks_last_poll: Option<Instant>,
+    pub(crate) storyboard: Option<search::StoryboardSpec>,
+    pub(crate) storyboard_video_url: Option<String>,
 }
 
 impl Default for PlaybackState {
@@ -437,6 +452,16 @@ impl Default for PlaybackState {
             last_video_size_url: None,
             last_video_size: None,
             auto_subtitle_attempted: false,
+            aspect_zoom: overlay::AspectZoomMode::Auto,
+            audio_eq: overlay::AudioEqPreset::Flat,
+            brightness: 0,
+            contrast: 0,
+            saturation: 0,
+            audio_tracks: Vec::new(),
+            audio_tracks_video_url: None,
+            audio_tracks_last_poll: None,
+            storyboard: None,
+            storyboard_video_url: None,
         }
     }
 }
@@ -542,6 +567,22 @@ impl SettingsTab {
 
 pub(crate) type BackupPickerResult = (bool, Result<Option<PathBuf>, String>);
 
+pub(crate) enum YtDlpUpdaterMessage {
+    Checked(Result<updater::YtDlpUpdateCheck, String>),
+    Updated {
+        version: String,
+        result: Result<PathBuf, String>,
+    },
+}
+
+pub(crate) enum AppUpdaterMessage {
+    Checked {
+        silent: bool,
+        result: Result<updater::AppUpdateCheck, String>,
+    },
+    Prepared(Result<updater::AppUpdatePrepared, String>),
+}
+
 pub(crate) struct SettingsState {
     pub(crate) buffer: BufferSettingsState,
     pub(crate) playback: TrackedSettings<PlaybackPreferences>,
@@ -555,6 +596,9 @@ pub(crate) struct SettingsState {
     pub(crate) cache_dir_input: String,
     pub(crate) cache_dir_input_synced: bool,
     pub(crate) cache_picker_rx: Option<Receiver<Result<Option<PathBuf>, String>>>,
+    pub(crate) download_dir_input: String,
+    pub(crate) download_dir_input_synced: bool,
+    pub(crate) download_picker_rx: Option<Receiver<Result<Option<PathBuf>, String>>>,
     pub(crate) backup_picker_rx: Option<Receiver<BackupPickerResult>>,
     pub(crate) oauth_picker_rx: Option<Receiver<Result<Option<PathBuf>, String>>>,
     pub(crate) oauth_import_status: Option<(bool, String)>,
@@ -566,6 +610,18 @@ pub(crate) struct SettingsState {
     pub(crate) custom_buffer_cache_secs: u32,
     pub(crate) custom_buffer_synced: bool,
     pub(crate) pending_reload_video: bool,
+    pub(crate) ytdlp_check: Option<updater::YtDlpUpdateCheck>,
+    pub(crate) ytdlp_status: Option<(bool, String)>,
+    pub(crate) ytdlp_rx: Option<Receiver<YtDlpUpdaterMessage>>,
+    pub(crate) ytdlp_cancel: Option<process::Cancellation>,
+    pub(crate) app_update_check: Option<updater::AppUpdateCheck>,
+    pub(crate) app_update_prepared: Option<updater::AppUpdatePrepared>,
+    pub(crate) app_update_status: Option<(bool, String)>,
+    pub(crate) app_update_rx: Option<Receiver<AppUpdaterMessage>>,
+    pub(crate) app_update_cancel: Option<process::Cancellation>,
+    pub(crate) app_update_auto_checked: bool,
+    pub(crate) app_update_banner_dismissed: bool,
+    pub(crate) capturing_keybinding: Option<&'static str>,
 }
 
 impl Default for SettingsState {
@@ -584,6 +640,9 @@ impl Default for SettingsState {
             cache_dir_input: String::new(),
             cache_dir_input_synced: false,
             cache_picker_rx: None,
+            download_dir_input: String::new(),
+            download_dir_input_synced: false,
+            download_picker_rx: None,
             backup_picker_rx: None,
             oauth_picker_rx: None,
             oauth_import_status: None,
@@ -595,6 +654,18 @@ impl Default for SettingsState {
             custom_buffer_cache_secs: defaults.cache_seconds,
             custom_buffer_synced: false,
             pending_reload_video: false,
+            ytdlp_check: None,
+            ytdlp_status: None,
+            ytdlp_rx: None,
+            ytdlp_cancel: None,
+            app_update_check: None,
+            app_update_prepared: None,
+            app_update_status: None,
+            app_update_rx: None,
+            app_update_cancel: None,
+            app_update_auto_checked: false,
+            app_update_banner_dismissed: false,
+            capturing_keybinding: None,
         }
     }
 }
@@ -646,6 +717,12 @@ pub(crate) struct HistorySaveState {
     pub(crate) last_duration_ms: Option<Option<u64>>,
 }
 
+pub(crate) struct RemotePlaylistFetchMessage {
+    pub(crate) request_id: u64,
+    pub(crate) playlist_id: String,
+    pub(crate) result: Result<Vec<search::SearchResult>, String>,
+}
+
 pub(crate) struct QueueState {
     pub(crate) data: Queue,
     pub(crate) path: Option<PathBuf>,
@@ -661,6 +738,13 @@ pub(crate) struct QueueState {
     pub(crate) pending_advance: bool,
     pub(crate) pending_play_entry_id: Option<u64>,
     pub(crate) save_collection_name: String,
+    pub(crate) repeat_mode: queue::RepeatMode,
+    pub(crate) remote_playlist_id: Option<String>,
+    pub(crate) remote_playlist_rx: Option<Receiver<RemotePlaylistFetchMessage>>,
+    pub(crate) remote_playlist_cancel: Option<process::Cancellation>,
+    pub(crate) remote_playlist_next_id: u64,
+    pub(crate) remote_playlist_active_id: Option<u64>,
+    pub(crate) remote_playlist_save_name: String,
 }
 
 impl Default for QueueState {
@@ -680,6 +764,13 @@ impl Default for QueueState {
             pending_advance: false,
             pending_play_entry_id: None,
             save_collection_name: String::new(),
+            repeat_mode: queue::RepeatMode::Off,
+            remote_playlist_id: None,
+            remote_playlist_rx: None,
+            remote_playlist_cancel: None,
+            remote_playlist_next_id: 0,
+            remote_playlist_active_id: None,
+            remote_playlist_save_name: String::new(),
         }
     }
 }
@@ -701,6 +792,24 @@ pub(crate) struct LibraryState {
     pub(crate) editing_bookmark_idx: Option<usize>,
     pub(crate) editing_bookmark_note: String,
     pub(crate) pending_bookmark_seek: Option<(String, u64)>,
+}
+
+#[derive(Default)]
+pub(crate) struct FollowedChannelsState {
+    pub(crate) data: followed_channels::FollowedChannels,
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) error: Option<String>,
+    pub(crate) feed_items: Vec<search::SearchResult>,
+    pub(crate) new_video_urls: HashSet<String>,
+    pub(crate) feed_rx: Option<Receiver<Result<followed_channels::LocalFeedOutput, String>>>,
+    pub(crate) feed_cancel: Option<process::Cancellation>,
+    pub(crate) loaded_at: Option<Instant>,
+}
+
+#[derive(Default)]
+pub(crate) struct DownloadState {
+    pub(crate) manager: downloads::DownloadManager,
+    pub(crate) notice: Option<String>,
 }
 
 #[derive(Default)]
@@ -833,6 +942,11 @@ pub(crate) struct WatchMetadataUiCache {
     pub(crate) description_chapters: Vec<crate::watch_extras::DescriptionChapter>,
 }
 
+pub(crate) struct CommunityExtrasFetchMessage {
+    pub(crate) request_id: u64,
+    pub(crate) outcome: community_apis::CommunityExtrasOutcome,
+}
+
 #[derive(Default)]
 pub(crate) struct WatchState {
     pub(crate) extras: crate::watch_extras::WatchExtras,
@@ -842,6 +956,12 @@ pub(crate) struct WatchState {
     pub(crate) sidebar_cache: WatchSidebarCache,
     pub(crate) metadata_cache: WatchMetadataUiCache,
     pub(crate) overlay_cache: OverlayCache,
+    pub(crate) community_cache: community_apis::CommunityExtrasCache,
+    pub(crate) community_rx: Option<Receiver<CommunityExtrasFetchMessage>>,
+    pub(crate) community_cancel: Option<process::Cancellation>,
+    pub(crate) community_next_id: u64,
+    pub(crate) community_active_id: Option<u64>,
+    pub(crate) show_original_title: bool,
 }
 
 pub(crate) fn load_playback_settings_from_path(path: &Path) -> Result<PlaybackPreferences, String> {

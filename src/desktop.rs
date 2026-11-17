@@ -6,6 +6,7 @@ use fastframe_now_playing::{
     Playback as MediaPlayback, State as MediaState, Track as MediaTrack,
 };
 use fastframe_power::{Conditions as PowerConditions, Event as PowerEvent, KeepAwake, Power};
+use fastframe_tray::{Config as TrayConfig, Event as TrayEvent, MenuItem as TrayMenuItem, Tray};
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
@@ -15,6 +16,105 @@ use std::time::Duration;
 
 const MAX_ARTWORK_BYTES: usize = 4 * 1024 * 1024;
 const ARTWORK_TIMEOUT: Duration = Duration::from_secs(8);
+
+pub(crate) fn fasttube_icon_rgba(size: usize) -> Vec<u8> {
+    let size = size.max(8);
+    let mut rgba = vec![0u8; size * size * 4];
+    let s = size as f32;
+    let margin = s * 0.08;
+    let min_x = margin;
+    let max_x = s - margin;
+    let min_y = s * 0.14;
+    let max_y = s - s * 0.14;
+    let radius = (max_y - min_y) * 0.24;
+
+    // White play triangle vertices
+    let ax = s * 0.40;
+    let ay = s * 0.33;
+    let bx = s * 0.40;
+    let by = s * 0.67;
+    let cx = s * 0.68;
+    let cy = s * 0.50;
+
+    let point_in_triangle = |px: f32, py: f32| -> bool {
+        let sign = |x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32| {
+            (x1 - x3) * (y2 - y3) - (x2 - x3) * (y1 - y3)
+        };
+        let d1 = sign(px, py, ax, ay, bx, by);
+        let d2 = sign(px, py, bx, by, cx, cy);
+        let d3 = sign(px, py, cx, cy, ax, ay);
+        let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+        let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+        !(has_neg && has_pos)
+    };
+
+    for y in 0..size {
+        for x in 0..size {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let inside_box = if px >= min_x && px <= max_x && py >= min_y && py <= max_y {
+                let dx = if px < min_x + radius {
+                    min_x + radius - px
+                } else if px > max_x - radius {
+                    px - (max_x - radius)
+                } else {
+                    0.0
+                };
+                let dy = if py < min_y + radius {
+                    min_y + radius - py
+                } else if py > max_y - radius {
+                    py - (max_y - radius)
+                } else {
+                    0.0
+                };
+                (dx * dx + dy * dy) <= radius * radius
+            } else {
+                false
+            };
+
+            if inside_box {
+                let idx = (y * size + x) * 4;
+                if point_in_triangle(px, py) {
+                    rgba[idx] = 255;
+                    rgba[idx + 1] = 255;
+                    rgba[idx + 2] = 255;
+                    rgba[idx + 3] = 255;
+                } else {
+                    rgba[idx] = 229;
+                    rgba[idx + 1] = 25;
+                    rgba[idx + 2] = 43;
+                    rgba[idx + 3] = 255;
+                }
+            }
+        }
+    }
+    rgba
+}
+
+pub(crate) fn window_icon_data() -> egui::IconData {
+    egui::IconData {
+        rgba: fasttube_icon_rgba(64),
+        width: 64,
+        height: 64,
+    }
+}
+
+pub(crate) fn is_hidden_launch_flag(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed.eq_ignore_ascii_case(fastframe_autostart::START_HIDDEN)
+        || trimmed.eq_ignore_ascii_case("--hidden")
+        || trimmed.eq_ignore_ascii_case("--minimized")
+        || trimmed.eq_ignore_ascii_case("--tray")
+}
+
+pub(crate) fn has_hidden_launch_arg<I>(args: I) -> bool
+where
+    I: IntoIterator<Item = String>,
+{
+    args.into_iter()
+        .skip(1)
+        .any(|arg| is_hidden_launch_flag(&arg))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum InstanceCommand {
@@ -73,14 +173,40 @@ pub(crate) fn is_supported_youtube_url(raw: &str) -> bool {
     )
 }
 
+pub(crate) fn normalize_fasttube_protocol_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if is_supported_youtube_url(trimmed) {
+        return Some(trimmed.to_owned());
+    }
+    let parsed = url::Url::parse(trimmed).ok()?;
+    if !parsed.scheme().eq_ignore_ascii_case("fasttube") {
+        return None;
+    }
+    let rest = trimmed
+        .strip_prefix("fasttube://")
+        .or_else(|| trimmed.strip_prefix("FASTTUBE://"))?
+        .trim_start_matches('/');
+    if rest.is_empty() {
+        return None;
+    }
+    if is_supported_youtube_url(rest) {
+        return Some(rest.to_owned());
+    }
+    let candidate = format!("https://www.youtube.com/{rest}");
+    is_supported_youtube_url(&candidate).then_some(candidate)
+}
+
 pub(crate) fn launch_argument_request<I>(args: I) -> String
 where
     I: IntoIterator<Item = String>,
 {
     for arg in args.into_iter().skip(1) {
         let trimmed = arg.trim();
-        if is_supported_youtube_url(trimmed) {
-            return format!("open {trimmed}");
+        if is_hidden_launch_flag(trimmed) {
+            continue;
+        }
+        if let Some(url) = normalize_fasttube_protocol_url(trimmed) {
+            return format!("open {url}");
         }
     }
     "show".to_owned()
@@ -96,8 +222,8 @@ pub(crate) fn parse_instance_request(line: &str) -> Option<InstanceCommand> {
         .or_else(|| trimmed.strip_prefix("OPEN "))
     {
         let url = rest.trim();
-        if is_supported_youtube_url(url) {
-            return Some(InstanceCommand::OpenUrl(url.to_owned()));
+        if let Some(normalized) = normalize_fasttube_protocol_url(url) {
+            return Some(InstanceCommand::OpenUrl(normalized));
         }
     }
     None
@@ -259,13 +385,23 @@ fn download_artwork_to(url: &str, dest: &PathBuf) -> Option<PathBuf> {
     Some(dest.clone())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AutostartUiState {
     Loading,
     Unsupported,
     Disabled,
-    Enabled,
+    Enabled { hidden: bool },
     NeedsApproval,
+}
+
+impl AutostartUiState {
+    pub(crate) fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled { .. })
+    }
+
+    pub(crate) fn is_hidden(self) -> bool {
+        matches!(self, Self::Enabled { hidden: true })
+    }
 }
 
 enum AutostartResponse {
@@ -316,7 +452,7 @@ impl AutostartController {
         });
     }
 
-    pub(crate) fn set_enabled(&mut self, enabled: bool, ctx: &egui::Context) {
+    pub(crate) fn set_enabled(&mut self, enabled: bool, hidden: bool, ctx: &egui::Context) {
         self.busy = true;
         self.error = None;
         let (tx, rx) = mpsc::channel();
@@ -324,7 +460,11 @@ impl AutostartController {
         let ctx_clone = ctx.clone();
         std::thread::spawn(move || {
             let autostart = Autostart::new("fasttube", "FastTube");
-            let target = if enabled { Some(Start::Window) } else { None };
+            let target = if enabled {
+                Some(if hidden { Start::Hidden } else { Start::Window })
+            } else {
+                None
+            };
             let response = match autostart.set(target) {
                 Ok(state) => AutostartResponse::State(map_autostart_state(state)),
                 Err(err) => AutostartResponse::Error(format!(
@@ -334,6 +474,15 @@ impl AutostartController {
             let _ = tx.send(response);
             ctx_clone.request_repaint();
         });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_state_for_test(&mut self, state: AutostartUiState) {
+        self.state = state;
+        self.initialized = true;
+        self.busy = false;
+        self.error = None;
+        self.rx = None;
     }
 
     pub(crate) fn poll(&mut self) {
@@ -364,9 +513,30 @@ fn map_autostart_state(state: AutostartState) -> AutostartUiState {
     match state {
         AutostartState::Unsupported => AutostartUiState::Unsupported,
         AutostartState::Off => AutostartUiState::Disabled,
-        AutostartState::On(_) => AutostartUiState::Enabled,
+        AutostartState::On(start) => AutostartUiState::Enabled {
+            hidden: start == Start::Hidden,
+        },
         AutostartState::NeedsApproval(_) => AutostartUiState::NeedsApproval,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TrayAction {
+    Show,
+    ToggleVisibility,
+    PlayPause,
+    CheckUpdates,
+    Quit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TrayMenuSnapshot {
+    hidden_to_tray: bool,
+    has_video: bool,
+    playing: bool,
+    pt: bool,
+    update_version: Option<String>,
+    video_title: Option<String>,
 }
 
 #[derive(Default)]
@@ -376,14 +546,51 @@ pub(crate) struct DesktopIntegrations {
     artwork: ArtworkCache,
     power: Option<Power>,
     keep_awake: Option<KeepAwake>,
+    tray: Option<Tray>,
+    last_tray_snapshot: Option<TrayMenuSnapshot>,
+    pub(crate) hidden_to_tray: bool,
+    pub(crate) tray_quit_requested: bool,
     pub(crate) autostart: AutostartController,
 }
 
 impl DesktopIntegrations {
-    pub(crate) fn init(&mut self, ctx: &egui::Context, instance: Option<InstanceHandle>) {
+    pub(crate) fn init(
+        &mut self,
+        ctx: &egui::Context,
+        instance: Option<InstanceHandle>,
+        start_hidden: bool,
+    ) {
         if let Some(handle) = instance {
             handle.attach_ctx(ctx);
             self.instance = Some(handle);
+        }
+        if self.tray.is_none() {
+            let wake_ctx = ctx.clone();
+            let config = TrayConfig {
+                id: "fasttube",
+                title: "FastTube".into(),
+                icon: fasttube_icon_rgba,
+                template_icon: None,
+                themed_icon: false,
+                menu: vec![
+                    TrayMenuItem::action("show", "Abrir FastTube"),
+                    TrayMenuItem::action("play_pause", "Reproduzir / Pausar").visible(false),
+                    TrayMenuItem::Separator,
+                    TrayMenuItem::action("check_update", "Verificar atualizações..."),
+                    TrayMenuItem::Separator,
+                    TrayMenuItem::action("quit", "Sair"),
+                ],
+            };
+            if let Some(mut tray) = Tray::spawn(config, move || {
+                wake_ctx.request_repaint();
+            }) {
+                tray.attach();
+                self.tray = Some(tray);
+            }
+        }
+        if start_hidden && self.tray_active() {
+            self.hidden_to_tray = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
         if self.now_playing.is_none() {
             let app = NowPlayingApp::new("fasttube", "FastTube");
@@ -399,6 +606,94 @@ impl DesktopIntegrations {
             }));
         }
         self.autostart.ensure_loaded(ctx);
+    }
+
+    pub(crate) fn tray_active(&self) -> bool {
+        self.tray.as_ref().is_some_and(Tray::is_shown)
+    }
+
+    pub(crate) fn poll_tray_actions(&self) -> Vec<TrayAction> {
+        let Some(tray) = &self.tray else {
+            return Vec::new();
+        };
+        tray.events()
+            .into_iter()
+            .filter_map(|event| match event {
+                TrayEvent::Show => Some(TrayAction::Show),
+                TrayEvent::Toggle => Some(TrayAction::ToggleVisibility),
+                TrayEvent::Menu("show") => Some(if self.hidden_to_tray {
+                    TrayAction::Show
+                } else {
+                    TrayAction::ToggleVisibility
+                }),
+                TrayEvent::Menu("play_pause") => Some(TrayAction::PlayPause),
+                TrayEvent::Menu("check_update") => Some(TrayAction::CheckUpdates),
+                TrayEvent::Menu("quit") => Some(TrayAction::Quit),
+                TrayEvent::Menu(_) => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn sync_tray(
+        &mut self,
+        hidden_to_tray: bool,
+        has_video: bool,
+        playing: bool,
+        pt: bool,
+        update_version: Option<&str>,
+        video_title: Option<&str>,
+    ) {
+        let Some(tray) = &mut self.tray else {
+            return;
+        };
+        let snapshot = TrayMenuSnapshot {
+            hidden_to_tray,
+            has_video,
+            playing,
+            pt,
+            update_version: update_version.map(str::to_owned),
+            video_title: video_title.map(str::to_owned),
+        };
+        if self.last_tray_snapshot.as_ref() == Some(&snapshot) {
+            return;
+        }
+        self.last_tray_snapshot = Some(snapshot);
+
+        let show_label = match (hidden_to_tray, pt) {
+            (true, true) => "Abrir FastTube",
+            (true, false) => "Show FastTube",
+            (false, true) => "Minimizar para a bandeja",
+            (false, false) => "Minimize to tray",
+        };
+        tray.set_label("show", show_label);
+
+        tray.set_visible("play_pause", has_video);
+        let play_label = match (playing, pt) {
+            (true, true) => "Pausar vídeo",
+            (true, false) => "Pause video",
+            (false, true) => "Reproduzir vídeo",
+            (false, false) => "Play video",
+        };
+        tray.set_label("play_pause", play_label);
+
+        let update_label = match (update_version, pt) {
+            (Some(ver), true) => format!("Atualização disponível (v{ver})"),
+            (Some(ver), false) => format!("Update available (v{ver})"),
+            (None, true) => "Verificar atualizações...".to_owned(),
+            (None, false) => "Check for updates...".to_owned(),
+        };
+        tray.set_label("check_update", update_label);
+        tray.set_label("quit", if pt { "Sair" } else { "Quit" });
+
+        let mut tooltip = String::from("FastTube");
+        if let Some(title) = video_title.filter(|t| !t.trim().is_empty()) {
+            tooltip.push('\n');
+            let truncated: String = title.chars().take(64).collect();
+            tooltip.push_str(&truncated);
+        } else if let Some(ver) = update_version {
+            tooltip.push_str(&format!("\nv{ver} disponível"));
+        }
+        tray.set_tooltip(tooltip);
     }
 
     pub(crate) fn drain_instance_commands(&self) -> Vec<InstanceCommand> {
@@ -566,10 +861,45 @@ mod tests {
         assert_eq!(
             launch_argument_request([
                 "fasttube.exe".into(),
+                "--hidden".into(),
                 "https://www.youtube.com/watch?v=abc".into()
             ]),
             "open https://www.youtube.com/watch?v=abc"
         );
+        assert!(has_hidden_launch_arg([
+            "fasttube.exe".into(),
+            fastframe_autostart::START_HIDDEN.into()
+        ]));
+        assert!(has_hidden_launch_arg([
+            "fasttube.exe".into(),
+            "--hidden".into()
+        ]));
+        assert!(has_hidden_launch_arg([
+            "fasttube.exe".into(),
+            "--minimized".into()
+        ]));
+        assert!(!has_hidden_launch_arg(["fasttube.exe".into()]));
+    }
+
+    #[test]
+    fn generates_tray_and_window_icon_and_maps_autostart() {
+        let icon = window_icon_data();
+        assert_eq!(icon.width, 64);
+        assert_eq!(icon.height, 64);
+        assert_eq!(icon.rgba.len(), 64 * 64 * 4);
+        assert!(icon.rgba.contains(&255));
+
+        assert_eq!(
+            map_autostart_state(AutostartState::On(Start::Hidden)),
+            AutostartUiState::Enabled { hidden: true }
+        );
+        assert_eq!(
+            map_autostart_state(AutostartState::On(Start::Window)),
+            AutostartUiState::Enabled { hidden: false }
+        );
+        assert!(AutostartUiState::Enabled { hidden: true }.is_enabled());
+        assert!(AutostartUiState::Enabled { hidden: true }.is_hidden());
+        assert!(!AutostartUiState::Enabled { hidden: false }.is_hidden());
     }
 
     #[test]

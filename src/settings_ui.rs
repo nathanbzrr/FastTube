@@ -1,7 +1,7 @@
 use crate::{
     BackupImportMode, DIAGNOSTICS_REFRESH_INTERVAL, FastTube, ThemePalette, app_state::SettingsTab,
-    buffer_profile_summary, copy_text_to_clipboard, diagnostics, format_diagnostics_display,
-    history, settings, sponsorblock,
+    buffer_profile_summary, copy_text_to_clipboard, diagnostics, downloads, followed_channels,
+    format_diagnostics_display, history, i18n, open_external_url, settings, sponsorblock, updater,
 };
 use eframe::egui::{self, Color32, CornerRadius, CursorIcon, Pos2, RichText, Sense, Stroke, Vec2};
 use settings::{BufferProfile, BufferSettings, HwdecMode, Theme};
@@ -22,27 +22,33 @@ struct SettingsSearchEntry {
 const SETTINGS_SEARCH_INDEX: &[SettingsSearchEntry] = &[
     SettingsSearchEntry {
         tab: SettingsTab::General,
-        section: "Tema da interface",
-        description: "Alterne entre o visual Escuro e Claro para painéis, listas e configurações.",
-        keywords: "tema escuro claro aparencia dark light cores interface visual",
+        section: "Tema e idioma da interface",
+        description: "Alterne entre Escuro e Claro e escolha o idioma (Português / English).",
+        keywords: "tema escuro claro aparencia dark light idioma language english portugues pt en",
     },
     SettingsSearchEntry {
         tab: SettingsTab::General,
-        section: "Densidade compacta e Shorts",
-        description: "Ajuste colunas por linha da grade e oculte a estante de Shorts no Início.",
-        keywords: "densidade compacta cartoes feed grade shorts ocultar pagina inicial",
+        section: "Densidade compacta, Shorts e Mini player automático",
+        description: "Ajuste colunas por linha da grade, oculte Shorts e ative o Mini player ao navegar.",
+        keywords: "densidade compacta cartoes feed grade shorts ocultar mini player automatico navegacao",
     },
     SettingsSearchEntry {
         tab: SettingsTab::General,
-        section: "Sistema, tela ativa e inicialização",
-        description: "Evite suspensão durante vídeos e configure iniciar automaticamente com o Windows.",
-        keywords: "energia tela ativa suspensao monitor iniciar windows autostart sistema",
+        section: "Sistema, bandeja e inicialização com o Windows",
+        description: "Configure tela ativa, minimizar ou fechar para a bandeja e iniciar junto com o Windows.",
+        keywords: "energia tela ativa suspensao monitor iniciar windows autostart bandeja tray minimizar fechar hidden minimizado sistema",
     },
     SettingsSearchEntry {
         tab: SettingsTab::General,
-        section: "Atalhos de teclado",
-        description: "Consulte os principais comandos de reprodução e navegação ou abra a guia F1.",
-        keywords: "atalhos teclado teclas f1 espaco fullscreen teatro miniplayer",
+        section: "Atualizador automático do FastTube (GitHub Releases)",
+        description: "Verifique, baixe com verificação SHA-256 e instale a release mais recente do GitHub.",
+        keywords: "atualizador automatico update github releases versao sha256 instalador portatil",
+    },
+    SettingsSearchEntry {
+        tab: SettingsTab::General,
+        section: "Atalhos de teclado personalizáveis",
+        description: "Capture novas teclas de atalho para player e comandos ou restaure os padrões.",
+        keywords: "atalhos teclado teclas keybindings personalizar capturar f1 espaco fullscreen teatro miniplayer",
     },
     SettingsSearchEntry {
         tab: SettingsTab::Playback,
@@ -88,9 +94,21 @@ const SETTINGS_SEARCH_INDEX: &[SettingsSearchEntry] = &[
     },
     SettingsSearchEntry {
         tab: SettingsTab::Privacy,
+        section: "APIs comunitárias opcionais (opt-in)",
+        description: "Return YouTube Dislike (contagem estimada) e DeArrow (títulos diretos), desativados por padrão.",
+        keywords: "return youtube dislike ryd dislikes dearrow comunidade opt-in api privacidade",
+    },
+    SettingsSearchEntry {
+        tab: SettingsTab::Privacy,
         section: "Histórico, aprendizado e tópicos",
         description: "Pause o histórico ou aprendizado, silencie tópicos específicos e limpe dados locais.",
         keywords: "historico privacidade pausar recomendacoes topicos aprendidos silenciar limpar",
+    },
+    SettingsSearchEntry {
+        tab: SettingsTab::Storage,
+        section: "Pasta de downloads e atualizador do yt-dlp",
+        description: "Configure onde salvar downloads offline e verifique ou atualize o yt-dlp pelo GitHub.",
+        keywords: "downloads pasta offline yt-dlp atualizar versao github bin",
     },
     SettingsSearchEntry {
         tab: SettingsTab::Storage,
@@ -108,7 +126,7 @@ const SETTINGS_SEARCH_INDEX: &[SettingsSearchEntry] = &[
         tab: SettingsTab::BackupDiagnostics,
         section: "Diagnóstico de vídeo e persistência",
         description: "Veja codec, aceleração ativa, relatório redigido e abra arquivos de dados do app.",
-        keywords: "diagnostico hwdec codec relatorio arquivos persistencia settings.json history.json",
+        keywords: "diagnostico hwdec codec relatorio arquivos persistencia settings.json history.json followed-channels.json",
     },
 ];
 
@@ -312,26 +330,6 @@ fn settings_pill_badge(ui: &mut egui::Ui, text: &str, fg: Color32, bg: Color32) 
         .inner_margin(egui::Margin::symmetric(8, 2))
         .show(ui, |ui| {
             ui.label(RichText::new(text).size(11.0).strong().color(fg));
-        });
-}
-
-fn settings_keycap_badge(ui: &mut egui::Ui, key_text: &str, palette: ThemePalette, theme: Theme) {
-    let bg = match theme {
-        Theme::Dark => Color32::from_rgb(36, 36, 40),
-        Theme::Light => Color32::from_rgb(241, 243, 247),
-    };
-    egui::Frame::new()
-        .fill(bg)
-        .stroke(Stroke::new(1.0, palette.card_alt_stroke))
-        .corner_radius(CornerRadius::same(5))
-        .inner_margin(egui::Margin::symmetric(7, 2))
-        .show(ui, |ui| {
-            ui.monospace(
-                RichText::new(key_text)
-                    .size(11.5)
-                    .strong()
-                    .color(palette.channel_fg),
-            );
         });
 }
 
@@ -916,6 +914,44 @@ impl FastTube {
         }
     }
 
+    pub(crate) fn poll_download_dir_picker(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.settings.download_picker_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(Some(path))) => {
+                self.settings.download_picker_rx = None;
+                let path_str = path.to_string_lossy().into_owned();
+                self.settings.download_dir_input = path_str.clone();
+                self.settings.download_dir_input_synced = true;
+                let mut prefs = self.settings.prefs.value.clone();
+                prefs.download_dir_override = Some(path_str);
+                self.apply_app_preferences(prefs);
+                if self.settings.prefs.error.is_none() {
+                    self.downloads.notice = Some(format!(
+                        "{}: {}",
+                        self.pick("Pasta de downloads atualizada", "Downloads folder updated"),
+                        path.display()
+                    ));
+                }
+                ctx.request_repaint();
+            }
+            Ok(Ok(None)) => {
+                self.settings.download_picker_rx = None;
+            }
+            Ok(Err(error)) => {
+                self.settings.download_picker_rx = None;
+                self.downloads.notice = Some(error);
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(120));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.settings.download_picker_rx = None;
+            }
+        }
+    }
+
     pub(crate) fn poll_backup_picker(&mut self, ctx: &egui::Context) {
         let Some(rx) = self.settings.backup_picker_rx.as_ref() else {
             return;
@@ -999,9 +1035,18 @@ impl FastTube {
                 self.sync_theme_visuals(ctx);
                 let mut prefs = self.settings.prefs.value.clone();
                 let changed_feed = prefs.hide_shorts_in_home != defaults.hide_shorts_in_home;
+                prefs.language = defaults.language;
                 prefs.compact_card_density = defaults.compact_card_density;
                 prefs.hide_shorts_in_home = defaults.hide_shorts_in_home;
+                prefs.auto_mini_player = defaults.auto_mini_player;
                 prefs.keep_awake_during_playback = defaults.keep_awake_during_playback;
+                prefs.minimize_to_tray = defaults.minimize_to_tray;
+                prefs.close_to_tray = defaults.close_to_tray;
+                prefs.start_minimized_to_tray = defaults.start_minimized_to_tray;
+                prefs.auto_check_updates = defaults.auto_check_updates;
+                prefs.skipped_app_update_version = defaults.skipped_app_update_version;
+                prefs.keybindings = defaults.keybindings;
+                self.settings.capturing_keybinding = None;
                 self.apply_app_preferences(prefs);
                 if changed_feed {
                     self.invalidate_feed_cache();
@@ -1038,7 +1083,22 @@ impl FastTube {
                 prefs.sponsorblock = sponsorblock::SponsorBlockSettings::default();
                 self.apply_app_preferences(prefs);
             }
-            SettingsTab::Privacy | SettingsTab::Storage | SettingsTab::BackupDiagnostics => {}
+            SettingsTab::Privacy => {
+                let mut prefs = self.settings.prefs.value.clone();
+                prefs.ryd_enabled = defaults.ryd_enabled;
+                prefs.dearrow_enabled = defaults.dearrow_enabled;
+                self.apply_app_preferences(prefs);
+            }
+            SettingsTab::Storage => {
+                let mut prefs = self.settings.prefs.value.clone();
+                prefs.cache_dir_override = defaults.cache_dir_override;
+                prefs.download_dir_override = defaults.download_dir_override;
+                self.apply_app_preferences(prefs);
+                self.settings.cache_dir_input_synced = false;
+                self.settings.download_dir_input_synced = false;
+                self.settings.cache_disk_usage = None;
+            }
+            SettingsTab::BackupDiagnostics => {}
         }
     }
 
@@ -1379,7 +1439,11 @@ impl FastTube {
                     });
                     if matches!(
                         tab,
-                        SettingsTab::General | SettingsTab::Playback | SettingsTab::SponsorBlock
+                        SettingsTab::General
+                            | SettingsTab::Playback
+                            | SettingsTab::SponsorBlock
+                            | SettingsTab::Privacy
+                            | SettingsTab::Storage
                     ) {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if self.settings.confirm_reset_tab == Some(tab) {
@@ -1489,7 +1553,7 @@ impl FastTube {
                     settings_row_frame(ui, |ui| {
                         ui.label(
                         RichText::new(
-                            "Tente termos como \"volume\", \"legendas\", \"buffer\", \"oauth\", \"cache\" ou \"tema\".",
+                            "Tente termos como \"idioma\", \"volume\", \"legendas\", \"buffer\", \"oauth\", \"downloads\", \"yt-dlp\" ou \"tema\".",
                         )
                         .size(12.5)
                         .color(palette.snippet_fg),
@@ -1561,81 +1625,171 @@ impl FastTube {
         palette: ThemePalette,
         theme: Theme,
     ) {
-        settings_card(ui, palette, "Aparência e feed", None, None, |ui| {
-            settings_control_row(
-                ui,
-                palette,
-                "Tema da interface",
-                "Aplicado imediatamente aos painéis e cartões; a superfície do vídeo permanece escura.",
-                275.0,
-                |ui| {
-                    let mut selected_theme = self.settings.theme.value;
-                    if theme_swatch_card(
-                        ui,
-                        palette,
-                        Theme::Dark,
-                        "Escuro (padrão)",
-                        selected_theme == Theme::Dark,
-                    ) {
-                        selected_theme = Theme::Dark;
-                    }
-                    ui.add_space(6.0);
-                    if theme_swatch_card(
-                        ui,
-                        palette,
-                        Theme::Light,
-                        "Claro",
-                        selected_theme == Theme::Light,
-                    ) {
-                        selected_theme = Theme::Light;
-                    }
-                    if selected_theme != self.settings.theme.value {
-                        self.apply_theme(selected_theme);
-                        self.sync_theme_visuals(ctx);
-                    }
-                },
-            );
-            paint_row_divider(ui, palette);
+        let pt = self.ui_pt();
+        settings_card(
+            ui,
+            palette,
+            if pt {
+                "Aparência e feed"
+            } else {
+                "Appearance & feed"
+            },
+            None,
+            None,
+            |ui| {
+                settings_control_row(
+                    ui,
+                    palette,
+                    if pt {
+                        "Tema da interface"
+                    } else {
+                        "Interface theme"
+                    },
+                    if pt {
+                        "Aplicado imediatamente aos painéis e cartões; a superfície do vídeo permanece escura."
+                    } else {
+                        "Applied immediately to panels and cards; video surface stays dark."
+                    },
+                    275.0,
+                    |ui| {
+                        let mut selected_theme = self.settings.theme.value;
+                        if theme_swatch_card(
+                            ui,
+                            palette,
+                            Theme::Dark,
+                            if pt {
+                                "Escuro (padrão)"
+                            } else {
+                                "Dark (default)"
+                            },
+                            selected_theme == Theme::Dark,
+                        ) {
+                            selected_theme = Theme::Dark;
+                        }
+                        ui.add_space(6.0);
+                        if theme_swatch_card(
+                            ui,
+                            palette,
+                            Theme::Light,
+                            if pt { "Claro" } else { "Light" },
+                            selected_theme == Theme::Light,
+                        ) {
+                            selected_theme = Theme::Light;
+                        }
+                        if selected_theme != self.settings.theme.value {
+                            self.apply_theme(selected_theme);
+                            self.sync_theme_visuals(ctx);
+                        }
+                    },
+                );
+                paint_row_divider(ui, palette);
 
-            let mut prefs = self.settings.prefs.value.clone();
-            let mut changed = false;
-            let mut invalidate = false;
+                let mut prefs = self.settings.prefs.value.clone();
+                let mut changed = false;
+                let mut invalidate = false;
 
-            if settings_toggle_row(
-                ui,
-                palette,
-                theme,
-                "Densidade compacta dos cartões",
-                "Exibe mais colunas por linha e reduz o espaçamento na grade da página inicial.",
-                &mut prefs.compact_card_density,
-                None,
-                None,
-            ) {
-                changed = true;
-            }
-            paint_row_divider(ui, palette);
+                settings_control_row(
+                    ui,
+                    palette,
+                    if pt {
+                        "Idioma da interface"
+                    } else {
+                        "Interface language"
+                    },
+                    if pt {
+                        "Alterne entre Português (Brasil) e Inglês imediatamente."
+                    } else {
+                        "Switch immediately between Portuguese (Brazil) and English."
+                    },
+                    240.0,
+                    |ui| {
+                        for lang in i18n::UiLanguage::ALL {
+                            if pill_choice_button(ui, lang.label(), prefs.language == lang, palette)
+                                .clicked()
+                                && prefs.language != lang
+                            {
+                                prefs.language = lang;
+                                changed = true;
+                            }
+                        }
+                    },
+                );
+                paint_row_divider(ui, palette);
 
-            if settings_toggle_row(
-                ui,
-                palette,
-                theme,
-                "Ocultar Shorts na página inicial",
-                "Remove a estante e os cartões de Shorts da aba Início (a seção Shorts continua acessível).",
-                &mut prefs.hide_shorts_in_home,
-                None,
-                None,
-            ) {
-                changed = true;
-                invalidate = true;
-            }
-
-            if changed {
-                self.apply_app_preferences(prefs);
-                if invalidate {
-                    self.invalidate_feed_cache();
+                if settings_toggle_row(
+                    ui,
+                    palette,
+                    theme,
+                    if pt {
+                        "Densidade compacta dos cartões"
+                    } else {
+                        "Compact card density"
+                    },
+                    if pt {
+                        "Exibe mais colunas por linha e reduz o espaçamento na grade da página inicial."
+                    } else {
+                        "Show more columns per row and tighten spacing on the home grid."
+                    },
+                    &mut prefs.compact_card_density,
+                    None,
+                    None,
+                ) {
+                    changed = true;
                 }
-            }
-        });
+                paint_row_divider(ui, palette);
+
+                if settings_toggle_row(
+                    ui,
+                    palette,
+                    theme,
+                    if pt {
+                        "Ocultar Shorts na página inicial"
+                    } else {
+                        "Hide Shorts on Home"
+                    },
+                    if pt {
+                        "Remove a estante e os cartões de Shorts da aba Início (a seção Shorts continua acessível)."
+                    } else {
+                        "Remove the Shorts shelf and cards from Home (the Shorts section remains accessible)."
+                    },
+                    &mut prefs.hide_shorts_in_home,
+                    None,
+                    None,
+                ) {
+                    changed = true;
+                    invalidate = true;
+                }
+                paint_row_divider(ui, palette);
+
+                if settings_toggle_row(
+                    ui,
+                    palette,
+                    theme,
+                    if pt {
+                        "Auto Mini player ao navegar"
+                    } else {
+                        "Auto Mini player while browsing"
+                    },
+                    if pt {
+                        "Enquanto um vídeo estiver reproduzindo, entrar no Mini player automaticamente ao navegar para outra seção."
+                    } else {
+                        "Automatically enter Mini player when navigating away while a video is actively playing."
+                    },
+                    &mut prefs.auto_mini_player,
+                    None,
+                    None,
+                ) {
+                    changed = true;
+                }
+
+                if changed {
+                    self.apply_app_preferences(prefs);
+                    if invalidate {
+                        self.invalidate_feed_cache();
+                    }
+                }
+            },
+        );
         if let Some(error) = &self.settings.theme.error {
             ui.add_space(8.0);
             status_banner(ui, palette, error, true);
@@ -1645,116 +1799,654 @@ impl FastTube {
         self.desktop.autostart.ensure_loaded(ctx);
         self.desktop.autostart.poll();
 
-        settings_card(ui, palette, "Sistema e energia", None, None, |ui| {
-            let mut prefs = self.settings.prefs.value.clone();
-            if settings_toggle_row(
-                ui,
-                palette,
-                theme,
-                "Manter tela ativa durante a reprodução",
-                "Evita suspensão do sistema ou desligamento do monitor enquanto um vídeo está em reprodução.",
-                &mut prefs.keep_awake_during_playback,
-                None,
-                None,
-            ) {
-                self.apply_app_preferences(prefs);
-            }
-            paint_row_divider(ui, palette);
+        settings_card(
+            ui,
+            palette,
+            if pt {
+                "Sistema, energia e bandeja"
+            } else {
+                "System, power & tray"
+            },
+            None,
+            None,
+            |ui| {
+                let mut prefs = self.settings.prefs.value.clone();
+                let mut prefs_changed = false;
+                if settings_toggle_row(
+                    ui,
+                    palette,
+                    theme,
+                    if pt {
+                        "Manter tela ativa durante a reprodução"
+                    } else {
+                        "Keep screen awake during playback"
+                    },
+                    if pt {
+                        "Evita suspensão do sistema ou desligamento do monitor enquanto um vídeo está em reprodução."
+                    } else {
+                        "Prevents system sleep or display turn-off while a video is actively playing."
+                    },
+                    &mut prefs.keep_awake_during_playback,
+                    None,
+                    None,
+                ) {
+                    prefs_changed = true;
+                }
+                paint_row_divider(ui, palette);
 
-            let unsupported = matches!(
-                self.desktop.autostart.state,
-                crate::desktop::AutostartUiState::Unsupported
-            );
-            let loading = matches!(
-                self.desktop.autostart.state,
-                crate::desktop::AutostartUiState::Loading
-            );
-            let mut autostart_enabled = matches!(
-                self.desktop.autostart.state,
-                crate::desktop::AutostartUiState::Enabled
-            );
-            let autostart_desc = match self.desktop.autostart.state {
-                crate::desktop::AutostartUiState::Loading => {
-                    "Verificando configuração de inicialização no Windows..."
+                if settings_toggle_row(
+                    ui,
+                    palette,
+                    theme,
+                    if pt {
+                        "Minimizar para a bandeja do sistema"
+                    } else {
+                        "Minimize to system tray"
+                    },
+                    if pt {
+                        "Ao minimizar a janela principal, oculta o FastTube na área de notificação."
+                    } else {
+                        "When minimizing the main window, hide FastTube to the notification area."
+                    },
+                    &mut prefs.minimize_to_tray,
+                    None,
+                    None,
+                ) {
+                    prefs_changed = true;
                 }
-                crate::desktop::AutostartUiState::Unsupported => {
-                    "Inicialização automática indisponível neste ambiente."
+                paint_row_divider(ui, palette);
+
+                if settings_toggle_row(
+                    ui,
+                    palette,
+                    theme,
+                    if pt {
+                        "Fechar janela para a bandeja"
+                    } else {
+                        "Close window to tray"
+                    },
+                    if pt {
+                        "Ao clicar em fechar (X), mantém o FastTube em segundo plano na bandeja até escolher Sair."
+                    } else {
+                        "Clicking close (X) keeps FastTube running in the tray until you choose Quit."
+                    },
+                    &mut prefs.close_to_tray,
+                    None,
+                    None,
+                ) {
+                    prefs_changed = true;
                 }
-                crate::desktop::AutostartUiState::NeedsApproval => {
-                    "Requer aprovação nas configurações de inicialização do Windows."
-                }
-                crate::desktop::AutostartUiState::Disabled
-                | crate::desktop::AutostartUiState::Enabled => {
-                    "Inicia o FastTube automaticamente ao entrar na sessão do Windows."
-                }
-            };
-            let autostart_badge = match self.desktop.autostart.state {
-                crate::desktop::AutostartUiState::Enabled => {
-                    Some(("Ativo", palette.notice_fg, palette.notice_bg))
-                }
-                crate::desktop::AutostartUiState::NeedsApproval => {
-                    Some(("Aprovação no Windows", palette.warning_fg, palette.error_bg))
-                }
-                _ => None,
-            };
-            ui.add_enabled_ui(
-                !self.desktop.autostart.busy && !unsupported && !loading,
-                |ui| {
-                    if settings_toggle_row(
-                        ui,
-                        palette,
-                        theme,
-                        "Iniciar com o Windows",
-                        autostart_desc,
-                        &mut autostart_enabled,
-                        None,
-                        autostart_badge,
-                    ) {
-                        self.desktop.autostart.set_enabled(autostart_enabled, ctx);
+                paint_row_divider(ui, palette);
+
+                let unsupported = matches!(
+                    self.desktop.autostart.state,
+                    crate::desktop::AutostartUiState::Unsupported
+                );
+                let loading = matches!(
+                    self.desktop.autostart.state,
+                    crate::desktop::AutostartUiState::Loading
+                );
+                let mut autostart_enabled = self.desktop.autostart.state.is_enabled();
+                let autostart_hidden = self.desktop.autostart.state.is_hidden();
+                let autostart_desc = match self.desktop.autostart.state {
+                    crate::desktop::AutostartUiState::Loading => {
+                        if pt {
+                            "Verificando configuração de inicialização no Windows..."
+                        } else {
+                            "Checking Windows startup configuration..."
+                        }
                     }
-                },
-            );
-            if let Some(err) = &self.desktop.autostart.error {
-                settings_row_frame(ui, |ui| {
-                    status_banner(ui, palette, err, true);
-                });
-            }
-        });
+                    crate::desktop::AutostartUiState::Unsupported => {
+                        if pt {
+                            "Inicialização automática indisponível neste ambiente."
+                        } else {
+                            "Automatic startup is unavailable in this environment."
+                        }
+                    }
+                    crate::desktop::AutostartUiState::NeedsApproval => {
+                        if pt {
+                            "Requer aprovação nas configurações de inicialização do Windows."
+                        } else {
+                            "Requires approval in Windows Startup Apps settings."
+                        }
+                    }
+                    crate::desktop::AutostartUiState::Disabled
+                    | crate::desktop::AutostartUiState::Enabled { .. } => {
+                        if pt {
+                            "Inicia o FastTube automaticamente ao entrar na sessão do Windows."
+                        } else {
+                            "Starts FastTube automatically when signing in to Windows."
+                        }
+                    }
+                };
+                let autostart_badge = match self.desktop.autostart.state {
+                    crate::desktop::AutostartUiState::Enabled { hidden: true } => Some((
+                        if pt {
+                            "Ativo (bandeja)"
+                        } else {
+                            "Active (tray)"
+                        },
+                        palette.notice_fg,
+                        palette.notice_bg,
+                    )),
+                    crate::desktop::AutostartUiState::Enabled { hidden: false } => Some((
+                        if pt { "Ativo" } else { "Active" },
+                        palette.notice_fg,
+                        palette.notice_bg,
+                    )),
+                    crate::desktop::AutostartUiState::NeedsApproval => Some((
+                        if pt {
+                            "Aprovação no Windows"
+                        } else {
+                            "Needs Windows approval"
+                        },
+                        palette.warning_fg,
+                        palette.error_bg,
+                    )),
+                    _ => None,
+                };
+                ui.add_enabled_ui(
+                    !self.desktop.autostart.busy && !unsupported && !loading,
+                    |ui| {
+                        if settings_toggle_row(
+                            ui,
+                            palette,
+                            theme,
+                            if pt {
+                                "Iniciar com o Windows"
+                            } else {
+                                "Start with Windows"
+                            },
+                            autostart_desc,
+                            &mut autostart_enabled,
+                            None,
+                            autostart_badge,
+                        ) {
+                            self.desktop.autostart.set_enabled(
+                                autostart_enabled,
+                                prefs.start_minimized_to_tray,
+                                ctx,
+                            );
+                        }
+                    },
+                );
+                paint_row_divider(ui, palette);
+
+                let syncing_badge = (autostart_enabled
+                    && autostart_hidden != prefs.start_minimized_to_tray)
+                    .then_some((
+                        if pt { "Sincronizando" } else { "Syncing" },
+                        palette.info_accent_fg,
+                        palette.queue_next_bg,
+                    ));
+                let start_min_toggled = settings_toggle_row(
+                    ui,
+                    palette,
+                    theme,
+                    if pt {
+                        "Iniciar minimizado na bandeja ao entrar no Windows"
+                    } else {
+                        "Start minimized to tray on Windows startup"
+                    },
+                    if pt {
+                        "Quando o início automático estiver ativo, abre o FastTube diretamente oculto na bandeja."
+                    } else {
+                        "When automatic startup is enabled, launches FastTube hidden in the system tray."
+                    },
+                    &mut prefs.start_minimized_to_tray,
+                    None,
+                    syncing_badge,
+                );
+                if start_min_toggled {
+                    prefs_changed = true;
+                    if autostart_enabled && !self.desktop.autostart.busy && !unsupported && !loading
+                    {
+                        self.desktop.autostart.set_enabled(
+                            true,
+                            prefs.start_minimized_to_tray,
+                            ctx,
+                        );
+                    }
+                }
+
+                if prefs_changed {
+                    self.apply_app_preferences(prefs);
+                }
+
+                if let Some(err) = &self.desktop.autostart.error {
+                    settings_row_frame(ui, |ui| {
+                        status_banner(ui, palette, err, true);
+                    });
+                }
+            },
+        );
 
         ui.add_space(16.0);
+        let app_update_busy = self.settings.app_update_rx.is_some();
+        let app_badge = if let Some(check) = &self.settings.app_update_check {
+            if check.update_available {
+                Some((
+                    format!("v{} -> v{}", check.current_version, check.latest_version),
+                    palette.info_accent_fg,
+                    palette.queue_next_bg,
+                ))
+            } else {
+                Some((
+                    format!("v{}", check.current_version),
+                    palette.notice_fg,
+                    palette.notice_bg,
+                ))
+            }
+        } else {
+            Some((
+                format!("v{}", updater::CURRENT_APP_VERSION),
+                palette.snippet_fg,
+                palette.queue_next_bg,
+            ))
+        };
+        let install_kind = updater::current_install_kind();
+        settings_card(
+            ui,
+            palette,
+            if pt {
+                "Atualizador automático (GitHub Releases)"
+            } else {
+                "Auto-updater (GitHub Releases)"
+            },
+            app_badge
+                .as_ref()
+                .map(|(text, fg, bg)| (text.as_str(), *fg, *bg)),
+            None,
+            |ui| {
+                let mut prefs = self.settings.prefs.value.clone();
+                if settings_toggle_row(
+                    ui,
+                    palette,
+                    theme,
+                    if pt {
+                        "Verificar atualizações automaticamente ao iniciar"
+                    } else {
+                        "Check for updates automatically at startup"
+                    },
+                    if pt {
+                        "Consulta a release mais recente do repositório nathanbzrr/FastTube no GitHub ao abrir o app."
+                    } else {
+                        "Checks the latest release from nathanbzrr/FastTube on GitHub when launching the app."
+                    },
+                    &mut prefs.auto_check_updates,
+                    None,
+                    Some((
+                        install_kind.label(pt),
+                        palette.snippet_fg,
+                        palette.queue_next_bg,
+                    )),
+                ) {
+                    self.apply_app_preferences(prefs);
+                }
+                paint_row_divider(ui, palette);
+
+                let check_snapshot = self.settings.app_update_check.clone();
+                let control_desc = if let Some(check) = &check_snapshot {
+                    if check.update_available {
+                        if pt {
+                            format!(
+                                "Nova versão v{} disponível ({}). Integridade validada por SHA-256 antes de reiniciar.",
+                                check.latest_version, check.asset_name
+                            )
+                        } else {
+                            format!(
+                                "New version v{} available ({}). Verified with SHA-256 before restarting.",
+                                check.latest_version, check.asset_name
+                            )
+                        }
+                    } else if pt {
+                        format!(
+                            "Você já está na versão mais recente (v{}).",
+                            check.current_version
+                        )
+                    } else {
+                        format!(
+                            "You are on the latest version (v{}).",
+                            check.current_version
+                        )
+                    }
+                } else if pt {
+                    "Verifica se há uma nova versão no GitHub e aplica a atualização automaticamente.".to_owned()
+                } else {
+                    "Checks GitHub for a newer release and applies the update automatically."
+                        .to_owned()
+                };
+
+                settings_control_row(
+                    ui,
+                    palette,
+                    if pt {
+                        "Versão do FastTube"
+                    } else {
+                        "FastTube version"
+                    },
+                    &control_desc,
+                    300.0,
+                    |ui| {
+                        ui.add_enabled_ui(!app_update_busy, |ui| {
+                            if pill_choice_button(
+                                ui,
+                                if app_update_busy {
+                                    if pt { "Processando..." } else { "Working..." }
+                                } else if pt {
+                                    "Verificar atualizações"
+                                } else {
+                                    "Check updates"
+                                },
+                                false,
+                                palette,
+                            )
+                            .clicked()
+                            {
+                                self.start_app_update_check(false, ctx);
+                            }
+
+                            if let Some(check) = &check_snapshot
+                                && check.update_available
+                            {
+                                if pill_choice_button(
+                                    ui,
+                                    if pt {
+                                        "Baixar e instalar"
+                                    } else {
+                                        "Download & install"
+                                    },
+                                    true,
+                                    palette,
+                                )
+                                .clicked()
+                                {
+                                    self.start_app_update_download(ctx);
+                                }
+                                if pill_choice_button(ui, "GitHub", false, palette).clicked() {
+                                    open_external_url(&check.release_url);
+                                }
+                            }
+                        });
+                    },
+                );
+
+                if let Some(check) = &check_snapshot
+                    && check.update_available
+                {
+                    let is_skipped = self
+                        .settings
+                        .prefs
+                        .value
+                        .skipped_app_update_version
+                        .as_deref()
+                        == Some(check.latest_version.as_str());
+                    if is_skipped {
+                        settings_row_frame(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(if pt {
+                                        format!(
+                                            "Aviso da versão v{} silenciado.",
+                                            check.latest_version
+                                        )
+                                    } else {
+                                        format!("Banner for v{} is muted.", check.latest_version)
+                                    })
+                                    .size(12.0)
+                                    .color(palette.snippet_fg),
+                                );
+                                if pill_choice_button(
+                                    ui,
+                                    if pt { "Mostrar novamente" } else { "Un-mute" },
+                                    false,
+                                    palette,
+                                )
+                                .clicked()
+                                {
+                                    let mut prefs = self.settings.prefs.value.clone();
+                                    prefs.skipped_app_update_version = None;
+                                    self.apply_app_preferences(prefs);
+                                    self.settings.app_update_banner_dismissed = false;
+                                }
+                            });
+                        });
+                    }
+                    if !check.release_notes.trim().is_empty() {
+                        paint_row_divider(ui, palette);
+                        settings_row_frame(ui, |ui| {
+                            ui.label(
+                                RichText::new(if pt {
+                                    format!("Notas da versão ({}):", check.tag_name)
+                                } else {
+                                    format!("Release notes ({}):", check.tag_name)
+                                })
+                                .size(12.0)
+                                .strong()
+                                .color(palette.channel_fg),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(&check.release_notes)
+                                    .size(12.0)
+                                    .color(palette.snippet_fg),
+                            );
+                        });
+                    }
+                }
+
+                if let Some((ok, status)) = &self.settings.app_update_status {
+                    settings_row_frame(ui, |ui| {
+                        status_banner(ui, palette, status, !*ok);
+                    });
+                }
+            },
+        );
+
+        ui.add_space(16.0);
+        if let Some(slot_id) = self.settings.capturing_keybinding {
+            let captured = ctx.input(|i| {
+                if i.key_pressed(egui::Key::Escape) {
+                    return Some(None);
+                }
+                let ctrl = i.modifiers.ctrl || i.modifiers.command;
+                let alt = i.modifiers.alt;
+                let shift = i.modifiers.shift;
+                for ev in &i.events {
+                    if let egui::Event::Key {
+                        key,
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    } = ev
+                        && let Some(formatted) =
+                            settings::Keybindings::format_egui_key(ctrl, alt, shift, *key)
+                    {
+                        return Some(Some(formatted));
+                    }
+                }
+                None
+            });
+            if let Some(maybe_binding) = captured {
+                if let Some(binding) = maybe_binding {
+                    let mut prefs = self.settings.prefs.value.clone();
+                    match slot_id {
+                        "play_pause" => prefs.keybindings.play_pause = binding,
+                        "seek_back" => prefs.keybindings.seek_back = binding,
+                        "seek_forward" => prefs.keybindings.seek_forward = binding,
+                        "mute" => prefs.keybindings.mute = binding,
+                        "theater" => prefs.keybindings.theater = binding,
+                        "fullscreen" => prefs.keybindings.fullscreen = binding,
+                        "mini_player" => prefs.keybindings.mini_player = binding,
+                        "audio_only" => prefs.keybindings.audio_only = binding,
+                        "screenshot" => prefs.keybindings.screenshot = binding,
+                        "ab_loop_a" => prefs.keybindings.ab_loop_a = binding,
+                        "ab_loop_b" => prefs.keybindings.ab_loop_b = binding,
+                        "ab_loop_clear" => prefs.keybindings.ab_loop_clear = binding,
+                        "command_palette" => prefs.keybindings.command_palette = binding,
+                        _ => {}
+                    }
+                    self.apply_app_preferences(prefs);
+                }
+                self.settings.capturing_keybinding = None;
+            }
+        }
+
+        let kb = self.settings.prefs.value.keybindings.clone();
         let step_secs = self.seek_step_secs();
         let shortcuts_open = settings_card(
             ui,
             palette,
-            "Atalhos de teclado",
+            if pt {
+                "Atalhos de teclado personalizáveis"
+            } else {
+                "Customizable keyboard shortcuts"
+            },
             None,
-            Some("Guia completa (F1)"),
+            Some(if pt {
+                "Guia completa (F1)"
+            } else {
+                "Full guide (F1)"
+            }),
             |ui| {
                 settings_row_frame(ui, |ui| {
-                    let seek_desc = format!("Voltar ou avançar {step_secs} segundos");
-                    let items: [(&[&str], &str); 5] = [
-                        (&["Espaço", "K"], "Reproduzir ou pausar"),
-                        (&["← / →", "J / L"], seek_desc.as_str()),
-                        (&["M", "C"], "Silenciar / alternar legendas"),
-                        (&["T", "F", "I"], "Modo teatro / tela cheia / miniplayer"),
-                        (&["Alt+1..5"], "Navegar entre seções principais"),
+                    let seek_back_desc = if pt {
+                        format!("Voltar {step_secs} segundos")
+                    } else {
+                        format!("Seek back {step_secs}s")
+                    };
+                    let seek_fwd_desc = if pt {
+                        format!("Avançar {step_secs} segundos")
+                    } else {
+                        format!("Seek forward {step_secs}s")
+                    };
+                    let rows: [(&'static str, &str, &str); 13] = [
+                        (
+                            "play_pause",
+                            if pt {
+                                "Reproduzir / pausar"
+                            } else {
+                                "Play / pause"
+                            },
+                            &kb.play_pause,
+                        ),
+                        ("seek_back", &seek_back_desc, &kb.seek_back),
+                        ("seek_forward", &seek_fwd_desc, &kb.seek_forward),
+                        (
+                            "mute",
+                            if pt { "Silenciar áudio" } else { "Mute audio" },
+                            &kb.mute,
+                        ),
+                        (
+                            "theater",
+                            if pt { "Modo teatro" } else { "Theater mode" },
+                            &kb.theater,
+                        ),
+                        (
+                            "fullscreen",
+                            if pt { "Tela cheia" } else { "Fullscreen" },
+                            &kb.fullscreen,
+                        ),
+                        ("mini_player", "Mini player", &kb.mini_player),
+                        (
+                            "audio_only",
+                            if pt {
+                                "Modo somente áudio"
+                            } else {
+                                "Audio-only mode"
+                            },
+                            &kb.audio_only,
+                        ),
+                        (
+                            "screenshot",
+                            if pt {
+                                "Capturar frame (PNG)"
+                            } else {
+                                "Screenshot frame (PNG)"
+                            },
+                            &kb.screenshot,
+                        ),
+                        (
+                            "ab_loop_a",
+                            if pt {
+                                "Marcar ponto A do loop"
+                            } else {
+                                "Set A-B loop start"
+                            },
+                            &kb.ab_loop_a,
+                        ),
+                        (
+                            "ab_loop_b",
+                            if pt {
+                                "Marcar ponto B do loop"
+                            } else {
+                                "Set A-B loop end"
+                            },
+                            &kb.ab_loop_b,
+                        ),
+                        (
+                            "ab_loop_clear",
+                            if pt {
+                                "Limpar loop A-B"
+                            } else {
+                                "Clear A-B loop"
+                            },
+                            &kb.ab_loop_clear,
+                        ),
+                        (
+                            "command_palette",
+                            if pt {
+                                "Paleta de comandos"
+                            } else {
+                                "Command palette"
+                            },
+                            &kb.command_palette,
+                        ),
                     ];
-                    for (idx, (keys, desc)) in items.iter().enumerate() {
-                        if idx > 0 {
-                            ui.add_space(6.0);
-                        }
-                        ui.horizontal_wrapped(|ui| {
-                            for (k_idx, key) in keys.iter().enumerate() {
-                                if k_idx > 0 {
-                                    ui.label(
-                                        RichText::new("/").size(11.5).color(palette.snippet_fg),
-                                    );
-                                }
-                                settings_keycap_badge(ui, key, palette, theme);
-                            }
-                            ui.add_space(6.0);
-                            ui.label(RichText::new(*desc).size(12.5).color(palette.snippet_fg));
+                    for (slot, label, current_val) in rows {
+                        let capturing_this = self.settings.capturing_keybinding == Some(slot);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(label).size(12.5).color(palette.channel_fg));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let btn_text = if capturing_this {
+                                        if pt {
+                                            "Pressione tecla (Esc cancela)..."
+                                        } else {
+                                            "Press key (Esc cancels)..."
+                                        }
+                                    } else {
+                                        current_val
+                                    };
+                                    if pill_choice_button(ui, btn_text, capturing_this, palette)
+                                        .clicked()
+                                    {
+                                        self.settings.capturing_keybinding =
+                                            if capturing_this { None } else { Some(slot) };
+                                    }
+                                },
+                            );
                         });
+                        ui.add_space(4.0);
+                    }
+                    ui.add_space(6.0);
+                    if pill_choice_button(
+                        ui,
+                        if pt {
+                            "Restaurar atalhos padrão"
+                        } else {
+                            "Reset default shortcuts"
+                        },
+                        false,
+                        palette,
+                    )
+                    .clicked()
+                    {
+                        let mut prefs = self.settings.prefs.value.clone();
+                        prefs.keybindings = settings::Keybindings::default();
+                        self.settings.capturing_keybinding = None;
+                        self.apply_app_preferences(prefs);
                     }
                 });
             },
@@ -2993,6 +3685,76 @@ impl FastTube {
             },
         );
 
+        ui.add_space(16.0);
+        let pt = self.ui_pt();
+        let community_title = if pt {
+            "APIs comunitárias (opt-in)"
+        } else {
+            "Community APIs (opt-in)"
+        };
+        let community_badge = if prefs.ryd_enabled || prefs.dearrow_enabled {
+            if pt { "Ativo" } else { "Enabled" }
+        } else if pt {
+            "Desligado"
+        } else {
+            "Off"
+        };
+        let theme = self.settings.theme.value;
+        settings_card(
+            ui,
+            palette,
+            community_title,
+            Some((
+                community_badge,
+                if prefs.ryd_enabled || prefs.dearrow_enabled {
+                    palette.info_accent_fg
+                } else {
+                    palette.snippet_fg
+                },
+                palette.queue_next_bg,
+            )),
+            None,
+            |ui| {
+                let mut ryd = prefs.ryd_enabled;
+                if settings_toggle_row(
+                    ui,
+                    palette,
+                    theme,
+                    "Return YouTube Dislike",
+                    if pt {
+                        "Exibe contagem estimada de dislikes no player via returnyoutubedislikeapi.com. Nenhuma requisição é feita quando desativado."
+                    } else {
+                        "Shows estimated dislike counts in the watch view via returnyoutubedislikeapi.com. Zero requests are made when disabled."
+                    },
+                    &mut ryd,
+                    None,
+                    None,
+                ) {
+                    prefs.ryd_enabled = ryd;
+                    changed = true;
+                }
+                paint_row_divider(ui, palette);
+                let mut dearrow = prefs.dearrow_enabled;
+                if settings_toggle_row(
+                    ui,
+                    palette,
+                    theme,
+                    "DeArrow (SponsorBlock)",
+                    if pt {
+                        "Sugere títulos e miniaturas comunitárias menos sensacionalistas via sponsor.ajay.app. Nenhuma requisição é feita quando desativado."
+                    } else {
+                        "Fetches community crowd-sourced titles via sponsor.ajay.app (with Original toggle). Zero requests are made when disabled."
+                    },
+                    &mut dearrow,
+                    None,
+                    None,
+                ) {
+                    prefs.dearrow_enabled = dearrow;
+                    changed = true;
+                }
+            },
+        );
+
         if changed {
             self.apply_app_preferences(prefs);
             if invalidate {
@@ -3015,6 +3777,273 @@ impl FastTube {
         ctx: &egui::Context,
         palette: ThemePalette,
     ) {
+        let pt = self.ui_pt();
+        if !self.settings.download_dir_input_synced {
+            self.settings.download_dir_input = self
+                .settings
+                .prefs
+                .value
+                .download_dir_override
+                .clone()
+                .unwrap_or_else(|| {
+                    downloads::DownloadManager::default_download_dir()
+                        .to_string_lossy()
+                        .into_owned()
+                });
+            self.settings.download_dir_input_synced = true;
+        }
+        let effective_download_dir = downloads::DownloadManager::effective_download_dir(
+            self.settings.prefs.value.download_dir_override.as_deref(),
+        );
+
+        settings_card(
+            ui,
+            palette,
+            if pt {
+                "Pasta de downloads offline"
+            } else {
+                "Offline downloads folder"
+            },
+            None,
+            None,
+            |ui| {
+                settings_row_frame(ui, |ui| {
+                    ui.label(
+                        RichText::new(if pt {
+                            "Define onde o gerenciador de downloads salva arquivos MP4/M4A/Opus/MP3."
+                        } else {
+                            "Sets where the download manager saves offline MP4/M4A/Opus/MP3 files."
+                        })
+                        .size(12.5)
+                        .color(palette.snippet_fg),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let edit_w = (ui.available_width() - 110.0).max(160.0);
+                        ui.add_sized(
+                            [edit_w, 30.0],
+                            egui::TextEdit::singleline(&mut self.settings.download_dir_input)
+                                .hint_text(if pt {
+                                    "Caminho absoluto da pasta de downloads"
+                                } else {
+                                    "Absolute path to downloads folder"
+                                }),
+                        );
+                        let picking = self.settings.download_picker_rx.is_some();
+                        ui.add_enabled_ui(!picking, |ui| {
+                            if pill_choice_button(
+                                ui,
+                                if picking {
+                                    if pt { "Abrindo..." } else { "Opening..." }
+                                } else if pt {
+                                    "Procurar..."
+                                } else {
+                                    "Browse..."
+                                },
+                                false,
+                                palette,
+                            )
+                            .clicked()
+                            {
+                                let initial =
+                                    PathBuf::from(self.settings.download_dir_input.trim());
+                                let (tx, rx) = mpsc::channel();
+                                self.settings.download_picker_rx = Some(rx);
+                                let ctx_clone = ctx.clone();
+                                std::thread::spawn(move || {
+                                    let res = settings::pick_folder_dialog(Some(&initial));
+                                    let _ = tx.send(res);
+                                    ctx_clone.request_repaint();
+                                });
+                            }
+                        });
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if pill_choice_button(
+                            ui,
+                            if pt { "Aplicar pasta" } else { "Apply folder" },
+                            true,
+                            palette,
+                        )
+                        .clicked()
+                        {
+                            let candidate = self.settings.download_dir_input.trim().to_owned();
+                            if candidate.is_empty() || !PathBuf::from(&candidate).is_absolute() {
+                                self.downloads.notice = Some(if pt {
+                                    "Informe um caminho absoluto válido ou clique em Restaurar padrão."
+                                        .into()
+                                } else {
+                                    "Enter a valid absolute path or click Restore default.".into()
+                                });
+                            } else {
+                                let mut prefs = self.settings.prefs.value.clone();
+                                prefs.download_dir_override = Some(candidate);
+                                self.apply_app_preferences(prefs);
+                                if self.settings.prefs.error.is_none() {
+                                    self.downloads.notice = Some(if pt {
+                                        "Pasta de downloads atualizada.".into()
+                                    } else {
+                                        "Downloads folder updated.".into()
+                                    });
+                                }
+                            }
+                        }
+                        if pill_choice_button(
+                            ui,
+                            if pt { "Restaurar padrão" } else { "Restore default" },
+                            false,
+                            palette,
+                        )
+                        .clicked()
+                        {
+                            let mut prefs = self.settings.prefs.value.clone();
+                            prefs.download_dir_override = None;
+                            self.apply_app_preferences(prefs);
+                            self.settings.download_dir_input_synced = false;
+                            if self.settings.prefs.error.is_none() {
+                                self.downloads.notice = Some(if pt {
+                                    "Pasta de downloads restaurada para o padrão.".into()
+                                } else {
+                                    "Downloads folder restored to default.".into()
+                                });
+                            }
+                        }
+                        if pill_choice_button(
+                            ui,
+                            if pt { "Abrir no Explorer" } else { "Open in Explorer" },
+                            false,
+                            palette,
+                        )
+                        .clicked()
+                        {
+                            let _ = std::fs::create_dir_all(&effective_download_dir);
+                            if let Err(err) = settings::open_in_explorer(&effective_download_dir) {
+                                self.downloads.notice = Some(err);
+                            }
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "{}: {}",
+                            if pt {
+                                "Pasta efetiva"
+                            } else {
+                                "Effective folder"
+                            },
+                            effective_download_dir.display()
+                        ))
+                        .size(11.5)
+                        .color(palette.snippet_fg),
+                    );
+                    if let Some(notice) = &self.downloads.notice {
+                        ui.add_space(6.0);
+                        status_banner(ui, palette, notice, false);
+                    }
+                });
+            },
+        );
+
+        ui.add_space(16.0);
+        let ytdlp_busy = self.settings.ytdlp_rx.is_some();
+        let ytdlp_badge_info = self.settings.ytdlp_check.as_ref().map(|info| {
+            let label = if info.update_available {
+                format!(
+                    "{} -> {}",
+                    info.current_version.as_deref().unwrap_or("?"),
+                    info.latest_version
+                )
+            } else {
+                info.latest_version.clone()
+            };
+            (label, info.update_available)
+        });
+        settings_card(
+            ui,
+            palette,
+            if pt {
+                "Atualizador do yt-dlp"
+            } else {
+                "yt-dlp Updater"
+            },
+            ytdlp_badge_info.as_ref().map(|(lbl, upd)| {
+                (
+                    lbl.as_str(),
+                    if *upd {
+                        palette.info_accent_fg
+                    } else {
+                        palette.snippet_fg
+                    },
+                    palette.queue_next_bg,
+                )
+            }),
+            None,
+            |ui| {
+                settings_control_row(
+                    ui,
+                    palette,
+                    if pt {
+                        "Binário yt-dlp (GitHub Releases)"
+                    } else {
+                        "yt-dlp binary (GitHub Releases)"
+                    },
+                    if pt {
+                        "Verifica a versão mais recente no repositório oficial do yt-dlp e atualiza o executável localmente."
+                    } else {
+                        "Checks the latest official yt-dlp release on GitHub and atomically updates the local executable."
+                    },
+                    260.0,
+                    |ui| {
+                        ui.add_enabled_ui(!ytdlp_busy, |ui| {
+                            if pill_choice_button(
+                                ui,
+                                if ytdlp_busy {
+                                    if pt { "Consultando..." } else { "Checking..." }
+                                } else if pt {
+                                    "Verificar atualizações"
+                                } else {
+                                    "Check updates"
+                                },
+                                false,
+                                palette,
+                            )
+                            .clicked()
+                            {
+                                self.start_ytdlp_check(ctx);
+                            }
+                            if let Some(info) = self.settings.ytdlp_check.clone()
+                                && info.update_available
+                                && pill_choice_button(
+                                    ui,
+                                    if pt {
+                                        "Baixar / Atualizar"
+                                    } else {
+                                        "Download / Update"
+                                    },
+                                    true,
+                                    palette,
+                                )
+                                .clicked()
+                            {
+                                self.start_ytdlp_update(
+                                    info.download_url,
+                                    info.install_path,
+                                    info.latest_version,
+                                    ctx,
+                                );
+                            }
+                        });
+                    },
+                );
+                if let Some((ok, status)) = &self.settings.ytdlp_status {
+                    ui.add_space(6.0);
+                    status_banner(ui, palette, status, !*ok);
+                }
+            },
+        );
+
+        ui.add_space(16.0);
         if !self.settings.cache_dir_input_synced {
             self.settings.cache_dir_input = self
                 .settings
@@ -3540,6 +4569,13 @@ impl FastTube {
                         .ok()
                         .map(|p| p.with_file_name("feed-preferences.json"))
                 }),
+            ),
+            (
+                "Canais seguidos (locais)",
+                self.followed_channels
+                    .path
+                    .clone()
+                    .or_else(|| followed_channels::path().ok()),
             ),
             ("Cliente OAuth", settings::oauth_client_path().ok()),
         ];

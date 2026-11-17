@@ -27,6 +27,8 @@ const MAX_CACHED_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_THUMBNAIL_DECODE_WIDTH: u32 = 1280;
 const MAX_THUMBNAIL_DECODE_HEIGHT: u32 = 720;
 const MAX_AVATAR_DECODE_SIZE: u32 = 256;
+const MAX_STORYBOARD_DECODE_SIZE: u32 = 2048;
+const MAX_RETAINED_STORYBOARD_SHEETS: usize = 12;
 const IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(12);
 const MTIME_TOUCH_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -443,6 +445,7 @@ pub struct ThumbnailCache {
     disk_cache: Option<Arc<DiskImageCache>>,
     result_tx: mpsc::Sender<LoadedImage>,
     result_rx: mpsc::Receiver<LoadedImage>,
+    storyboard_sheets: StoryboardSheetCache,
 }
 
 impl Default for ThumbnailCache {
@@ -456,7 +459,7 @@ impl Default for ThumbnailCache {
         cache.allow_burst_loads = true;
         #[cfg(not(test))]
         {
-            cache.disk_cache = DiskImageCache::default_production();
+            cache.set_disk_cache(DiskImageCache::default_production());
         }
         cache
     }
@@ -488,17 +491,19 @@ impl ThumbnailCache {
             disk_cache: None,
             result_tx,
             result_rx,
+            storyboard_sheets: StoryboardSheetCache::with_limit(MAX_RETAINED_STORYBOARD_SHEETS),
         }
     }
 
     #[cfg(test)]
     pub fn with_disk_cache(mut self, disk_cache: Option<Arc<DiskImageCache>>) -> Self {
-        self.disk_cache = disk_cache;
+        self.set_disk_cache(disk_cache);
         self
     }
 
     pub fn set_disk_cache(&mut self, disk_cache: Option<Arc<DiskImageCache>>) {
-        self.disk_cache = disk_cache;
+        self.disk_cache = disk_cache.clone();
+        self.storyboard_sheets.set_disk_cache(disk_cache);
     }
 
     #[cfg(test)]
@@ -517,6 +522,19 @@ impl ThumbnailCache {
         self.in_flight_count() > 0
             || !self.retired_in_flight.is_empty()
             || !self.candidates.is_empty()
+            || self.storyboard_sheets.has_pending_work()
+    }
+
+    pub fn resolve_storyboard_texture(
+        &mut self,
+        ctx: &egui::Context,
+        uri: &str,
+    ) -> Option<(egui::TextureId, [u32; 2])> {
+        self.storyboard_sheets.resolve_texture(ctx, uri)
+    }
+
+    pub fn clear_storyboards(&mut self, ctx: &egui::Context) {
+        self.storyboard_sheets.clear(ctx);
     }
 
     fn bump_tick(&mut self) -> u64 {
@@ -635,6 +653,7 @@ impl ThumbnailCache {
 
     pub fn maintain(&mut self, ctx: &egui::Context) {
         self.drain_loaded(ctx);
+        self.storyboard_sheets.maintain(ctx);
         if self.retired_in_flight.is_empty()
             && !self
                 .entries
@@ -1428,6 +1447,198 @@ impl AvatarCache {
                 }
                 ctx.forget_image(trimmed);
                 false
+            }
+        }
+    }
+}
+
+pub struct StoryboardSheetCache {
+    entries: HashMap<String, AvatarEntry>,
+    access_counter: u64,
+    max_retained: usize,
+    disk_cache: Option<Arc<DiskImageCache>>,
+    result_tx: mpsc::Sender<LoadedImage>,
+    result_rx: mpsc::Receiver<LoadedImage>,
+}
+
+impl StoryboardSheetCache {
+    pub fn with_limit(max_retained: usize) -> Self {
+        let max_retained = max_retained.max(1);
+        let (result_tx, result_rx) = mpsc::channel();
+        Self {
+            entries: HashMap::with_capacity(max_retained),
+            access_counter: 0,
+            max_retained,
+            disk_cache: None,
+            result_tx,
+            result_rx,
+        }
+    }
+
+    pub fn set_disk_cache(&mut self, disk_cache: Option<Arc<DiskImageCache>>) {
+        self.disk_cache = disk_cache;
+    }
+
+    pub fn has_pending_work(&self) -> bool {
+        self.entries
+            .values()
+            .any(|entry| matches!(entry.state, AvatarEntryState::Loading { .. }))
+    }
+
+    pub fn clear(&mut self, ctx: &egui::Context) {
+        for uri in self.entries.keys() {
+            ctx.forget_image(uri);
+        }
+        self.entries.clear();
+    }
+
+    pub fn maintain(&mut self, ctx: &egui::Context) {
+        while let Ok(loaded) = self.result_rx.try_recv() {
+            let Some(entry) = self.entries.get_mut(&loaded.uri) else {
+                continue;
+            };
+            if !matches!(entry.state, AvatarEntryState::Loading { .. }) {
+                continue;
+            }
+            match loaded.image {
+                Ok(color_image) => {
+                    let size = [color_image.width() as u32, color_image.height() as u32];
+                    let texture = ctx.load_texture(
+                        format!("sb:{}", loaded.uri),
+                        color_image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    entry.state = AvatarEntryState::Ready {
+                        size,
+                        texture_id: Some(texture.id()),
+                    };
+                    entry.texture = Some(texture);
+                }
+                Err(()) => {
+                    entry.state = AvatarEntryState::Failed;
+                    entry.texture = None;
+                }
+            }
+        }
+        let now = Instant::now();
+        for entry in self.entries.values_mut() {
+            if let AvatarEntryState::Loading { started_at } = entry.state
+                && now.saturating_duration_since(started_at) >= IN_FLIGHT_TIMEOUT
+            {
+                entry.state = AvatarEntryState::Failed;
+                entry.texture = None;
+            }
+        }
+    }
+
+    pub fn resolve_texture(
+        &mut self,
+        ctx: &egui::Context,
+        uri: &str,
+    ) -> Option<(egui::TextureId, [u32; 2])> {
+        let trimmed = uri.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let uses_disk_worker = self.disk_cache.is_some() && uri_uses_disk_worker(trimmed);
+        let now = Instant::now();
+        let already_tracked = self.entries.contains_key(trimmed);
+
+        if let Some(entry) = self.entries.get_mut(trimmed) {
+            match entry.state {
+                AvatarEntryState::Failed => return None,
+                AvatarEntryState::Ready {
+                    size,
+                    texture_id: Some(texture_id),
+                } => {
+                    self.access_counter = self.access_counter.wrapping_add(1);
+                    entry.last_access_tick = self.access_counter;
+                    return Some((texture_id, size));
+                }
+                AvatarEntryState::Loading { started_at }
+                    if now.saturating_duration_since(started_at) >= IN_FLIGHT_TIMEOUT =>
+                {
+                    entry.state = AvatarEntryState::Failed;
+                    entry.texture = None;
+                    ctx.forget_image(trimmed);
+                    return None;
+                }
+                AvatarEntryState::Loading { .. } if uses_disk_worker => {
+                    self.access_counter = self.access_counter.wrapping_add(1);
+                    entry.last_access_tick = self.access_counter;
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
+        let is_new = !already_tracked;
+        self.access_counter = self.access_counter.wrapping_add(1);
+        let tick = self.access_counter;
+        if is_new {
+            if self.entries.len() >= self.max_retained
+                && let Some(victim) = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_access_tick)
+                    .map(|(k, _)| k.clone())
+            {
+                self.entries.remove(&victim);
+                ctx.forget_image(&victim);
+            }
+            self.entries.insert(
+                trimmed.to_owned(),
+                AvatarEntry {
+                    state: AvatarEntryState::Loading { started_at: now },
+                    texture: None,
+                    last_access_tick: tick,
+                },
+            );
+        }
+
+        if uses_disk_worker {
+            if is_new && let Some(disk_cache) = self.disk_cache.clone() {
+                spawn_image_load(
+                    disk_cache,
+                    trimmed.to_owned(),
+                    MAX_STORYBOARD_DECODE_SIZE,
+                    MAX_STORYBOARD_DECODE_SIZE,
+                    self.result_tx.clone(),
+                    ctx.clone(),
+                );
+            }
+            return None;
+        }
+
+        let size_hint = egui::SizeHint::Size {
+            width: MAX_STORYBOARD_DECODE_SIZE,
+            height: MAX_STORYBOARD_DECODE_SIZE,
+            maintain_aspect_ratio: true,
+        };
+        match ctx.try_load_texture(trimmed, egui::TextureOptions::LINEAR, size_hint) {
+            Ok(egui::load::TexturePoll::Ready { texture }) => {
+                let size = [
+                    texture.size.x.max(1.0).round() as u32,
+                    texture.size.y.max(1.0).round() as u32,
+                ];
+                if let Some(entry) = self.entries.get_mut(trimmed) {
+                    entry.state = AvatarEntryState::Ready {
+                        size,
+                        texture_id: Some(texture.id),
+                    };
+                }
+                Some((texture.id, size))
+            }
+            Ok(egui::load::TexturePoll::Pending { .. }) => {
+                ctx.request_repaint_after(Duration::from_millis(80));
+                None
+            }
+            Err(_) => {
+                if let Some(entry) = self.entries.get_mut(trimmed) {
+                    entry.state = AvatarEntryState::Failed;
+                }
+                ctx.forget_image(trimmed);
+                None
             }
         }
     }

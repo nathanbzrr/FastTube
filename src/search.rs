@@ -98,7 +98,66 @@ fn store_cached_subtitle_tracks(url: &str, tracks: &[SubtitleTrack]) {
     });
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoryboardFragment {
+    pub url: String,
+    pub duration_secs: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoryboardSpec {
+    pub rows: u32,
+    pub columns: u32,
+    pub thumb_width: u32,
+    pub thumb_height: u32,
+    pub fragments: Vec<StoryboardFragment>,
+}
+
+impl StoryboardSpec {
+    /// Resolves the storyboard sheet URL and normalized UV rectangle for a timestamp.
+    pub fn lookup(&self, time_secs: f64) -> Option<(&str, eframe::egui::Rect)> {
+        if self.rows == 0
+            || self.columns == 0
+            || self.fragments.is_empty()
+            || !time_secs.is_finite()
+        {
+            return None;
+        }
+        let target = time_secs.max(0.0);
+        let mut elapsed = 0.0;
+        let per_sheet = (self.rows as usize) * (self.columns as usize);
+        if per_sheet == 0 {
+            return None;
+        }
+        for (idx, frag) in self.fragments.iter().enumerate() {
+            let dur = frag.duration_secs.max(1.0);
+            let is_last = idx + 1 == self.fragments.len();
+            if target < elapsed + dur || is_last {
+                let local = (target - elapsed).clamp(0.0, dur);
+                let frame_idx = ((local / dur) * (per_sheet as f64))
+                    .floor()
+                    .clamp(0.0, (per_sheet - 1) as f64) as usize;
+                let col = (frame_idx % self.columns as usize) as f32;
+                let row = (frame_idx / self.columns as usize) as f32;
+                let u0 = col / self.columns as f32;
+                let v0 = row / self.rows as f32;
+                let u1 = (col + 1.0) / self.columns as f32;
+                let v1 = (row + 1.0) / self.rows as f32;
+                return Some((
+                    frag.url.as_str(),
+                    eframe::egui::Rect::from_min_max(
+                        eframe::egui::pos2(u0, v0),
+                        eframe::egui::pos2(u1, v1),
+                    ),
+                ));
+            }
+            elapsed += dur;
+        }
+        None
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct PlaybackExtraInfo {
     pub is_live: bool,
     pub title: Option<String>,
@@ -107,6 +166,7 @@ pub(crate) struct PlaybackExtraInfo {
     pub channel_url: Option<String>,
     pub description: Option<String>,
     pub concurrent_view_count: Option<u64>,
+    pub storyboard: Option<StoryboardSpec>,
 }
 
 struct CachedPlaybackExtra {
@@ -305,7 +365,7 @@ pub struct SubtitleTrack {
     pub url: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct VideoPlaybackMetadata {
     pub heights: Vec<u32>,
     pub subtitles: Vec<SubtitleTrack>,
@@ -316,6 +376,7 @@ pub struct VideoPlaybackMetadata {
     pub channel_url: Option<String>,
     pub description: Option<String>,
     pub concurrent_view_count: Option<u64>,
+    pub storyboard: Option<StoryboardSpec>,
 }
 
 const SUBTITLE_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -1503,10 +1564,19 @@ pub fn clear_in_memory_caches() {
     }
 }
 
+pub(crate) fn yt_dlp_command() -> Command {
+    yt_dlp()
+}
+
 fn yt_dlp() -> Command {
-    let program = std::env::current_exe()
-        .ok()
-        .and_then(|executable| bundled_yt_dlp(&executable))
+    let program = crate::updater::local_bin_yt_dlp_path()
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|executable| bundled_yt_dlp(&executable))
+        })
+        .map(|path| path.into_os_string())
         .unwrap_or_else(|| "yt-dlp".into());
     let mut command = Command::new(program);
     if let Some(cache_dir) = effective_yt_dlp_cache_dir() {
@@ -1563,6 +1633,7 @@ pub fn playback_metadata_with_cancel(
         channel_url: extra.channel_url,
         description: extra.description,
         concurrent_view_count: extra.concurrent_view_count,
+        storyboard: extra.storyboard,
     })
 }
 
@@ -1611,6 +1682,72 @@ fn parse_resolutions_from_json(value: &Value) -> Result<Vec<u32>, String> {
     }
 }
 
+fn parse_storyboard_from_json(value: &Value) -> Option<StoryboardSpec> {
+    let formats = value.get("formats").and_then(Value::as_array)?;
+    let mut best: Option<(u32, StoryboardSpec)> = None;
+    for fmt in formats {
+        let is_sb = fmt
+            .get("format_note")
+            .and_then(Value::as_str)
+            .is_some_and(|n| n.eq_ignore_ascii_case("storyboard"))
+            || fmt
+                .get("protocol")
+                .and_then(Value::as_str)
+                .is_some_and(|p| p == "mhtml");
+        if !is_sb {
+            continue;
+        }
+        let rows = fmt.get("rows").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let columns = fmt.get("columns").and_then(Value::as_u64).unwrap_or(0) as u32;
+        if rows == 0 || columns == 0 {
+            continue;
+        }
+        let thumb_width = fmt.get("width").and_then(Value::as_u64).unwrap_or(160) as u32;
+        let thumb_height = fmt.get("height").and_then(Value::as_u64).unwrap_or(90) as u32;
+        let Some(raw_frags) = fmt.get("fragments").and_then(Value::as_array) else {
+            continue;
+        };
+        let fragments: Vec<StoryboardFragment> = raw_frags
+            .iter()
+            .filter_map(|frag| {
+                let url = frag.get("url").and_then(Value::as_str)?.trim();
+                if !url.starts_with("https://") {
+                    return None;
+                }
+                let duration_secs = frag
+                    .get("duration")
+                    .and_then(Value::as_f64)
+                    .filter(|d| d.is_finite() && *d > 0.0)
+                    .unwrap_or(100.0);
+                Some(StoryboardFragment {
+                    url: url.to_owned(),
+                    duration_secs,
+                })
+            })
+            .collect();
+        if fragments.is_empty() {
+            continue;
+        }
+        let score = thumb_width;
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, _)| score > *best_score)
+        {
+            best = Some((
+                score,
+                StoryboardSpec {
+                    rows,
+                    columns,
+                    thumb_width,
+                    thumb_height,
+                    fragments,
+                },
+            ));
+        }
+    }
+    best.map(|(_, spec)| spec)
+}
+
 fn parse_playback_extra_from_json(value: &Value) -> PlaybackExtraInfo {
     let live_status = value.get("live_status").and_then(Value::as_str);
     let is_live = value.get("is_live").and_then(Value::as_bool) == Some(true)
@@ -1631,6 +1768,7 @@ fn parse_playback_extra_from_json(value: &Value) -> PlaybackExtraInfo {
         channel_url: non_empty_str("channel_url").or_else(|| non_empty_str("uploader_url")),
         description: non_empty_str("description"),
         concurrent_view_count: value.get("concurrent_view_count").and_then(Value::as_u64),
+        storyboard: parse_storyboard_from_json(value),
     }
 }
 

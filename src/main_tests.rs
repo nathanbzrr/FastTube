@@ -9452,3 +9452,324 @@ fn filter_chips_bar_scrolls_horizontally_via_left_and_right_buttons() {
     out_left.textures_delta.clear();
     assert_eq!(app.ui.chips_scroll_offset, 0.0);
 }
+
+#[test]
+fn v030_app_preferences_defaults_and_opt_in_community_apis() {
+    let prefs = settings::AppPreferences::default();
+    assert!(!prefs.ryd_enabled);
+    assert!(!prefs.dearrow_enabled);
+    assert!(!prefs.auto_mini_player);
+    assert_eq!(prefs.language, i18n::UiLanguage::PtBr);
+    assert_eq!(prefs.download_dir_override, None);
+
+    let cancel = process::Cancellation::default();
+    let outcome = community_apis::fetch_community_extras("dQw4w9WgXcQ", false, false, &cancel);
+    assert_eq!(outcome.video_id, "dQw4w9WgXcQ");
+    assert!(outcome.ryd.is_none());
+    assert!(outcome.dearrow.is_none());
+}
+
+#[test]
+fn v030_keybindings_parse_format_and_normalization() {
+    assert_eq!(
+        settings::Keybindings::parse_egui_key("Space"),
+        Some((false, false, false, egui::Key::Space))
+    );
+    assert_eq!(
+        settings::Keybindings::parse_egui_key("Ctrl+Shift+M"),
+        Some((true, false, true, egui::Key::M))
+    );
+    assert_eq!(
+        settings::Keybindings::format_egui_key(true, false, false, egui::Key::K),
+        Some("Ctrl+K".to_owned())
+    );
+    let custom = settings::Keybindings {
+        play_pause: "   ".to_owned(),
+        seek_back: "J".to_owned(),
+        ..settings::Keybindings::default()
+    }
+    .normalized();
+    assert_eq!(custom.play_pause, "K");
+    assert_eq!(custom.seek_back, "J");
+    assert!(custom.valid());
+}
+
+#[test]
+fn v030_queue_repeat_mode_and_playlist_id_extraction() {
+    let mode = queue::RepeatMode::Off;
+    assert_eq!(mode.cycle(), queue::RepeatMode::All);
+    assert_eq!(queue::RepeatMode::All.cycle(), queue::RepeatMode::One);
+    assert_eq!(queue::RepeatMode::One.cycle(), queue::RepeatMode::Off);
+
+    assert_eq!(
+        extract_playlist_id_from_url("https://www.youtube.com/playlist?list=PLabcdef12345"),
+        Some("PLabcdef12345".to_owned())
+    );
+    assert_eq!(
+        extract_playlist_id_from_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+        None
+    );
+}
+
+#[test]
+fn v030_downloads_effective_dir_and_formats() {
+    let default_dir = downloads::DownloadManager::default_download_dir();
+    assert_eq!(
+        downloads::DownloadManager::effective_download_dir(None),
+        default_dir
+    );
+    assert_eq!(
+        downloads::DownloadManager::effective_download_dir(Some("relative/path")),
+        default_dir
+    );
+    #[cfg(windows)]
+    {
+        let custom = PathBuf::from(r"C:\FastTubeDownloads");
+        assert_eq!(
+            downloads::DownloadManager::effective_download_dir(Some(r"C:\FastTubeDownloads")),
+            custom
+        );
+    }
+    for fmt in downloads::DownloadFormat::ALL {
+        assert!(!fmt.label_pt().is_empty());
+        assert!(!fmt.label_en().is_empty());
+        assert!(!fmt.yt_dlp_args().is_empty());
+    }
+}
+
+#[test]
+fn v030_followed_channels_persistence_and_local_insights() {
+    let temp = std::env::temp_dir().join(format!(
+        "fasttube-v030-followed-insights-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&temp);
+    std::fs::create_dir_all(&temp).unwrap();
+    let path = temp.join("followed-channels.json");
+
+    let mut followed = followed_channels::FollowedChannels::default();
+    followed.channels.push(followed_channels::FollowedChannel {
+        channel_id: "UCuAXFkgsw1L7xaCfnd5JJOw".to_owned(),
+        title: "Rick Astley".to_owned(),
+        handle: Some("@RickAstleyYT".to_owned()),
+        url: "https://www.youtube.com/channel/UCuAXFkgsw1L7xaCfnd5JJOw".to_owned(),
+        avatar_url: None,
+        followed_at_ms: 1_700_000_000_000,
+        last_seen_video_id: Some("dQw4w9WgXcQ".to_owned()),
+    });
+    followed_channels::save(&path, &followed).unwrap();
+    let loaded = followed_channels::load(&path).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert!(loaded.is_following("UCuAXFkgsw1L7xaCfnd5JJOw"));
+    assert!(loaded.is_following("@rickastleyyt"));
+
+    let mut hist = History::default();
+    hist.record(history::Entry {
+        video_id: "dQw4w9WgXcQ".to_owned(),
+        title: "Never Gonna Give You Up".to_owned(),
+        channel: "Rick Astley".to_owned(),
+        position_ms: 210_000,
+        duration_ms: Some(213_000),
+        watched_at_ms: Some(1_700_000_000_000),
+    })
+    .unwrap();
+    let lib = library::Library::default();
+    let mut profile = UserProfile::default();
+    profile.token_weights.insert("music".to_owned(), 2.5);
+    let summary = insights::compute_local_insights(&hist, &lib, &profile, &loaded);
+    assert_eq!(summary.total_videos, 1);
+    assert_eq!(summary.completed_videos, 1);
+    assert_eq!(summary.followed_channels_count, 1);
+    assert_eq!(summary.top_channels[0].channel, "Rick Astley");
+    assert_eq!(summary.top_topics[0].0, "music");
+
+    let _ = std::fs::remove_dir_all(&temp);
+}
+
+#[test]
+fn v030_ytdlp_updater_github_release_parser() {
+    let payload = br#"{
+        "tag_name": "2026.03.13",
+        "assets": [
+            {
+                "name": "yt-dlp.exe",
+                "browser_download_url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.03.13/yt-dlp.exe"
+            }
+        ]
+    }"#;
+    let parsed = updater::parse_github_release_json(payload).unwrap();
+    assert_eq!(parsed.0, "2026.03.13");
+    assert!(parsed.1.ends_with("/yt-dlp.exe"));
+
+    let missing_asset = br#"{"tag_name": "2026.03.13", "assets": []}"#;
+    assert!(updater::parse_github_release_json(missing_asset).is_err());
+}
+
+#[test]
+fn v030_protocol_url_and_bilingual_downloads_insights_ui() {
+    assert_eq!(
+        desktop::normalize_fasttube_protocol_url("fasttube://watch?v=dQw4w9WgXcQ"),
+        Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_owned())
+    );
+    assert_eq!(
+        desktop::normalize_fasttube_protocol_url("fasttube://https://youtu.be/dQw4w9WgXcQ"),
+        Some("https://youtu.be/dQw4w9WgXcQ".to_owned())
+    );
+    assert_eq!(
+        desktop::normalize_fasttube_protocol_url("javascript:alert(1)"),
+        None
+    );
+
+    let mut app = FastTube::default();
+    assert_eq!(app.pick("Início", "Home"), "Início");
+    app.settings.prefs.value.language = i18n::UiLanguage::En;
+    assert_eq!(app.pick("Início", "Home"), "Home");
+
+    let ctx = egui::Context::default();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 640.0));
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.downloads_section_ui(ui, &c);
+            app.insights_section_ui(ui, &c);
+        },
+    );
+    out.textures_delta.clear();
+}
+
+#[test]
+fn tray_and_updater_preferences_defaults_serialization_and_reset() {
+    let defaults = settings::AppPreferences::default();
+    assert!(!defaults.minimize_to_tray);
+    assert!(!defaults.close_to_tray);
+    assert!(!defaults.start_minimized_to_tray);
+    assert!(defaults.auto_check_updates);
+    assert_eq!(defaults.skipped_app_update_version, None);
+
+    let json = serde_json::json!({
+        "minimize_to_tray": true,
+        "close_to_tray": true,
+        "start_minimized_to_tray": true,
+        "auto_check_updates": false,
+        "skipped_app_update_version": "  0.4.0  "
+    });
+    let parsed: settings::AppPreferences =
+        serde_json::from_value(json).expect("deserializes tray/updater preferences");
+    let normalized = parsed.normalized();
+    assert!(normalized.minimize_to_tray);
+    assert!(normalized.close_to_tray);
+    assert!(normalized.start_minimized_to_tray);
+    assert!(!normalized.auto_check_updates);
+    assert_eq!(
+        normalized.skipped_app_update_version.as_deref(),
+        Some("0.4.0")
+    );
+
+    let mut app = FastTube::default();
+    let ctx = egui::Context::default();
+    app.settings.prefs.value = normalized;
+    app.reset_settings_tab_defaults(app_state::SettingsTab::General, &ctx);
+    assert!(!app.settings.prefs.value.minimize_to_tray);
+    assert!(!app.settings.prefs.value.close_to_tray);
+    assert!(!app.settings.prefs.value.start_minimized_to_tray);
+    assert!(app.settings.prefs.value.auto_check_updates);
+    assert_eq!(app.settings.prefs.value.skipped_app_update_version, None);
+}
+
+#[test]
+fn tray_hidden_flag_suppresses_video_window_and_restores() {
+    let mut app = FastTube::default();
+    let ctx = egui::Context::default();
+    app.selected = Some(Video {
+        title: "Sample".into(),
+        channel: "Channel".into(),
+        duration: "1:00".into(),
+        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+        thumbnail: String::new(),
+    });
+    assert!(app.should_show_video_window());
+
+    app.desktop.hidden_to_tray = true;
+    assert!(!app.should_show_video_window());
+
+    app.show_from_tray(&ctx);
+    assert!(!app.desktop.hidden_to_tray);
+    assert!(app.should_show_video_window());
+}
+
+#[test]
+fn settings_general_renders_tray_autostart_and_github_updater_ui_and_header_banner() {
+    let mut app = FastTube::default();
+    app.settings.active_tab = app_state::SettingsTab::General;
+    app.desktop
+        .autostart
+        .set_state_for_test(desktop::AutostartUiState::Enabled { hidden: true });
+    app.settings.app_update_check = Some(updater::AppUpdateCheck {
+        current_version: "0.3.0".into(),
+        latest_version: "0.4.0".into(),
+        tag_name: "v0.4.0".into(),
+        release_url: "https://github.com/nathanbzrr/FastTube/releases/tag/v0.4.0".into(),
+        release_notes: "- Tray support\n- Auto-updater".into(),
+        asset_name: "FastTube-Setup-0.4.0-x64.exe".into(),
+        download_url: "https://github.com/nathanbzrr/FastTube/releases/download/v0.4.0/FastTube-Setup-0.4.0-x64.exe".into(),
+        checksums_url: Some("https://github.com/nathanbzrr/FastTube/releases/download/v0.4.0/SHA256SUMS.txt".into()),
+        install_kind: updater::AppInstallKind::Installer,
+        update_available: true,
+    });
+
+    let ctx = egui::Context::default();
+    let run_general = |app: &mut FastTube| -> String {
+        let mut rendered = String::new();
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1120.0, 3200.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let c = ui.ctx().clone();
+                    let palette = app.palette();
+                    app.app_update_banner_pill_ui(ui, &c, palette);
+                    app.settings_page_ui(ui, &c);
+                },
+            );
+            rendered = collect_rendered_text(&out.shapes).join("\n");
+            out.textures_delta.clear();
+        }
+        rendered
+    };
+
+    let pt_text = run_general(&mut app);
+    assert!(pt_text.contains("Nova versão do FastTube disponível: v0.4.0"));
+    assert!(pt_text.contains("Sistema, energia e bandeja"));
+    assert!(pt_text.contains("Minimizar para a bandeja do sistema"));
+    assert!(pt_text.contains("Fechar janela para a bandeja"));
+    assert!(pt_text.contains("Iniciar com o Windows"));
+    assert!(pt_text.contains("Ativo (bandeja)"));
+    assert!(pt_text.contains("Iniciar minimizado na bandeja ao entrar no Windows"));
+    assert!(pt_text.contains("Atualizador automático (GitHub Releases)"));
+    assert!(pt_text.contains("Baixar e instalar"));
+
+    // Skipping the version suppresses active_app_update_available and header banner.
+    app.settings.prefs.value.skipped_app_update_version = Some("0.4.0".into());
+    assert!(app.active_app_update_available().is_none());
+    let skipped_text = run_general(&mut app);
+    assert!(!skipped_text.contains("Nova versão do FastTube disponível: v0.4.0"));
+    assert!(skipped_text.contains("Aviso da versão v0.4.0 silenciado."));
+
+    // Switching to English renders localized labels cleanly.
+    app.settings.prefs.value.skipped_app_update_version = None;
+    app.settings.prefs.value.language = i18n::UiLanguage::En;
+    let en_text = run_general(&mut app);
+    assert!(en_text.contains("New FastTube update available: v0.4.0"));
+    assert!(en_text.contains("System, power & tray"));
+    assert!(en_text.contains("Auto-updater (GitHub Releases)"));
+    assert!(en_text.contains("Download & install"));
+}

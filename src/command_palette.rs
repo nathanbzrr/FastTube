@@ -127,6 +127,8 @@ pub(crate) enum PaletteAction {
     ToggleTheme,
     ToggleTheater,
     ToggleMiniPlayer,
+    CycleRepeat,
+    ShuffleQueue,
     ClearQueue,
     OpenShortcuts,
 }

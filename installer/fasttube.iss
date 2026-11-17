@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "0.1.0"
+  #define AppVersion "0.3.0"
 #endif
 #ifndef StagingDir
   #define StagingDir "..\target\installer-staging"
@@ -48,12 +48,25 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [CustomMessages]
 brazilianportuguese.SystemIntegration=Integração com o sistema:
 brazilianportuguese.AddToPath=Adicionar a pasta de instalação ao PATH
+brazilianportuguese.RegisterProtocol=Registrar protocolo fasttube:// (abrir links no FastTube)
+brazilianportuguese.StartWithWindows=Iniciar o FastTube junto com o Windows (na bandeja)
 english.SystemIntegration=System integration:
 english.AddToPath=Add installation folder to PATH
+english.RegisterProtocol=Register fasttube:// protocol handler (open links in FastTube)
+english.StartWithWindows=Start FastTube with Windows (minimized to tray)
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 Name: "addtopath"; Description: "{cm:AddToPath}"; GroupDescription: "{cm:SystemIntegration}"; Flags: unchecked
+Name: "protocol"; Description: "{cm:RegisterProtocol}"; GroupDescription: "{cm:SystemIntegration}"
+Name: "autostart"; Description: "{cm:StartWithWindows}"; GroupDescription: "{cm:SystemIntegration}"; Flags: unchecked
+
+[Registry]
+Root: HKA; Subkey: "Software\Classes\fasttube"; ValueType: string; ValueName: ""; ValueData: "URL:FastTube Protocol"; Flags: uninsdeletekey; Tasks: protocol
+Root: HKA; Subkey: "Software\Classes\fasttube"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""; Flags: uninsdeletekey; Tasks: protocol
+Root: HKA; Subkey: "Software\Classes\fasttube\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\fasttube.exe"",0"; Flags: uninsdeletekey; Tasks: protocol
+Root: HKA; Subkey: "Software\Classes\fasttube\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\fasttube.exe"" ""%1"""; Flags: uninsdeletekey; Tasks: protocol
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "FastTube"; ValueData: """{app}\fasttube.exe"" --start-hidden"; Flags: uninsdeletevalue; Tasks: autostart
 
 [Files]
 Source: "{#StagingDir}\fasttube.exe"; DestDir: "{app}"; Flags: ignoreversion

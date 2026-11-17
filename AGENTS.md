@@ -4,8 +4,8 @@ FastTube is a Windows-first Rust desktop YouTube client (`eframe`/`egui` + `libm
 
 ## Architecture & Navigation
 
-- Read [`docs/architecture.md`](docs/architecture.md) first for the 21-module map, the 12 domain substates in [`src/app_state.rs`](src/app_state.rs), and system invariants.
-- [`src/main.rs`](src/main.rs) is ~16,000 lines. **Do not read it sequentially.**
+- Read [`docs/architecture.md`](docs/architecture.md) first for the 39-module map, the 14 domain substates in [`src/app_state.rs`](src/app_state.rs), and system invariants.
+- [`src/main.rs`](src/main.rs) is ~13,200 lines. **Do not read it sequentially.**
 - **Graphify decision rule (per prompt)**:
   - **Use Graphify (`graphify query --budget 1800`, `explain`, `affected`, `path`)** when the prompt involves cross-module call flows, impact/dependency analysis, architectural questions, or locating logic inside `src/main.rs` without a known symbol/line (see [`docs/graphify.md`](docs/graphify.md)).
   - **Skip Graphify (use targeted search / `view_file` directly)** when the prompt names a specific file, function, struct, UI string, or small localized fix, to avoid CLI overhead and save tokens.
