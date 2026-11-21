@@ -71,6 +71,23 @@ impl PaletteCategory {
             Self::Subscription => "Canal inscrito",
         }
     }
+
+    pub(crate) fn label_en(self) -> &'static str {
+        match self {
+            Self::Action => "Quick action",
+            Self::Section => "Navigation",
+            Self::Settings => "Settings",
+            Self::Bookmark => "Bookmark",
+            Self::Queue => "Queue",
+            Self::Library => "Library",
+            Self::History => "History",
+            Self::Subscription => "Subscribed channel",
+        }
+    }
+
+    pub(crate) fn label(self, pt: bool) -> &'static str {
+        if pt { self.label_pt() } else { self.label_en() }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,21 +105,25 @@ pub(crate) enum DirectYouTubeTarget {
 }
 
 impl DirectYouTubeTarget {
-    pub(crate) fn display_label(&self) -> String {
+    pub(crate) fn display_label_i18n(&self, pt: bool) -> String {
         match self {
             Self::Video {
                 video_id, start_ms, ..
             } => {
+                let prefix = if pt { "V\u{00ed}deo" } else { "Video" };
                 if let Some(ms) = start_ms {
-                    format!("V\u{00ed}deo {video_id} ({})", format_timestamp_ms(*ms))
+                    format!("{prefix} {video_id} ({})", format_timestamp_ms(*ms))
                 } else {
-                    format!("V\u{00ed}deo {video_id}")
+                    format!("{prefix} {video_id}")
                 }
             }
-            Self::Channel(target) => match target {
-                ChannelTarget::Handle(handle) => format!("Canal {handle}"),
-                ChannelTarget::ChannelId(id) => format!("Canal {id}"),
-            },
+            Self::Channel(target) => {
+                let prefix = if pt { "Canal" } else { "Channel" };
+                match target {
+                    ChannelTarget::Handle(handle) => format!("{prefix} {handle}"),
+                    ChannelTarget::ChannelId(id) => format!("{prefix} {id}"),
+                }
+            }
             Self::Playlist { list_id, .. } => format!("Playlist {list_id}"),
         }
     }
@@ -286,12 +307,17 @@ pub(crate) fn score_palette_item(query_norm: &str, item: &PaletteItem) -> Option
     let title_norm = normalize_for_search(&item.title);
     let subtitle_norm = normalize_for_search(&item.subtitle);
     let keywords_norm = normalize_for_search(&item.keywords);
-    let category_norm = normalize_for_search(item.category.label_pt());
+    let category_pt_norm = normalize_for_search(item.category.label_pt());
+    let category_en_norm = normalize_for_search(item.category.label_en());
 
     let title_score = fuzzy_match_score(query_norm, &title_norm).map(|s| s + 1_000);
     let subtitle_score = fuzzy_match_score(query_norm, &subtitle_norm).map(|s| s + 350);
     let keywords_score = fuzzy_match_score(query_norm, &keywords_norm).map(|s| s + 150);
-    let category_score = fuzzy_match_score(query_norm, &category_norm).map(|s| s + 50);
+    let category_score = fuzzy_match_score(query_norm, &category_pt_norm)
+        .into_iter()
+        .chain(fuzzy_match_score(query_norm, &category_en_norm))
+        .max()
+        .map(|s| s + 50);
 
     let best = [title_score, subtitle_score, keywords_score, category_score]
         .into_iter()
@@ -302,7 +328,9 @@ pub(crate) fn score_palette_item(query_norm: &str, item: &PaletteItem) -> Option
         return best;
     }
 
-    let combined = format!("{category_norm} {title_norm} {subtitle_norm} {keywords_norm}");
+    let combined = format!(
+        "{category_pt_norm} {category_en_norm} {title_norm} {subtitle_norm} {keywords_norm}"
+    );
     fuzzy_match_score(query_norm, &combined)
 }
 

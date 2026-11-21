@@ -319,6 +319,20 @@ pub fn overlay_visible_with_state(
         || overlay_visible(pointer_over_video, paused, ended, seconds_since_activity)
 }
 
+pub fn should_keep_overlay_visible_for_pointer(
+    fullscreen: bool,
+    pointer_pos: Option<Pos2>,
+    video_rect: Rect,
+) -> bool {
+    if fullscreen {
+        return false;
+    }
+    let Some(pos) = pointer_pos else {
+        return false;
+    };
+    compute_bar_rect(video_rect).is_some_and(|bar| bar.contains(pos))
+}
+
 pub fn format_time(seconds: f64) -> String {
     let clamped = if seconds.is_finite() && seconds > 0.0 {
         seconds.floor() as u64
@@ -357,7 +371,7 @@ fn format_elapsed_total(position_secs: f64, duration_secs: Option<f64>) -> Strin
     format!("{elapsed} / {total}")
 }
 
-fn compute_bar_rect(video_rect: Rect) -> Option<Rect> {
+pub(crate) fn compute_bar_rect(video_rect: Rect) -> Option<Rect> {
     let vw = video_rect.width();
     let vh = video_rect.height();
     if !vw.is_finite() || !vh.is_finite() || vw <= 1.0 || vh <= 1.0 {
@@ -2991,6 +3005,582 @@ pub fn show(
     (action, over_controls)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlayerContextAction {
+    ToggleLoop,
+    ToggleMiniPlayer,
+    CopyVideoUrl,
+    CopyVideoUrlAtCurrentTime,
+    CopyEmbedCode,
+    CopyDebugInfo,
+    TroubleshootPlayback,
+    ToggleStatsForNerds,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlayerContextMenuState {
+    pub pt: bool,
+    pub is_live: bool,
+    pub loop_video: bool,
+    pub mini_player: bool,
+    pub can_copy_embed: bool,
+    pub stats_for_nerds_open: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ContextMenuGlyph {
+    Loop,
+    MiniPlayer,
+    Link,
+    Embed,
+    Bug,
+    Help,
+    Info,
+}
+
+fn paint_context_menu_icon(
+    painter: &egui::Painter,
+    center: Pos2,
+    glyph: ContextMenuGlyph,
+    color: Color32,
+) {
+    let stroke = Stroke::new(1.55, color);
+    match glyph {
+        ContextMenuGlyph::Loop => {
+            painter.line_segment(
+                [
+                    Pos2::new(center.x - 6.0, center.y - 3.5),
+                    Pos2::new(center.x + 5.0, center.y - 3.5),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(center.x + 2.5, center.y - 6.0),
+                    Pos2::new(center.x + 5.5, center.y - 3.5),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(center.x + 2.5, center.y - 1.0),
+                    Pos2::new(center.x + 5.5, center.y - 3.5),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(center.x - 5.0, center.y + 3.5),
+                    Pos2::new(center.x + 6.0, center.y + 3.5),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(center.x - 2.5, center.y + 1.0),
+                    Pos2::new(center.x - 5.5, center.y + 3.5),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(center.x - 2.5, center.y + 6.0),
+                    Pos2::new(center.x - 5.5, center.y + 3.5),
+                ],
+                stroke,
+            );
+        }
+        ContextMenuGlyph::MiniPlayer => {
+            let outer = Rect::from_center_size(center, Vec2::new(15.0, 11.0));
+            painter.rect_stroke(
+                outer,
+                CornerRadius::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            let pip = Rect::from_min_max(
+                Pos2::new(outer.right() - 7.0, outer.bottom() - 5.2),
+                Pos2::new(outer.right() - 1.6, outer.bottom() - 1.6),
+            );
+            painter.rect_filled(pip, 1.0, color);
+        }
+        ContextMenuGlyph::Link => {
+            let left_loop =
+                Rect::from_center_size(Pos2::new(center.x - 3.2, center.y), Vec2::new(7.0, 5.2));
+            let right_loop =
+                Rect::from_center_size(Pos2::new(center.x + 3.2, center.y), Vec2::new(7.0, 5.2));
+            painter.rect_stroke(
+                left_loop,
+                CornerRadius::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.rect_stroke(
+                right_loop,
+                CornerRadius::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(center.x - 2.2, center.y),
+                    Pos2::new(center.x + 2.2, center.y),
+                ],
+                stroke,
+            );
+        }
+        ContextMenuGlyph::Embed => {
+            painter.line_segment(
+                [
+                    Pos2::new(center.x - 2.5, center.y - 4.0),
+                    Pos2::new(center.x - 6.5, center.y),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(center.x - 6.5, center.y),
+                    Pos2::new(center.x - 2.5, center.y + 4.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(center.x + 2.5, center.y - 4.0),
+                    Pos2::new(center.x + 6.5, center.y),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(center.x + 6.5, center.y),
+                    Pos2::new(center.x + 2.5, center.y + 4.0),
+                ],
+                stroke,
+            );
+        }
+        ContextMenuGlyph::Bug => {
+            let body =
+                Rect::from_center_size(Pos2::new(center.x, center.y + 0.8), Vec2::new(7.0, 8.6));
+            painter.rect_stroke(
+                body,
+                CornerRadius::same(3),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(center.x - 2.5, body.top() - 1.5),
+                    Pos2::new(center.x - 0.8, body.top()),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(center.x + 2.5, body.top() - 1.5),
+                    Pos2::new(center.x + 0.8, body.top()),
+                ],
+                stroke,
+            );
+            for dy in [-1.5_f32, 1.5, 4.0] {
+                painter.line_segment(
+                    [
+                        Pos2::new(body.left() - 2.5, center.y + dy),
+                        Pos2::new(body.left(), center.y + dy),
+                    ],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        Pos2::new(body.right(), center.y + dy),
+                        Pos2::new(body.right() + 2.5, center.y + dy),
+                    ],
+                    stroke,
+                );
+            }
+        }
+        ContextMenuGlyph::Help => {
+            painter.circle_stroke(center, 7.0, stroke);
+            painter.text(
+                Pos2::new(center.x, center.y + 0.3),
+                egui::Align2::CENTER_CENTER,
+                "?",
+                FontId::proportional(10.5),
+                color,
+            );
+        }
+        ContextMenuGlyph::Info => {
+            painter.circle_stroke(center, 7.0, stroke);
+            painter.text(
+                Pos2::new(center.x, center.y + 0.3),
+                egui::Align2::CENTER_CENTER,
+                "i",
+                FontId::proportional(10.5),
+                color,
+            );
+        }
+    }
+}
+
+pub fn show_context_menu(
+    ctx: &egui::Context,
+    anchor_pos: Pos2,
+    state: &PlayerContextMenuState,
+    style: &OverlayStyle,
+) -> (Option<PlayerContextAction>, Rect) {
+    let content = ctx.input(|i| i.content_rect());
+    let bounds = content.shrink(8.0);
+    let menu_w = (bounds.width().max(180.0))
+        .clamp(220.0, 316.0)
+        .min(bounds.width().max(140.0));
+    let row_h = 36.0_f32;
+    let pad_y = 6.0_f32;
+    let rows_count = 8_usize;
+    let menu_h = (rows_count as f32 * row_h + pad_y * 2.0).min(bounds.height().max(row_h));
+    let max_x = (bounds.right() - menu_w).max(bounds.left());
+    let max_y = (bounds.bottom() - menu_h).max(bounds.top());
+    let x = anchor_pos.x.clamp(bounds.left(), max_x);
+    let y = anchor_pos.y.clamp(bounds.top(), max_y);
+    let menu_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(menu_w, menu_h));
+
+    let pick = |pt_text: &'static str, en_text: &'static str| -> &'static str {
+        if state.pt { pt_text } else { en_text }
+    };
+    let items: [(PlayerContextAction, ContextMenuGlyph, &str, bool, bool); 8] = [
+        (
+            PlayerContextAction::ToggleLoop,
+            ContextMenuGlyph::Loop,
+            "Loop",
+            !state.is_live,
+            state.loop_video,
+        ),
+        (
+            PlayerContextAction::ToggleMiniPlayer,
+            ContextMenuGlyph::MiniPlayer,
+            "Miniplayer",
+            true,
+            state.mini_player,
+        ),
+        (
+            PlayerContextAction::CopyVideoUrl,
+            ContextMenuGlyph::Link,
+            pick("Copiar URL do v\u{00ed}deo", "Copy video URL"),
+            true,
+            false,
+        ),
+        (
+            PlayerContextAction::CopyVideoUrlAtCurrentTime,
+            ContextMenuGlyph::Link,
+            pick(
+                "Copiar URL do v\u{00ed}deo no momento atual",
+                "Copy video URL at current time",
+            ),
+            true,
+            false,
+        ),
+        (
+            PlayerContextAction::CopyEmbedCode,
+            ContextMenuGlyph::Embed,
+            pick("Copiar c\u{00f3}digo de incorporação", "Copy embed code"),
+            state.can_copy_embed,
+            false,
+        ),
+        (
+            PlayerContextAction::CopyDebugInfo,
+            ContextMenuGlyph::Bug,
+            pick(
+                "Copiar informa\u{00e7}\u{00f5}es de depura\u{00e7}\u{00e3}o",
+                "Copy debug info",
+            ),
+            true,
+            false,
+        ),
+        (
+            PlayerContextAction::TroubleshootPlayback,
+            ContextMenuGlyph::Help,
+            pick(
+                "Resolver problemas de reprodu\u{00e7}\u{00e3}o",
+                "Troubleshoot playback issue",
+            ),
+            true,
+            false,
+        ),
+        (
+            PlayerContextAction::ToggleStatsForNerds,
+            ContextMenuGlyph::Info,
+            pick("Estat\u{00ed}sticas para nerds", "Stats for nerds"),
+            true,
+            state.stats_for_nerds_open,
+        ),
+    ];
+
+    let mut chosen: Option<PlayerContextAction> = None;
+    let mut rendered_rect = menu_rect;
+    egui::Area::new(egui::Id::new("fasttube_player_context_menu"))
+        .order(egui::Order::Foreground)
+        .movable(false)
+        .fade_in(false)
+        .default_size(menu_rect.size())
+        .fixed_pos(menu_rect.min)
+        .show(ctx, |ui| {
+            let frame_resp = egui::Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(24, 24, 26, 242))
+                .stroke(Stroke::new(
+                    1.0,
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 28),
+                ))
+                .corner_radius(CornerRadius::same(12))
+                .shadow(egui::Shadow {
+                    offset: [0, 6],
+                    blur: 18,
+                    spread: 0,
+                    color: Color32::from_rgba_unmultiplied(0, 0, 0, 145),
+                })
+                .inner_margin(egui::Margin::symmetric(6, pad_y as i8))
+                .show(ui, |ui| {
+                    let inner_w = (menu_w - 12.0).max(120.0);
+                    ui.set_min_width(inner_w);
+                    ui.set_max_width(inner_w);
+                    ui.spacing_mut().item_spacing = Vec2::ZERO;
+                    egui::ScrollArea::vertical()
+                        .id_salt("fasttube_player_context_menu_scroll")
+                        .max_height((bounds.height() - pad_y * 2.0).max(row_h))
+                        .show(ui, |ui| {
+                            for (act, glyph, label, enabled, checked) in items {
+                                let (row_rect, row_resp) = ui.allocate_exact_size(
+                                    Vec2::new(inner_w, row_h),
+                                    if enabled {
+                                        Sense::click()
+                                    } else {
+                                        Sense::hover()
+                                    },
+                                );
+                                let row_resp = if enabled {
+                                    row_resp.on_hover_cursor(CursorIcon::PointingHand)
+                                } else {
+                                    row_resp
+                                };
+                                if ui.is_rect_visible(row_rect) {
+                                    let painter = ui.painter();
+                                    if enabled && row_resp.hovered() {
+                                        painter.rect_filled(
+                                            row_rect,
+                                            CornerRadius::same(6),
+                                            Color32::from_rgba_unmultiplied(255, 255, 255, 24),
+                                        );
+                                    }
+                                    let fg = if enabled {
+                                        style.text
+                                    } else {
+                                        style.text.gamma_multiply(0.4)
+                                    };
+                                    let icon_center =
+                                        Pos2::new(row_rect.left() + 18.0, row_rect.center().y);
+                                    paint_context_menu_icon(painter, icon_center, glyph, fg);
+                                    let text_right_limit = if checked {
+                                        row_rect.right() - 26.0
+                                    } else {
+                                        row_rect.right() - 8.0
+                                    };
+                                    let text_rect = Rect::from_min_max(
+                                        Pos2::new(row_rect.left() + 36.0, row_rect.top()),
+                                        Pos2::new(
+                                            text_right_limit.max(row_rect.left() + 40.0),
+                                            row_rect.bottom(),
+                                        ),
+                                    );
+                                    painter.with_clip_rect(text_rect).text(
+                                        Pos2::new(text_rect.left(), row_rect.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        label,
+                                        FontId::proportional(13.0),
+                                        fg,
+                                    );
+                                    if checked {
+                                        painter.text(
+                                            Pos2::new(row_rect.right() - 10.0, row_rect.center().y),
+                                            egui::Align2::RIGHT_CENTER,
+                                            "\u{2713}",
+                                            FontId::proportional(13.5),
+                                            style.accent,
+                                        );
+                                    }
+                                }
+                                if enabled && row_resp.clicked() {
+                                    chosen = Some(act);
+                                }
+                            }
+                        });
+                });
+            rendered_rect = frame_resp.response.rect;
+        });
+
+    (chosen, rendered_rect)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatsForNerdsData {
+    pub pt: bool,
+    pub video_id: String,
+    pub viewport_and_frames: String,
+    pub current_res: String,
+    pub volume_and_speed: String,
+    pub codecs: String,
+    pub decoding: String,
+    pub buffer_health: String,
+    pub bitrate: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatsForNerdsAction {
+    CopyDebugInfo,
+    Close,
+}
+
+pub fn show_stats_for_nerds(
+    ui: &mut egui::Ui,
+    video_rect: Rect,
+    data: &StatsForNerdsData,
+    style: &OverlayStyle,
+) -> (Option<StatsForNerdsAction>, bool) {
+    if video_rect.width() < 160.0 || video_rect.height() < 110.0 {
+        return (None, false);
+    }
+    let pt = data.pt;
+    let pick = |pt_text: &'static str, en_text: &'static str| -> &'static str {
+        if pt { pt_text } else { en_text }
+    };
+    let card_w = (video_rect.width() - 24.0).clamp(150.0, 372.0);
+    let max_h = (video_rect.height() - 24.0).max(90.0);
+    let mut rows: Vec<(&'static str, &str)> = vec![
+        ("Video ID", &data.video_id),
+        (
+            pick("Viewport / Quadros", "Viewport / Frames"),
+            &data.viewport_and_frames,
+        ),
+        (
+            pick("Resolu\u{00e7}\u{00e3}o / FPS", "Current / Optimal Res"),
+            &data.current_res,
+        ),
+        (
+            pick("Volume / Velocidade", "Volume / Speed"),
+            &data.volume_and_speed,
+        ),
+        ("Codecs", &data.codecs),
+        (
+            pick("Decodifica\u{00e7}\u{00e3}o", "Decoding"),
+            &data.decoding,
+        ),
+        ("Buffer Health", &data.buffer_health),
+    ];
+    if let Some(bitrate) = data.bitrate.as_deref() {
+        rows.push((pick("Taxa de bits", "Bitrate"), bitrate));
+    }
+
+    let header_h = 26.0_f32;
+    let row_h = 18.0_f32;
+    let pad = 10.0_f32;
+    let card_h = (pad * 2.0 + header_h + 6.0 + rows.len() as f32 * row_h).min(max_h);
+    let card_rect = Rect::from_min_size(
+        Pos2::new(video_rect.left() + 12.0, video_rect.top() + 12.0),
+        Vec2::new(card_w, card_h),
+    );
+    let pointer_inside = ui
+        .input(|i| i.pointer.hover_pos())
+        .is_some_and(|p| card_rect.contains(p));
+
+    let mut action: Option<StatsForNerdsAction> = None;
+    ui.scope_builder(egui::UiBuilder::new().max_rect(card_rect), |ui| {
+        ui.set_clip_rect(card_rect.intersect(video_rect));
+        let bg_id = ui.make_persistent_id("fasttube_stats_for_nerds_bg");
+        let _ = ui.interact(card_rect, bg_id, Sense::click());
+
+        let painter = ui.painter();
+        painter.rect_filled(
+            card_rect,
+            CornerRadius::same(8),
+            Color32::from_rgba_unmultiplied(15, 15, 18, 224),
+        );
+        painter.rect_stroke(
+            card_rect,
+            CornerRadius::same(8),
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 30)),
+            egui::StrokeKind::Inside,
+        );
+
+        let inner = card_rect.shrink(pad);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(4.0, 2.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(pick("Estat\u{00ed}sticas para nerds", "Stats for nerds"))
+                        .size(12.5)
+                        .strong()
+                        .color(Color32::WHITE),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let close_btn = egui::Button::new(
+                        RichText::new("\u{2715}").size(11.5).color(Color32::WHITE),
+                    )
+                    .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 22))
+                    .corner_radius(5)
+                    .min_size(Vec2::new(22.0, 20.0));
+                    if ui
+                        .add(close_btn)
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        action = Some(StatsForNerdsAction::Close);
+                    }
+                    let copy_btn = egui::Button::new(
+                        RichText::new(pick("Copiar", "Copy"))
+                            .size(10.5)
+                            .color(Color32::WHITE),
+                    )
+                    .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 22))
+                    .corner_radius(5)
+                    .min_size(Vec2::new(48.0, 20.0));
+                    if ui
+                        .add(copy_btn)
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked()
+                        && action.is_none()
+                    {
+                        action = Some(StatsForNerdsAction::CopyDebugInfo);
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            let label_w = (inner.width() * 0.40).clamp(84.0, 140.0);
+            for (label, value) in rows {
+                let (r, _) = ui.allocate_exact_size(Vec2::new(inner.width(), 16.0), Sense::hover());
+                let p = ui.painter();
+                let label_rect = Rect::from_min_max(
+                    r.min,
+                    Pos2::new((r.min.x + label_w - 6.0).max(r.min.x + 20.0), r.max.y),
+                );
+                let value_rect = Rect::from_min_max(Pos2::new(r.min.x + label_w, r.min.y), r.max);
+                p.with_clip_rect(label_rect).text(
+                    Pos2::new(label_rect.left(), r.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    FontId::proportional(11.0),
+                    style.text.gamma_multiply(0.72),
+                );
+                p.with_clip_rect(value_rect).text(
+                    Pos2::new(value_rect.left(), r.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    value,
+                    FontId::proportional(11.0),
+                    Color32::WHITE,
+                );
+            }
+        });
+    });
+
+    (action, pointer_inside)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3618,5 +4208,214 @@ mod tests {
             });
             out.textures_delta.clear();
         }
+    }
+
+    #[test]
+    fn should_keep_overlay_visible_for_pointer_differs_between_fullscreen_and_windowed() {
+        let video_rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(800.0, 450.0));
+        let bar_rect = compute_bar_rect(video_rect).expect("bar_rect");
+        let on_bar = Pos2::new(bar_rect.center().x, bar_rect.center().y);
+        let on_canvas = Pos2::new(video_rect.center().x, video_rect.center().y);
+
+        assert!(!should_keep_overlay_visible_for_pointer(
+            true,
+            Some(on_bar),
+            video_rect
+        ));
+        assert!(!should_keep_overlay_visible_for_pointer(
+            true,
+            Some(on_canvas),
+            video_rect
+        ));
+        assert!(should_keep_overlay_visible_for_pointer(
+            false,
+            Some(on_bar),
+            video_rect
+        ));
+        assert!(!should_keep_overlay_visible_for_pointer(
+            false,
+            Some(on_canvas),
+            video_rect
+        ));
+        assert!(!should_keep_overlay_visible_for_pointer(
+            false, None, video_rect
+        ));
+    }
+
+    #[test]
+    fn context_menu_and_stats_for_nerds_render_and_emit_expected_actions() {
+        let ctx = egui::Context::default();
+        let style = sample_style();
+        let screen = Rect::from_min_max(Pos2::ZERO, Pos2::new(960.0, 540.0));
+        let anchor = Pos2::new(220.0, 120.0);
+
+        for (pt, expected_items) in [
+            (
+                true,
+                [
+                    "Loop",
+                    "Miniplayer",
+                    "Copiar URL do vídeo",
+                    "Copiar URL do vídeo no momento atual",
+                    "Copiar código de incorporação",
+                    "Copiar informações de depuração",
+                    "Resolver problemas de reprodução",
+                    "Estatísticas para nerds",
+                ],
+            ),
+            (
+                false,
+                [
+                    "Loop",
+                    "Miniplayer",
+                    "Copy video URL",
+                    "Copy video URL at current time",
+                    "Copy embed code",
+                    "Copy debug info",
+                    "Troubleshoot playback issue",
+                    "Stats for nerds",
+                ],
+            ),
+        ] {
+            let menu_state = PlayerContextMenuState {
+                pt,
+                is_live: false,
+                loop_video: true,
+                mini_player: false,
+                can_copy_embed: true,
+                stats_for_nerds_open: false,
+            };
+            let mut menu_rect = Rect::NOTHING;
+            let mut texts = Vec::new();
+            let mut warm_out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| {
+                    let _ = show_context_menu(ui.ctx(), anchor, &menu_state, &style);
+                },
+            );
+            warm_out.textures_delta.clear();
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ui| {
+                    let (_, rect) = show_context_menu(ui.ctx(), anchor, &menu_state, &style);
+                    menu_rect = rect;
+                },
+            );
+            for clipped in &out.shapes {
+                if let Shape::Text(text) = &clipped.shape {
+                    texts.push(text.galley.text().to_owned());
+                } else if let Shape::Vec(items) = &clipped.shape {
+                    for s in items {
+                        if let Shape::Text(text) = s {
+                            texts.push(text.galley.text().to_owned());
+                        }
+                    }
+                }
+            }
+            out.textures_delta.clear();
+            for item in expected_items {
+                assert!(
+                    texts.iter().any(|t| t == item),
+                    "pt={pt}: missing menu item {item:?} in {texts:?}"
+                );
+            }
+            assert!(menu_rect.height() > 200.0);
+        }
+
+        // Click on last row ("Stats for nerds" / row index 7).
+        let pt_state = PlayerContextMenuState {
+            pt: true,
+            is_live: false,
+            loop_video: false,
+            mini_player: false,
+            can_copy_embed: true,
+            stats_for_nerds_open: false,
+        };
+        let mut last_row_pos = Pos2::new(anchor.x + 80.0, anchor.y + 6.0 + 7.5 * 36.0);
+        let mut warm = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::PointerMoved(last_row_pos)],
+                ..Default::default()
+            },
+            |ui| {
+                let (_, rect) = show_context_menu(ui.ctx(), anchor, &pt_state, &style);
+                last_row_pos = Pos2::new(rect.center().x, rect.bottom() - 24.0);
+            },
+        );
+        warm.textures_delta.clear();
+
+        let mut picked_action = None;
+        for pressed in [true, false] {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![
+                        egui::Event::PointerMoved(last_row_pos),
+                        egui::Event::PointerButton {
+                            pos: last_row_pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| {
+                    let (act, _) = show_context_menu(ui.ctx(), anchor, &pt_state, &style);
+                    if act.is_some() {
+                        picked_action = act;
+                    }
+                },
+            );
+            out.textures_delta.clear();
+        }
+        assert_eq!(
+            picked_action,
+            Some(PlayerContextAction::ToggleStatsForNerds)
+        );
+
+        let stats_data = StatsForNerdsData {
+            pt: true,
+            video_id: "dQw4w9WgXcQ".to_owned(),
+            viewport_and_frames: "1280x720 / 0 descartados".to_owned(),
+            current_res: "1920x1080 @ 60 fps".to_owned(),
+            volume_and_speed: "100% / 1.00x".to_owned(),
+            codecs: "av1 / opus".to_owned(),
+            decoding: "hardware ativo (d3d11va)".to_owned(),
+            buffer_health: "12.5s (Padrão)".to_owned(),
+            bitrate: Some("2.4 Mbps".to_owned()),
+        };
+        let mut stats_texts = Vec::new();
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                let _ = show_stats_for_nerds(ui, screen, &stats_data, &style);
+            },
+        );
+        for clipped in &out.shapes {
+            if let Shape::Text(text) = &clipped.shape {
+                stats_texts.push(text.galley.text().to_owned());
+            } else if let Shape::Vec(items) = &clipped.shape {
+                for s in items {
+                    if let Shape::Text(text) = s {
+                        stats_texts.push(text.galley.text().to_owned());
+                    }
+                }
+            }
+        }
+        out.textures_delta.clear();
+        assert!(stats_texts.iter().any(|t| t == "Estatísticas para nerds"));
+        assert!(stats_texts.iter().any(|t| t == "dQw4w9WgXcQ"));
+        assert!(stats_texts.iter().any(|t| t == "av1 / opus"));
     }
 }

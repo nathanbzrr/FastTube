@@ -66,7 +66,7 @@ impl ImportRestorePoint {
         if directory.exists() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "jÃ¡ existe um ponto de restauraÃ§Ã£o de importaÃ§Ã£o",
+                "já existe um ponto de restauração de importação",
             ));
         }
         let result = (|| -> io::Result<()> {
@@ -156,7 +156,7 @@ fn validate_data_file(root: &Path, path: &Path) -> io::Result<()> {
     if path.parent() != Some(root) || path.file_name().is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "arquivo de dados fora da pasta de recuperaÃ§Ã£o",
+            "arquivo de dados fora da pasta de recuperação",
         ));
     }
     Ok(())

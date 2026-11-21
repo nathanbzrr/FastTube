@@ -28,6 +28,26 @@ pub struct LocalInsights {
     pub followed_channels_count: usize,
 }
 
+impl LocalInsights {
+    #[allow(dead_code)]
+    pub fn completion_rate_percent(&self) -> f32 {
+        if self.total_videos == 0 {
+            0.0
+        } else {
+            (self.completed_videos as f32 / self.total_videos as f32) * 100.0
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn average_watch_ms(&self) -> u64 {
+        if self.total_videos == 0 {
+            0
+        } else {
+            self.total_watch_ms / self.total_videos as u64
+        }
+    }
+}
+
 pub fn compute_local_insights(
     history: &History,
     library: &Library,
@@ -38,7 +58,7 @@ pub fn compute_local_insights(
     let mut total_watch_ms: u64 = 0;
     let mut completed_videos = 0usize;
     let mut in_progress_videos = 0usize;
-    let mut by_channel: HashMap<String, (usize, u64)> = HashMap::new();
+    let mut by_channel: HashMap<String, (String, usize, u64)> = HashMap::new();
 
     for entry in entries {
         let completed = entry.is_near_end() && entry.position_ms > 0;
@@ -54,15 +74,18 @@ pub fn compute_local_insights(
         }
         let ch = entry.channel.trim();
         if !ch.is_empty() {
-            let slot = by_channel.entry(ch.to_owned()).or_insert((0, 0));
-            slot.0 += 1;
-            slot.1 = slot.1.saturating_add(watched);
+            // History entries are newest-first, so keeping the first casing preserves the latest.
+            let slot = by_channel
+                .entry(ch.to_lowercase())
+                .or_insert_with(|| (ch.to_owned(), 0, 0));
+            slot.1 += 1;
+            slot.2 = slot.2.saturating_add(watched);
         }
     }
 
     let mut top_channels: Vec<ChannelStat> = by_channel
-        .into_iter()
-        .map(|(channel, (videos, watch_ms))| ChannelStat {
+        .into_values()
+        .map(|(channel, videos, watch_ms)| ChannelStat {
             channel,
             videos,
             watch_ms,
@@ -165,5 +188,44 @@ mod tests {
         assert_eq!(insights.total_watch_ms, 660_000);
         assert_eq!(insights.top_channels[0].channel, "Alpha");
         assert_eq!(insights.top_topics[0].0, "rust");
+    }
+
+    #[test]
+    fn merges_channel_casing_and_computes_completion_metrics() {
+        let empty = LocalInsights::default();
+        assert_eq!(empty.completion_rate_percent(), 0.0);
+        assert_eq!(empty.average_watch_ms(), 0);
+
+        let mut history = History::default();
+        let _ = history.record(Entry {
+            video_id: "aaaaaaaaaaa".into(),
+            title: "Older".into(),
+            channel: "rustlang".into(),
+            position_ms: 120_000,
+            duration_ms: Some(300_000),
+            watched_at_ms: Some(1),
+        });
+        let _ = history.record(Entry {
+            video_id: "bbbbbbbbbbb".into(),
+            title: "Newer".into(),
+            channel: "RustLang".into(),
+            position_ms: 295_000,
+            duration_ms: Some(300_000),
+            watched_at_ms: Some(2),
+        });
+        let insights = compute_local_insights(
+            &history,
+            &Library::default(),
+            &UserProfile::default(),
+            &FollowedChannels::default(),
+        );
+        assert_eq!(insights.total_videos, 2);
+        assert_eq!(insights.completed_videos, 1);
+        assert_eq!(insights.top_channels.len(), 1);
+        assert_eq!(insights.top_channels[0].channel, "RustLang");
+        assert_eq!(insights.top_channels[0].videos, 2);
+        assert_eq!(insights.top_channels[0].watch_ms, 420_000);
+        assert!((insights.completion_rate_percent() - 50.0).abs() < 0.001);
+        assert_eq!(insights.average_watch_ms(), 210_000);
     }
 }

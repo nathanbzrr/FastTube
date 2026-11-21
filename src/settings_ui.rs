@@ -423,22 +423,13 @@ where
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    let btn = egui::Button::new(
-                                        RichText::new(action_label)
-                                            .size(12.0)
-                                            .strong()
-                                            .color(palette.info_accent_fg),
+                                    if crate::styled_compact_button(
+                                        ui,
+                                        action_label,
+                                        false,
+                                        &palette,
                                     )
-                                    .fill(Color32::TRANSPARENT)
-                                    .stroke(Stroke::new(
-                                        1.0,
-                                        palette.info_accent_fg.gamma_multiply(0.35),
-                                    ))
-                                    .corner_radius(CornerRadius::same(8));
-                                    if ui
-                                        .add(btn)
-                                        .on_hover_cursor(CursorIcon::PointingHand)
-                                        .clicked()
+                                    .clicked()
                                     {
                                         action_clicked = true;
                                     }
@@ -582,39 +573,11 @@ fn pill_choice_button(
     selected: bool,
     palette: ThemePalette,
 ) -> egui::Response {
-    let (bg, fg, stroke_col) = if selected {
-        (
-            palette.active_button_bg,
-            palette.active_button_fg,
-            palette.active_button_bg,
-        )
-    } else {
-        (
-            palette.header_button_bg,
-            palette.header_button_fg,
-            palette.card_alt_stroke,
-        )
-    };
-    let btn = egui::Button::new(RichText::new(label).size(12.5).strong().color(fg))
-        .fill(bg)
-        .stroke(Stroke::new(1.0, stroke_col))
-        .corner_radius(CornerRadius::same(8))
-        .min_size(Vec2::new(0.0, 28.0));
-    ui.add(btn).on_hover_cursor(CursorIcon::PointingHand)
+    crate::styled_pill_button(ui, label, selected, &palette)
 }
 
 fn danger_outline_button(ui: &mut egui::Ui, label: &str, palette: ThemePalette) -> egui::Response {
-    let btn = egui::Button::new(
-        RichText::new(label)
-            .size(12.0)
-            .strong()
-            .color(palette.error_banner_fg),
-    )
-    .fill(palette.error_bg)
-    .stroke(Stroke::new(1.0, palette.error_stroke))
-    .corner_radius(CornerRadius::same(8))
-    .min_size(Vec2::new(0.0, 28.0));
-    ui.add(btn).on_hover_cursor(CursorIcon::PointingHand)
+    crate::styled_danger_button(ui, label, &palette)
 }
 
 fn status_banner(ui: &mut egui::Ui, palette: ThemePalette, text: &str, is_error: bool) {
@@ -1160,22 +1123,7 @@ impl FastTube {
                     .id_salt("settings_rail_scroll")
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("← Voltar")
-                                        .size(13.0)
-                                        .strong()
-                                        .color(palette.header_button_fg),
-                                )
-                                .fill(palette.header_button_bg)
-                                .stroke(Stroke::new(1.0, palette.card_alt_stroke))
-                                .corner_radius(CornerRadius::same(16))
-                                .min_size(Vec2::new(0.0, 32.0)),
-                            )
-                            .on_hover_cursor(CursorIcon::PointingHand)
-                            .clicked()
-                        {
+                        if crate::styled_pill_button(ui, "← Voltar", false, &palette).clicked() {
                             self.ui.settings_open = false;
                             self.sync_player_window_visibility();
                         }
@@ -1314,20 +1262,7 @@ impl FastTube {
 
     fn settings_top_tabs_ui(&mut self, ui: &mut egui::Ui, palette: ThemePalette, theme: Theme) {
         ui.horizontal_wrapped(|ui| {
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new("← Voltar")
-                            .size(12.5)
-                            .strong()
-                            .color(palette.header_button_fg),
-                    )
-                    .fill(palette.header_button_bg)
-                    .corner_radius(CornerRadius::same(14))
-                    .min_size(Vec2::new(0.0, 28.0)),
-                )
-                .clicked()
-            {
+            if crate::styled_pill_button(ui, "← Voltar", false, &palette).clicked() {
                 self.ui.settings_open = false;
                 self.sync_player_window_visibility();
             }
@@ -1771,9 +1706,9 @@ impl FastTube {
                         "Auto Mini player while browsing"
                     },
                     if pt {
-                        "Enquanto um vídeo estiver reproduzindo, entrar no Mini player automaticamente ao navegar para outra seção."
+                        "Fixa o vídeo no miniplayer interno no canto inferior direito ao voltar para o menu ou outra aba (sem minimizar o programa)."
                     } else {
-                        "Automatically enter Mini player when navigating away while a video is actively playing."
+                        "Dock the video into FastTube's bottom-right in-app miniplayer when navigating to the menu or other non-video tabs."
                     },
                     &mut prefs.auto_mini_player,
                     None,
@@ -4745,6 +4680,12 @@ impl FastTube {
                     settings_pill_badge(
                         ui,
                         &format!("{} no histórico", preview.history_entries),
+                        palette.channel_fg,
+                        palette.header_button_bg,
+                    );
+                    settings_pill_badge(
+                        ui,
+                        &format!("{} canais seguidos", preview.followed_channels),
                         palette.channel_fg,
                         palette.header_button_bg,
                     );

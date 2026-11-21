@@ -70,6 +70,7 @@ pub enum RecommendationReason {
     PlaylistMix,
 }
 
+#[cfg(test)]
 impl RecommendationReason {
     pub fn badge_label(&self) -> &'static str {
         match self {
@@ -100,15 +101,18 @@ pub struct ScoredVideo {
     pub metadata: VideoMetadata,
     pub score: f64,
     pub is_short: bool,
+    #[allow(dead_code)]
     pub reasons: Vec<RecommendationReason>,
     pub matched_topic: Option<String>,
 }
 
 impl ScoredVideo {
+    #[cfg(test)]
     pub fn primary_reason_label(&self) -> Option<&'static str> {
         self.reasons.first().map(RecommendationReason::badge_label)
     }
 
+    #[cfg(test)]
     pub fn explanation_tooltip(&self) -> String {
         if self.reasons.is_empty() {
             return "Por que este vídeo?\n• Sugestão geral do feed".into();

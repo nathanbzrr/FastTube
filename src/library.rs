@@ -238,6 +238,7 @@ impl Library {
         }
         Ok(())
     }
+    #[allow(dead_code)]
     pub fn toggle_favorite(&mut self, video: Video) {
         toggle(&mut self.favorites, video);
     }

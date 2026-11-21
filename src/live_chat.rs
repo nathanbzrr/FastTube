@@ -150,29 +150,70 @@ pub struct LiveWatchState {
     pub send_cancel: Option<Cancellation>,
 }
 
+fn normalize_filter_str(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars().flat_map(char::to_lowercase) {
+        let mapped = match ch {
+            'á' | 'à' | 'â' | 'ã' | 'ä' | 'å' => 'a',
+            'é' | 'è' | 'ê' | 'ë' => 'e',
+            'í' | 'ì' | 'î' | 'ï' => 'i',
+            'ó' | 'ò' | 'ô' | 'õ' | 'ö' | 'ø' => 'o',
+            'ú' | 'ù' | 'û' | 'ü' => 'u',
+            'ç' => 'c',
+            'ñ' => 'n',
+            'ý' | 'ÿ' => 'y',
+            '\u{0300}'..='\u{036f}' => continue,
+            other => other,
+        };
+        out.push(mapped);
+    }
+    out
+}
+
 pub fn message_matches_filter(msg: &LiveChatMessage, query: &str) -> bool {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return true;
     }
-    let needle = trimmed.to_lowercase();
-    let author_lower = msg.author_name.to_lowercase();
-    if author_lower.contains(&needle)
+    let needle = normalize_filter_str(trimmed);
+    let role_match = match needle.as_str() {
+        "@mod" | "mod" | "moderador" | "moderator" => {
+            msg.badges.contains(&LiveChatBadgeKind::Moderator)
+        }
+        "@member" | "member" | "membro" => {
+            msg.badges.contains(&LiveChatBadgeKind::Member)
+                || matches!(msg.kind, LiveChatMessageKind::Membership { .. })
+        }
+        "@owner" | "owner" | "dono" => msg.badges.contains(&LiveChatBadgeKind::Owner),
+        "@verified" | "verified" | "verificado" => {
+            msg.badges.contains(&LiveChatBadgeKind::Verified)
+        }
+        "@superchat" | "superchat" | "paid" => {
+            matches!(msg.kind, LiveChatMessageKind::Paid { .. })
+        }
+        _ => false,
+    };
+    if role_match {
+        return true;
+    }
+    let author_norm = normalize_filter_str(&msg.author_name);
+    if author_norm.contains(&needle)
         || needle
             .strip_prefix('@')
-            .is_some_and(|stripped| !stripped.is_empty() && author_lower.contains(stripped))
+            .is_some_and(|stripped| !stripped.is_empty() && author_norm.contains(stripped))
     {
         return true;
     }
-    if msg.text.to_lowercase().contains(&needle) {
+    if normalize_filter_str(&msg.text).contains(&needle) {
         return true;
     }
-    if let LiveChatMessageKind::Membership { header_subtext } = &msg.kind
-        && header_subtext.to_lowercase().contains(&needle)
-    {
-        return true;
+    match &msg.kind {
+        LiveChatMessageKind::Membership { header_subtext } => {
+            normalize_filter_str(header_subtext).contains(&needle)
+        }
+        LiveChatMessageKind::Paid { amount, .. } => normalize_filter_str(amount).contains(&needle),
+        LiveChatMessageKind::Text | LiveChatMessageKind::Engagement => false,
     }
-    false
 }
 
 impl LiveWatchState {
@@ -599,6 +640,8 @@ pub fn fetch_watch_live_info(
     mut web_session: Option<&mut YouTubeWebSession>,
     cancel: &Cancellation,
 ) -> Result<WatchLiveInfo, String> {
+    use std::io::Read;
+    const MAX_WATCH_HTML_BYTES: usize = 8 * 1024 * 1024;
     if cancel.cancelled() {
         return Err("Consulta ao vivo cancelada.".into());
     }
@@ -629,9 +672,17 @@ pub fn fetch_watch_live_info(
             response.status().as_u16()
         ));
     }
-    let html = response.text().map_err(|_| {
-        "N\u{00e3}o foi poss\u{00ed}vel ler a p\u{00e1}gina do v\u{00ed}deo.".to_owned()
-    })?;
+    let mut bytes = Vec::new();
+    response
+        .take((MAX_WATCH_HTML_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            "N\u{00e3}o foi poss\u{00ed}vel ler a p\u{00e1}gina do v\u{00ed}deo.".to_owned()
+        })?;
+    if bytes.len() > MAX_WATCH_HTML_BYTES {
+        return Err("A p\u{00e1}gina do v\u{00ed}deo excedeu o limite de 8 MiB.".into());
+    }
+    let html = String::from_utf8_lossy(&bytes).into_owned();
     if let Some(session) = web_session {
         if let Some(ver) = extract_json_string_field(&html, "INNERTUBE_CLIENT_VERSION") {
             session.client_version = ver;
@@ -1418,8 +1469,13 @@ fn parse_digits_count(text: &str) -> Option<u64> {
 pub fn extract_assigned_json_object(html: &str, var_name: &str) -> Option<Value> {
     let patterns = [
         format!("var {var_name} = "),
+        format!("var {var_name}="),
         format!("{var_name} = "),
+        format!("{var_name}="),
         format!("window[\"{var_name}\"] = "),
+        format!("window[\"{var_name}\"]="),
+        format!("window['{var_name}'] = "),
+        format!("window['{var_name}']="),
     ];
     for pattern in &patterns {
         let mut search_from = 0usize;
@@ -1911,5 +1967,75 @@ mod tests {
         state.reset_for_video(None, None);
         assert!(state.filter_query.is_empty());
         assert!(state.messages.is_empty());
+    }
+
+    #[test]
+    fn live_chat_filtering_supports_diacritics_roles_superchats_and_minified_json() {
+        let mod_msg = LiveChatMessage {
+            id: "m-mod".into(),
+            author_name: "@José".into(),
+            author_channel_id: None,
+            author_avatar_url: None,
+            badges: vec![LiveChatBadgeKind::Moderator],
+            text: "Ótima transmissão, parabéns!".into(),
+            timestamp_text: None,
+            kind: LiveChatMessageKind::Text,
+        };
+        let member_msg = LiveChatMessage {
+            id: "m-member".into(),
+            author_name: "Carla".into(),
+            author_channel_id: None,
+            author_avatar_url: None,
+            badges: vec![LiveChatBadgeKind::Member],
+            text: "Modo escuro ficou ótimo".into(),
+            timestamp_text: None,
+            kind: LiveChatMessageKind::Membership {
+                header_subtext: "Membro há 6 meses".into(),
+            },
+        };
+        let paid_msg = LiveChatMessage {
+            id: "m-paid".into(),
+            author_name: "Dono".into(),
+            author_channel_id: None,
+            author_avatar_url: None,
+            badges: vec![LiveChatBadgeKind::Owner, LiveChatBadgeKind::Verified],
+            text: "Valeu!".into(),
+            timestamp_text: None,
+            kind: LiveChatMessageKind::Paid {
+                amount: "R$ 50,00".into(),
+                header_bg: 0,
+                body_bg: 0,
+            },
+        };
+
+        assert!(message_matches_filter(&mod_msg, "otima transmissao"));
+        assert!(message_matches_filter(&mod_msg, "PARABÉNS"));
+        assert!(message_matches_filter(&mod_msg, "@jose"));
+        assert!(message_matches_filter(&mod_msg, "@mod"));
+        assert!(message_matches_filter(&mod_msg, "moderador"));
+        assert!(!message_matches_filter(&member_msg, "@mod"));
+        assert!(message_matches_filter(&member_msg, "mod"));
+
+        assert!(message_matches_filter(&member_msg, "@member"));
+        assert!(message_matches_filter(&member_msg, "membro"));
+        assert!(message_matches_filter(&member_msg, "ha 6 meses"));
+        assert!(!message_matches_filter(&mod_msg, "@member"));
+
+        assert!(message_matches_filter(&paid_msg, "@superchat"));
+        assert!(message_matches_filter(&paid_msg, "paid"));
+        assert!(message_matches_filter(&paid_msg, "r$ 50"));
+        assert!(message_matches_filter(&paid_msg, "@owner"));
+        assert!(message_matches_filter(&paid_msg, "@verified"));
+        assert!(!message_matches_filter(&mod_msg, "@superchat"));
+
+        let minified_html = concat!(
+            "<script>var ytInitialData={\"contents\":{\"ok\":true}};",
+            "window['ytInitialPlayerResponse']={\"videoDetails\":{\"isLive\":true}};</script>"
+        );
+        let initial_data = extract_assigned_json_object(minified_html, "ytInitialData").unwrap();
+        assert_eq!(initial_data["contents"]["ok"], json!(true));
+        let player_resp =
+            extract_assigned_json_object(minified_html, "ytInitialPlayerResponse").unwrap();
+        assert_eq!(player_resp["videoDetails"]["isLive"], json!(true));
     }
 }

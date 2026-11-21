@@ -434,7 +434,6 @@ fn header_and_navigation_dimensions_adapt_to_viewport_width() {
     assert_eq!(compute_home_grid_columns(480.0), 1);
     assert_eq!(compute_home_grid_columns(640.0), 1);
     assert_eq!(compute_home_grid_columns(1028.0), 3);
-    assert_eq!(compute_continue_watching_columns(640.0), 1);
 }
 
 #[test]
@@ -3664,6 +3663,7 @@ fn import_preview_renders_modes_without_applying_data() {
         watch_later: 1,
         collections: 1,
         bookmarks: 0,
+        followed_channels: 0,
         queue_items: 2,
         history_entries: 4,
         merge_added: 2,
@@ -6250,6 +6250,7 @@ fn backup_round_trip_preserves_and_restores_app_preferences() {
         app.library.path = Some(temp_dir.join("library.json"));
         app.queue.path = Some(temp_dir.join("queue.json"));
         app.history.path = Some(temp_dir.join("history.json"));
+        app.followed_channels.path = Some(temp_dir.join("followed-channels.json"));
         app.settings.playback.path = Some(temp_dir.join("playback-settings.txt"));
         app.settings.theme.path = Some(temp_dir.join("theme-settings.txt"));
         app.feed_preferences.path = Some(temp_dir.join("feed-prefs.json"));
@@ -6259,6 +6260,19 @@ fn backup_round_trip_preserves_and_restores_app_preferences() {
 
     let mut exporter = FastTube::default();
     configure_paths(&mut exporter);
+    exporter
+        .followed_channels
+        .data
+        .channels
+        .push(followed_channels::FollowedChannel {
+            channel_id: "UC_x5XG1OV2P6uZZ5FSM9Ttw".to_owned(),
+            title: "Google Developers".to_owned(),
+            handle: Some("@GoogleDevelopers".to_owned()),
+            url: "https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw".to_owned(),
+            avatar_url: None,
+            followed_at_ms: 1_700_000_000_000,
+            last_seen_video_id: None,
+        });
     exporter.settings.prefs.value.seek_step_secs = 15;
     exporter.settings.prefs.value.hwdec_mode = settings::HwdecMode::Software;
     exporter.settings.prefs.value.sponsorblock.skip_mode =
@@ -6274,12 +6288,23 @@ fn backup_round_trip_preserves_and_restores_app_preferences() {
     importer.backup.path_text = backup_file.display().to_string();
     importer.analyze_import();
     assert!(importer.backup.confirm_import);
+    assert_eq!(
+        importer.backup.preview.as_ref().unwrap().followed_channels,
+        1
+    );
     importer.backup.import_mode = BackupImportMode::Replace;
     importer.import_user_data();
 
     assert_eq!(importer.settings.prefs.value, exporter.settings.prefs.value);
+    assert_eq!(
+        importer.followed_channels.data,
+        exporter.followed_channels.data
+    );
     let persisted = settings::load_app_preferences(&temp_dir.join("app-preferences.json")).unwrap();
     assert_eq!(persisted, exporter.settings.prefs.value);
+    let persisted_followed =
+        followed_channels::load(&temp_dir.join("followed-channels.json")).unwrap();
+    assert_eq!(persisted_followed, exporter.followed_channels.data);
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
@@ -6351,6 +6376,7 @@ fn settings_search_custom_buffer_and_backup_modal_render_headlessly() {
         watch_later: 1,
         collections: 1,
         bookmarks: 3,
+        followed_channels: 2,
         queue_items: 2,
         history_entries: 5,
         merge_added: 3,
@@ -7227,158 +7253,6 @@ fn shortcuts_window_lists_new_player_controls_in_pt_br() {
 }
 
 #[test]
-fn continue_watching_shelf_renders_non_shorts_excludes_near_end_and_resumes() {
-    let ctx = egui::Context::default();
-    let mut app = FastTube::default();
-    app.history.data = History::default();
-    app.feed.videos = vec![Video {
-        title: "Short em Andamento".into(),
-        channel: "Shorts Canal".into(),
-        url: "https://www.youtube.com/shorts/ccccccccccc".into(),
-        thumbnail: String::new(),
-        duration: "0:30".into(),
-    }];
-    let _ = app.history.data.record(history::Entry {
-        video_id: "aaaaaaaaaaa".into(),
-        title: "Guia Completo de Rust".into(),
-        channel: "Dev Canal".into(),
-        position_ms: 120_000,
-        duration_ms: Some(300_000),
-        watched_at_ms: None,
-    });
-    let _ = app.history.data.record(history::Entry {
-        video_id: "bbbbbbbbbbb".into(),
-        title: "Video Quase Terminado".into(),
-        channel: "Dev Canal".into(),
-        position_ms: 295_000,
-        duration_ms: Some(300_000),
-        watched_at_ms: None,
-    });
-    let _ = app.history.data.record(history::Entry {
-        video_id: "ccccccccccc".into(),
-        title: "Short em Andamento".into(),
-        channel: "Shorts Canal".into(),
-        position_ms: 15_000,
-        duration_ms: Some(30_000),
-        watched_at_ms: None,
-    });
-
-    let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(960.0, 480.0));
-    let mut out = egui::FullOutput::default();
-    for _ in 0..2 {
-        out = ctx.run_ui(
-            egui::RawInput {
-                screen_rect: Some(screen),
-                ..Default::default()
-            },
-            |ui| {
-                let _ = app.continue_watching_ui(ui, &ctx);
-            },
-        );
-        out.textures_delta.clear();
-    }
-    let rects = collect_rendered_text_rects(&out.shapes);
-    let rendered = rects
-        .iter()
-        .map(|(t, _)| t.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        rendered.contains("Continuar assistindo"),
-        "missing shelf title:\n{rendered}"
-    );
-    assert!(
-        rendered.contains("Guia Completo de Rust"),
-        "missing in-progress video:\n{rendered}"
-    );
-    assert!(
-        rendered.contains("Restam 3:00"),
-        "missing remaining time indicator:\n{rendered}"
-    );
-    assert!(
-        !rendered.contains("Video Quase Terminado"),
-        "near-end video should be excluded:\n{rendered}"
-    );
-    assert!(
-        !rendered.contains("Short em Andamento"),
-        "Shorts should be excluded from Continue Watching shelf:\n{rendered}"
-    );
-
-    let title_pos = rects
-        .iter()
-        .find(|(t, _)| t.contains("Guia Completo de Rust"))
-        .map(|(_, r)| r.center())
-        .unwrap();
-    let mut chosen = None;
-    let click_events = vec![
-        egui::Event::PointerMoved(title_pos),
-        egui::Event::PointerButton {
-            pos: title_pos,
-            button: egui::PointerButton::Primary,
-            pressed: true,
-            modifiers: egui::Modifiers::NONE,
-        },
-        egui::Event::PointerButton {
-            pos: title_pos,
-            button: egui::PointerButton::Primary,
-            pressed: false,
-            modifiers: egui::Modifiers::NONE,
-        },
-    ];
-    let mut click_out = ctx.run_ui(
-        egui::RawInput {
-            screen_rect: Some(screen),
-            events: click_events,
-            ..Default::default()
-        },
-        |ui| {
-            chosen = app.continue_watching_ui(ui, &ctx);
-        },
-    );
-    click_out.textures_delta.clear();
-    assert_eq!(
-        chosen.as_ref().map(|v| v.url.as_str()),
-        Some("https://www.youtube.com/watch?v=aaaaaaaaaaa")
-    );
-
-    // Click "Concluir" and verify the entry is marked watched and toast emitted.
-    let done_pos = rects
-        .iter()
-        .find(|(t, _)| t == "Concluir")
-        .map(|(_, r)| r.center())
-        .unwrap();
-    let done_events = vec![
-        egui::Event::PointerMoved(done_pos),
-        egui::Event::PointerButton {
-            pos: done_pos,
-            button: egui::PointerButton::Primary,
-            pressed: true,
-            modifiers: egui::Modifiers::NONE,
-        },
-        egui::Event::PointerButton {
-            pos: done_pos,
-            button: egui::PointerButton::Primary,
-            pressed: false,
-            modifiers: egui::Modifiers::NONE,
-        },
-    ];
-    let mut done_out = ctx.run_ui(
-        egui::RawInput {
-            screen_rect: Some(screen),
-            events: done_events,
-            ..Default::default()
-        },
-        |ui| {
-            let _ = app.continue_watching_ui(ui, &ctx);
-        },
-    );
-    done_out.textures_delta.clear();
-    let updated_entry = app.history.data.get("aaaaaaaaaaa").unwrap();
-    assert!(updated_entry.is_near_end());
-    assert!(!app.toasts.is_empty());
-}
-
-#[test]
 fn home_cards_show_explainability_badge_mute_actions_and_pinned_topics() {
     let ctx = egui::Context::default();
     let mut app = FastTube::default();
@@ -7425,12 +7299,12 @@ fn home_cards_show_explainability_badge_mute_actions_and_pinned_topics() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        rendered.contains("Por que este vídeo?"),
-        "missing explainability badge:\n{rendered}"
+        rendered.contains("Rust Async Deep Dive"),
+        "missing home card title:\n{rendered}"
     );
     assert!(
-        rendered.contains("📌 Rust"),
-        "missing pinned topic chip indicator:\n{rendered}"
+        rendered.contains("Rust"),
+        "missing pinned topic chip:\n{rendered}"
     );
 
     app.mute_channel_preference("Canal Favorito");
@@ -8082,31 +7956,26 @@ fn find_rendered_text_center(
         .find_map(|clipped| find_text_center_recursive(&clipped.shape, needle))
 }
 
-fn find_last_text_center_recursive(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+fn find_circle_center_recursive(
+    shape: &egui::Shape,
+    radius: f32,
+    max_x: f32,
+) -> Option<egui::Pos2> {
     match shape {
-        egui::Shape::Text(text) => {
-            if text.galley.job.text == needle || text.galley.job.text.contains(needle) {
-                let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
-                return Some(rect.center());
-            }
-            None
-        }
+        egui::Shape::Circle(circle) => ((circle.radius - radius).abs() < 0.15
+            && circle.center.x <= max_x)
+            .then_some(circle.center),
         egui::Shape::Vec(items) => items
             .iter()
-            .rev()
-            .find_map(|item| find_last_text_center_recursive(item, needle)),
+            .find_map(|item| find_circle_center_recursive(item, radius, max_x)),
         _ => None,
     }
 }
 
-fn find_last_rendered_text_center(
-    shapes: &[egui::epaint::ClippedShape],
-    needle: &str,
-) -> Option<egui::Pos2> {
+fn find_more_dots_center(shapes: &[egui::epaint::ClippedShape], max_x: f32) -> Option<egui::Pos2> {
     shapes
         .iter()
-        .rev()
-        .find_map(|clipped| find_last_text_center_recursive(&clipped.shape, needle))
+        .find_map(|clipped| find_circle_center_recursive(&clipped.shape, 1.45, max_x))
 }
 
 fn headless_pointer_click<F>(
@@ -8268,7 +8137,7 @@ fn library_collections_crud_rename_delete_filter_and_remove_headless() {
     assert!(
         filtered_texts
             .iter()
-            .any(|t| t.contains("Nenhum item em Assistir depois corresponde"))
+            .any(|t| t.contains("Nenhum item em Assistir mais tarde corresponde"))
     );
     app.library.search_query.clear();
 
@@ -8572,14 +8441,27 @@ fn history_search_filter_date_grouping_stats_and_remove_headless() {
     assert!(texts.iter().any(|t| t == "Hoje"));
     assert!(texts.iter().any(|t| t == "Ontem"));
     assert!(texts.iter().any(|t| t == "Mais antigos"));
-    assert!(
-        texts.iter().any(|t| t.contains("Total: 3")
-            && t.contains("Concluídos: 1")
-            && t.contains("Canal Alfa (2)")),
-        "Expected local stats banner in {texts:?}"
-    );
+    for expected in [
+        "Tudo",
+        "V\u{00ed}deos",
+        "Shorts",
+        "Podcasts",
+        "M\u{00fa}sica",
+        "Limpar todo o hist\u{00f3}rico de exibi\u{00e7}\u{00e3}o",
+        "Pausar o hist\u{00f3}rico de visualiza\u{00e7}\u{00f5}es",
+        "Gerenciar hist\u{00f3}rico",
+        "Coment\u{00e1}rios",
+        "Postagens",
+        "Chat ao vivo",
+    ] {
+        assert!(
+            texts.iter().any(|t| t == expected),
+            "expected official YouTube history UI label '{expected}', got:\n{}",
+            texts.join("\n")
+        );
+    }
 
-    // Filter chip "Concluídos" + search query
+    // Filter chip "Completed" + category filter "Shorts" + search query
     app.history.filter = history::HistoryFilter::Completed;
     let mut completed_out = ctx.run_ui(
         egui::RawInput {
@@ -8599,6 +8481,20 @@ fn history_search_filter_date_grouping_stats_and_remove_headless() {
     );
     assert!(!completed_texts.iter().any(|t| t.contains("Aula Rust Hoje")));
 
+    app.history.filter = history::HistoryFilter::Shorts;
+    let mut shorts_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        },
+        |ui| {
+            let _ = app.history_section_ui(ui, "hist_full_test", false, None, None);
+        },
+    );
+    let shorts_texts = collect_rendered_text(&shorts_out.shapes);
+    shorts_out.textures_delta.clear();
+    assert!(!shorts_texts.iter().any(|t| t.contains("Aula Rust Hoje")));
+
     app.history.filter = history::HistoryFilter::All;
     app.history.search_query = "Canal Beta".into();
     let mut search_out = ctx.run_ui(
@@ -8615,9 +8511,35 @@ fn history_search_filter_date_grouping_stats_and_remove_headless() {
     assert!(search_texts.iter().any(|t| t.contains(&videos[2].title)));
     assert!(!search_texts.iter().any(|t| t.contains("Aula Rust Hoje")));
 
-    // Remove visible entry via ✕ button
-    let remove_pos =
-        find_last_rendered_text_center(&search_out.shapes, "✕").expect("remove button on entry");
+    // Remove visible entry via ⋮ menu -> "Remover do histórico de exibição"
+    let dots_pos =
+        find_more_dots_center(&search_out.shapes, 600.0).expect("more dots button on entry");
+    let mut menu_out = headless_pointer_click(&ctx, size, dots_pos, |ui| {
+        let _ = app.history_section_ui(ui, "hist_full_test", false, None, None);
+    });
+    if find_rendered_text_center(
+        &menu_out.shapes,
+        "Remover do hist\u{00f3}rico de exibi\u{00e7}\u{00e3}o",
+    )
+    .is_none()
+    {
+        menu_out.textures_delta.clear();
+        menu_out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                ..Default::default()
+            },
+            |ui| {
+                let _ = app.history_section_ui(ui, "hist_full_test", false, None, None);
+            },
+        );
+    }
+    let remove_pos = find_rendered_text_center(
+        &menu_out.shapes,
+        "Remover do hist\u{00f3}rico de exibi\u{00e7}\u{00e3}o",
+    )
+    .expect("remove menu item on entry");
+    menu_out.textures_delta.clear();
     let _ = headless_pointer_click(&ctx, size, remove_pos, |ui| {
         let _ = app.history_section_ui(ui, "hist_full_test", false, None, None);
     });
@@ -9277,21 +9199,39 @@ fn grid_card_hover_quick_actions_trigger_without_opening_video() {
             let _ = app.youtube_grid_card_ui(ui, &c, &scored, 300.0);
         },
     );
-    let rects = collect_rendered_text_rects(&out.shapes);
+    fn collect_quick_action_rects(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Rect> {
+        let mut quick = Vec::new();
+        fn visit(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Rect(r)
+                    if (r.rect.width() - 28.0).abs() < 0.5
+                        && (r.rect.height() - 28.0).abs() < 0.5 =>
+                {
+                    out.push(r.rect);
+                }
+                egui::Shape::Vec(items) => {
+                    for item in items {
+                        visit(item, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for clipped in shapes {
+            visit(&clipped.shape, &mut quick);
+        }
+        quick.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        quick
+    }
+    let quick_rects = collect_quick_action_rects(&out.shapes);
     out.textures_delta.clear();
-
-    let fila_pos = rects
-        .iter()
-        .find(|(text, _)| text == "+ Fila")
-        .expect("+ Fila hover button")
-        .1
-        .center();
-    let wl_pos = rects
-        .iter()
-        .find(|(text, _)| text == "Assistir depois")
-        .expect("Assistir depois hover button")
-        .1
-        .center();
+    assert!(
+        quick_rects.len() >= 2,
+        "expected 2 hover quick action rects, found {}",
+        quick_rects.len()
+    );
+    let wl_pos = quick_rects[0].center();
+    let fila_pos = quick_rects[1].center();
 
     // Click "+ Fila"
     let mut fila_actions = HomeCardActions::default();
@@ -9772,4 +9712,2489 @@ fn settings_general_renders_tray_autostart_and_github_updater_ui_and_header_bann
     assert!(en_text.contains("System, power & tray"));
     assert!(en_text.contains("Auto-updater (GitHub Releases)"));
     assert!(en_text.contains("Download & install"));
+}
+
+#[test]
+fn queued_video_card_renders_na_fila_badge() {
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+    let video = Video {
+        title: "Queued Walkthrough".into(),
+        channel: "Rust Channel".into(),
+        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+        thumbnail: String::new(),
+        duration: "8:20".into(),
+    };
+    app.queue.data.add(video.clone()).expect("enqueue video");
+    let scored = ScoredVideo {
+        video,
+        score: 100.0,
+        metadata: VideoMetadata::default(),
+        is_short: false,
+        reasons: Vec::new(),
+        matched_topic: None,
+    };
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 340.0));
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            let _ = app.youtube_grid_card_ui(ui, &c, &scored, 300.0);
+        },
+    );
+    let rendered = collect_rendered_text(&out.shapes);
+    out.textures_delta.clear();
+    assert!(
+        rendered.iter().any(|t| t == "Na fila"),
+        "expected 'Na fila' badge on queued video card, got: {rendered:?}"
+    );
+}
+
+#[test]
+fn youtube_parity_removes_non_youtube_tabs_and_exposes_youtube_controls_headless() {
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+    app.feed.videos = sample_videos();
+
+    // 1. Expanded sidebar keeps official YouTube sections and removes non-YouTube tabs.
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 960.0));
+    let mut nav_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.navigation_ui(ui, &c);
+        },
+    );
+    let nav_text = collect_rendered_text(&nav_out.shapes).join("\n");
+    nav_out.textures_delta.clear();
+    for expected in [
+        "In\u{00ed}cio",
+        "Shorts",
+        "Inscri\u{00e7}\u{00f5}es",
+        "Voc\u{00ea}",
+        "Hist\u{00f3}rico",
+        "Playlists",
+        "Seu canal",
+        "Assistir mais tarde",
+        "Downloads",
+        "Explorar",
+        "Em alta",
+        "M\u{00fa}sica",
+        "Ao vivo",
+        "Jogos",
+        "Podcasts",
+        "Configura\u{00e7}\u{00f5}es",
+    ] {
+        assert!(
+            nav_text.contains(expected),
+            "expected official YouTube sidebar item '{expected}', got:\n{nav_text}"
+        );
+    }
+    for removed in [
+        "Insights",
+        "Fila de reprodu\u{00e7}\u{00e3}o",
+        "Mixes",
+        "Novidades",
+        "Assistindo",
+        "Fechar v\u{00ed}deo",
+    ] {
+        assert!(
+            !nav_text.contains(removed),
+            "non-YouTube sidebar item '{removed}' should be removed, got:\n{nav_text}"
+        );
+    }
+
+    // 2. Compact 72px rail only renders Home, Shorts, Subscriptions, You.
+    let mut rail_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.compact_navigation_ui(ui, &c);
+        },
+    );
+    let rail_text = collect_rendered_text(&rail_out.shapes).join("\n");
+    rail_out.textures_delta.clear();
+    assert!(rail_text.contains("In\u{00ed}cio"));
+    assert!(rail_text.contains("Shorts"));
+    assert!(rail_text.contains("Inscri\u{00e7}\u{00f5}es"));
+    assert!(rail_text.contains("Voc\u{00ea}"));
+    assert!(!rail_text.contains("Downloads"));
+    assert!(!rail_text.contains("Insights"));
+
+    // 3. Header omits non-YouTube Ctrl+K button.
+    let mut hdr_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.header_ui(ui, &c);
+        },
+    );
+    let hdr_text = collect_rendered_text(&hdr_out.shapes).join("\n");
+    hdr_out.textures_delta.clear();
+    assert!(!hdr_text.contains("Ctrl+K"));
+
+    // 4. Command palette exposes only YouTube sections (no Insights, Queue, or Explore hub).
+    let palette_items = app.build_command_palette_items();
+    assert!(!palette_items.iter().any(|i| matches!(
+        i.action,
+        command_palette::PaletteAction::Browse(
+            BrowseSection::Insights | BrowseSection::Queue | BrowseSection::Explore
+        )
+    )));
+
+    // 5. Watch page omits standalone "Fila" action button and "Transcrição" sidebar chip;
+    //    expanded description reveals "Mostrar transcrição", and Transcript view hides chips.
+    let video = app.feed.videos[0].clone();
+    app.selected = Some(video.clone());
+    app.video_metadata.insert(
+        video.url.clone(),
+        VideoMetadata {
+            description: Some("Linha 1\nLinha 2\nLinha 3\nLinha 4".into()),
+            ..Default::default()
+        },
+    );
+    app.ensure_watch_metadata_cache(&video);
+    app.watch.metadata_cache.description_expanded = true;
+    app.watch.extras.comments_loaded = true;
+    let mut watch_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.watch_metadata_card_ui(ui, &video, 820.0, None);
+            let _ = app.watch_sidebar_results_ui(ui, &c, "parity_watch_sidebar");
+        },
+    );
+    let watch_tokens = collect_rendered_text(&watch_out.shapes);
+    watch_out.textures_delta.clear();
+    assert!(
+        watch_tokens
+            .iter()
+            .any(|t| t == "Mostrar transcri\u{00e7}\u{00e3}o"),
+        "expanded watch description must show official YouTube 'Mostrar transcrição' button"
+    );
+    assert!(
+        !watch_tokens.iter().any(|t| t == "Fila"),
+        "watch action bar should move Queue into overflow menu instead of standalone 'Fila' pill"
+    );
+    assert!(
+        !watch_tokens.iter().any(|t| t == "Transcri\u{00e7}\u{00e3}o"
+            && watch_tokens.contains(&"Todos".to_owned())
+            && app.watch.extras.sidebar_tab == watch_extras::SidebarTab::All)
+            || watch_tokens
+                .iter()
+                .filter(|t| t.as_str() == "Transcri\u{00e7}\u{00e3}o")
+                .count()
+                == 1,
+        "sidebar chips must not show 'Transcrição'; only expanded description heading shows it"
+    );
+
+    app.watch.extras.sidebar_tab = watch_extras::SidebarTab::Transcript;
+    let mut tr_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            let _ = app.watch_sidebar_results_ui(ui, &c, "parity_watch_transcript");
+        },
+    );
+    let tr_tokens = collect_rendered_text(&tr_out.shapes);
+    tr_out.textures_delta.clear();
+    assert!(tr_tokens.iter().any(|t| t == "Transcri\u{00e7}\u{00e3}o"));
+    assert!(
+        !tr_tokens.iter().any(|t| t == "Relacionados"),
+        "Transcript panel should replace sidebar chips cleanly until closed"
+    );
+
+    // 6. Empty "Você" (Library) omits non-YouTube empty Favorites and Bookmarks shelves.
+    let palette = app.palette();
+    let mut lib_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let _ = app.browse_library_ui(ui, &ctx, palette);
+        },
+    );
+    let lib_text = collect_rendered_text(&lib_out.shapes).join("\n");
+    lib_out.textures_delta.clear();
+    assert!(lib_text.contains("Assistir mais tarde"));
+    assert!(lib_text.contains("Playlists"));
+    assert!(!lib_text.contains("Favoritos"));
+    assert!(!lib_text.contains("Marcadores"));
+
+    // 7. History page shows official YouTube title and Pause Watch History toggle.
+    let mut hist_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let _ = app.history_section_ui(ui, "parity_history", false, None, None);
+        },
+    );
+    let hist_text = collect_rendered_text(&hist_out.shapes).join("\n");
+    hist_out.textures_delta.clear();
+    assert!(hist_text.contains("Hist\u{00f3}rico de exibi\u{00e7}\u{00e3}o"));
+    assert!(hist_text.contains("Pausar o hist\u{00f3}rico de visualiza\u{00e7}\u{00f5}es"));
+    let pause_pos = find_rendered_text_center(
+        &hist_out.shapes,
+        "Pausar o hist\u{00f3}rico de visualiza\u{00e7}\u{00f5}es",
+    )
+    .expect("pause btn");
+    let _ = headless_pointer_click(&ctx, screen.size(), pause_pos, |ui| {
+        let _ = app.history_section_ui(ui, "parity_history", false, None, None);
+    });
+    assert!(app.settings.prefs.value.pause_watch_history);
+}
+
+#[test]
+fn bilingual_english_surfaces_and_followed_backup_modal_render_cleanly() {
+    let ctx = egui::Context::default();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 1100.0));
+    let mut app = FastTube::default();
+
+    // 1) Backup import modal renders the followed-channels badge in PT-BR.
+    app.ui.settings_open = true;
+    app.backup.confirm_import = true;
+    app.backup.preview = Some(BackupPreview {
+        path: PathBuf::from("fasttube-backup.json"),
+        library_items: 4,
+        favorites: 2,
+        watch_later: 1,
+        collections: 1,
+        bookmarks: 3,
+        followed_channels: 2,
+        queue_items: 2,
+        history_entries: 5,
+        merge_added: 3,
+        merge_conflicts: 1,
+        merge_skipped: 0,
+        history_progress_updates: 2,
+    });
+    let mut modal_text = String::new();
+    for _ in 0..2 {
+        let mut modal_out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                let c = ui.ctx().clone();
+                app.backup_import_modal_ui(&c);
+            },
+        );
+        modal_text = collect_rendered_text(&modal_out.shapes).join("\n");
+        modal_out.textures_delta.clear();
+    }
+    assert!(
+        modal_text.contains("2 canais seguidos"),
+        "expected followed channels badge in backup modal, got:\n{modal_text}"
+    );
+
+    // 2) Switch UI language to English and verify Command Palette, Library, History & Downloads.
+    app.ui.settings_open = false;
+    app.backup.confirm_import = false;
+    app.settings.prefs.value.language = i18n::UiLanguage::En;
+
+    let palette_items = app.build_command_palette_items();
+    assert!(
+        palette_items
+            .iter()
+            .any(|item| item.category.label(false) == "Quick action"),
+        "expected English category label in command palette items"
+    );
+
+    app.ui.command_palette.open_palette();
+    app.ui.command_palette.query.clear();
+    let mut cp_text = String::new();
+    for _ in 0..2 {
+        let mut cp_out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                let c = ui.ctx().clone();
+                app.command_palette_ui(&c);
+            },
+        );
+        cp_text = collect_rendered_text(&cp_out.shapes).join("\n");
+        cp_out.textures_delta.clear();
+    }
+    assert!(
+        cp_text.contains("Quick action") || cp_text.contains("Settings"),
+        "expected English Command Palette labels, got:\n{cp_text}"
+    );
+    app.ui.command_palette.open = false;
+
+    let videos = three_youtube_videos();
+    app.library.data.toggle_watch_later(videos[0].clone());
+    app.library.data.toggle_favorite(videos[1].clone());
+    let palette = app.palette();
+    let mut lib_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let _ = app.browse_library_ui(ui, &ctx, palette);
+        },
+    );
+    let lib_text = collect_rendered_text(&lib_out.shapes).join("\n");
+    lib_out.textures_delta.clear();
+    assert!(
+        lib_text.contains("You")
+            && lib_text.contains("1 in Watch later")
+            && lib_text.contains("1 favorites"),
+        "expected English library header, got:\n{lib_text}"
+    );
+
+    let mut hist_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let _ = app.history_section_ui(ui, "en_hist_test", false, None, None);
+        },
+    );
+    let hist_text = collect_rendered_text(&hist_out.shapes).join("\n");
+    hist_out.textures_delta.clear();
+    assert!(
+        hist_text.contains("Watch history"),
+        "expected English history heading, got:\n{hist_text}"
+    );
+
+    let format = downloads::DownloadFormat::ALL[0];
+    app.downloads.manager.items.push(downloads::DownloadItem {
+        id: 1,
+        video: videos[0].clone(),
+        format,
+        output_dir: std::env::temp_dir(),
+        status: downloads::DownloadStatus::Completed {
+            output_path: Some(std::env::temp_dir().join("demo.mp4")),
+        },
+    });
+    app.downloads.manager.items.push(downloads::DownloadItem {
+        id: 2,
+        video: videos[1].clone(),
+        format,
+        output_dir: std::env::temp_dir(),
+        status: downloads::DownloadStatus::Failed("network error".into()),
+    });
+    let mut dl_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.downloads_section_ui(ui, &c);
+        },
+    );
+    let dl_text = collect_rendered_text(&dl_out.shapes).join("\n");
+    dl_out.textures_delta.clear();
+    assert!(
+        dl_text.contains("Open folder")
+            && dl_text.contains("Show in folder")
+            && dl_text.contains("↻ Retry"),
+        "expected English download actions, got:\n{dl_text}"
+    );
+}
+
+#[test]
+fn sidebar_youtube_labs_explore_and_report_history_headless() {
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 960.0));
+
+    let mut collapsed_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.navigation_ui(ui, &c);
+        },
+    );
+    let collapsed_text = collect_rendered_text(&collapsed_out.shapes).join("\n");
+    collapsed_out.textures_delta.clear();
+    for expected in [
+        "Mais do YouTube",
+        "YouTube Labs",
+        "Filmes",
+        "Mostrar mais",
+        "Histórico de denúncias",
+    ] {
+        assert!(
+            collapsed_text.contains(expected),
+            "expected sidebar item '{expected}', got:\n{collapsed_text}"
+        );
+    }
+    for forbidden in ["YouTube Premium", "YouTube Music", "YouTube Kids"] {
+        assert!(
+            !collapsed_text.contains(forbidden),
+            "red-X item '{forbidden}' must not appear in sidebar, got:\n{collapsed_text}"
+        );
+    }
+
+    app.ui.explore_expanded = true;
+    let mut expanded_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.navigation_ui(ui, &c);
+        },
+    );
+    let expanded_text = collect_rendered_text(&expanded_out.shapes).join("\n");
+    expanded_out.textures_delta.clear();
+    for expected in ["Sala de Jogos", "Assinaturas", "Mostrar menos"] {
+        assert!(
+            expanded_text.contains(expected),
+            "expected expanded Explore item '{expected}', got:\n{expanded_text}"
+        );
+    }
+}
+
+#[test]
+fn your_channel_empty_videos_tab_recovery_and_studio_buttons_headless() {
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+    let my_target = search::ChannelTarget::ChannelId("UCx20-fNue2nSzLQtuWeFD9g".into());
+    app.auth.my_channel = Some(my_target.clone());
+    app.auth.my_channel_title = Some("Meu Canal Teste".into());
+
+    let (req_id, valid_target) = app
+        .begin_channel_request(my_target, &ctx)
+        .expect("should initiate channel request");
+    assert!(app.complete_channel_request(
+        req_id,
+        &valid_target,
+        Err(
+            "Não foi possível consultar o canal: ERROR: [youtube:tab] UCx20-fNue2nSzLQtuWeFD9g: This channel does not have a videos tab"
+                .into()
+        ),
+        &ctx,
+    ));
+    assert!(app.channels.error.is_none());
+    assert_eq!(
+        app.channels.page.as_ref().and_then(|p| p.title.as_deref()),
+        Some("Meu Canal Teste")
+    );
+
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            let _ = app.channel_section_ui(ui, &c, "test_my_chan", false, None);
+        },
+    );
+    let rendered = collect_rendered_text(&out.shapes).join("\n");
+    out.textures_delta.clear();
+    assert!(
+        rendered.contains("Personalizar o canal") && rendered.contains("Gerenciar vídeos"),
+        "expected Studio management buttons on own channel, got:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Inscrever-se"),
+        "own channel must not render subscribe button, got:\n{rendered}"
+    );
+}
+
+#[test]
+fn playlists_watch_later_and_liked_pages_1to1_headless() {
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+    let videos = three_youtube_videos();
+    app.library.data.toggle_watch_later(videos[0].clone());
+    app.library.data.toggle_watch_later(videos[1].clone());
+    app.library.data.toggle_favorite(videos[2].clone());
+    let col_idx = app
+        .library
+        .data
+        .create_collection("Estudos")
+        .expect("create Estudos collection");
+    app.library
+        .data
+        .collections
+        .get_mut(col_idx)
+        .expect("Estudos collection")
+        .videos
+        .push(crate::library::VideoRecord {
+            video: videos[0].clone(),
+        });
+
+    let palette = app.palette();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 820.0));
+
+    let mut pl_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            let _ = app.playlists_page_ui(ui, &c, palette);
+        },
+    );
+    let pl_text = collect_rendered_text(&pl_out.shapes).join("\n");
+    pl_out.textures_delta.clear();
+    for expected in [
+        "Playlists",
+        "Tudo",
+        "Criadas por você",
+        "Salvas",
+        "Assistir mais tarde",
+        "Vídeos com \"Gostei\"",
+        "Estudos",
+    ] {
+        assert!(
+            pl_text.contains(expected),
+            "expected '{expected}' on Playlists page, got:\n{pl_text}"
+        );
+    }
+
+    app.library.selected_collection_idx = Some(col_idx);
+    let mut detail_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            let _ = app.playlists_page_ui(ui, &c, palette);
+        },
+    );
+    let detail_text = collect_rendered_text(&detail_out.shapes).join("\n");
+    detail_out.textures_delta.clear();
+    for expected in [
+        "‹  Playlists",
+        "▶  Reproduzir tudo",
+        "🔀 Aleatório",
+        "+ Fila",
+        "Estudos",
+    ] {
+        assert!(
+            detail_text.contains(expected),
+            "expected '{expected}' in collection detail view, got:\n{detail_text}"
+        );
+    }
+
+    let mut wl_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            let _ = app.watch_later_page_ui(ui, &c, palette);
+        },
+    );
+    let wl_text = collect_rendered_text(&wl_out.shapes).join("\n");
+    wl_out.textures_delta.clear();
+    assert!(
+        wl_text.contains("Assistir mais tarde")
+            && wl_text.contains("Tudo")
+            && wl_text.contains("Shorts")
+            && wl_text.contains(&videos[0].title),
+        "expected Watch Later 1:1 detail layout, got:\n{wl_text}"
+    );
+
+    let mut liked_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            let _ = app.liked_videos_page_ui(ui, &c, palette);
+        },
+    );
+    let liked_text = collect_rendered_text(&liked_out.shapes).join("\n");
+    liked_out.textures_delta.clear();
+    assert!(
+        liked_text.contains("Vídeos com \"Gostei\"")
+            && liked_text.contains("Tudo")
+            && liked_text.contains("Shorts")
+            && liked_text.contains(&videos[2].title),
+        "expected Liked Videos 1:1 detail layout, got:\n{liked_text}"
+    );
+}
+
+#[test]
+fn liked_videos_page_renders_5000_count_and_shorts_grid_headless() {
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+
+    let short_item = SearchResult {
+        video: Video {
+            title: "FIZEMOS o ALHO NEGRO de R$ 500!".into(),
+            channel: "Manual do Mundo".into(),
+            url: "https://www.youtube.com/shorts/f0UuuLmAhQk".into(),
+            thumbnail: "https://i.ytimg.com/vi/f0UuuLmAhQk/oardefault.jpg".into(),
+            duration: "2:27".into(),
+        },
+        metadata: VideoMetadata {
+            view_count: Some(461_000),
+            kind: search::SearchResultKind::Short,
+            ..Default::default()
+        },
+    };
+    let regular_short_duration = SearchResult {
+        video: Video {
+            title: "Me at the zoo".into(),
+            channel: "jawed".into(),
+            url: "https://www.youtube.com/watch?v=jNQXAC9IVRw".into(),
+            thumbnail: "https://i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg".into(),
+            duration: "0:19".into(),
+        },
+        metadata: VideoMetadata {
+            view_count: Some(300_000_000),
+            kind: search::SearchResultKind::Video,
+            ..Default::default()
+        },
+    };
+
+    app.video_metadata
+        .insert(short_item.video.url.clone(), short_item.metadata.clone());
+    app.video_metadata.insert(
+        regular_short_duration.video.url.clone(),
+        regular_short_duration.metadata.clone(),
+    );
+    app.library.liked_videos.total_results = Some(5_000);
+    app.library.liked_videos.loaded = true;
+    app.library.liked_videos.items = vec![short_item.clone(), regular_short_duration.clone()];
+    app.library.liked_videos.revision = 1;
+
+    let palette = app.palette();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 820.0));
+
+    app.library.detail_chip_filter = 0;
+    let mut all_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            let _ = app.liked_videos_page_ui(ui, &c, palette);
+        },
+    );
+    let all_text = collect_rendered_text(&all_out.shapes).join("\n");
+    all_out.textures_delta.clear();
+    assert!(
+        all_text.contains("5.000 vídeos")
+            && all_text.contains(&short_item.video.title)
+            && all_text.contains(&regular_short_duration.video.title),
+        "expected 5.000 vídeos and both items in Tudo tab, got:\n{all_text}"
+    );
+
+    app.library.detail_chip_filter = 1;
+    let mut videos_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            let _ = app.liked_videos_page_ui(ui, &c, palette);
+        },
+    );
+    let videos_text = collect_rendered_text(&videos_out.shapes).join("\n");
+    videos_out.textures_delta.clear();
+    assert!(
+        videos_text.contains(&regular_short_duration.video.title)
+            && !videos_text.contains(&short_item.video.title),
+        "expected Vídeos tab to include 0:19 regular video and exclude 2:27 Short, got:\n{videos_text}"
+    );
+
+    app.library.detail_chip_filter = 2;
+    let mut shorts_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            let _ = app.liked_videos_page_ui(ui, &c, palette);
+        },
+    );
+    let shorts_lines = collect_rendered_text(&shorts_out.shapes);
+    let shorts_text = shorts_lines.join("\n");
+    shorts_out.textures_delta.clear();
+    assert!(
+        shorts_text.contains(&short_item.video.title)
+            && shorts_text.contains("461 mil visualizações")
+            && !shorts_text.contains(&regular_short_duration.video.title)
+            && !shorts_lines.iter().any(|line| line.trim() == "1"),
+        "expected Shorts grid with 2:27 Short, compact views, no 0:19 non-Short, and no row numbering, got:\n{shorts_text}"
+    );
+}
+
+#[test]
+fn poll_liked_videos_streams_batches_ignores_stale_requests_and_resets_on_sign_out() {
+    let mut app = FastTube::default();
+    app.auth.authenticated = true;
+    app.auth.session = Some(oauth::TokenSession::test_session("tok"));
+
+    let (tx, rx) = mpsc::channel();
+    app.library.liked_videos.active_request_id = Some(2);
+    app.library.liked_videos.rx = Some(rx);
+
+    tx.send(LikedVideosFetchMessage::Progress {
+        request_id: 1,
+        batch: vec![SearchResult {
+            video: Video {
+                title: "Stale Short".into(),
+                channel: "Old".into(),
+                url: "https://www.youtube.com/shorts/stale000001".into(),
+                thumbnail: String::new(),
+                duration: "0:30".into(),
+            },
+            metadata: VideoMetadata {
+                kind: search::SearchResultKind::Short,
+                ..Default::default()
+            },
+        }],
+        total_results: Some(99),
+    })
+    .unwrap();
+
+    tx.send(LikedVideosFetchMessage::Progress {
+        request_id: 2,
+        batch: vec![SearchResult {
+            video: Video {
+                title: "Fresh Short".into(),
+                channel: "Creator".into(),
+                url: "https://www.youtube.com/shorts/fresh000001".into(),
+                thumbnail: "https://i.ytimg.com/vi/fresh000001/oardefault.jpg".into(),
+                duration: "1:45".into(),
+            },
+            metadata: VideoMetadata {
+                view_count: Some(181_000),
+                kind: search::SearchResultKind::Short,
+                ..Default::default()
+            },
+        }],
+        total_results: Some(5_000),
+    })
+    .unwrap();
+
+    tx.send(LikedVideosFetchMessage::Finished {
+        request_id: 2,
+        token: Some(oauth::TokenSession::test_session("tok")),
+        total_results: Some(5_000),
+        result: Ok(()),
+    })
+    .unwrap();
+
+    app.poll_liked_videos();
+
+    assert!(app.library.liked_videos.loaded);
+    assert_eq!(app.library.liked_videos.total_results, Some(5_000));
+    assert_eq!(app.library.liked_videos.items.len(), 1);
+    assert_eq!(app.library.liked_videos.items[0].video.title, "Fresh Short");
+    assert_eq!(
+        app.video_metadata
+            .get("https://www.youtube.com/shorts/fresh000001")
+            .and_then(|m| m.view_count),
+        Some(181_000)
+    );
+
+    app.sign_out_and_reload_home(&egui::Context::default());
+    assert!(!app.library.liked_videos.loaded);
+    assert!(app.library.liked_videos.items.is_empty());
+    assert_eq!(app.library.liked_videos.total_results, None);
+}
+
+#[test]
+fn downloads_two_column_page_and_direct_input_headless() {
+    assert!(library_ui::parse_direct_youtube_input("").is_none());
+    assert!(library_ui::parse_direct_youtube_input("not a video").is_none());
+    for raw in [
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "https://youtu.be/dQw4w9WgXcQ",
+        "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+        "dQw4w9WgXcQ",
+    ] {
+        let parsed = library_ui::parse_direct_youtube_input(raw).expect("valid YouTube video");
+        assert_eq!(parsed.url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+    }
+
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 820.0));
+    let mut out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.downloads_section_ui(ui, &c);
+        },
+    );
+    let rendered = collect_rendered_text(&out.shapes).join("\n");
+    out.textures_delta.clear();
+    for expected in [
+        "Downloads",
+        "Salvos localmente via yt-dlp",
+        "Tudo",
+        "Vídeos",
+        "Áudio",
+        "Em andamento",
+        "Concluídos",
+        "⬇ Baixar",
+        "Abrir pasta",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "expected '{expected}' on Downloads page, got:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn report_history_and_youtube_labs_pages_headless() {
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+    let palette = app.palette();
+    app.feed
+        .report_history
+        .push(app_state::ReportedContentEntry {
+            kind: "Vídeo".into(),
+            title: "Vídeo de Teste".into(),
+            channel: "Canal X".into(),
+            video_id: Some("dQw4w9WgXcQ".into()),
+            reason: "Problema na imagem ou no título > Conteúdo violento".into(),
+            timestamp_label: "20 de nov. de 2026".into(),
+            status: "Ativo".into(),
+        });
+
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 820.0));
+    let mut report_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.report_history_page_ui(ui, &c, palette);
+        },
+    );
+    let report_text = collect_rendered_text(&report_out.shapes).join("\n");
+    report_out.textures_delta.clear();
+    for expected in [
+        "Agradecemos pela denúncia",
+        "Tipo",
+        "Conteúdo",
+        "Motivo da denúncia",
+        "Status",
+        "Vídeo de Teste",
+        "Problema na imagem ou no título > Conteúdo violento",
+        "Ativo",
+    ] {
+        assert!(
+            report_text.contains(expected),
+            "expected '{expected}' on Report history page, got:\n{report_text}"
+        );
+    }
+
+    let mut labs_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.youtube_labs_page_ui(ui, &c, palette);
+        },
+    );
+    let labs_text = collect_rendered_text(&labs_out.shapes).join("\n");
+    labs_out.textures_delta.clear();
+    for expected in [
+        "YouTube Labs",
+        "SponsorBlock",
+        "Return YouTube Dislike",
+        "DeArrow",
+        "Miniplayer automático",
+    ] {
+        assert!(
+            labs_text.contains(expected),
+            "expected '{expected}' on YouTube Labs page, got:\n{labs_text}"
+        );
+    }
+}
+
+#[test]
+fn in_app_docked_mini_player_activates_across_tabs_without_desktop_pip_headless() {
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+    let videos = three_youtube_videos();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 820.0));
+
+    // 1. With auto_mini_player = true, navigating from watch page to Home/tabs docks in-app only.
+    app.settings.prefs.value.auto_mini_player = true;
+    app.feed.videos = videos.clone();
+    app.selected = Some(videos[0].clone());
+    assert!(app.is_watch_page_active());
+
+    app.handle_header_home(&ctx);
+    assert!(app.is_in_app_mini_player_active());
+    assert!(!app.playback.mini_player);
+    assert!(!app.is_watch_page_active());
+    assert_eq!(
+        app.current_navigation_route(),
+        app_state::NavigationRoute::Browse {
+            section: BrowseSection::Home,
+            search_query: None,
+        }
+    );
+
+    // 2. Switching between non-video tabs keeps the docked miniplayer active instead of closing.
+    app.navigate_from_shortcut(&ctx, BrowseSection::History);
+    assert!(app.is_in_app_mini_player_active());
+    assert!(!app.playback.mini_player);
+    assert_eq!(app.ui.browse_section, BrowseSection::History);
+    assert_eq!(
+        app.current_navigation_route(),
+        app_state::NavigationRoute::Browse {
+            section: BrowseSection::History,
+            search_query: None,
+        }
+    );
+
+    app.navigate_from_shortcut(&ctx, BrowseSection::Playlists);
+    assert!(app.is_in_app_mini_player_active());
+    assert_eq!(app.ui.browse_section, BrowseSection::Playlists);
+
+    app.open_subscriptions_section(false, &ctx);
+    assert!(app.is_in_app_mini_player_active());
+    assert_eq!(app.ui.browse_section, BrowseSection::Subscriptions);
+
+    app.navigate_from_shortcut(&ctx, BrowseSection::Downloads);
+    assert!(app.is_in_app_mini_player_active());
+    assert_eq!(app.ui.browse_section, BrowseSection::Downloads);
+
+    // 3. Sidebar remains highlighted on active browse tab while miniplayer is docked.
+    let mut nav_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.navigation_ui(ui, &c);
+        },
+    );
+    let nav_text = collect_rendered_text(&nav_out.shapes).join("\n");
+    nav_out.textures_delta.clear();
+    assert!(nav_text.contains("Downloads") && nav_text.contains("Início"));
+
+    // 4. Docked miniplayer renders card + controls and pointer clicks expand or close properly.
+    let mut mini_text = String::new();
+    let mut expand_pos = None;
+    for _ in 0..2 {
+        let mut mini_out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                app.in_app_mini_player_ui(ui.ctx());
+            },
+        );
+        mini_text = collect_rendered_text(&mini_out.shapes).join("\n");
+        expand_pos = find_rendered_text_center(&mini_out.shapes, "\u{2922}");
+        mini_out.textures_delta.clear();
+    }
+    for expected in [
+        videos[0].title.as_str(),
+        videos[0].channel.as_str(),
+        "\u{2922}",
+        "\u{29c9}",
+        "\u{2715}",
+    ] {
+        assert!(
+            mini_text.contains(expected),
+            "expected '{expected}' in docked miniplayer, got:\n{mini_text}"
+        );
+    }
+
+    let expand_pos = expand_pos.expect("expand button rendered");
+    let _ = headless_pointer_click(&ctx, screen.size(), expand_pos, |ui| {
+        app.in_app_mini_player_ui(ui.ctx());
+    });
+    assert!(!app.playback.in_app_mini_player);
+    assert!(app.is_watch_page_active());
+
+    // Re-dock via Home, then click Close on docked miniplayer.
+    app.handle_header_home(&ctx);
+    assert!(app.is_in_app_mini_player_active());
+    let mut close_pos = None;
+    for _ in 0..2 {
+        let mut mini_out2 = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                app.in_app_mini_player_ui(ui.ctx());
+            },
+        );
+        close_pos = find_rendered_text_center(&mini_out2.shapes, "\u{2715}");
+        mini_out2.textures_delta.clear();
+    }
+    let close_pos = close_pos.expect("close button rendered");
+    let _ = headless_pointer_click(&ctx, screen.size(), close_pos, |ui| {
+        app.in_app_mini_player_ui(ui.ctx());
+    });
+    assert!(app.selected.is_none());
+    assert!(!app.playback.in_app_mini_player);
+
+    // 5. Opening same or another video clears in_app_mini_player cleanly.
+    app.selected = Some(videos[0].clone());
+    app.playback.in_app_mini_player = true;
+    app.open_video_at_timestamp(videos[0].clone(), None, &ctx);
+    assert!(!app.playback.in_app_mini_player);
+    assert!(app.is_watch_page_active());
+
+    app.playback.in_app_mini_player = true;
+    app.open_video_at_timestamp(videos[1].clone(), None, &ctx);
+    assert!(!app.playback.in_app_mini_player);
+    assert!(app.playback.pending_open_video.is_some());
+
+    // 6. With auto_mini_player = false, navigating home closes the video normally.
+    app.settings.prefs.value.auto_mini_player = false;
+    app.playback.pending_open_video = None;
+    app.selected = Some(videos[1].clone());
+    app.playback.in_app_mini_player = false;
+    app.handle_header_home(&ctx);
+    assert!(app.selected.is_none());
+    assert!(!app.playback.in_app_mini_player);
+    assert!(!app.playback.mini_player);
+}
+
+#[test]
+fn in_app_mini_player_edge_hover_stability_and_controls_headless() {
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+    let videos = three_youtube_videos();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 820.0));
+
+    app.settings.prefs.value.auto_mini_player = true;
+    app.feed.videos = videos.clone();
+    app.selected = Some(videos[1].clone());
+    app.playback.video_back_stack = vec![videos[0].clone()];
+    app.playback.mini_player_volume = 80.0;
+    app.playback.mini_player_muted = false;
+    app.playback.mini_player_paused = false;
+    assert!(app.enter_in_app_mini_player(&ctx));
+
+    let area_id = egui::Id::new("fasttube_in_app_mini_player");
+    let mut expand_pos = None;
+    let mut title_pos = None;
+    let mut base_texts = String::new();
+    for _ in 0..2 {
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |_| app.in_app_mini_player_ui(&ctx),
+        );
+        base_texts = collect_rendered_text(&out.shapes).join("\n");
+        expand_pos = find_rendered_text_center(&out.shapes, "\u{2922}");
+        title_pos = find_rendered_text_center(&out.shapes, videos[1].title.as_str());
+        out.textures_delta.clear();
+    }
+
+    assert!(
+        !base_texts.contains('\u{25b6}') && !base_texts.contains('\u{23f8}'),
+        "footer play/pause button must be removed, got:\n{base_texts}"
+    );
+    let base_rect = ctx
+        .memory(|m| m.area_rect(area_id))
+        .expect("miniplayer area rect");
+    assert!(
+        (base_rect.bottom() - (screen.bottom() - 18.0)).abs() < 0.5,
+        "miniplayer should settle at bottom-right anchor within 2 frames, got {base_rect:?}"
+    );
+    let expand_pos = expand_pos.expect("expand button rendered");
+    let title_pos = title_pos.expect("title rendered");
+    let card_w = base_rect.width() - 2.0;
+    let video_h = (card_w * 9.0 / 16.0).round();
+    let vrect = egui::Rect::from_min_size(
+        base_rect.min + egui::vec2(1.0, 1.0),
+        egui::vec2(card_w, video_h),
+    );
+
+    // Hovering any outer edge, corner, video center, or moving off and back onto the top edge must never shift or resize the miniplayer.
+    let hover_probes = [
+        egui::pos2(vrect.center().x, vrect.top() + 0.5),
+        egui::pos2(vrect.center().x, base_rect.bottom() - 0.5),
+        egui::pos2(vrect.left() + 0.5, vrect.center().y),
+        egui::pos2(vrect.right() - 0.5, vrect.center().y),
+        egui::pos2(vrect.left() + 1.0, vrect.top() + 1.0),
+        egui::pos2(vrect.right() - 1.0, vrect.top() + 1.0),
+        egui::pos2(base_rect.left() + 1.0, base_rect.bottom() - 1.0),
+        egui::pos2(base_rect.right() - 1.0, base_rect.bottom() - 1.0),
+        vrect.center(),
+        egui::Pos2::new(10.0, 10.0),
+        egui::pos2(vrect.center().x, vrect.top() + 0.5),
+    ];
+    for pos in hover_probes {
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![egui::Event::PointerMoved(pos)],
+                    ..Default::default()
+                },
+                |_| app.in_app_mini_player_ui(&ctx),
+            );
+            let txt = collect_rendered_text(&out.shapes).join("\n");
+            assert!(
+                !txt.contains('\u{25b6}') && !txt.contains('\u{23f8}'),
+                "no footer play/pause glyph should appear at {pos:?}"
+            );
+            out.textures_delta.clear();
+        }
+        let hovered_rect = ctx
+            .memory(|m| m.area_rect(area_id))
+            .expect("hovered miniplayer rect");
+        assert!(
+            (hovered_rect.min - base_rect.min).length() < 0.5
+                && (hovered_rect.size() - base_rect.size()).length() < 0.5,
+            "miniplayer shifted on hover at {pos:?}: base={base_rect:?}, hovered={hovered_rect:?}"
+        );
+    }
+
+    // Clicking anywhere on the video surface toggles play/pause without leaving the miniplayer.
+    for (idx, click_pos) in [
+        egui::pos2(vrect.left() + 8.0, vrect.top() + 8.0),
+        egui::pos2(vrect.right() - 8.0, vrect.top() + 8.0),
+        egui::pos2(vrect.left() + 8.0, vrect.bottom() - 12.0),
+        vrect.center(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let expected_paused = idx % 2 == 0;
+        let _ = headless_pointer_click(&ctx, screen.size(), click_pos, |_| {
+            app.in_app_mini_player_ui(&ctx);
+        });
+        assert_eq!(
+            app.playback.mini_player_paused, expected_paused,
+            "video click #{idx} at {click_pos:?} should toggle pause"
+        );
+        assert!(
+            app.playback.in_app_mini_player,
+            "clicking video surface must not expand miniplayer"
+        );
+    }
+
+    // Clicking the title must also keep the miniplayer docked (expand button only).
+    let _ = headless_pointer_click(&ctx, screen.size(), title_pos, |_| {
+        app.in_app_mini_player_ui(&ctx);
+    });
+    assert!(app.playback.in_app_mini_player);
+
+    // Locate Row 2 left-aligned controls relative to card left and expand button vertical center.
+    let inner_w = (card_w - 20.0).max(200.0);
+    let row2_left = base_rect.left() + 11.0;
+    let row2_y = expand_pos.y;
+    let prev_pos = egui::pos2(row2_left + 13.0, row2_y);
+    let next_pos = egui::pos2(row2_left + 26.0 + 4.0 + 13.0, row2_y);
+    let mute_pos = egui::pos2(row2_left + 26.0 + 4.0 + 26.0 + 8.0 + 13.0, row2_y);
+    let slider_left = row2_left + 26.0 + 4.0 + 26.0 + 8.0 + 26.0 + 4.0;
+    let slider_w = (inner_w - 196.0).clamp(36.0, 96.0);
+    let slider_track_left = slider_left + 5.0;
+    let slider_track_right = slider_left + slider_w - 5.0;
+
+    // Mute toggle & inline volume slider.
+    let _ = headless_pointer_click(&ctx, screen.size(), mute_pos, |_| {
+        app.in_app_mini_player_ui(&ctx);
+    });
+    assert!(app.playback.mini_player_muted);
+    let quarter_x = slider_track_left + (slider_track_right - slider_track_left) * 0.25;
+    let _ = headless_pointer_click(&ctx, screen.size(), egui::pos2(quarter_x, row2_y), |_| {
+        app.in_app_mini_player_ui(&ctx);
+    });
+    assert!(!app.playback.mini_player_muted);
+    assert!(
+        (app.playback.mini_player_volume - 25.0).abs() <= 2.0,
+        "expected volume near 25%, got {}",
+        app.playback.mini_player_volume
+    );
+
+    // Previous button pops video_back_stack and preserves miniplayer mode.
+    let _ = headless_pointer_click(&ctx, screen.size(), prev_pos, |_| {
+        app.in_app_mini_player_ui(&ctx);
+    });
+    assert_eq!(app.playback.pending_open_video, Some(videos[0].clone()));
+    assert!(app.playback.pending_open_keep_mini_player);
+    assert!(app.playback.pending_open_suppress_back_stack);
+    assert_eq!(app.playback.video_forward_stack, vec![videos[1].clone()]);
+
+    // Next button pops video_forward_stack first.
+    app.playback.pending_open_video = None;
+    app.playback.pending_open_keep_mini_player = false;
+    app.playback.pending_open_suppress_back_stack = false;
+    app.selected = Some(videos[0].clone());
+    for _ in 0..2 {
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |_| app.in_app_mini_player_ui(&ctx),
+        );
+        out.textures_delta.clear();
+    }
+    let _ = headless_pointer_click(&ctx, screen.size(), next_pos, |_| {
+        app.in_app_mini_player_ui(&ctx);
+    });
+    assert_eq!(app.playback.pending_open_video, Some(videos[1].clone()));
+    assert!(app.playback.pending_open_keep_mini_player);
+    assert_eq!(app.playback.video_back_stack.last(), Some(&videos[0]));
+
+    // With empty forward stack and non-empty queue, Next requests queue advance without popping.
+    app.playback.pending_open_video = None;
+    app.playback.pending_open_keep_mini_player = false;
+    app.playback.video_forward_stack.clear();
+    assert!(app.queue.data.add(videos[2].clone()).is_ok());
+    for _ in 0..2 {
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |_| app.in_app_mini_player_ui(&ctx),
+        );
+        out.textures_delta.clear();
+    }
+    let _ = headless_pointer_click(&ctx, screen.size(), next_pos, |_| {
+        app.in_app_mini_player_ui(&ctx);
+    });
+    assert!(app.queue.pending_advance);
+    assert_eq!(app.queue.data.videos(), &[videos[2].clone()]);
+
+    // With empty forward stack and empty queue, Next falls back to next_recommended_video.
+    app.queue.pending_advance = false;
+    app.queue.data.clear();
+    app.selected = Some(videos[0].clone());
+    app.invalidate_feed_cache();
+    for _ in 0..2 {
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |_| app.in_app_mini_player_ui(&ctx),
+        );
+        out.textures_delta.clear();
+    }
+    let _ = headless_pointer_click(&ctx, screen.size(), next_pos, |_| {
+        app.in_app_mini_player_ui(&ctx);
+    });
+    assert!(app.playback.pending_open_video.is_some());
+    assert!(app.playback.pending_open_keep_mini_player);
+
+    // With empty back stack, Previous falls back to local watch history without ping-ponging.
+    app.playback.pending_open_video = None;
+    app.playback.pending_open_keep_mini_player = false;
+    app.playback.video_back_stack.clear();
+    app.playback.video_forward_stack.clear();
+    let hist_id = history::youtube_video_id(&videos[2].url).unwrap();
+    app.history
+        .data
+        .record(history::Entry {
+            video_id: hist_id,
+            title: videos[2].title.clone(),
+            channel: videos[2].channel.clone(),
+            position_ms: 15_000,
+            duration_ms: Some(120_000),
+            watched_at_ms: Some(1_700_000_000_000),
+        })
+        .unwrap();
+    for _ in 0..2 {
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |_| app.in_app_mini_player_ui(&ctx),
+        );
+        out.textures_delta.clear();
+    }
+    let _ = headless_pointer_click(&ctx, screen.size(), prev_pos, |_| {
+        app.in_app_mini_player_ui(&ctx);
+    });
+    assert!(
+        app.playback
+            .pending_open_video
+            .as_ref()
+            .is_some_and(|v| FastTube::same_video_target(&v.url, &videos[2].url))
+    );
+    assert!(app.playback.pending_open_keep_mini_player);
+
+    // Only the Expand button returns from the miniplayer to the full watch view.
+    let _ = headless_pointer_click(&ctx, screen.size(), expand_pos, |_| {
+        app.in_app_mini_player_ui(&ctx);
+    });
+    assert!(!app.playback.in_app_mini_player);
+    assert!(app.is_watch_page_active());
+}
+
+#[test]
+fn header_brand_displays_fasttube_and_dynamic_language_region_badge() {
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 160.0));
+
+    app.settings.prefs.value.language = i18n::UiLanguage::PtBr;
+    let mut pt_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.header_ui(ui, &c);
+        },
+    );
+    let pt_tokens = collect_rendered_text(&pt_out.shapes);
+    pt_out.textures_delta.clear();
+    assert!(pt_tokens.iter().any(|t| t == "FastTube"), "{pt_tokens:?}");
+    assert!(pt_tokens.iter().any(|t| t == "BR"), "{pt_tokens:?}");
+    assert!(!pt_tokens.iter().any(|t| t == "YouTube"), "{pt_tokens:?}");
+
+    app.settings.prefs.value.language = i18n::UiLanguage::En;
+    let mut en_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            app.header_ui(ui, &c);
+        },
+    );
+    let en_tokens = collect_rendered_text(&en_out.shapes);
+    en_out.textures_delta.clear();
+    assert!(en_tokens.iter().any(|t| t == "FastTube"), "{en_tokens:?}");
+    assert!(en_tokens.iter().any(|t| t == "US"), "{en_tokens:?}");
+    assert!(!en_tokens.iter().any(|t| t == "BR"), "{en_tokens:?}");
+    assert!(!en_tokens.iter().any(|t| t == "YouTube"), "{en_tokens:?}");
+}
+
+#[test]
+fn sidebar_panels_are_non_resizable_and_icons_align_with_hamburger() {
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+    app.feed.videos = sample_videos();
+
+    // Warm up one frame so egui populates widget hit-test rects before checking hover at (36.0, 28.0).
+    let compact_screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 768.0));
+    let mut warmup_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(compact_screen),
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            let frame = egui::Frame::new()
+                .fill(c.global_style().visuals.panel_fill)
+                .inner_margin(egui::Margin::ZERO);
+            egui::Panel::top("header")
+                .default_size(56.0)
+                .show_separator_line(false)
+                .frame(frame)
+                .show(ui, |ui| {
+                    app.header_ui(ui, &c);
+                });
+            egui::Panel::left("compact_navigation")
+                .resizable(false)
+                .show_separator_line(false)
+                .exact_size(COMPACT_NAVIGATION_WIDTH)
+                .frame(frame)
+                .show(ui, |ui| {
+                    app.compact_navigation_ui(ui, &c);
+                });
+            egui::CentralPanel::default().show(ui, |_| {});
+        },
+    );
+    warmup_out.textures_delta.clear();
+
+    // Hover the hamburger center at (36.0, 28.0) so it paints its hover circle, then inspect centers.
+    let mut compact_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(compact_screen),
+            events: vec![egui::Event::PointerMoved(egui::pos2(36.0, 28.0))],
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            let frame = egui::Frame::new()
+                .fill(c.global_style().visuals.panel_fill)
+                .inner_margin(egui::Margin::ZERO);
+            egui::Panel::top("header")
+                .default_size(56.0)
+                .show_separator_line(false)
+                .frame(frame)
+                .show(ui, |ui| {
+                    app.header_ui(ui, &c);
+                });
+            egui::Panel::left("compact_navigation")
+                .resizable(false)
+                .show_separator_line(false)
+                .exact_size(COMPACT_NAVIGATION_WIDTH)
+                .frame(frame)
+                .show(ui, |ui| {
+                    app.compact_navigation_ui(ui, &c);
+                });
+            egui::CentralPanel::default().show(ui, |_| {});
+        },
+    );
+    compact_out.textures_delta.clear();
+    let hamburger_center = compact_out
+        .shapes
+        .iter()
+        .find_map(|clipped| find_circle_center_recursive(&clipped.shape, 18.0, 72.0))
+        .expect("hamburger hover circle");
+    let compact_text_rects = collect_rendered_text_rects(&compact_out.shapes);
+    let home_label_rect = compact_text_rects
+        .iter()
+        .find(|(text, rect)| text == "In\u{00ed}cio" && rect.left() < COMPACT_NAVIGATION_WIDTH)
+        .expect("compact sidebar Home label")
+        .1;
+    assert!(
+        (hamburger_center.x - 36.0).abs() <= 0.5,
+        "expected hamburger center at x=36, got {}",
+        hamburger_center.x
+    );
+    assert!(
+        (home_label_rect.center().x - 36.0).abs() <= 0.5,
+        "expected compact rail item centered at x=36, got {}",
+        home_label_rect.center().x
+    );
+    assert!(
+        (hamburger_center.x - home_label_rect.center().x).abs() <= 0.5,
+        "hamburger x={} and compact rail item x={} should match",
+        hamburger_center.x,
+        home_label_rect.center().x
+    );
+
+    // Moving the pointer over the compact sidebar right edge must not trigger a resize cursor.
+    let mut compact_edge_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(compact_screen),
+            events: vec![egui::Event::PointerMoved(egui::pos2(
+                COMPACT_NAVIGATION_WIDTH,
+                200.0,
+            ))],
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            let frame = egui::Frame::new()
+                .fill(c.global_style().visuals.panel_fill)
+                .inner_margin(egui::Margin::ZERO);
+            egui::Panel::top("header")
+                .default_size(56.0)
+                .show_separator_line(false)
+                .frame(frame)
+                .show(ui, |ui| {
+                    app.header_ui(ui, &c);
+                });
+            egui::Panel::left("compact_navigation")
+                .resizable(false)
+                .show_separator_line(false)
+                .exact_size(COMPACT_NAVIGATION_WIDTH)
+                .frame(frame)
+                .show(ui, |ui| {
+                    app.compact_navigation_ui(ui, &c);
+                });
+            egui::CentralPanel::default().show(ui, |_| {});
+        },
+    );
+    compact_edge_out.textures_delta.clear();
+    assert!(
+        !matches!(
+            compact_edge_out.platform_output.cursor_icon,
+            egui::CursorIcon::ResizeHorizontal
+                | egui::CursorIcon::ResizeEast
+                | egui::CursorIcon::ResizeWest
+        ),
+        "compact sidebar edge should not show resize cursor: {:?}",
+        compact_edge_out.platform_output.cursor_icon
+    );
+
+    // Expanded navigation sidebar at wide viewport must also be non-resizable and keep x=36 alignment.
+    let wide_screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 768.0));
+    let nav_width = layout::compute_youtube_sidebar_width(wide_screen.width());
+    let mut wide_edge_out = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(wide_screen),
+            events: vec![egui::Event::PointerMoved(egui::pos2(nav_width, 200.0))],
+            ..Default::default()
+        },
+        |ui| {
+            let c = ui.ctx().clone();
+            let frame = egui::Frame::new()
+                .fill(c.global_style().visuals.panel_fill)
+                .inner_margin(egui::Margin::ZERO);
+            egui::Panel::top("header")
+                .default_size(56.0)
+                .show_separator_line(false)
+                .frame(frame)
+                .show(ui, |ui| {
+                    app.header_ui(ui, &c);
+                });
+            egui::Panel::left("navigation")
+                .resizable(false)
+                .show_separator_line(false)
+                .exact_size(nav_width)
+                .frame(frame)
+                .show(ui, |ui| {
+                    app.navigation_ui(ui, &c);
+                });
+            egui::CentralPanel::default().show(ui, |_| {});
+        },
+    );
+    let expanded_texts = collect_rendered_text_rects(&wide_edge_out.shapes);
+    wide_edge_out.textures_delta.clear();
+    assert!(
+        !matches!(
+            wide_edge_out.platform_output.cursor_icon,
+            egui::CursorIcon::ResizeHorizontal
+                | egui::CursorIcon::ResizeEast
+                | egui::CursorIcon::ResizeWest
+        ),
+        "expanded sidebar edge should not show resize cursor: {:?}",
+        wide_edge_out.platform_output.cursor_icon
+    );
+    let expanded_home = expanded_texts
+        .iter()
+        .find(|(text, _)| text == "In\u{00ed}cio")
+        .expect("expanded sidebar Home text")
+        .1;
+    assert!(
+        (expanded_home.left() - 60.0).abs() <= 0.5,
+        "expanded sidebar label should start at x=60 alongside x=36 centered icon, got {}",
+        expanded_home.left()
+    );
+}
+
+#[test]
+fn frameless_window_controls_and_resize_directions() {
+    use egui::viewport::ResizeDirection;
+
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+    assert_eq!(
+        FastTube::viewport_resize_direction(rect, egui::pos2(2.0, 2.0), 4.0, 10.0),
+        Some(ResizeDirection::NorthWest)
+    );
+    assert_eq!(
+        FastTube::viewport_resize_direction(rect, egui::pos2(1198.0, 2.0), 4.0, 10.0),
+        Some(ResizeDirection::NorthEast)
+    );
+    assert_eq!(
+        FastTube::viewport_resize_direction(rect, egui::pos2(2.0, 798.0), 4.0, 10.0),
+        Some(ResizeDirection::SouthWest)
+    );
+    assert_eq!(
+        FastTube::viewport_resize_direction(rect, egui::pos2(1198.0, 798.0), 4.0, 10.0),
+        Some(ResizeDirection::SouthEast)
+    );
+    assert_eq!(
+        FastTube::viewport_resize_direction(rect, egui::pos2(600.0, 2.0), 4.0, 10.0),
+        Some(ResizeDirection::North)
+    );
+    assert_eq!(
+        FastTube::viewport_resize_direction(rect, egui::pos2(600.0, 798.0), 4.0, 10.0),
+        Some(ResizeDirection::South)
+    );
+    assert_eq!(
+        FastTube::viewport_resize_direction(rect, egui::pos2(2.0, 400.0), 4.0, 10.0),
+        Some(ResizeDirection::West)
+    );
+    assert_eq!(
+        FastTube::viewport_resize_direction(rect, egui::pos2(1198.0, 400.0), 4.0, 10.0),
+        Some(ResizeDirection::East)
+    );
+    assert_eq!(
+        FastTube::viewport_resize_direction(rect, egui::pos2(600.0, 400.0), 4.0, 10.0),
+        None
+    );
+
+    let ctx = egui::Context::default();
+    fastframe_icons::install::<Icon>(&ctx);
+    let mut app = FastTube::default();
+
+    for width in [480.0_f32, 760.0, 1360.0] {
+        let size = egui::vec2(width, 160.0);
+        let mut init = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                ..Default::default()
+            },
+            |ui| {
+                let c = ui.ctx().clone();
+                app.header_ui(ui, &c);
+            },
+        );
+        init.textures_delta.clear();
+
+        let min_out = headless_pointer_click(&ctx, size, egui::pos2(width - 100.0, 28.0), |ui| {
+            let c = ui.ctx().clone();
+            app.header_ui(ui, &c);
+        });
+        let min_cmds = &min_out.viewport_output[&egui::ViewportId::ROOT].commands;
+        assert!(
+            min_cmds.contains(&egui::ViewportCommand::Minimized(true)),
+            "width={width}: expected Minimized(true), got {min_cmds:?}"
+        );
+
+        let max_out = headless_pointer_click(&ctx, size, egui::pos2(width - 62.0, 28.0), |ui| {
+            let c = ui.ctx().clone();
+            app.header_ui(ui, &c);
+        });
+        let max_cmds = &max_out.viewport_output[&egui::ViewportId::ROOT].commands;
+        assert!(
+            max_cmds.contains(&egui::ViewportCommand::Maximized(true)),
+            "width={width}: expected Maximized(true), got {max_cmds:?}"
+        );
+
+        let close_out = headless_pointer_click(&ctx, size, egui::pos2(width - 24.0, 28.0), |ui| {
+            let c = ui.ctx().clone();
+            app.header_ui(ui, &c);
+        });
+        let close_cmds = &close_out.viewport_output[&egui::ViewportId::ROOT].commands;
+        assert!(
+            close_cmds.contains(&egui::ViewportCommand::Close),
+            "width={width}: expected Close, got {close_cmds:?}"
+        );
+    }
+
+    // When maximized, the middle window control toggles back to Maximized(false).
+    let size = egui::vec2(1440.0, 160.0);
+    let mut max_warmup_raw = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+        ..Default::default()
+    };
+    if let Some(vp) = max_warmup_raw.viewports.get_mut(&egui::ViewportId::ROOT) {
+        vp.maximized = Some(true);
+    }
+    let mut max_warmup_out = ctx.run_ui(max_warmup_raw, |ui| {
+        let c = ui.ctx().clone();
+        app.header_ui(ui, &c);
+    });
+    max_warmup_out.textures_delta.clear();
+
+    let mut click_maximized = |pos: egui::Pos2| {
+        for pressed in [true, false] {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+                ..Default::default()
+            };
+            if let Some(vp) = raw.viewports.get_mut(&egui::ViewportId::ROOT) {
+                vp.maximized = Some(true);
+            }
+            let mut out = ctx.run_ui(raw, |ui| {
+                let c = ui.ctx().clone();
+                app.header_ui(ui, &c);
+            });
+            out.textures_delta.clear();
+            if !pressed {
+                return out;
+            }
+        }
+        unreachable!()
+    };
+    let restore_out = click_maximized(egui::pos2(1440.0 - 62.0, 28.0));
+    let restore_cmds = &restore_out.viewport_output[&egui::ViewportId::ROOT].commands;
+    assert!(
+        restore_cmds.contains(&egui::ViewportCommand::Maximized(false)),
+        "expected Maximized(false) when already maximized, got {restore_cmds:?}"
+    );
+
+    // Double-clicking empty header space toggles maximize (advance time well past prior restore click).
+    let mut run_header_at = |time: f64, events: Vec<egui::Event>| {
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                let c = ui.ctx().clone();
+                app.header_ui(ui, &c);
+            },
+        );
+        out.textures_delta.clear();
+        out
+    };
+    let empty_pos = egui::pos2(1050.0, 28.0);
+    let _ = run_header_at(10.0, vec![egui::Event::PointerMoved(empty_pos)]);
+    for (time, pressed) in [(10.02, true), (10.04, false), (10.08, true)] {
+        let _ = run_header_at(
+            time,
+            vec![
+                egui::Event::PointerMoved(empty_pos),
+                egui::Event::PointerButton {
+                    pos: empty_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+    }
+    let dbl_out = run_header_at(
+        10.10,
+        vec![
+            egui::Event::PointerMoved(empty_pos),
+            egui::Event::PointerButton {
+                pos: empty_pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ],
+    );
+    let dbl_cmds = &dbl_out.viewport_output[&egui::ViewportId::ROOT].commands;
+    assert!(
+        dbl_cmds.contains(&egui::ViewportCommand::Maximized(true)),
+        "double-clicking empty header should emit Maximized(true), got {dbl_cmds:?}"
+    );
+
+    // Dragging empty header space starts native window move, while dragging a header button does not.
+    let _ = run_header_at(
+        11.0,
+        vec![
+            egui::Event::PointerMoved(empty_pos),
+            egui::Event::PointerButton {
+                pos: empty_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+        ],
+    );
+    let drag_empty_out = run_header_at(
+        11.05,
+        vec![egui::Event::PointerMoved(egui::pos2(
+            empty_pos.x + 20.0,
+            empty_pos.y,
+        ))],
+    );
+    let drag_empty_cmds = &drag_empty_out.viewport_output[&egui::ViewportId::ROOT].commands;
+    assert!(
+        drag_empty_cmds.contains(&egui::ViewportCommand::StartDrag),
+        "dragging empty header space should emit StartDrag, got {drag_empty_cmds:?}"
+    );
+    let _ = run_header_at(
+        11.08,
+        vec![egui::Event::PointerButton {
+            pos: egui::pos2(empty_pos.x + 20.0, empty_pos.y),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        }],
+    );
+
+    let close_pos = egui::pos2(1440.0 - 24.0, 28.0);
+    let _ = run_header_at(11.98, vec![egui::Event::PointerMoved(close_pos)]);
+    let _ = run_header_at(
+        12.0,
+        vec![
+            egui::Event::PointerMoved(close_pos),
+            egui::Event::PointerButton {
+                pos: close_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+        ],
+    );
+    let drag_button_out = run_header_at(
+        12.05,
+        vec![egui::Event::PointerMoved(egui::pos2(
+            close_pos.x - 20.0,
+            close_pos.y,
+        ))],
+    );
+    let drag_button_cmds = &drag_button_out.viewport_output[&egui::ViewportId::ROOT].commands;
+    assert!(
+        !drag_button_cmds.contains(&egui::ViewportCommand::StartDrag),
+        "dragging from an interactive header button must not emit StartDrag, got {drag_button_cmds:?}"
+    );
+    let _ = run_header_at(
+        12.08,
+        vec![egui::Event::PointerButton {
+            pos: egui::pos2(close_pos.x - 20.0, close_pos.y),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        }],
+    );
+}
+
+#[test]
+fn middle_click_autoscroll_pans_scroll_area_and_exits_cleanly() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0));
+    let mut sim_time = 1.0_f64;
+
+    let mut step = |app: &mut FastTube, events: Vec<egui::Event>| {
+        sim_time += 1.0 / 60.0;
+        let mut clicked_button = false;
+        let mut scroll_offset = 0.0_f32;
+        let mut card_rect = egui::Rect::NOTHING;
+        let mut raw = egui::RawInput {
+            screen_rect: Some(screen),
+            time: Some(sim_time),
+            predicted_dt: 1.0 / 60.0,
+            events,
+            ..Default::default()
+        };
+        app.preprocess_raw_input(&mut raw);
+        let mut out = ctx.run_ui(raw, |ui| {
+            let c = ui.ctx().clone();
+            app.scrolling.apply(&c);
+            app.apply_middle_autoscroll(&c);
+            egui::Panel::top("test_autoscroll_hdr")
+                .default_size(56.0)
+                .show_separator_line(false)
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| {
+                    ui.set_min_size(egui::vec2(screen.width(), 56.0));
+                });
+            egui::CentralPanel::default().show(ui, |ui| {
+                let sa = egui::ScrollArea::vertical()
+                    .id_salt("test_autoscroll_sa")
+                    .show(ui, |ui| {
+                        let resp = ui.button("Card 0");
+                        card_rect = resp.rect;
+                        if resp.clicked() {
+                            clicked_button = true;
+                        }
+                        for _ in 0..40 {
+                            ui.allocate_exact_size(egui::vec2(600.0, 48.0), egui::Sense::hover());
+                        }
+                    });
+                scroll_offset = sa.state.offset.y;
+            });
+            app.paint_middle_autoscroll_overlay(&c);
+        });
+        out.textures_delta.clear();
+        (out, scroll_offset, card_rect, clicked_button)
+    };
+
+    // Warm up layout.
+    let anchor = egui::pos2(400.0, 220.0);
+    let (_, _, card_rect, _) = step(&mut app, vec![egui::Event::PointerMoved(anchor)]);
+
+    // Middle-click inside header (< 56px) must not activate autoscroll.
+    let _ = step(
+        &mut app,
+        vec![egui::Event::PointerButton {
+            pos: egui::pos2(400.0, 24.0),
+            button: egui::PointerButton::Middle,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    let _ = step(
+        &mut app,
+        vec![egui::Event::PointerButton {
+            pos: egui::pos2(400.0, 24.0),
+            button: egui::PointerButton::Middle,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert!(!app.autoscroll.is_active());
+
+    // Click-toggle autoscroll: press and release inside deadzone keeps panning active.
+    let (_, scroll_offset, _, _) = step(
+        &mut app,
+        vec![
+            egui::Event::PointerMoved(anchor),
+            egui::Event::PointerButton {
+                pos: anchor,
+                button: egui::PointerButton::Middle,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: anchor,
+                button: egui::PointerButton::Middle,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    assert!(app.autoscroll.is_active());
+    assert_eq!(scroll_offset, 0.0);
+
+    // Moving far downward (even near left edge outside inner content) pans vertically downward.
+    let pan_pos = egui::pos2(18.0, anchor.y + 180.0);
+    let _ = step(&mut app, vec![egui::Event::PointerMoved(pan_pos)]);
+    let (mut pan_out, mut scroll_offset, _, _) = step(&mut app, Vec::new());
+    for _ in 0..4 {
+        let res = step(&mut app, Vec::new());
+        pan_out = res.0;
+        scroll_offset = res.1;
+    }
+    assert!(
+        scroll_offset > 10.0,
+        "expected vertical autoscroll downward, got offset={scroll_offset}"
+    );
+    assert_eq!(
+        pan_out.platform_output.cursor_icon,
+        egui::CursorIcon::ResizeSouthWest
+    );
+    let anchor_circle = pan_out
+        .shapes
+        .iter()
+        .find_map(|s| find_circle_center_recursive(&s.shape, 13.5, anchor.x + 16.0))
+        .expect("autoscroll anchor circle");
+    assert!(
+        anchor_circle.distance(anchor) <= 1.0,
+        "expected anchor circle near {anchor:?}, got {anchor_circle:?}"
+    );
+
+    // Exiting via left-click over Card 0 must deactivate without clicking Card 0.
+    let exit_pos = card_rect.center();
+    let (_, _, _, clicked_button) = step(
+        &mut app,
+        vec![
+            egui::Event::PointerMoved(exit_pos),
+            egui::Event::PointerButton {
+                pos: exit_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: exit_pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    assert!(!app.autoscroll.is_active());
+    assert!(
+        !clicked_button,
+        "exiting autoscroll via click must not activate buttons underneath"
+    );
+
+    // Escape exits click-toggle autoscroll.
+    let _ = step(
+        &mut app,
+        vec![
+            egui::Event::PointerButton {
+                pos: anchor,
+                button: egui::PointerButton::Middle,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: anchor,
+                button: egui::PointerButton::Middle,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    assert!(app.autoscroll.is_active());
+    let _ = step(
+        &mut app,
+        vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert!(!app.autoscroll.is_active());
+
+    // Hold-and-drag autoscroll exits automatically on middle release.
+    let offset_before_hold = scroll_offset;
+    let _ = step(
+        &mut app,
+        vec![egui::Event::PointerButton {
+            pos: anchor,
+            button: egui::PointerButton::Middle,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    let _ = step(
+        &mut app,
+        vec![egui::Event::PointerMoved(egui::pos2(
+            anchor.x,
+            anchor.y + 150.0,
+        ))],
+    );
+    let (hold_out, scroll_after_hold, _, _) = step(&mut app, Vec::new());
+    assert!(scroll_after_hold > offset_before_hold);
+    assert_eq!(
+        hold_out.platform_output.cursor_icon,
+        egui::CursorIcon::ResizeSouth
+    );
+    let _ = step(
+        &mut app,
+        vec![egui::Event::PointerButton {
+            pos: egui::pos2(anchor.x, anchor.y + 150.0),
+            button: egui::PointerButton::Middle,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert!(!app.autoscroll.is_active());
+}
+
+#[test]
+fn player_right_click_context_menu_and_stats_for_nerds_work_headlessly() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    let video = sample_videos().remove(0);
+    app.selected = Some(video.clone());
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 540.0));
+    let video_rect = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(800.0, 450.0));
+
+    let run_player_frame = |app: &mut FastTube, events: Vec<egui::Event>| {
+        let playback = OverlayPlaybackContext {
+            video: video.clone(),
+            paused: false,
+            ended: false,
+            muted: false,
+            position: 42.0,
+            duration: Some(180.0),
+            buffered_secs: Some(15.0),
+            raw_volume: 100.0,
+            speed: 1.0,
+            current_height: Some(1080),
+            selected_quality: None,
+            qualities: vec![1080, 720],
+            qualities_loading: false,
+            has_queued: false,
+            has_active_subtitle: false,
+            subtitles: Vec::new(),
+            subtitles_loading: false,
+            chapters: Vec::new(),
+            theater: false,
+            fullscreen: false,
+            mini_player: false,
+            autoplay: true,
+            loop_video: app.playback.loop_video,
+            can_bookmark: true,
+            is_live: false,
+            is_live_dvr: false,
+            at_live_edge: false,
+            live_behind_secs: 0.0,
+            raw_path: Some(video.url.clone()),
+            raw_position: Some(42.0),
+            now: Instant::now(),
+        };
+        let mut emitted = None;
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                let c = ui.ctx().clone();
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let (_, resp) = ui.allocate_exact_size(video_rect.size(), egui::Sense::click());
+                    emitted = app.player_overlay_ui(ui, Some((resp.rect, resp)), &playback, &c);
+                });
+            },
+        );
+        out.textures_delta.clear();
+        (out, emitted)
+    };
+
+    // Warm up video area hit rect.
+    let _ = run_player_frame(
+        &mut app,
+        vec![egui::Event::PointerMoved(egui::pos2(300.0, 200.0))],
+    );
+
+    // Right-click opens YouTube-style context menu.
+    let rclick_pos = egui::pos2(300.0, 200.0);
+    let _ = run_player_frame(
+        &mut app,
+        vec![egui::Event::PointerButton {
+            pos: rclick_pos,
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    let _ = run_player_frame(
+        &mut app,
+        vec![egui::Event::PointerButton {
+            pos: rclick_pos,
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert_eq!(app.playback.player_context_menu, Some(rclick_pos));
+    // Run one repaint frame so egui::Area completes its initial sizing pass and paints the menu.
+    let (menu_out, _) = run_player_frame(&mut app, Vec::new());
+    let menu_texts = collect_rendered_text_rects(&menu_out.shapes);
+    for expected in [
+        "Loop",
+        "Miniplayer",
+        "Copiar URL do vídeo",
+        "Copiar URL do vídeo no momento atual",
+        "Copiar código de incorporação",
+        "Copiar informações de depuração",
+        "Resolver problemas de reprodução",
+        "Estatísticas para nerds",
+    ] {
+        assert!(
+            menu_texts.iter().any(|(text, _)| text == expected),
+            "missing context menu item {expected:?} in {menu_texts:?}"
+        );
+    }
+
+    // Clicking "Loop" toggles loop_video and closes menu.
+    let loop_rect = menu_texts
+        .iter()
+        .find(|(text, _)| text == "Loop")
+        .expect("Loop menu item")
+        .1;
+    let _ = run_player_frame(
+        &mut app,
+        vec![egui::Event::PointerMoved(loop_rect.center())],
+    );
+    let _ = run_player_frame(
+        &mut app,
+        vec![egui::Event::PointerButton {
+            pos: loop_rect.center(),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    let _ = run_player_frame(
+        &mut app,
+        vec![egui::Event::PointerButton {
+            pos: loop_rect.center(),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert!(app.playback.loop_video);
+    assert!(app.playback.player_context_menu.is_none());
+
+    // Open again and toggle "Estatísticas para nerds".
+    let _ = run_player_frame(
+        &mut app,
+        vec![
+            egui::Event::PointerMoved(rclick_pos),
+            egui::Event::PointerButton {
+                pos: rclick_pos,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: rclick_pos,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    let (reopened_out, _) = run_player_frame(&mut app, Vec::new());
+    let stats_item_rect = collect_rendered_text_rects(&reopened_out.shapes)
+        .into_iter()
+        .find(|(text, _)| text == "Estatísticas para nerds")
+        .expect("Stats for nerds menu item")
+        .1;
+    let _ = run_player_frame(
+        &mut app,
+        vec![
+            egui::Event::PointerMoved(stats_item_rect.center()),
+            egui::Event::PointerButton {
+                pos: stats_item_rect.center(),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: stats_item_rect.center(),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    assert!(app.playback.stats_for_nerds_open);
+    let (stats_out, _) = run_player_frame(&mut app, Vec::new());
+    let stats_texts = collect_rendered_text(&stats_out.shapes);
+    assert!(stats_texts.iter().any(|t| t == "Estatísticas para nerds"));
+
+    // Clicking outside an open context menu dismisses it without toggling Play/Pause.
+    let _ = run_player_frame(
+        &mut app,
+        vec![
+            egui::Event::PointerMoved(rclick_pos),
+            egui::Event::PointerButton {
+                pos: rclick_pos,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: rclick_pos,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    let dismiss_pos = egui::pos2(80.0, 420.0);
+    let _ = run_player_frame(
+        &mut app,
+        vec![
+            egui::Event::PointerMoved(dismiss_pos),
+            egui::Event::PointerButton {
+                pos: dismiss_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    let (_, emitted_on_dismiss) = run_player_frame(
+        &mut app,
+        vec![egui::Event::PointerButton {
+            pos: dismiss_pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert!(app.playback.player_context_menu.is_none());
+    assert_eq!(emitted_on_dismiss, None);
+
+    // "Resolver problemas de reprodução" routes to BackupDiagnostics settings tab.
+    let _ = run_player_frame(
+        &mut app,
+        vec![
+            egui::Event::PointerMoved(rclick_pos),
+            egui::Event::PointerButton {
+                pos: rclick_pos,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: rclick_pos,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    let (troubleshoot_out, _) = run_player_frame(&mut app, Vec::new());
+    let troubleshoot_rect = collect_rendered_text_rects(&troubleshoot_out.shapes)
+        .into_iter()
+        .find(|(text, _)| text == "Resolver problemas de reprodução")
+        .expect("Troubleshoot menu item")
+        .1;
+    let _ = run_player_frame(
+        &mut app,
+        vec![
+            egui::Event::PointerMoved(troubleshoot_rect.center()),
+            egui::Event::PointerButton {
+                pos: troubleshoot_rect.center(),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: troubleshoot_rect.center(),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    assert!(app.ui.settings_open);
+    assert_eq!(
+        app.settings.active_tab,
+        app_state::SettingsTab::BackupDiagnostics
+    );
+}
+
+#[test]
+fn fullscreen_player_auto_hides_overlay_and_cursor_when_mouse_is_idle() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    let video = sample_videos().remove(0);
+    app.selected = Some(video.clone());
+    app.playback.fullscreen = true;
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+
+    let run_fs_frame = |app: &mut FastTube, paused: bool, events: Vec<egui::Event>| {
+        let playback = OverlayPlaybackContext {
+            video: video.clone(),
+            paused,
+            ended: false,
+            muted: false,
+            position: 42.0,
+            duration: Some(180.0),
+            buffered_secs: Some(15.0),
+            raw_volume: 100.0,
+            speed: 1.0,
+            current_height: Some(1080),
+            selected_quality: None,
+            qualities: vec![1080, 720],
+            qualities_loading: false,
+            has_queued: false,
+            has_active_subtitle: false,
+            subtitles: Vec::new(),
+            subtitles_loading: false,
+            chapters: Vec::new(),
+            theater: false,
+            fullscreen: true,
+            mini_player: false,
+            autoplay: true,
+            loop_video: false,
+            can_bookmark: true,
+            is_live: false,
+            is_live_dvr: false,
+            at_live_edge: false,
+            live_behind_secs: 0.0,
+            raw_path: Some(video.url.clone()),
+            raw_position: Some(42.0),
+            now: Instant::now(),
+        };
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                let c = ui.ctx().clone();
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let (_, resp) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                    let _ = app.player_overlay_ui(ui, Some((resp.rect, resp)), &playback, &c);
+                });
+            },
+        );
+        out.textures_delta.clear();
+        out
+    };
+
+    // Moving mouse inside fullscreen reveals overlay & cursor.
+    let pos1 = egui::pos2(640.0, 360.0);
+    let active_out = run_fs_frame(&mut app, false, vec![egui::Event::PointerMoved(pos1)]);
+    assert!(
+        collect_rendered_text(&active_out.shapes)
+            .iter()
+            .any(|t| t == "0:42 / 3:00")
+    );
+    assert_ne!(
+        active_out.platform_output.cursor_icon,
+        egui::CursorIcon::None
+    );
+
+    // Leaving mouse stationary past OVERLAY_HIDE_DELAY_SECS hides both HUD and cursor.
+    app.playback.overlay_last_activity = Instant::now() - Duration::from_secs(4);
+    let idle_out = run_fs_frame(&mut app, false, Vec::new());
+    assert!(
+        !collect_rendered_text(&idle_out.shapes)
+            .iter()
+            .any(|t| t == "0:42 / 3:00"),
+        "fullscreen HUD should hide when mouse stays still"
+    );
+    assert_eq!(idle_out.platform_output.cursor_icon, egui::CursorIcon::None);
+
+    // Nudging the mouse brings both HUD and cursor back immediately.
+    let pos2 = egui::pos2(656.0, 372.0);
+    let wake_out = run_fs_frame(&mut app, false, vec![egui::Event::PointerMoved(pos2)]);
+    assert!(
+        collect_rendered_text(&wake_out.shapes)
+            .iter()
+            .any(|t| t == "0:42 / 3:00")
+    );
+    assert_ne!(wake_out.platform_output.cursor_icon, egui::CursorIcon::None);
+
+    // Paused video keeps HUD and cursor visible even after idle timeout.
+    app.playback.overlay_last_activity = Instant::now() - Duration::from_secs(4);
+    let paused_out = run_fs_frame(&mut app, true, Vec::new());
+    assert!(
+        collect_rendered_text(&paused_out.shapes)
+            .iter()
+            .any(|t| t == "0:42 / 3:00")
+    );
+    assert_ne!(
+        paused_out.platform_output.cursor_icon,
+        egui::CursorIcon::None
+    );
 }

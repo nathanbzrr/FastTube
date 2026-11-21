@@ -710,7 +710,7 @@ impl Player {
                     if event_result < 0 {
                         let detail = player.describe_error(event_result);
                         return Err(format!(
-                            "N??o foi poss??vel habilitar a correla????o de eventos do libmpv: {detail}"
+                            "Não foi possível habilitar a correlação de eventos do libmpv: {detail}"
                         ));
                     }
                 }
@@ -778,7 +778,7 @@ impl Player {
                         let detail = player.describe_error(event_result);
                         (api.terminate)(handle);
                         return Err(format!(
-                            "N??o foi poss??vel habilitar a correla????o de eventos do libmpv: {detail}"
+                            "Não foi possível habilitar a correlação de eventos do libmpv: {detail}"
                         ));
                     }
                 }

@@ -26,6 +26,13 @@ impl UiLanguage {
         }
     }
 
+    pub fn region_code(self) -> &'static str {
+        match self {
+            Self::PtBr => "BR",
+            Self::En => "US",
+        }
+    }
+
     #[inline]
     pub fn pick<'a>(self, pt: &'a str, en: &'a str) -> &'a str {
         match self {
@@ -43,6 +50,8 @@ mod tests {
     fn language_pick_and_round_trip() {
         assert_eq!(UiLanguage::PtBr.code(), "pt-BR");
         assert_eq!(UiLanguage::En.code(), "en");
+        assert_eq!(UiLanguage::PtBr.region_code(), "BR");
+        assert_eq!(UiLanguage::En.region_code(), "US");
         assert_eq!(UiLanguage::PtBr.pick("Início", "Home"), "Início");
         assert_eq!(UiLanguage::En.pick("Início", "Home"), "Home");
         let encoded = serde_json::to_string(&UiLanguage::En).unwrap();

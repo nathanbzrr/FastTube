@@ -185,6 +185,79 @@ impl Entry {
     pub fn is_near_end(&self) -> bool {
         is_near_end(self.position_ms, self.duration_ms)
     }
+
+    pub fn is_short(&self) -> bool {
+        if self.duration_ms.is_some_and(|d| d > 0 && d <= 62_000) {
+            return true;
+        }
+        let title_lower = self.title.to_lowercase();
+        let channel_lower = self.channel.to_lowercase();
+        title_lower.contains("#shorts")
+            || title_lower.contains("#short")
+            || title_lower.contains("shorts")
+            || channel_lower.contains("shorts")
+    }
+
+    pub fn is_podcast(&self) -> bool {
+        if self.duration_ms.is_some_and(|d| d >= 1_500_000) {
+            return true;
+        }
+        const KEYWORDS: &[&str] = &[
+            "podcast",
+            "cortes",
+            "entrevista",
+            "episódio",
+            "episodio",
+            "papo",
+            "conversa",
+            "achismos",
+            "flow",
+            "inteligência ltda",
+            "podpah",
+            "monark",
+            "debate",
+        ];
+        entry_matches_keywords(&self.title, &self.channel, KEYWORDS)
+    }
+
+    pub fn is_music(&self) -> bool {
+        const KEYWORDS: &[&str] = &[
+            "music",
+            "música",
+            "musica",
+            "song",
+            "clipe",
+            "official video",
+            "live from",
+            "vevo",
+            "acoustic",
+            "acústico",
+            "violão",
+            "guitar",
+            "cover",
+            "lyrics",
+            "letra",
+            "album",
+            "álbum",
+            "feat",
+            "ft.",
+            "banda",
+            "remix",
+            "soundtrack",
+        ];
+        if entry_matches_keywords(&self.title, &self.channel, &["asmr"]) {
+            return false;
+        }
+        entry_matches_keywords(&self.title, &self.channel, KEYWORDS)
+    }
+}
+
+fn entry_matches_keywords(title: &str, channel: &str, keywords_lower: &[&str]) -> bool {
+    let title_lower = title.to_lowercase();
+    let channel_lower = channel.to_lowercase();
+    keywords_lower
+        .iter()
+        .any(|kw| title_lower.contains(kw) || channel_lower.contains(kw))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -315,6 +388,10 @@ impl History {
 pub enum HistoryFilter {
     #[default]
     All,
+    Videos,
+    Shorts,
+    Podcasts,
+    Music,
     InProgress,
     Completed,
 }
@@ -336,8 +413,22 @@ impl DateGroup {
             Self::Older => "Mais antigos",
         }
     }
+
+    pub fn label_en(self) -> &'static str {
+        match self {
+            Self::Today => "Today",
+            Self::Yesterday => "Yesterday",
+            Self::ThisWeek => "This week",
+            Self::Older => "Older",
+        }
+    }
+
+    pub fn label(self, pt: bool) -> &'static str {
+        if pt { self.label_pt() } else { self.label_en() }
+    }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WatchStats {
     pub total_videos: usize,
@@ -356,6 +447,10 @@ pub fn filter_entries<'a>(
         .filter(|entry| {
             let matches_filter = match filter {
                 HistoryFilter::All => true,
+                HistoryFilter::Videos => !entry.is_short(),
+                HistoryFilter::Shorts => entry.is_short(),
+                HistoryFilter::Podcasts => entry.is_podcast(),
+                HistoryFilter::Music => entry.is_music(),
                 HistoryFilter::InProgress => !entry.is_near_end(),
                 HistoryFilter::Completed => entry.is_near_end(),
             };
@@ -394,6 +489,7 @@ pub fn date_group_at(
     }
 }
 
+#[cfg(test)]
 pub fn compute_watch_stats(entries: &[Entry]) -> WatchStats {
     use std::collections::HashMap;
 
@@ -913,6 +1009,65 @@ mod tests {
         );
         assert_eq!(
             filter_entries(&entries, "tokio", HistoryFilter::Completed).len(),
+            1
+        );
+
+        let category_entries = vec![
+            Entry {
+                video_id: "11111111111".into(),
+                title: "Rust Tutorial Completo".into(),
+                channel: "Dev Channel".into(),
+                position_ms: 120_000,
+                duration_ms: Some(600_000),
+                watched_at_ms: Some(now),
+            },
+            Entry {
+                video_id: "22222222222".into(),
+                title: "Clip rápido #shorts".into(),
+                channel: "Shorts Canal".into(),
+                position_ms: 15_000,
+                duration_ms: Some(30_000),
+                watched_at_ms: Some(now),
+            },
+            Entry {
+                video_id: "33333333333".into(),
+                title: "Podcast Tecnologia Episódio 10".into(),
+                channel: "Tech Talk".into(),
+                position_ms: 400_000,
+                duration_ms: Some(2_400_000),
+                watched_at_ms: Some(now),
+            },
+            Entry {
+                video_id: "44444444444".into(),
+                title: "Acoustic Guitar Cover".into(),
+                channel: "Music Studio".into(),
+                position_ms: 90_000,
+                duration_ms: Some(210_000),
+                watched_at_ms: Some(now),
+            },
+            Entry {
+                video_id: "55555555555".into(),
+                title: "Haircut asmr".into(),
+                channel: "klara".into(),
+                position_ms: 300_000,
+                duration_ms: Some(660_000),
+                watched_at_ms: Some(now),
+            },
+        ];
+        assert_eq!(
+            filter_entries(&category_entries, "", HistoryFilter::Videos).len(),
+            4
+        );
+        assert_eq!(
+            filter_entries(&category_entries, "", HistoryFilter::Shorts).len(),
+            1
+        );
+        assert_eq!(
+            filter_entries(&category_entries, "", HistoryFilter::Podcasts).len(),
+            1
+        );
+        assert_eq!(
+            filter_entries(&category_entries, "", HistoryFilter::Music).len(),
             1
         );
 

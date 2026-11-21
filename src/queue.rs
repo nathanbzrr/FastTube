@@ -111,7 +111,7 @@ impl Queue {
 
     /// Decodes a queue value embedded in a user-data backup.
     pub fn from_backup_value(value: Value, limit: usize) -> io::Result<Self> {
-        let invalid = || io::Error::new(io::ErrorKind::InvalidData, "fila invÃ¡lida");
+        let invalid = || io::Error::new(io::ErrorKind::InvalidData, "fila inválida");
         Self::from_value_with_validator(value, limit, invalid)
     }
 

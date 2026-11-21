@@ -56,7 +56,35 @@ impl DownloadFormat {
         }
     }
 
+    #[cfg(test)]
     pub fn yt_dlp_args(self) -> Vec<&'static str> {
+        self.yt_dlp_args_with_ffmpeg(true)
+    }
+
+    /// Selects format arguments for `yt-dlp`. When `ffmpeg` is absent, falls back
+    /// to pre-muxed / native container streams so downloads succeed without post-processing
+    /// or subscription requirements.
+    pub fn yt_dlp_args_with_ffmpeg(self, ffmpeg_available: bool) -> Vec<&'static str> {
+        if !ffmpeg_available {
+            return match self {
+                Self::VideoMp4Best => vec!["-f", "best[ext=mp4]/best"],
+                Self::Video1080p => vec![
+                    "-f",
+                    "best[height<=1080][ext=mp4]/best[height<=1080]/best[ext=mp4]/best",
+                ],
+                Self::Video720p => vec![
+                    "-f",
+                    "best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/best",
+                ],
+                Self::Video480p => vec![
+                    "-f",
+                    "best[height<=480][ext=mp4]/best[height<=480]/best[ext=mp4]/best",
+                ],
+                Self::AudioM4a => vec!["-f", "bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio"],
+                Self::AudioOpus => vec!["-f", "bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio"],
+                Self::AudioMp3 => vec!["-f", "bestaudio[ext=mp3]/bestaudio[ext=m4a]/bestaudio"],
+            };
+        }
         match self {
             Self::VideoMp4Best => vec![
                 "-f",
@@ -87,6 +115,32 @@ impl DownloadFormat {
             Self::AudioMp3 => vec!["-x", "--audio-format", "mp3"],
         }
     }
+}
+
+pub fn has_ffmpeg() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let probe = |bin: &Path| {
+            let mut cmd = std::process::Command::new(bin);
+            cmd.arg("-version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000);
+            }
+            cmd.status().map(|s| s.success()).unwrap_or(false)
+        };
+        if probe(Path::new("ffmpeg")) {
+            return true;
+        }
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("ffmpeg.exe")))
+            .is_some_and(|p| p.exists() && probe(&p))
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -246,6 +300,38 @@ impl DownloadManager {
         self.items.retain(|item| !item.status.is_terminal());
     }
 
+    pub fn retry(&mut self, id: u64, ctx: &eframe::egui::Context) -> bool {
+        let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
+            return false;
+        };
+        if !matches!(
+            item.status,
+            DownloadStatus::Failed(_) | DownloadStatus::Cancelled
+        ) {
+            return false;
+        }
+        item.status = DownloadStatus::Queued;
+        self.pending_output_paths.remove(&id);
+        self.pump_next(ctx);
+        true
+    }
+
+    pub fn remove(&mut self, id: u64) -> bool {
+        if self.active_id == Some(id) {
+            return false;
+        }
+        let Some(pos) = self
+            .items
+            .iter()
+            .position(|item| item.id == id && item.status.is_terminal())
+        else {
+            return false;
+        };
+        self.items.remove(pos);
+        self.pending_output_paths.remove(&id);
+        true
+    }
+
     pub fn poll(&mut self, ctx: &eframe::egui::Context) -> Option<(u64, Result<(), String>)> {
         let mut completed: Option<(u64, Result<(), String>)> = None;
         let mut disconnected = false;
@@ -363,6 +449,29 @@ impl DownloadManager {
     }
 }
 
+pub fn parse_yt_dlp_output_path_line(line: &str) -> Option<PathBuf> {
+    let trimmed = line.trim();
+    if let Some(dest) = trimmed.strip_prefix("[download] Destination: ") {
+        let p = dest.trim();
+        return (!p.is_empty()).then(|| PathBuf::from(p));
+    }
+    if let Some(dest) = trimmed.strip_prefix("[ExtractAudio] Destination: ") {
+        let p = dest.trim();
+        return (!p.is_empty()).then(|| PathBuf::from(p));
+    }
+    if let Some(rest) = trimmed.strip_prefix("[Merger] Merging formats into ") {
+        let unquoted = rest.trim().trim_matches('"').trim();
+        return (!unquoted.is_empty()).then(|| PathBuf::from(unquoted));
+    }
+    if let Some(rest) = trimmed.strip_prefix("[download] ")
+        && let Some(path_part) = rest.strip_suffix(" has already been downloaded")
+    {
+        let p = path_part.trim();
+        return (!p.is_empty()).then(|| PathBuf::from(p));
+    }
+    None
+}
+
 pub fn parse_yt_dlp_progress_line(line: &str) -> Option<(f32, Option<String>, Option<String>)> {
     let trimmed = line.trim();
     if !trimmed.starts_with("[download]") {
@@ -406,7 +515,7 @@ fn run_yt_dlp_download(
         .arg(output_dir)
         .arg("-o")
         .arg("%(title).120B [%(id)s].%(ext)s");
-    for arg in format.yt_dlp_args() {
+    for arg in format.yt_dlp_args_with_ffmpeg(has_ffmpeg()) {
         cmd.arg(arg);
     }
     cmd.arg("--").arg(url);
@@ -415,6 +524,15 @@ fn run_yt_dlp_download(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Não foi possível iniciar yt-dlp: {e}"))?;
+    let err_handle = child.stderr.take().map(|stderr| {
+        std::thread::spawn(move || {
+            BufReader::new(stderr)
+                .lines()
+                .map_while(Result::ok)
+                .filter(|line| !line.trim().is_empty())
+                .collect::<Vec<_>>()
+        })
+    });
     let stdout = child.stdout.take();
     if let Some(stdout) = stdout {
         let reader = BufReader::new(stdout);
@@ -432,22 +550,24 @@ fn run_yt_dlp_download(
                     eta,
                 });
                 wake.request_repaint();
-            } else if let Some(dest) = line.strip_prefix("[download] Destination: ") {
-                let _ = tx.send(WorkerEvent::OutputPath {
-                    id,
-                    path: PathBuf::from(dest.trim()),
-                });
+            } else if let Some(path) = parse_yt_dlp_output_path_line(&line) {
+                let _ = tx.send(WorkerEvent::OutputPath { id, path });
             }
         }
     }
     let status = child
         .wait()
         .map_err(|e| format!("Erro aguardando yt-dlp: {e}"))?;
+    let stderr_lines = err_handle
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
     if cancel.cancelled() {
         return Err("Download cancelado.".to_owned());
     }
     if status.success() {
         Ok(())
+    } else if let Some(last_err) = stderr_lines.last() {
+        Err(last_err.clone())
     } else {
         Err(format!("yt-dlp terminou com código {:?}.", status.code()))
     }
@@ -465,5 +585,83 @@ mod tests {
         assert_eq!(parsed.1.as_deref(), Some("3.42MiB/s"));
         assert_eq!(parsed.2.as_deref(), Some("00:21"));
         assert!(parse_yt_dlp_progress_line("[info] Downloading 1 format").is_none());
+    }
+
+    #[test]
+    fn parses_yt_dlp_output_paths_and_supports_retry_and_remove() {
+        assert_eq!(
+            parse_yt_dlp_output_path_line("[download] Destination: C:\\Temp\\video.f137.mp4"),
+            Some(PathBuf::from("C:\\Temp\\video.f137.mp4"))
+        );
+        assert_eq!(
+            parse_yt_dlp_output_path_line(
+                "[Merger] Merging formats into \"C:\\Temp\\video [abc].mp4\""
+            ),
+            Some(PathBuf::from("C:\\Temp\\video [abc].mp4"))
+        );
+        assert_eq!(
+            parse_yt_dlp_output_path_line("[ExtractAudio] Destination: C:\\Temp\\audio [abc].mp3"),
+            Some(PathBuf::from("C:\\Temp\\audio [abc].mp3"))
+        );
+        assert_eq!(
+            parse_yt_dlp_output_path_line(
+                "[download] C:\\Temp\\already.mp4 has already been downloaded"
+            ),
+            Some(PathBuf::from("C:\\Temp\\already.mp4"))
+        );
+
+        let ctx = eframe::egui::Context::default();
+        let video = Video {
+            title: "Test".into(),
+            channel: "Chan".into(),
+            url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+            thumbnail: String::new(),
+            duration: "1:00".into(),
+        };
+        let mut manager = DownloadManager {
+            items: vec![
+                DownloadItem {
+                    id: 1,
+                    video: video.clone(),
+                    format: DownloadFormat::Video720p,
+                    output_dir: PathBuf::from("C:\\Temp"),
+                    status: DownloadStatus::Failed("erro".into()),
+                },
+                DownloadItem {
+                    id: 2,
+                    video,
+                    format: DownloadFormat::AudioMp3,
+                    output_dir: PathBuf::from("C:\\Temp"),
+                    status: DownloadStatus::Completed {
+                        output_path: Some(PathBuf::from("C:\\Temp\\out.mp3")),
+                    },
+                },
+            ],
+            next_id: 2,
+            ..Default::default()
+        };
+        assert!(!manager.retry(2, &ctx));
+        assert!(manager.remove(2));
+        assert_eq!(manager.items.len(), 1);
+        assert!(manager.retry(1, &ctx));
+        assert!(!manager.remove(1));
+        manager.cancel_all();
+        assert!(manager.remove(1));
+        assert!(manager.items.is_empty());
+    }
+
+    #[test]
+    fn fallback_download_args_avoid_ffmpeg_postprocessing() {
+        let video_args = DownloadFormat::Video1080p.yt_dlp_args_with_ffmpeg(false);
+        assert!(!video_args.contains(&"--merge-output-format"));
+        assert!(
+            video_args
+                .iter()
+                .any(|arg| arg.contains("best[height<=1080]"))
+        );
+
+        let audio_args = DownloadFormat::AudioMp3.yt_dlp_args_with_ffmpeg(false);
+        assert!(!audio_args.contains(&"-x"));
+        assert!(audio_args.iter().any(|arg| arg.contains("bestaudio")));
     }
 }

@@ -44,14 +44,16 @@ impl CommunityExtrasCache {
     }
 
     pub fn insert(&mut self, video_id: String, outcome: CommunityExtrasOutcome) {
-        if !self.entries.contains_key(&video_id) {
-            if self.order.len() >= CACHE_CAPACITY
-                && let Some(oldest) = self.order.pop_front()
-            {
-                self.entries.remove(&oldest);
+        if self.entries.contains_key(&video_id) {
+            if let Some(pos) = self.order.iter().position(|id| id == &video_id) {
+                self.order.remove(pos);
             }
-            self.order.push_back(video_id.clone());
+        } else if self.order.len() >= CACHE_CAPACITY
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.entries.remove(&oldest);
         }
+        self.order.push_back(video_id.clone());
         self.entries.insert(video_id, outcome);
     }
 
@@ -121,7 +123,13 @@ pub fn parse_dearrow_response(video_id: &str, bytes: &[u8]) -> Option<DeArrowBra
         .into_iter()
         .filter(|t| !t.title.trim().is_empty() && (t.locked || t.votes >= 0))
         .max_by_key(|t| (t.locked, t.votes))
-        .map(|t| t.title.replace('>', "").trim().to_owned())
+        .map(|t| {
+            t.title
+                .replace('>', "")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
         .filter(|t| !t.is_empty());
     let thumbnail_time = raw
         .thumbnails
@@ -137,6 +145,48 @@ pub fn parse_dearrow_response(video_id: &str, bytes: &[u8]) -> Option<DeArrowBra
         clean_title,
         thumbnail_time,
     })
+}
+
+fn fetch_limited_body(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    cancel: &Cancellation,
+) -> Option<Vec<u8>> {
+    if cancel.cancelled() {
+        return None;
+    }
+    let resp = client.get(url).send().ok()?;
+    if cancel.cancelled() || !resp.status().is_success() {
+        return None;
+    }
+    let mut body = Vec::new();
+    resp.take((MAX_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut body)
+        .ok()?;
+    if cancel.cancelled() || body.len() > MAX_RESPONSE_BYTES {
+        return None;
+    }
+    Some(body)
+}
+
+fn fetch_ryd(
+    client: &reqwest::blocking::Client,
+    video_id: &str,
+    cancel: &Cancellation,
+) -> Option<RydStats> {
+    let url = format!("https://returnyoutubedislikeapi.com/votes?videoId={video_id}");
+    let body = fetch_limited_body(client, &url, cancel)?;
+    parse_ryd_response(video_id, &body)
+}
+
+fn fetch_dearrow(
+    client: &reqwest::blocking::Client,
+    video_id: &str,
+    cancel: &Cancellation,
+) -> Option<DeArrowBranding> {
+    let url = format!("https://sponsor.ajay.app/api/branding?videoID={video_id}");
+    let body = fetch_limited_body(client, &url, cancel)?;
+    parse_dearrow_response(video_id, &body)
 }
 
 pub fn fetch_community_extras(
@@ -161,38 +211,19 @@ pub fn fetch_community_extras(
         return outcome;
     };
 
-    if ryd_enabled && !cancel.cancelled() {
-        let url = format!("https://returnyoutubedislikeapi.com/votes?videoId={video_id}");
-        if let Ok(resp) = client.get(&url).send()
-            && resp.status().is_success()
-        {
-            let mut body = Vec::new();
-            if resp
-                .take((MAX_RESPONSE_BYTES + 1) as u64)
-                .read_to_end(&mut body)
-                .is_ok()
-                && body.len() <= MAX_RESPONSE_BYTES
-            {
-                outcome.ryd = parse_ryd_response(video_id, &body);
-            }
+    match (ryd_enabled, dearrow_enabled) {
+        (true, true) => {
+            let (ryd, dearrow) = std::thread::scope(|s| {
+                let ryd_handle = s.spawn(|| fetch_ryd(&client, video_id, cancel));
+                let dearrow = fetch_dearrow(&client, video_id, cancel);
+                (ryd_handle.join().ok().flatten(), dearrow)
+            });
+            outcome.ryd = ryd;
+            outcome.dearrow = dearrow;
         }
-    }
-
-    if dearrow_enabled && !cancel.cancelled() {
-        let url = format!("https://sponsor.ajay.app/api/branding?videoID={video_id}");
-        if let Ok(resp) = client.get(&url).send()
-            && resp.status().is_success()
-        {
-            let mut body = Vec::new();
-            if resp
-                .take((MAX_RESPONSE_BYTES + 1) as u64)
-                .read_to_end(&mut body)
-                .is_ok()
-                && body.len() <= MAX_RESPONSE_BYTES
-            {
-                outcome.dearrow = parse_dearrow_response(video_id, &body);
-            }
-        }
+        (true, false) => outcome.ryd = fetch_ryd(&client, video_id, cancel),
+        (false, true) => outcome.dearrow = fetch_dearrow(&client, video_id, cancel),
+        (false, false) => {}
     }
 
     outcome
@@ -226,5 +257,65 @@ mod tests {
         let out = fetch_community_extras("dQw4w9WgXcQ", false, false, &cancel);
         assert!(out.ryd.is_none() && out.dearrow.is_none());
         assert!(!valid_video_id("invalid"));
+    }
+
+    #[test]
+    fn cache_insert_refreshes_lru_order_on_update() {
+        let mut cache = CommunityExtrasCache::default();
+        for i in 1..=CACHE_CAPACITY {
+            let id = format!("id_{i:08}");
+            cache.insert(
+                id.clone(),
+                CommunityExtrasOutcome {
+                    video_id: id,
+                    ..Default::default()
+                },
+            );
+        }
+        assert!(cache.get("id_00000001").is_some());
+        assert!(cache.get("id_00000002").is_some());
+
+        cache.insert(
+            "id_00000001".to_owned(),
+            CommunityExtrasOutcome {
+                video_id: "id_00000001".to_owned(),
+                ryd: Some(RydStats {
+                    video_id: "id_00000001".to_owned(),
+                    likes: 10,
+                    dislikes: 1,
+                    rating: 4.5,
+                }),
+                dearrow: None,
+            },
+        );
+
+        cache.insert(
+            "id_new".to_owned(),
+            CommunityExtrasOutcome {
+                video_id: "id_new".to_owned(),
+                ..Default::default()
+            },
+        );
+
+        assert!(cache.get("id_00000001").is_some());
+        assert_eq!(
+            cache
+                .get("id_00000001")
+                .and_then(|o| o.ryd.as_ref())
+                .map(|r| r.likes),
+            Some(10)
+        );
+        assert!(cache.get("id_00000002").is_none());
+        assert!(cache.get("id_new").is_some());
+    }
+
+    #[test]
+    fn dearrow_normalizes_extra_whitespace_after_marker_removal() {
+        let parsed = parse_dearrow_response(
+            "dQw4w9WgXcQ",
+            br#"{"titles":[{"title":">  Clean   Title >Here","votes":2,"locked":false}]}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.clean_title.as_deref(), Some("Clean Title Here"));
     }
 }

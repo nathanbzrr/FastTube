@@ -35,6 +35,12 @@ cargo test --locked --target-dir target\validation
 - CI runs on Windows MSVC (`stable`). For GNU builds (`+stable-x86_64-pc-windows-gnu`), configure `CC_x86_64_pc_windows_gnu`, `CXX_x86_64_pc_windows_gnu`, `AR_x86_64_pc_windows_gnu`, and `CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER` if MinGW is not already in `PATH`.
 - PowerShell tooling tests: `.\scripts\test-portable-package.ps1`, `.\scripts\test-measure-process.ps1`, `.\scripts\test-measure-network.ps1`.
 
+## Turn & Task Completion Discipline
+
+- **Never end a turn while tasks are still running**: Do not finish a turn or reply with an interim "waiting for background task" message while any non-daemon `run_command` task, build, test, or subagent/delegate work is still in progress.
+- **Drain background tasks within the same turn**: When a `run_command` call exceeds `WaitMsBeforeAsync` (10,000 ms) and backgrounds into a `taskId`, never choose the "update the user and end the turn" branch. Proceed with other independent work or check `manage_task` (`Action: "status"`) until the task reaches `DONE`, resolve any failures, and only end the turn after all tasks and validations have completely finished.
+- **Prefer bounded synchronous steps**: Always pass `WaitMsBeforeAsync: 10000` for normal build/test/lint commands so incremental runs complete synchronously without leaving orphaned background tasks.
+
 ## Code & Documentation Style
 
 - Write all code comments, commit messages, filenames, and documentation in **English** (user-facing UI strings follow the app's UI language).

@@ -17,7 +17,7 @@ The root application struct `FastTube` in [`src/main.rs`](../src/main.rs) acts a
 | `history` | `HistoryState` | Local watch history and throttled save checkpointing |
 | `queue` | `QueueState` | Persisted FIFO playback queue, repeat mode (`Off`/`All`/`One`), remote playlist loader, load confirmation state |
 | `library` | `LibraryState` | OAuth-independent shelves, named collections, and timestamp bookmarks |
-| `backup` | `BackupState` | JSON v1 backup export, import preview, merge/replace execution |
+| `backup` | `BackupState` | JSON v1 backup export (including `followed-channels.json`), import preview, merge/replace execution |
 | `ui` | `NavigationUiState` | Active browse section (including `Downloads` and `Insights`), sidebar drawer state, command palette, shortcut modal, clipboard target |
 | `watch` | `WatchState` | Watch-page sidebar tab, transcript UI state, live comments pagination/posting, SponsorBlock runtime, opt-in community extras cache |
 | `followed_channels` | `FollowedChannelsState` | OAuth-free local followed channels (`followed-channels.json`) and public YouTube RSS feed poller |
@@ -35,6 +35,7 @@ The root application struct `FastTube` in [`src/main.rs`](../src/main.rs) acts a
 | [`src/library_ui.rs`](../src/library_ui.rs) | Queue/history/library views, Offline Downloads view, and Local Watch Insights panel |
 | [`src/watch_ui.rs`](../src/watch_ui.rs) | Watch player stage, video/audio EQ, aspect/zoom, storyboard scrub, comments, live chat, and transcript |
 | [`src/ui_icons.rs`](../src/ui_icons.rs) | Custom vector icons, sidebar items, card action structs, and header badges |
+| [`src/skeleton.rs`](../src/skeleton.rs) | Shimmer skeleton placeholders for feeds, search, channel pages, watch sidebar, comments, transcript, and live chat |
 | [`src/command_palette.rs`](../src/command_palette.rs) | `Ctrl+K` command palette, direct YouTube URL/playlist/channel parser, quick jump actions |
 | [`src/comment_actions.rs`](../src/comment_actions.rs) | Watch-page comment composer, replies, and like/delete actions |
 | [`src/community_apis.rs`](../src/community_apis.rs) | Opt-in Return YouTube Dislike and DeArrow API clients (strictly idle unless enabled) |

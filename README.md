@@ -1,5 +1,9 @@
 # FastTube
 
+[![Windows CI](https://github.com/nathanbzrr/FastTube/actions/workflows/ci.yml/badge.svg)](https://github.com/nathanbzrr/FastTube/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/nathanbzrr/FastTube)](https://github.com/nathanbzrr/FastTube/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 Native Windows desktop YouTube client built with `eframe`/`egui`, embedded `libmpv` playback, `yt-dlp` stream/metadata resolution, and local-first discovery.
 
 ## Requirements
@@ -17,7 +21,7 @@ Native Windows desktop YouTube client built with `eframe`/`egui`, embedded `libm
 4. Launch FastTube, click **Sign in**, and complete authorization in the browser.
 5. If access expires, sign in again; tokens and cookies are never included in backups.
 
-See [`scripts/build-portable.ps1`](scripts/build-portable.ps1) and [`docs/benchmarking.md`](docs/benchmarking.md) to assemble a portable distribution. The packager does not download binaries or bundle credentials; comply with the licenses of all redistributed binaries.
+To build from source, use the validation commands in [Development & Validation](#development--validation). Releases provide a Windows x64 installer and a portable ZIP. The packager does not bundle credentials; runtime binaries remain subject to their upstream licenses, summarized in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 ## Features
 
@@ -93,3 +97,16 @@ If building with the GNU toolchain (`+stable-x86_64-pc-windows-gnu`), ensure Min
 - [`docs/architecture.md`](docs/architecture.md) — Domain state layout, module map, and system invariants.
 - [`docs/graphify.md`](docs/graphify.md) — Generating and querying the local AST code graph.
 - [`docs/benchmarking.md`](docs/benchmarking.md) — Portable packaging and process/network sampling scripts.
+
+## Contributing
+
+Contributions are welcome. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a pull request, and follow the project's validation and privacy requirements.
+
+## License
+
+FastTube is available under either of the following licenses, at your option:
+
+- Apache License, Version 2.0 ([`LICENSE-APACHE`](LICENSE-APACHE))
+- MIT License ([`LICENSE-MIT`](LICENSE-MIT))
+
+Third-party components retain their own licenses. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

@@ -34,6 +34,13 @@ pub struct FollowedChannels {
     pub channels: Vec<FollowedChannel>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FollowedMergeSummary {
+    pub added: usize,
+    pub conflicts: usize,
+    pub skipped_for_limit: usize,
+}
+
 impl FollowedChannels {
     pub fn len(&self) -> usize {
         self.channels.len()
@@ -150,6 +157,45 @@ impl FollowedChannels {
             }
         }
         Ok(())
+    }
+
+    /// Adds imported channels that are absent locally while preserving local metadata on conflicts.
+    pub fn merged(&self, imported: &Self) -> (Self, FollowedMergeSummary) {
+        let mut merged = self.clone();
+        let mut summary = FollowedMergeSummary::default();
+        for ch in &imported.channels {
+            let id = ch.channel_id.trim();
+            if id.is_empty() || id.len() > 128 {
+                continue;
+            }
+            let existing_pos = merged.channels.iter().position(|cur| {
+                cur.channel_id.eq_ignore_ascii_case(id)
+                    || ch.handle.as_deref().is_some_and(|h| {
+                        cur.handle
+                            .as_deref()
+                            .is_some_and(|existing_h| existing_h.eq_ignore_ascii_case(h))
+                    })
+            });
+            if let Some(pos) = existing_pos {
+                summary.conflicts += 1;
+                let existing = &mut merged.channels[pos];
+                if existing.title.trim().is_empty() && !ch.title.trim().is_empty() {
+                    existing.title = ch.title.clone();
+                }
+                if existing.avatar_url.is_none() {
+                    existing.avatar_url = ch.avatar_url.clone();
+                }
+                if existing.handle.is_none() {
+                    existing.handle = ch.handle.clone();
+                }
+            } else if merged.channels.len() < MAX_FOLLOWED_CHANNELS {
+                merged.channels.push(ch.clone());
+                summary.added += 1;
+            } else {
+                summary.skipped_for_limit += 1;
+            }
+        }
+        (merged, summary)
     }
 }
 
@@ -415,5 +461,32 @@ mod tests {
         assert!(load(&file).is_err());
         assert_eq!(fs::read(&file).unwrap(), b"{corrupt");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_keeps_local_channels_and_adds_missing_within_limit() {
+        let mut local = FollowedChannels::default();
+        let mut ch1 = sample_channel("UC0000000000000001", "Alpha");
+        ch1.avatar_url = None;
+        local.follow(ch1).unwrap();
+
+        let mut imported = FollowedChannels::default();
+        let mut imp1 = sample_channel("UC0000000000000001", "Alpha Remote");
+        imp1.avatar_url = Some("https://example.test/avatar.png".into());
+        let imp2 = sample_channel("UC0000000000000002", "Beta");
+        imported.follow(imp1).unwrap();
+        imported.follow(imp2).unwrap();
+
+        let (merged, summary) = local.merged(&imported);
+        assert_eq!(summary.added, 1);
+        assert_eq!(summary.conflicts, 1);
+        assert_eq!(summary.skipped_for_limit, 0);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged.channels[0].title, "Alpha");
+        assert_eq!(
+            merged.channels[0].avatar_url.as_deref(),
+            Some("https://example.test/avatar.png")
+        );
+        assert_eq!(merged.channels[1].channel_id, "UC0000000000000002");
     }
 }

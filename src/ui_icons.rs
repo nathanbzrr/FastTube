@@ -1,6 +1,7 @@
 use crate::*;
 use eframe::egui::{self, Color32, RichText};
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum YtSidebarIcon {
     Home,
@@ -21,6 +22,10 @@ pub(crate) enum YtSidebarIcon {
     Gaming,
     Podcasts,
     Trending,
+    Movies,
+    Playables,
+    YouTubeLabs,
+    ReportHistory,
     Mixes,
     NewToYou,
     Settings,
@@ -625,6 +630,139 @@ pub(crate) fn paint_yt_icon(
                 }
             }
         }
+        YtSidebarIcon::Movies => {
+            let body = egui::Rect::from_center_size(
+                egui::pos2(center.x, center.y + 1.2),
+                egui::vec2(14.5, 10.5),
+            );
+            if filled {
+                painter.rect_filled(body, 2.0, color);
+                let top = egui::Rect::from_min_max(
+                    egui::pos2(body.left(), center.y - 6.6),
+                    egui::pos2(body.right(), center.y - 3.8),
+                );
+                painter.rect_filled(top, 1.2, color);
+            } else {
+                painter.rect_stroke(body, 2.0, stroke, egui::StrokeKind::Inside);
+                painter.line_segment(
+                    [
+                        egui::pos2(body.left(), body.top() - 2.6),
+                        egui::pos2(body.right(), body.top() - 2.6),
+                    ],
+                    thin,
+                );
+                for x_off in [-4.0_f32, 0.5, 5.0] {
+                    painter.line_segment(
+                        [
+                            egui::pos2(center.x + x_off, body.top() - 2.6),
+                            egui::pos2(center.x + x_off - 2.2, body.top()),
+                        ],
+                        thin,
+                    );
+                }
+            }
+        }
+        YtSidebarIcon::Playables => {
+            // Geometric tile grid inspired by YouTube Playables ("Sala de Jogos").
+            let offsets = [
+                (-4.6_f32, -4.6_f32),
+                (0.0, -4.6),
+                (4.6, -4.6),
+                (-4.6, 0.0),
+                (0.0, 0.0),
+                (-4.6, 4.6),
+                (0.0, 4.6),
+                (4.6, 4.6),
+            ];
+            for (dx, dy) in offsets {
+                let tile = egui::Rect::from_center_size(
+                    egui::pos2(center.x + dx, center.y + dy),
+                    egui::vec2(3.2, 3.2),
+                );
+                if filled {
+                    painter.rect_filled(tile, 0.6, color);
+                } else {
+                    painter.rect_stroke(
+                        tile,
+                        0.6,
+                        egui::Stroke::new(1.25, color),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+            }
+            let tilted = egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(center.x + 4.8, center.y - 2.4),
+                    egui::pos2(center.x + 7.2, center.y),
+                    egui::pos2(center.x + 4.8, center.y + 2.4),
+                    egui::pos2(center.x + 2.4, center.y),
+                ],
+                if filled { color } else { Color32::TRANSPARENT },
+                if filled {
+                    egui::Stroke::NONE
+                } else {
+                    egui::Stroke::new(1.25, color)
+                },
+            );
+            painter.add(tilted);
+        }
+        YtSidebarIcon::YouTubeLabs => {
+            // Erlenmeyer flask with bubbling accent.
+            let flask = vec![
+                egui::pos2(center.x - 2.2, center.y - 6.8),
+                egui::pos2(center.x + 2.2, center.y - 6.8),
+                egui::pos2(center.x + 2.2, center.y - 2.8),
+                egui::pos2(center.x + 6.8, center.y + 5.0),
+                egui::pos2(center.x + 5.6, center.y + 6.8),
+                egui::pos2(center.x - 5.6, center.y + 6.8),
+                egui::pos2(center.x - 6.8, center.y + 5.0),
+                egui::pos2(center.x - 2.2, center.y - 2.8),
+            ];
+            painter.line_segment(
+                [
+                    egui::pos2(center.x - 3.4, center.y - 6.8),
+                    egui::pos2(center.x + 3.4, center.y - 6.8),
+                ],
+                stroke,
+            );
+            if filled {
+                painter.add(egui::Shape::convex_polygon(
+                    flask,
+                    color,
+                    egui::Stroke::NONE,
+                ));
+            } else {
+                painter.add(egui::Shape::closed_line(flask, stroke));
+                painter.line_segment(
+                    [
+                        egui::pos2(center.x - 4.0, center.y + 2.4),
+                        egui::pos2(center.x + 4.0, center.y + 2.4),
+                    ],
+                    thin,
+                );
+            }
+        }
+        YtSidebarIcon::ReportHistory => {
+            // Flag icon for report history.
+            painter.line_segment(
+                [
+                    egui::pos2(center.x - 4.8, center.y - 6.8),
+                    egui::pos2(center.x - 4.8, center.y + 7.2),
+                ],
+                stroke,
+            );
+            let flag = vec![
+                egui::pos2(center.x - 4.8, center.y - 6.4),
+                egui::pos2(center.x + 5.8, center.y - 6.4),
+                egui::pos2(center.x + 5.8, center.y + 1.2),
+                egui::pos2(center.x - 4.8, center.y + 1.2),
+            ];
+            if filled {
+                painter.add(egui::Shape::convex_polygon(flag, color, egui::Stroke::NONE));
+            } else {
+                painter.add(egui::Shape::closed_line(flag, stroke));
+            }
+        }
     }
 }
 
@@ -833,6 +971,50 @@ pub(crate) fn paint_short_novo_badge(ui: &egui::Ui, rect: egui::Rect) {
     );
 }
 
+pub(crate) fn paint_queued_badge(ui: &egui::Ui, rect: egui::Rect, offset_for_novo: bool) {
+    let x = rect.left() + if offset_for_novo { 50.0 } else { 8.0 };
+    let badge_rect =
+        egui::Rect::from_min_size(egui::pos2(x, rect.top() + 8.0), egui::vec2(48.0, 20.0));
+    if badge_rect.right() > rect.right() - 8.0 {
+        return;
+    }
+    ui.painter().rect_filled(
+        badge_rect,
+        4.0,
+        Color32::from_rgba_unmultiplied(28, 110, 210, 226),
+    );
+    ui.painter().text(
+        badge_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "Na fila",
+        egui::FontId::proportional(11.0),
+        Color32::WHITE,
+    );
+}
+
+pub(crate) fn paint_card_hover_highlight(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    corner_radius: f32,
+    hover_t: f32,
+    palette: &ThemePalette,
+) {
+    if hover_t <= 0.01 {
+        return;
+    }
+    ui.painter().rect_stroke(
+        rect.expand(1.5),
+        corner_radius + 1.5,
+        egui::Stroke::new(
+            1.4,
+            palette
+                .info_accent_fg
+                .gamma_multiply(0.45 * hover_t.clamp(0.0, 1.0)),
+        ),
+        egui::StrokeKind::Outside,
+    );
+}
+
 pub(crate) fn paint_mix_top_tabs(ui: &egui::Ui, rect: egui::Rect, dark_theme: bool) {
     let outer_color = if dark_theme {
         Color32::from_rgb(56, 56, 58)
@@ -874,22 +1056,108 @@ pub(crate) fn paint_mix_top_tabs(ui: &egui::Ui, rect: egui::Rect, dark_theme: bo
     );
 }
 
-pub(crate) fn paint_youtube_logo_badge(ui: &mut egui::Ui) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(30.0, 21.0), egui::Sense::click());
-    ui.painter()
-        .rect_filled(rect, 6.0, Color32::from_rgb(255, 0, 51));
+pub(crate) fn paint_youtube_logo_badge_at(painter: &egui::Painter, rect: egui::Rect) {
+    painter.rect_filled(rect, 6.0, Color32::from_rgb(255, 0, 51));
     let center = rect.center();
     let triangle = vec![
         egui::pos2(center.x - 3.6, center.y - 4.6),
         egui::pos2(center.x - 3.6, center.y + 4.6),
         egui::pos2(center.x + 5.0, center.y),
     ];
-    ui.painter().add(egui::Shape::convex_polygon(
+    painter.add(egui::Shape::convex_polygon(
         triangle,
         Color32::WHITE,
         egui::Stroke::NONE,
     ));
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowControlKind {
+    Minimize,
+    Maximize,
+    Restore,
+    Close,
+}
+
+pub(crate) fn paint_window_control_button(
+    ui: &mut egui::Ui,
+    kind: WindowControlKind,
+    tooltip: &str,
+    palette: &ThemePalette,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(36.0, 32.0), egui::Sense::click());
+    let hovered = response.hovered();
+    if hovered {
+        let hover_bg = if kind == WindowControlKind::Close {
+            Color32::from_rgb(232, 17, 35)
+        } else {
+            palette.header_button_bg
+        };
+        ui.painter().rect_filled(rect, 6.0, hover_bg);
+    }
+    let icon_color = if hovered && kind == WindowControlKind::Close {
+        Color32::WHITE
+    } else if hovered {
+        palette.header_button_fg
+    } else {
+        palette.icon_fg
+    };
+    let c = rect.center();
+    let stroke = egui::Stroke::new(1.25, icon_color);
+    match kind {
+        WindowControlKind::Minimize => {
+            ui.painter().line_segment(
+                [
+                    egui::pos2(c.x - 5.0, c.y + 0.5),
+                    egui::pos2(c.x + 5.0, c.y + 0.5),
+                ],
+                stroke,
+            );
+        }
+        WindowControlKind::Maximize => {
+            let box_rect = egui::Rect::from_center_size(c, egui::vec2(9.5, 9.5));
+            ui.painter()
+                .rect_stroke(box_rect, 1.2, stroke, egui::StrokeKind::Inside);
+        }
+        WindowControlKind::Restore => {
+            let front = egui::Rect::from_center_size(
+                egui::pos2(c.x - 1.2, c.y + 1.2),
+                egui::vec2(7.6, 7.6),
+            );
+            ui.painter()
+                .rect_stroke(front, 1.0, stroke, egui::StrokeKind::Inside);
+            ui.painter().add(egui::Shape::line(
+                vec![
+                    egui::pos2(front.left() + 2.0, front.top()),
+                    egui::pos2(front.left() + 2.0, front.top() - 2.2),
+                    egui::pos2(front.right() + 2.2, front.top() - 2.2),
+                    egui::pos2(front.right() + 2.2, front.bottom() - 2.0),
+                    egui::pos2(front.right(), front.bottom() - 2.0),
+                ],
+                egui::Stroke::new(1.2, icon_color),
+            ));
+        }
+        WindowControlKind::Close => {
+            let close_stroke = egui::Stroke::new(1.35, icon_color);
+            ui.painter().line_segment(
+                [
+                    egui::pos2(c.x - 4.5, c.y - 4.5),
+                    egui::pos2(c.x + 4.5, c.y + 4.5),
+                ],
+                close_stroke,
+            );
+            ui.painter().line_segment(
+                [
+                    egui::pos2(c.x + 4.5, c.y - 4.5),
+                    egui::pos2(c.x - 4.5, c.y + 4.5),
+                ],
+                close_stroke,
+            );
+        }
+    }
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(tooltip)
 }
 
 pub(crate) fn paint_channel_avatar(
@@ -903,6 +1171,7 @@ pub(crate) fn paint_channel_avatar(
     let initials = recommendations::channel_avatar_initials(channel_name);
     ui.painter()
         .circle_filled(rect.center(), diameter * 0.5, Color32::from_rgb(r, g, b));
+    paint_subtle_avatar_ring(ui, rect.center(), diameter * 0.5);
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
@@ -910,41 +1179,6 @@ pub(crate) fn paint_channel_avatar(
         egui::FontId::proportional((diameter * 0.39).clamp(10.0, 16.0)),
         Color32::WHITE,
     );
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-pub(crate) fn youtube_tab_button(
-    ui: &mut egui::Ui,
-    label: &str,
-    selected: bool,
-    palette: &ThemePalette,
-) -> egui::Response {
-    let text = if selected {
-        RichText::new(label)
-            .size(14.0)
-            .strong()
-            .color(palette.header_button_fg)
-    } else {
-        RichText::new(label)
-            .size(14.0)
-            .color(palette.neutral_status_fg)
-    };
-    let response = ui.add(
-        egui::Button::new(text)
-            .frame(false)
-            .fill(Color32::TRANSPARENT)
-            .min_size(egui::vec2(0.0, 40.0)),
-    );
-    if selected {
-        let y = response.rect.bottom() - 1.0;
-        ui.painter().line_segment(
-            [
-                egui::pos2(response.rect.left() + 10.0, y),
-                egui::pos2(response.rect.right() - 10.0, y),
-            ],
-            egui::Stroke::new(3.0, palette.header_button_fg),
-        );
-    }
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -1011,7 +1245,7 @@ pub(crate) fn sidebar_pill_item(
     };
     paint_yt_icon(
         ui.painter(),
-        egui::pos2(pill_rect.left() + 22.0, pill_rect.center().y),
+        egui::pos2(pill_rect.left() + 24.0, pill_rect.center().y),
         icon,
         text_color,
         active,
@@ -1044,7 +1278,7 @@ pub(crate) fn compact_sidebar_item(
     let (rect, response) = ui.allocate_exact_size(egui::vec2(64.0, 72.0), egui::Sense::click());
     if response.hovered() {
         ui.painter().rect_filled(
-            rect.shrink2(egui::vec2(6.0, 4.0)),
+            rect.shrink2(egui::vec2(2.0, 4.0)),
             10.0,
             palette.card_alt_bg,
         );
@@ -1112,6 +1346,7 @@ pub(crate) fn sidebar_channel_item(
             Color32::WHITE,
         );
     }
+    paint_subtle_avatar_ring(ui, avatar_center, 12.0);
     let display_name = truncate_text_chars(channel_name, 16);
     ui.painter().text(
         egui::pos2(pill_rect.left() + 48.0, pill_rect.center().y),
@@ -1342,7 +1577,9 @@ pub(crate) enum SearchMenuIcon {
     Clock,
     Bookmark,
     Share,
+    Download,
     Flag,
+    Trash,
 }
 
 pub(crate) fn search_menu_item_ui(
@@ -1427,6 +1664,32 @@ pub(crate) fn search_menu_item_ui(
             ];
             painter.add(egui::Shape::closed_line(flag, stroke));
         }
+        SearchMenuIcon::Trash => {
+            paint_history_trash_icon(painter, c, fg);
+        }
+        SearchMenuIcon::Download => {
+            painter.line_segment(
+                [egui::pos2(c.x, c.y - 6.5), egui::pos2(c.x, c.y + 3.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(c.x - 3.5, c.y - 0.5), egui::pos2(c.x, c.y + 3.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(c.x + 3.5, c.y - 0.5), egui::pos2(c.x, c.y + 3.0)],
+                stroke,
+            );
+            painter.add(egui::Shape::line(
+                vec![
+                    egui::pos2(c.x - 6.5, c.y + 3.5),
+                    egui::pos2(c.x - 6.5, c.y + 6.5),
+                    egui::pos2(c.x + 6.5, c.y + 6.5),
+                    egui::pos2(c.x + 6.5, c.y + 3.5),
+                ],
+                stroke,
+            ));
+        }
     }
 
     painter.text(
@@ -1437,6 +1700,172 @@ pub(crate) fn search_menu_item_ui(
         fg,
     );
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+pub(crate) fn paint_history_trash_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    color: Color32,
+) {
+    let stroke = egui::Stroke::new(1.5, color);
+    let thin = egui::Stroke::new(1.3, color);
+    painter.line_segment(
+        [
+            egui::pos2(center.x - 6.5, center.y - 5.2),
+            egui::pos2(center.x + 6.5, center.y - 5.2),
+        ],
+        stroke,
+    );
+    painter.add(egui::Shape::line(
+        vec![
+            egui::pos2(center.x - 2.6, center.y - 5.2),
+            egui::pos2(center.x - 2.0, center.y - 7.6),
+            egui::pos2(center.x + 2.0, center.y - 7.6),
+            egui::pos2(center.x + 2.6, center.y - 5.2),
+        ],
+        thin,
+    ));
+    let body = egui::Rect::from_min_max(
+        egui::pos2(center.x - 4.8, center.y - 5.2),
+        egui::pos2(center.x + 4.8, center.y + 7.2),
+    );
+    painter.rect_stroke(body, 1.5, stroke, egui::StrokeKind::Inside);
+    for dx in [-1.8_f32, 1.8_f32] {
+        painter.line_segment(
+            [
+                egui::pos2(center.x + dx, center.y - 2.4),
+                egui::pos2(center.x + dx, center.y + 4.4),
+            ],
+            thin,
+        );
+    }
+}
+
+pub(crate) fn paint_history_pause_bars_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    color: Color32,
+) {
+    let stroke = egui::Stroke::new(1.5, color);
+    for dx in [-3.4_f32, 3.4_f32] {
+        let bar = egui::Rect::from_center_size(
+            egui::pos2(center.x + dx, center.y),
+            egui::vec2(3.6, 12.6),
+        );
+        painter.rect_stroke(bar, 0.8, stroke, egui::StrokeKind::Inside);
+    }
+}
+
+pub(crate) fn paint_history_play_icon(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
+    let stroke = egui::Stroke::new(1.5, color);
+    let pts = vec![
+        egui::pos2(center.x - 4.2, center.y - 6.4),
+        egui::pos2(center.x + 6.0, center.y),
+        egui::pos2(center.x - 4.2, center.y + 6.4),
+    ];
+    painter.add(egui::Shape::closed_line(pts, stroke));
+}
+
+pub(crate) fn paint_history_search_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    color: Color32,
+) {
+    let stroke = egui::Stroke::new(1.6, color);
+    let lens = egui::pos2(center.x - 1.4, center.y - 1.4);
+    painter.circle_stroke(lens, 5.8, stroke);
+    painter.line_segment(
+        [
+            egui::pos2(lens.x + 4.2, lens.y + 4.2),
+            egui::pos2(lens.x + 8.2, lens.y + 8.2),
+        ],
+        stroke,
+    );
+}
+
+pub(crate) fn paint_report_history_hero_illustration(ui: &mut egui::Ui, size: egui::Vec2) {
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let p = ui.painter_at(rect);
+    let card = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 8.0, rect.top() + 26.0),
+        egui::vec2((size.x - 36.0).max(80.0), (size.y - 36.0).max(60.0)),
+    );
+    // Blue player card base.
+    p.rect_filled(card, 14.0, Color32::from_rgb(0, 92, 230));
+    // Aqua hillside accent waves inside the frame.
+    let wave_top = vec![
+        egui::pos2(card.left() + 8.0, card.bottom() - 18.0),
+        egui::pos2(card.left() + 26.0, card.top() + 18.0),
+        egui::pos2(card.center().x + 6.0, card.top() + 34.0),
+        egui::pos2(card.right() - 10.0, card.top() + 14.0),
+        egui::pos2(card.right() - 10.0, card.bottom() - 18.0),
+    ];
+    p.add(egui::Shape::convex_polygon(
+        wave_top,
+        Color32::from_rgb(0, 178, 198),
+        egui::Stroke::NONE,
+    ));
+    let wave_front = vec![
+        egui::pos2(card.left() + 10.0, card.bottom() - 14.0),
+        egui::pos2(card.center().x - 12.0, card.center().y - 2.0),
+        egui::pos2(card.right() - 14.0, card.bottom() - 28.0),
+        egui::pos2(card.right() - 14.0, card.bottom() - 14.0),
+    ];
+    p.add(egui::Shape::convex_polygon(
+        wave_front,
+        Color32::from_rgb(42, 212, 168),
+        egui::Stroke::NONE,
+    ));
+    // Red scrubber bar + white playhead knob at the bottom of the frame.
+    let track_y = card.bottom() - 11.0;
+    let track_l = card.left() + 14.0;
+    let track_r = card.right() - 14.0;
+    let knob_x = track_l + (track_r - track_l) * 0.44;
+    p.line_segment(
+        [egui::pos2(knob_x, track_y), egui::pos2(track_r, track_y)],
+        egui::Stroke::new(3.0, Color32::from_rgba_unmultiplied(255, 255, 255, 110)),
+    );
+    p.line_segment(
+        [egui::pos2(track_l, track_y), egui::pos2(knob_x, track_y)],
+        egui::Stroke::new(3.2, Color32::from_rgb(255, 0, 51)),
+    );
+    p.circle_filled(
+        egui::pos2(knob_x, track_y),
+        4.6,
+        Color32::from_rgb(255, 0, 51),
+    );
+    p.circle_filled(egui::pos2(knob_x, track_y), 2.3, Color32::WHITE);
+
+    // Purple magnifier overlapping top-right corner of the video card.
+    let lens_center = egui::pos2(card.right() - 12.0, card.top() + 8.0);
+    let lens_radius = 27.0;
+    p.circle_filled(
+        lens_center,
+        lens_radius,
+        Color32::from_rgba_unmultiplied(15, 36, 115, 235),
+    );
+    p.circle_filled(
+        egui::pos2(lens_center.x - 10.0, lens_center.y + 6.0),
+        5.5,
+        Color32::WHITE,
+    );
+    p.circle_filled(
+        egui::pos2(lens_center.x - 2.0, lens_center.y - 3.0),
+        2.5,
+        Color32::WHITE,
+    );
+    p.circle_stroke(
+        lens_center,
+        lens_radius,
+        egui::Stroke::new(6.0, Color32::from_rgb(122, 44, 214)),
+    );
+    p.line_segment(
+        [
+            egui::pos2(lens_center.x + 19.0, lens_center.y + 19.0),
+            egui::pos2(lens_center.x + 33.0, lens_center.y + 37.0),
+        ],
+        egui::Stroke::new(7.5, Color32::from_rgb(122, 44, 214)),
+    );
 }
 
 pub(crate) fn paint_search_filters_button(
@@ -1674,5 +2103,564 @@ pub(crate) fn format_time(seconds: f64) -> String {
         )
     } else {
         format!("{}:{:02}", seconds / 60, seconds % 60)
+    }
+}
+
+pub(crate) fn styled_pill_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    active: bool,
+    palette: &ThemePalette,
+) -> egui::Response {
+    let (bg, fg, stroke_col) = if active {
+        (
+            palette.active_button_bg,
+            palette.active_button_fg,
+            palette.active_button_bg,
+        )
+    } else {
+        (
+            palette.header_button_bg,
+            palette.header_button_fg,
+            palette.card_alt_stroke,
+        )
+    };
+    let btn = egui::Button::new(RichText::new(label).size(13.0).strong().color(fg))
+        .fill(bg)
+        .stroke(egui::Stroke::new(1.0, stroke_col))
+        .corner_radius(16)
+        .min_size(egui::vec2(0.0, 30.0));
+    ui.add(btn).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+pub(crate) fn styled_compact_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    active: bool,
+    palette: &ThemePalette,
+) -> egui::Response {
+    let (bg, fg, stroke_col) = if active {
+        (
+            palette.active_button_bg,
+            palette.active_button_fg,
+            palette.active_button_bg,
+        )
+    } else {
+        (
+            palette.header_button_bg,
+            palette.header_button_fg,
+            palette.card_alt_stroke,
+        )
+    };
+    let btn = egui::Button::new(RichText::new(label).size(12.0).strong().color(fg))
+        .fill(bg)
+        .stroke(egui::Stroke::new(1.0, stroke_col))
+        .corner_radius(13)
+        .min_size(egui::vec2(0.0, 25.0));
+    ui.add(btn).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+pub(crate) fn styled_compact_button_enabled(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    label: &str,
+    active: bool,
+    palette: &ThemePalette,
+) -> egui::Response {
+    let (bg, fg, stroke_col) = if active {
+        (
+            palette.active_button_bg,
+            palette.active_button_fg,
+            palette.active_button_bg,
+        )
+    } else {
+        (
+            palette.header_button_bg,
+            palette.header_button_fg,
+            palette.card_alt_stroke,
+        )
+    };
+    let text_color = if enabled {
+        fg
+    } else {
+        palette.neutral_status_fg
+    };
+    let btn = egui::Button::new(RichText::new(label).size(12.0).strong().color(text_color))
+        .fill(bg)
+        .stroke(egui::Stroke::new(1.0, stroke_col))
+        .corner_radius(13)
+        .min_size(egui::vec2(0.0, 25.0));
+    let resp = ui.add_enabled(enabled, btn);
+    if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
+
+pub(crate) fn styled_danger_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    palette: &ThemePalette,
+) -> egui::Response {
+    let btn = egui::Button::new(
+        RichText::new(label)
+            .size(12.0)
+            .strong()
+            .color(palette.error_banner_fg),
+    )
+    .fill(palette.error_bg)
+    .stroke(egui::Stroke::new(1.0, palette.error_stroke))
+    .corner_radius(14)
+    .min_size(egui::vec2(0.0, 26.0));
+    ui.add(btn).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+pub(crate) fn styled_ghost_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    palette: &ThemePalette,
+) -> egui::Response {
+    let btn = egui::Button::new(
+        RichText::new(label)
+            .size(12.0)
+            .strong()
+            .color(palette.neutral_status_fg),
+    )
+    .fill(Color32::TRANSPARENT)
+    .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+    .corner_radius(13)
+    .min_size(egui::vec2(0.0, 25.0));
+    ui.add(btn).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+pub(crate) fn styled_icon_chip_button(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    label: &str,
+    palette: &ThemePalette,
+) -> egui::Response {
+    let fg = if enabled {
+        palette.header_button_fg
+    } else {
+        palette.neutral_status_fg
+    };
+    let btn = egui::Button::new(RichText::new(label).size(11.5).strong().color(fg))
+        .fill(palette.header_button_bg)
+        .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+        .corner_radius(8)
+        .min_size(egui::vec2(26.0, 24.0));
+    let resp = ui.add_enabled(enabled, btn);
+    if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
+
+pub(crate) fn is_actionable_inline_message(msg: &str) -> bool {
+    let trimmed = msg.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    let progress_or_info_prefixes = [
+        "pesquisando",
+        "pesquise ",
+        "carregando",
+        "consultando ",
+        "atualizando",
+        "sincronizando",
+        "enviando ",
+        "velocidade:",
+        "adicionado ",
+        "você gostou",
+        "você não gostou",
+        "avaliação removida",
+        "inscrito ",
+        "inscrição removida",
+        "loop a-b limpo",
+        "captura salva:",
+        "link do canal copiado:",
+        "searching",
+        "loading",
+        "fetching",
+        "refreshing",
+        "syncing",
+        "added to queue",
+        "speed:",
+    ];
+    if progress_or_info_prefixes
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+    {
+        return false;
+    }
+    let error_or_warning_terms = [
+        "erro",
+        "falha",
+        "falhou",
+        "não foi possível",
+        "nao foi possivel",
+        "indisponível",
+        "indisponivel",
+        "inválid",
+        "invalid",
+        "expir",
+        "somente no windows",
+        "entre com google",
+        "sign in",
+        "limite de 100",
+        "error",
+        "failed",
+        "unavailable",
+        "unable to",
+        "could not",
+        "cannot",
+        "aviso",
+        "warning",
+    ];
+    error_or_warning_terms
+        .iter()
+        .any(|term| lower.contains(term))
+}
+
+pub(crate) fn inline_error_banner_ui(ui: &mut egui::Ui, msg: &str, palette: &ThemePalette) -> bool {
+    let mut dismissed = false;
+    egui::Frame::new()
+        .fill(palette.error_bg)
+        .stroke(egui::Stroke::new(1.0, palette.error_stroke))
+        .corner_radius(10)
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(msg).size(12.5).color(palette.error_banner_fg));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let close_btn = egui::Button::new(
+                        RichText::new("✕").size(11.0).color(palette.error_banner_fg),
+                    )
+                    .fill(Color32::TRANSPARENT)
+                    .frame(false);
+                    if ui
+                        .add(close_btn)
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        dismissed = true;
+                    }
+                });
+            });
+        });
+    dismissed
+}
+
+pub(crate) fn page_header_ui(
+    ui: &mut egui::Ui,
+    title: &str,
+    subtitle: Option<&str>,
+    palette: &ThemePalette,
+    add_actions: impl FnOnce(&mut egui::Ui),
+) {
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.label(
+                RichText::new(title)
+                    .size(20.0)
+                    .strong()
+                    .color(palette.channel_fg),
+            );
+            if let Some(sub) = subtitle.map(str::trim).filter(|s| !s.is_empty()) {
+                ui.label(
+                    RichText::new(sub)
+                        .size(12.5)
+                        .color(palette.neutral_status_fg),
+                );
+            }
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            add_actions(ui);
+        });
+    });
+    ui.add_space(10.0);
+    let divider_w = ui.available_width().max(1.0);
+    let (div_rect, _) = ui.allocate_exact_size(egui::vec2(divider_w, 1.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(div_rect, 0.0, palette.card_alt_stroke.gamma_multiply(0.7));
+    ui.add_space(12.0);
+}
+
+pub(crate) fn empty_state_ui(
+    ui: &mut egui::Ui,
+    icon: Option<Icon>,
+    title: &str,
+    subtitle: &str,
+    cta_label: Option<&str>,
+    palette: &ThemePalette,
+) -> bool {
+    let mut cta_clicked = false;
+    let available_w = ui.available_width().max(1.0);
+    let card_w = (available_w - 24.0).clamp(160.0, 460.0).min(available_w);
+    let side_margin = ((available_w - card_w) * 0.5).max(0.0);
+    let inner_w = (card_w - 56.0).max(120.0);
+
+    ui.add_space(16.0);
+    ui.horizontal(|ui| {
+        ui.add_space(side_margin);
+        egui::Frame::new()
+            .fill(palette.card_alt_bg)
+            .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+            .corner_radius(12)
+            .inner_margin(egui::Margin::symmetric(28, 24))
+            .show(ui, |ui| {
+                ui.set_width(inner_w);
+                ui.set_max_width(inner_w);
+                ui.vertical_centered(|ui| {
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    if let Some(icon) = icon {
+                        let badge_size = 48.0;
+                        let (badge_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(badge_size, badge_size),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().circle_filled(
+                            badge_rect.center(),
+                            badge_size * 0.5,
+                            palette.info_box_bg,
+                        );
+                        ui.painter().circle_stroke(
+                            badge_rect.center(),
+                            badge_size * 0.5,
+                            egui::Stroke::new(1.0, palette.card_alt_stroke),
+                        );
+                        let icon_rect = egui::Rect::from_center_size(
+                            badge_rect.center(),
+                            egui::vec2(22.0, 22.0),
+                        );
+                        ui.put(icon_rect, icon.image(palette.neutral_status_fg, 22.0));
+                        ui.add_space(2.0);
+                    }
+                    ui.label(
+                        RichText::new(title)
+                            .size(15.5)
+                            .strong()
+                            .color(palette.channel_fg),
+                    );
+                    if !subtitle.trim().is_empty() {
+                        ui.label(
+                            RichText::new(subtitle)
+                                .size(12.5)
+                                .color(palette.neutral_status_fg),
+                        );
+                    }
+                    if let Some(label) = cta_label.map(str::trim).filter(|s| !s.is_empty()) {
+                        ui.add_space(6.0);
+                        if styled_pill_button(ui, label, true, palette).clicked() {
+                            cta_clicked = true;
+                        }
+                    }
+                });
+            });
+    });
+    ui.add_space(16.0);
+    cta_clicked
+}
+
+pub(crate) fn app_modal_window(
+    ctx: &egui::Context,
+    id_salt: &str,
+    title: &str,
+    max_width: f32,
+    palette: &ThemePalette,
+    add_body: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let screen = ctx.content_rect();
+    let scrim_id = egui::Id::new((id_salt, "modal_scrim_fade"));
+    let fade_t = ctx.animate_bool_with_time(scrim_id, true, 0.16);
+    let scrim_alpha = (135.0 * fade_t).round().clamp(0.0, 255.0) as u8;
+
+    let mut backdrop_clicked = false;
+    egui::Area::new(egui::Id::new((id_salt, "modal_backdrop")))
+        .order(egui::Order::Foreground)
+        .fixed_pos(screen.min)
+        .interactable(true)
+        .show(ctx, |ui| {
+            let (rect, resp) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+            ui.painter().rect_filled(
+                rect,
+                0.0,
+                Color32::from_rgba_unmultiplied(0, 0, 0, scrim_alpha),
+            );
+            if resp.clicked() {
+                backdrop_clicked = true;
+            }
+        });
+
+    let modal_w = max_width.min((screen.width() - 48.0).max(240.0)).max(240.0);
+    let inner_w = (modal_w - 40.0).max(180.0);
+    let mut close_clicked = false;
+
+    let win_resp = egui::Window::new(title)
+        .id(egui::Id::new(id_salt))
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .default_width(modal_w)
+        .max_width(modal_w)
+        .order(egui::Order::Foreground)
+        .frame(
+            egui::Frame::NONE
+                .fill(palette.card_alt_bg)
+                .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+                .corner_radius(14.0)
+                .inner_margin(egui::Margin::symmetric(20, 16))
+                .shadow(egui::Shadow {
+                    offset: [0, 8],
+                    blur: 24,
+                    spread: 0,
+                    color: Color32::from_rgba_unmultiplied(0, 0, 0, 110),
+                }),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(inner_w);
+            ui.horizontal(|ui| {
+                let title_max_w = (inner_w - 36.0).max(120.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(title_max_w, 26.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(title)
+                                    .size(18.0)
+                                    .strong()
+                                    .color(palette.channel_fg),
+                            )
+                            .truncate(),
+                        );
+                    },
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if styled_icon_chip_button(ui, true, "✕", palette).clicked() {
+                        close_clicked = true;
+                    }
+                });
+            });
+            ui.add_space(10.0);
+            let (div_rect, _) =
+                ui.allocate_exact_size(egui::vec2(inner_w, 1.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(div_rect, 0.0, palette.card_alt_stroke.gamma_multiply(0.7));
+            ui.add_space(12.0);
+            add_body(ui);
+        });
+
+    if backdrop_clicked && let Some(inner) = win_resp {
+        ctx.move_to_top(inner.response.layer_id);
+    }
+
+    let esc_pressed = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    let closed = close_clicked || backdrop_clicked || esc_pressed;
+    if closed {
+        let _ = ctx.animate_bool_with_time(scrim_id, false, 0.0);
+    }
+    closed
+}
+
+pub(crate) fn styled_menu_item_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    active: bool,
+    palette: &ThemePalette,
+) -> egui::Response {
+    let fg = if active {
+        palette.channel_fg
+    } else {
+        palette.header_button_fg
+    };
+    let text = if active {
+        RichText::new(label).size(13.0).strong().color(fg)
+    } else {
+        RichText::new(label).size(13.0).color(fg)
+    };
+    ui.scope(|ui| {
+        let visuals = ui.visuals_mut();
+        visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+        visuals.widgets.inactive.bg_fill = Color32::TRANSPARENT;
+        visuals.widgets.hovered.weak_bg_fill = palette.header_button_bg;
+        visuals.widgets.hovered.bg_fill = palette.header_button_bg;
+        visuals.widgets.active.weak_bg_fill = palette.header_button_bg;
+        visuals.widgets.active.bg_fill = palette.header_button_bg;
+
+        let mut btn = egui::Button::new(text)
+            .corner_radius(8)
+            .min_size(egui::vec2(0.0, 30.0));
+        if active {
+            btn = btn
+                .fill(palette.info_accent_fg.gamma_multiply(0.16))
+                .stroke(egui::Stroke::new(
+                    1.0,
+                    palette.info_accent_fg.gamma_multiply(0.32),
+                ));
+        } else {
+            btn = btn.stroke(egui::Stroke::NONE);
+        }
+        ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| {
+            ui.add(btn).on_hover_cursor(egui::CursorIcon::PointingHand)
+        })
+        .inner
+    })
+    .inner
+}
+
+pub(crate) fn paint_subtle_avatar_ring(ui: &egui::Ui, center: egui::Pos2, radius: f32) {
+    ui.painter().circle_stroke(
+        center,
+        radius,
+        egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(128, 128, 128, 45)),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_actionable_inline_message;
+
+    #[test]
+    fn suppresses_empty_and_progress_status_strings() {
+        assert!(!is_actionable_inline_message(""));
+        assert!(!is_actionable_inline_message("   "));
+        assert!(!is_actionable_inline_message("Pesquisando \"rust\"..."));
+        assert!(!is_actionable_inline_message("Carregando inscrições..."));
+        assert!(!is_actionable_inline_message(
+            "Consultando inscrições: 5 de 80..."
+        ));
+        assert!(!is_actionable_inline_message(
+            "Sincronizando em segundo plano..."
+        ));
+        assert!(!is_actionable_inline_message("Velocidade: 1.50x"));
+        assert!(!is_actionable_inline_message(
+            "Adicionado à fila: Meu vídeo"
+        ));
+        assert!(!is_actionable_inline_message("Loop A-B limpo."));
+        assert!(!is_actionable_inline_message("Captura salva: shot.png"));
+    }
+
+    #[test]
+    fn surfaces_actionable_errors_and_warnings() {
+        assert!(is_actionable_inline_message(
+            "Erro ao carregar feed inicial: timeout"
+        ));
+        assert!(is_actionable_inline_message(
+            "Não foi possível abrir o vídeo."
+        ));
+        assert!(is_actionable_inline_message(
+            "Entre com Google nas Configurações para curtir vídeos."
+        ));
+        assert!(is_actionable_inline_message(
+            "Loop A-B indisponível em transmissões ao vivo."
+        ));
+        assert!(is_actionable_inline_message("Failed to open video stream"));
     }
 }

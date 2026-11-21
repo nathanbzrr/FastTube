@@ -19,42 +19,53 @@ pub fn has_saved_profile() -> bool {
     profile_dir().is_ok_and(|p| p.join("Default").exists())
 }
 
-fn browser_executable() -> Result<PathBuf, String> {
-    // The registered Vivaldi installation is used when available, followed by Edge.
-    for key in [
-        r"HKCU\Software\Microsoft\Windows\CurrentVersion\App Paths\vivaldi.exe",
-        r"HKLM\Software\Microsoft\Windows\CurrentVersion\App Paths\vivaldi.exe",
-    ] {
-        if let Ok(output) = Command::new("reg")
-            .args(["query", key, "/ve"])
+const APP_PATHS_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\App Paths";
+
+fn first_existing_file(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn registry_app_path(executable: &str) -> Option<PathBuf> {
+    let candidates = ["HKCU", "HKLM"].into_iter().filter_map(|hive| {
+        let key = format!(r"{hive}\{APP_PATHS_KEY}\{executable}");
+        let output = Command::new("reg")
+            .args(["query", &key, "/ve"])
             .creation_flags_no_window()
             .output()
-        {
-            let text = String::from_utf8_lossy(&output.stdout);
-            if let Some(value) = text.lines().find_map(|line| {
-                line.split_once("REG_SZ")
-                    .map(|(_, value)| value.trim().trim_matches('"'))
-            }) {
-                let path = PathBuf::from(value);
-                if path.is_file() {
-                    return Ok(path);
-                }
-            }
-        }
-    }
-    for root in [
-        std::env::var_os("ProgramFiles(x86)"),
-        std::env::var_os("ProgramFiles"),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let path = PathBuf::from(root).join(r"Microsoft\Edge\Application\msedge.exe");
-        if path.is_file() {
+            .ok()?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        text.lines().find_map(|line| {
+            line.split_once("REG_SZ")
+                .map(|(_, value)| PathBuf::from(value.trim().trim_matches('"')))
+        })
+    });
+    first_existing_file(candidates)
+}
+
+fn browser_executable() -> Result<PathBuf, String> {
+    // Prefer Vivaldi, then Edge, Chrome, and Brave (App Paths registry first, then standard paths).
+    for executable in ["vivaldi.exe", "msedge.exe", "chrome.exe", "brave.exe"] {
+        if let Some(path) = registry_app_path(executable) {
             return Ok(path);
         }
     }
-    Err("Instale Vivaldi ou Microsoft Edge para entrar na sua conta.".into())
+    let roots = [
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        std::env::var_os("ProgramFiles(x86)").map(PathBuf::from),
+        std::env::var_os("ProgramFiles").map(PathBuf::from),
+    ];
+    let candidates = [
+        r"Vivaldi\Application\vivaldi.exe",
+        r"Microsoft\Edge\Application\msedge.exe",
+        r"Google\Chrome\Application\chrome.exe",
+        r"BraveSoftware\Brave-Browser\Application\brave.exe",
+    ]
+    .into_iter()
+    .flat_map(|relative| roots.iter().flatten().map(move |root| root.join(relative)));
+    if let Some(path) = first_existing_file(candidates) {
+        return Ok(path);
+    }
+    Err("Instale Vivaldi, Microsoft Edge, Google Chrome ou Brave para entrar na sua conta.".into())
 }
 
 trait HiddenCommand {
@@ -93,21 +104,28 @@ fn debug_json(port: u16, path: &str) -> Result<Value, String> {
     .map_err(|_| "Falha ao consultar navegador")?;
     let mut bytes = Vec::new();
     let mut buffer = [0u8; 8192];
-    let pages: Value = loop {
+    loop {
         let count = stream
             .read(&mut buffer)
             .map_err(|_| "Falha ao consultar navegador")?;
-        if count == 0 || bytes.len() + count > 2 * 1024 * 1024 {
+        if count == 0 {
+            break;
+        }
+        if bytes.len() + count > 2 * 1024 * 1024 {
             return Err("Resposta inválida do navegador".into());
         }
         bytes.extend_from_slice(&buffer[..count]);
         if let Some(start) = bytes.windows(4).position(|x| x == b"\r\n\r\n")
-            && let Ok(pages) = serde_json::from_slice(&bytes[start + 4..])
+            && let Ok(pages) = serde_json::from_slice::<Value>(&bytes[start + 4..])
         {
-            break pages;
+            return Ok(pages);
         }
+    }
+    let Some(start) = bytes.windows(4).position(|x| x == b"\r\n\r\n") else {
+        return Err("Resposta inválida do navegador".into());
     };
-    Ok(pages)
+    serde_json::from_slice::<Value>(&bytes[start + 4..])
+        .map_err(|_| "Resposta inválida do navegador".to_owned())
 }
 
 fn page_socket(port: u16) -> Result<String, String> {
@@ -386,5 +404,75 @@ mod tests {
             }
         }
         assert!(signed_in(&cookies(port).unwrap()));
+    }
+
+    #[test]
+    fn debug_json_parses_fragmented_http_response_closed_at_eof() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let worker = std::thread::spawn(move || {
+            let (mut http, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 512];
+            loop {
+                let count = http.read(&mut buffer).unwrap();
+                assert_ne!(count, 0, "HTTP request ended before its headers");
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            http.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n[{\"type\":")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            let rest = format!(
+                r#""page","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/devtools/page/test"}}]"#
+            );
+            http.write_all(rest.as_bytes()).unwrap();
+            let _ = http.shutdown(std::net::Shutdown::Write);
+            drop(http);
+        });
+        let value = debug_json(port, "/json/list").unwrap();
+        assert_eq!(
+            value,
+            json!([{
+                "type": "page",
+                "webSocketDebuggerUrl": format!("ws://127.0.0.1:{port}/devtools/page/test")
+            }])
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn first_existing_file_respects_priority_order() {
+        struct TempDirGuard(PathBuf);
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("fasttube-session-paths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = TempDirGuard(dir.clone());
+
+        let vivaldi = dir.join("vivaldi.exe");
+        let edge = dir.join("msedge.exe");
+        let chrome = dir.join("chrome.exe");
+        let brave = dir.join("brave.exe");
+        std::fs::write(&edge, b"").unwrap();
+        std::fs::write(&chrome, b"").unwrap();
+
+        assert_eq!(
+            first_existing_file([vivaldi.clone(), edge.clone(), chrome.clone(), brave.clone()]),
+            Some(edge.clone())
+        );
+        assert_eq!(
+            first_existing_file([vivaldi.clone(), chrome.clone(), edge, brave.clone()]),
+            Some(chrome)
+        );
+        assert_eq!(first_existing_file([vivaldi, brave]), None);
     }
 }

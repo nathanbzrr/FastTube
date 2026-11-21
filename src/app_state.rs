@@ -16,9 +16,10 @@ use crate::{
     ChannelPlaylistVideosFetchMessage, ChannelPlaylistsFetchMessage, ChannelSearchFetchMessage,
     ChannelSortedVideosFetchMessage, ChannelTab, ChannelTabVideosFetchMessage, DecodingDiagnostics,
     FeedDerivedCache, FeedFilter, HISTORY_MIN_POSITION_DELTA_MS, HISTORY_SAVE_INTERVAL,
-    HomeBatchFetchMessage, HomeFetchMessage, ImportedUserData, PlaybackPreferences, Queue,
-    QueuePlaybackCorrelation, SearchFetchMessage, SearchResult, Theme, ThemePalette, Video,
-    apply_theme_visuals, buffer_profile_name, buffer_profile_summary, parse_duration_ms,
+    HomeBatchFetchMessage, HomeFetchMessage, ImportedUserData, LikedVideosFetchMessage,
+    PlaybackPreferences, Queue, QueuePlaybackCorrelation, SearchFetchMessage, SearchResult, Theme,
+    ThemePalette, Video, apply_theme_visuals, buffer_profile_name, buffer_profile_summary,
+    parse_duration_ms,
 };
 use eframe::egui::{self, Color32};
 use std::collections::{HashMap, HashSet};
@@ -53,6 +54,19 @@ pub(crate) struct BrowseFeedState {
     pub(crate) share_modal_copied_at: Option<Instant>,
     pub(crate) recent_searches: Vec<String>,
     pub(crate) search_suggest: SearchSuggestState,
+    pub(crate) report_history: Vec<ReportedContentEntry>,
+    pub(crate) report_history_filter: u8,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReportedContentEntry {
+    pub(crate) kind: String,
+    pub(crate) title: String,
+    pub(crate) channel: String,
+    pub(crate) video_id: Option<String>,
+    pub(crate) reason: String,
+    pub(crate) timestamp_label: String,
+    pub(crate) status: String,
 }
 
 impl Default for BrowseFeedState {
@@ -84,6 +98,8 @@ impl Default for BrowseFeedState {
             share_modal_copied_at: None,
             recent_searches: Vec::new(),
             search_suggest: SearchSuggestState::default(),
+            report_history: Vec::new(),
+            report_history_filter: 0,
         }
     }
 }
@@ -134,6 +150,7 @@ pub(crate) struct HomeFeedState {
     pub(crate) channels_cancel: Option<process::Cancellation>,
     pub(crate) initial_public_started: bool,
     pub(crate) playlist_urls: Vec<String>,
+    pub(crate) playlist_total_results: Option<u64>,
     pub(crate) title: Option<String>,
     pub(crate) limit_reached: bool,
     pub(crate) subscription_channels: Vec<search::HomeChannel>,
@@ -356,6 +373,234 @@ pub(crate) struct MiniPlayerPendingApply {
     pub(crate) frames_left: u8,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PlayerNerdsStats {
+    pub(crate) audio_codec: Option<String>,
+    pub(crate) fps: Option<f64>,
+    pub(crate) dropped_frames: Option<u64>,
+    pub(crate) video_bitrate_bps: Option<f64>,
+    pub(crate) audio_bitrate_bps: Option<f64>,
+}
+
+pub(crate) const AUTOSCROLL_DEADZONE_PX: f32 = 14.0;
+pub(crate) const AUTOSCROLL_MAX_SPEED_PX_PER_SEC: f32 = 2400.0;
+
+#[derive(Clone, Copy, Debug)]
+struct ActiveAutoscroll {
+    anchor: egui::Pos2,
+    cursor_pos: egui::Pos2,
+    middle_held: bool,
+    moved_beyond_deadzone: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct AutoscrollState {
+    active: Option<ActiveAutoscroll>,
+    swallow_release_button: Option<egui::PointerButton>,
+    last_pointer_pos: Option<egui::Pos2>,
+}
+
+impl AutoscrollState {
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.is_some()
+    }
+
+    pub(crate) fn anchor(&self) -> Option<egui::Pos2> {
+        self.active.map(|state| state.anchor)
+    }
+
+    pub(crate) fn cancel(&mut self) {
+        self.active = None;
+    }
+
+    pub(crate) fn velocity_and_cursor(&self) -> Option<(egui::Vec2, egui::CursorIcon)> {
+        let active = self.active?;
+        let offset = active.cursor_pos - active.anchor;
+        if offset.length() <= AUTOSCROLL_DEADZONE_PX {
+            return Some((egui::Vec2::ZERO, egui::CursorIcon::AllScroll));
+        }
+
+        let speed_for = |excess: f32| {
+            (excess * 4.5 + excess * excess * 0.035).min(AUTOSCROLL_MAX_SPEED_PX_PER_SEC)
+        };
+        let vy = if offset.y.abs() > AUTOSCROLL_DEADZONE_PX {
+            let excess = offset.y.abs() - AUTOSCROLL_DEADZONE_PX;
+            // egui subtracts smooth_scroll_delta from ScrollArea::offset, so down-drag needs negative delta.
+            -offset.y.signum() * speed_for(excess)
+        } else {
+            0.0
+        };
+        let vx = if offset.x.abs() > 28.0 && offset.x.abs() > offset.y.abs() * 1.5 {
+            let excess = offset.x.abs() - 28.0;
+            -offset.x.signum() * speed_for(excess)
+        } else {
+            0.0
+        };
+
+        let angle = offset.y.atan2(offset.x).to_degrees();
+        let cursor = if (-22.5..22.5).contains(&angle) {
+            egui::CursorIcon::ResizeEast
+        } else if (22.5..67.5).contains(&angle) {
+            egui::CursorIcon::ResizeSouthEast
+        } else if (67.5..112.5).contains(&angle) {
+            egui::CursorIcon::ResizeSouth
+        } else if (112.5..157.5).contains(&angle) {
+            egui::CursorIcon::ResizeSouthWest
+        } else if !(-157.5..157.5).contains(&angle) {
+            egui::CursorIcon::ResizeWest
+        } else if (-157.5..-112.5).contains(&angle) {
+            egui::CursorIcon::ResizeNorthWest
+        } else if (-112.5..-67.5).contains(&angle) {
+            egui::CursorIcon::ResizeNorth
+        } else {
+            egui::CursorIcon::ResizeNorthEast
+        };
+
+        Some((egui::vec2(vx, vy), cursor))
+    }
+
+    pub(crate) fn is_scrolling(&self) -> bool {
+        self.velocity_and_cursor()
+            .is_some_and(|(vel, _)| vel != egui::Vec2::ZERO)
+    }
+
+    pub(crate) fn preprocess_raw_input(
+        &mut self,
+        raw_input: &mut egui::RawInput,
+        allow_activate: bool,
+        header_guard_y: f32,
+    ) {
+        if !allow_activate {
+            self.active = None;
+        }
+        let events = std::mem::take(&mut raw_input.events);
+        let mut out = Vec::with_capacity(events.len() + 1);
+
+        for event in events {
+            match &event {
+                egui::Event::PointerMoved(pos) => self.last_pointer_pos = Some(*pos),
+                egui::Event::PointerButton { pos, .. } => self.last_pointer_pos = Some(*pos),
+                _ => {}
+            }
+
+            if self.active.is_none()
+                && let egui::Event::PointerButton {
+                    button,
+                    pressed: false,
+                    ..
+                } = event
+                && self.swallow_release_button == Some(button)
+            {
+                self.swallow_release_button = None;
+                continue;
+            }
+            if self.active.is_none()
+                && matches!(event, egui::Event::PointerButton { pressed: true, .. })
+            {
+                self.swallow_release_button = None;
+            }
+
+            if self.active.is_none() {
+                if allow_activate
+                    && let egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Middle,
+                        pressed: true,
+                        ..
+                    } = event
+                    && pos.y >= header_guard_y
+                {
+                    self.active = Some(ActiveAutoscroll {
+                        anchor: pos,
+                        cursor_pos: pos,
+                        middle_held: true,
+                        moved_beyond_deadzone: false,
+                    });
+                    out.push(egui::Event::PointerMoved(pos));
+                    continue;
+                }
+                out.push(event);
+                continue;
+            }
+
+            match event {
+                egui::Event::PointerMoved(pos) => {
+                    if let Some(active) = self.active.as_mut() {
+                        active.cursor_pos = pos;
+                        if (pos - active.anchor).length() >= AUTOSCROLL_DEADZONE_PX {
+                            active.moved_beyond_deadzone = true;
+                        }
+                    }
+                }
+                egui::Event::PointerGone => {}
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Middle,
+                    pressed: false,
+                    ..
+                } => {
+                    let release_exits = if let Some(active) = self.active.as_mut() {
+                        active.cursor_pos = pos;
+                        active.middle_held = false;
+                        active.moved_beyond_deadzone
+                    } else {
+                        false
+                    };
+                    if release_exits {
+                        self.active = None;
+                        out.push(egui::Event::PointerMoved(pos));
+                    }
+                }
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed: true,
+                    ..
+                } => {
+                    self.active = None;
+                    self.swallow_release_button = Some(button);
+                    out.push(egui::Event::PointerMoved(pos));
+                }
+                egui::Event::MouseWheel { .. } => {
+                    let restore_pos = self
+                        .active
+                        .map_or(self.last_pointer_pos, |a| Some(a.cursor_pos));
+                    self.active = None;
+                    if let Some(pos) = restore_pos {
+                        out.push(egui::Event::PointerMoved(pos));
+                    }
+                    out.push(event);
+                }
+                egui::Event::Key {
+                    key: egui::Key::Escape,
+                    pressed: true,
+                    ..
+                } => {
+                    let restore_pos = self
+                        .active
+                        .map_or(self.last_pointer_pos, |a| Some(a.cursor_pos));
+                    self.active = None;
+                    if let Some(pos) = restore_pos {
+                        out.push(egui::Event::PointerMoved(pos));
+                    }
+                }
+                egui::Event::WindowFocused(false) => {
+                    self.active = None;
+                    out.push(event);
+                }
+                other => out.push(other),
+            }
+        }
+
+        if let Some(active) = self.active {
+            // Keep egui's pointer anchored inside the target ScrollArea even if the real pointer crosses other regions.
+            out.push(egui::Event::PointerMoved(active.anchor));
+        }
+
+        raw_input.events = out;
+    }
+}
+
 pub(crate) struct PlaybackState {
     pub(crate) fullscreen: bool,
     pub(crate) theater: bool,
@@ -370,6 +615,15 @@ pub(crate) struct PlaybackState {
     pub(crate) mini_player_saved_pos: Option<eframe::egui::Pos2>,
     pub(crate) mini_player_pending_enter: Option<MiniPlayerPendingApply>,
     pub(crate) mini_player_settled: bool,
+    /// Docked in-app miniplayer shown in the bottom-right corner while browsing other tabs.
+    pub(crate) in_app_mini_player: bool,
+    pub(crate) video_back_stack: Vec<Video>,
+    pub(crate) video_forward_stack: Vec<Video>,
+    pub(crate) pending_open_keep_mini_player: bool,
+    pub(crate) pending_open_suppress_back_stack: bool,
+    pub(crate) mini_player_paused: bool,
+    pub(crate) mini_player_muted: bool,
+    pub(crate) mini_player_volume: f32,
     pub(crate) active: Option<ActivePlayback>,
     pub(crate) quality: Option<u32>,
     pub(crate) qualities: Vec<u32>,
@@ -378,7 +632,12 @@ pub(crate) struct PlaybackState {
     pub(crate) quality_error: Option<String>,
     pub(crate) seek_drag: Option<f64>,
     pub(crate) overlay_last_activity: Instant,
+    pub(crate) overlay_last_pointer_pos: Option<egui::Pos2>,
     pub(crate) player_menu: Option<overlay::OverlayMenu>,
+    pub(crate) player_context_menu: Option<egui::Pos2>,
+    pub(crate) stats_for_nerds_open: bool,
+    pub(crate) stats_for_nerds_last_poll: Option<Instant>,
+    pub(crate) stats_for_nerds: PlayerNerdsStats,
     pub(crate) last_subtitle_id: Option<String>,
     pub(crate) autoplay: bool,
     pub(crate) loop_video: bool,
@@ -425,6 +684,14 @@ impl Default for PlaybackState {
             mini_player_saved_pos: None,
             mini_player_pending_enter: None,
             mini_player_settled: false,
+            in_app_mini_player: false,
+            video_back_stack: Vec::new(),
+            video_forward_stack: Vec::new(),
+            pending_open_keep_mini_player: false,
+            pending_open_suppress_back_stack: false,
+            mini_player_paused: false,
+            mini_player_muted: false,
+            mini_player_volume: 100.0,
             active: None,
             quality: None,
             qualities: Vec::new(),
@@ -433,7 +700,12 @@ impl Default for PlaybackState {
             quality_error: None,
             seek_drag: None,
             overlay_last_activity: Instant::now(),
+            overlay_last_pointer_pos: None,
             player_menu: None,
+            player_context_menu: None,
+            stats_for_nerds_open: false,
+            stats_for_nerds_last_poll: None,
+            stats_for_nerds: PlayerNerdsStats::default(),
             last_subtitle_id: None,
             autoplay: true,
             loop_video: false,
@@ -541,6 +813,21 @@ impl SettingsTab {
         }
     }
 
+    pub(crate) fn label_en(self) -> &'static str {
+        match self {
+            Self::General => "General & appearance",
+            Self::Playback => "Playback & performance",
+            Self::SponsorBlock => "SponsorBlock",
+            Self::Privacy => "Account & privacy",
+            Self::Storage => "Cache & storage",
+            Self::BackupDiagnostics => "Backup & diagnostics",
+        }
+    }
+
+    pub(crate) fn label(self, pt: bool) -> &'static str {
+        if pt { self.label_pt() } else { self.label_en() }
+    }
+
     pub(crate) fn subtitle_pt(self) -> &'static str {
         match self {
             Self::General => {
@@ -561,6 +848,27 @@ impl SettingsTab {
             Self::BackupDiagnostics => {
                 "Exporte ou restaure backups locais e inspecione diagnósticos do libmpv."
             }
+        }
+    }
+
+    pub(crate) fn subtitle_en(self) -> &'static str {
+        match self {
+            Self::General => "Customize theme, card density, startup behavior, and shortcuts.",
+            Self::Playback => "Configure speed, quality, audio, subtitles, hardware, and buffer.",
+            Self::SponsorBlock => "Automatically skip or highlight community-submitted segments.",
+            Self::Privacy => "Manage your Google account, OAuth, local history, and feed topics.",
+            Self::Storage => "Choose cache folder, inspect disk usage, and clear temporary data.",
+            Self::BackupDiagnostics => {
+                "Export or restore local backups and inspect libmpv diagnostics."
+            }
+        }
+    }
+
+    pub(crate) fn subtitle(self, pt: bool) -> &'static str {
+        if pt {
+            self.subtitle_pt()
+        } else {
+            self.subtitle_en()
         }
     }
 }
@@ -776,6 +1084,44 @@ impl Default for QueueState {
 }
 
 #[derive(Default)]
+pub(crate) struct LikedVideosState {
+    pub(crate) items: Vec<SearchResult>,
+    pub(crate) seen_keys: HashSet<String>,
+    pub(crate) total_results: Option<u64>,
+    pub(crate) revision: u64,
+    pub(crate) loaded: bool,
+    pub(crate) error: Option<String>,
+    pub(crate) rx: Option<Receiver<LikedVideosFetchMessage>>,
+    pub(crate) cancel: Option<process::Cancellation>,
+    pub(crate) next_request_id: u64,
+    pub(crate) active_request_id: Option<u64>,
+    pub(crate) merged_cache_key: Option<(u64, usize, u64, usize)>,
+    pub(crate) merged_videos: Vec<Video>,
+    pub(crate) merged_is_short: Vec<bool>,
+    pub(crate) extra_local_count: usize,
+}
+
+impl LikedVideosState {
+    pub(crate) fn reset(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel.cancel();
+        }
+        self.rx = None;
+        self.active_request_id = None;
+        self.items.clear();
+        self.seen_keys.clear();
+        self.total_results = None;
+        self.loaded = false;
+        self.error = None;
+        self.merged_videos.clear();
+        self.merged_is_short.clear();
+        self.extra_local_count = 0;
+        self.merged_cache_key = None;
+        self.revision = self.revision.wrapping_add(1);
+    }
+}
+
+#[derive(Default)]
 pub(crate) struct LibraryState {
     pub(crate) data: crate::library::Library,
     pub(crate) revision: u64,
@@ -792,6 +1138,11 @@ pub(crate) struct LibraryState {
     pub(crate) editing_bookmark_idx: Option<usize>,
     pub(crate) editing_bookmark_note: String,
     pub(crate) pending_bookmark_seek: Option<(String, u64)>,
+    pub(crate) selected_collection_idx: Option<usize>,
+    pub(crate) active_remote_playlist_title: Option<String>,
+    pub(crate) playlist_chip_filter: u8,
+    pub(crate) detail_chip_filter: u8,
+    pub(crate) liked_videos: LikedVideosState,
 }
 
 #[derive(Default)]
@@ -810,6 +1161,9 @@ pub(crate) struct FollowedChannelsState {
 pub(crate) struct DownloadState {
     pub(crate) manager: downloads::DownloadManager,
     pub(crate) notice: Option<String>,
+    pub(crate) direct_url_input: String,
+    pub(crate) selected_format: downloads::DownloadFormat,
+    pub(crate) filter_tab: u8,
 }
 
 #[derive(Default)]
@@ -940,6 +1294,7 @@ pub(crate) struct WatchMetadataUiCache {
     pub(crate) cleaned_description: Option<String>,
     pub(crate) description_lines: Option<Vec<crate::watch_extras::CachedTimestampLine>>,
     pub(crate) description_chapters: Vec<crate::watch_extras::DescriptionChapter>,
+    pub(crate) description_expanded: bool,
 }
 
 pub(crate) struct CommunityExtrasFetchMessage {

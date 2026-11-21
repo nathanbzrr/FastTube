@@ -1,9 +1,6 @@
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BufferSettings {
@@ -109,13 +106,6 @@ pub fn save(path: &Path, profile: BufferProfile) -> io::Result<()> {
     profile
         .validate()
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory")
-        })?;
-    fs::create_dir_all(parent)?;
     let content = match profile {
         BufferProfile::Small => "1 small\n".to_owned(),
         BufferProfile::Default => "1 default\n".to_owned(),
@@ -125,29 +115,7 @@ pub fn save(path: &Path, profile: BufferProfile) -> io::Result<()> {
             values.max_mib, values.back_mib, values.cache_seconds
         ),
     };
-    let (temporary, mut file) = loop {
-        let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let temporary = parent.join(format!(".fasttube-buffer-{}-{id}.tmp", std::process::id()));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-        {
-            Ok(file) => break (temporary, file),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    };
-    let result = (|| {
-        file.write_all(content.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temporary, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    crate::history::write_atomic(path, content.as_bytes())
 }
 
 /// Defaults for each newly opened video; quality is a preferred maximum height.
@@ -225,43 +193,12 @@ pub fn save_playback(path: &Path, preferences: PlaybackPreferences) -> io::Resul
             "invalid playback settings",
         ));
     }
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory")
-        })?;
-    fs::create_dir_all(parent)?;
-    let (temporary, mut file) = loop {
-        let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let temporary = parent.join(format!(
-            ".fasttube-playback-{}-{id}.tmp",
-            std::process::id()
-        ));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-        {
-            Ok(file) => break (temporary, file),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    };
     let height = preferences
         .max_height
         .map(|v| v.to_string())
         .unwrap_or_else(|| "auto".into());
-    let result = (|| {
-        writeln!(file, "1 {} {}", preferences.speed_quarters, height)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temporary, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    let content = format!("1 {} {}\n", preferences.speed_quarters, height);
+    crate::history::write_atomic(path, content.as_bytes())
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -299,40 +236,12 @@ pub fn load_theme(path: &Path) -> io::Result<Theme> {
 }
 
 pub fn save_theme(path: &Path, theme: Theme) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory")
-        })?;
-    fs::create_dir_all(parent)?;
-    let (temporary, mut file) = loop {
-        let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let temporary = parent.join(format!(".fasttube-theme-{}-{id}.tmp", std::process::id()));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-        {
-            Ok(file) => break (temporary, file),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    };
     let value = match theme {
         Theme::Dark => "dark",
         Theme::Light => "light",
     };
-    let result = (|| {
-        writeln!(file, "1 {value}")?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temporary, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    let content = format!("1 {value}\n");
+    crate::history::write_atomic(path, content.as_bytes())
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -829,37 +738,8 @@ pub fn save_app_preferences(path: &Path, prefs: &AppPreferences) -> io::Result<(
     normalized
         .validate()
         .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory")
-        })?;
-    fs::create_dir_all(parent)?;
     let bytes = serde_json::to_vec_pretty(&normalized)?;
-    let (temporary, mut file) = loop {
-        let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let temporary = parent.join(format!(".fasttube-prefs-{}-{id}.tmp", std::process::id()));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-        {
-            Ok(file) => break (temporary, file),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    };
-    let result = (|| {
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temporary, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    crate::history::write_atomic(path, &bytes)
 }
 
 pub fn default_cache_dir() -> io::Result<PathBuf> {
@@ -1060,7 +940,7 @@ pub fn pick_text_export_dialog(title: &str, default_name: &str) -> Result<Option
         "Add-Type -AssemblyName System.Windows.Forms; ",
         "$d = New-Object System.Windows.Forms.SaveFileDialog; ",
         "$d.Title = $env:FASTTUBE_PICKER_TITLE; ",
-        "$d.Filter = 'Arquivo de Texto (*.txt)|*.txt|Markdown (*.md)|*.md|Todos os arquivos (*.*)|*.*'; ",
+        "$d.Filter = 'Arquivo de Texto (*.txt)|*.txt|Markdown (*.md)|*.md|Legenda SubRip (*.srt)|*.srt|Todos os arquivos (*.*)|*.*'; ",
         "$d.DefaultExt = 'txt'; ",
         "$d.AddExtension = $true; ",
         "if ($env:FASTTUBE_PICKER_NAME) { $d.FileName = $env:FASTTUBE_PICKER_NAME }; ",
@@ -1152,45 +1032,16 @@ pub fn install_oauth_client_file(source: &Path, dest: &Path) -> Result<(), Strin
         .read_to_end(&mut bytes)
         .map_err(|error| format!("Falha ao ler o arquivo selecionado: {error}"))?;
     validate_oauth_client_json(&bytes)?;
-    let parent = dest
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| "Pasta de destino do cliente OAuth inválida.".to_owned())?;
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("Não foi possível criar a pasta de configurações: {error}"))?;
-    let (temporary, mut out_file) = loop {
-        let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let temporary = parent.join(format!(".fasttube-oauth-{}-{id}.tmp", std::process::id()));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-        {
-            Ok(file) => break (temporary, file),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(format!(
-                    "Não foi possível preparar a gravação do oauth-client.json: {error}"
-                ));
-            }
-        }
-    };
-    let result = (|| -> io::Result<()> {
-        out_file.write_all(&bytes)?;
-        out_file.sync_all()?;
-        drop(out_file);
-        fs::rename(&temporary, dest)
-    })();
-    if let Err(error) = result {
-        let _ = fs::remove_file(&temporary);
-        return Err(format!("Falha ao salvar oauth-client.json: {error}"));
-    }
-    Ok(())
+    crate::history::write_atomic(dest, &bytes)
+        .map_err(|error| format!("Falha ao salvar oauth-client.json: {error}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
     fn test_path() -> PathBuf {
         let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);

@@ -126,6 +126,259 @@ impl FastTube {
         }
     }
 
+    fn player_osd_id() -> egui::Id {
+        egui::Id::new("fasttube_player_osd_feedback")
+    }
+
+    #[cfg(windows)]
+    fn player_osd_snapshot_id() -> egui::Id {
+        egui::Id::new("fasttube_player_osd_snapshot")
+    }
+
+    pub(crate) fn record_player_osd(ctx: &egui::Context, label: impl Into<String>) {
+        let feedback = PlayerOsdFeedback {
+            label: label.into(),
+            shown_at: Instant::now(),
+        };
+        ctx.data_mut(|d| d.insert_temp(Self::player_osd_id(), feedback));
+        ctx.request_repaint_after(Duration::from_millis(16));
+    }
+
+    #[cfg(windows)]
+    fn update_player_osd_snapshot_state(
+        ctx: &egui::Context,
+        video_url: &str,
+        mutate: impl FnOnce(&mut PlayerOsdSnapshot),
+    ) {
+        ctx.data_mut(|d| {
+            let id = Self::player_osd_snapshot_id();
+            if let Some(mut snap) = d.get_temp::<PlayerOsdSnapshot>(id)
+                && snap.video_url == video_url
+            {
+                mutate(&mut snap);
+                d.insert_temp(id, snap);
+            }
+        });
+    }
+
+    #[cfg(windows)]
+    #[allow(clippy::too_many_arguments)]
+    fn sync_player_osd_from_telemetry(
+        &self,
+        ctx: &egui::Context,
+        video: &Video,
+        telemetry: &PlayerTelemetry,
+        position: f64,
+        duration: Option<f64>,
+        is_live: bool,
+        is_live_dvr: bool,
+    ) {
+        if self.ui.settings_open {
+            return;
+        }
+        let mut next = PlayerOsdSnapshot {
+            video_url: video.url.clone(),
+            paused: telemetry.paused,
+            muted: telemetry.muted,
+            volume_rounded: telemetry.raw_volume.round() as i32,
+            speed_hundredths: (telemetry.speed * 100.0).round() as i32,
+        };
+        let prev = ctx.data(|d| d.get_temp::<PlayerOsdSnapshot>(Self::player_osd_snapshot_id()));
+        if let Some(prev) = prev.filter(|p| p.video_url == video.url) {
+            if prev.paused != next.paused {
+                Self::record_player_osd(
+                    ctx,
+                    if next.paused {
+                        "\u{23f8} Pausado"
+                    } else {
+                        "\u{25b6} Reproduzindo"
+                    },
+                );
+            } else if prev.muted != next.muted || prev.volume_rounded != next.volume_rounded {
+                if next.muted || next.volume_rounded == 0 {
+                    Self::record_player_osd(ctx, "\u{1f507} Mudo");
+                } else {
+                    Self::record_player_osd(ctx, format!("\u{1f50a} {}%", next.volume_rounded));
+                }
+            } else if prev.speed_hundredths != next.speed_hundredths {
+                Self::record_player_osd(
+                    ctx,
+                    format!("\u{26a1} {:.2}x", f64::from(next.speed_hundredths) / 100.0),
+                );
+            }
+        }
+        if (!is_live || is_live_dvr) && !ctx.egui_wants_keyboard_input() {
+            let kb = &self.settings.prefs.value.keybindings;
+            let short_mode = self.is_watch_short_mode();
+            let default_step = self.seek_step_secs();
+            let (back_secs, forward_secs, pct_seek) = ctx.input(|input| {
+                let no_alt_ctrl = !input.modifiers.alt && !input.modifiers.ctrl;
+                let back = if no_alt_ctrl && !short_mode && input.key_pressed(egui::Key::J) {
+                    Some(10_u32)
+                } else if settings::Keybindings::matches_input(input, &kb.seek_back) {
+                    Some(default_step)
+                } else {
+                    None
+                };
+                let forward = if no_alt_ctrl && !short_mode && input.key_pressed(egui::Key::L) {
+                    Some(10_u32)
+                } else if settings::Keybindings::matches_input(input, &kb.seek_forward) {
+                    Some(default_step)
+                } else {
+                    None
+                };
+                let pct = if no_alt_ctrl {
+                    [
+                        (egui::Key::Num0, 0.0),
+                        (egui::Key::Num1, 0.1),
+                        (egui::Key::Num2, 0.2),
+                        (egui::Key::Num3, 0.3),
+                        (egui::Key::Num4, 0.4),
+                        (egui::Key::Num5, 0.5),
+                        (egui::Key::Num6, 0.6),
+                        (egui::Key::Num7, 0.7),
+                        (egui::Key::Num8, 0.8),
+                        (egui::Key::Num9, 0.9),
+                    ]
+                    .into_iter()
+                    .find_map(|(k, p)| input.key_pressed(k).then_some(p))
+                } else {
+                    None
+                };
+                (back, forward, pct)
+            });
+            if let Some(step) = back_secs {
+                Self::record_player_osd(ctx, format!("\u{23ea} -{step}s"));
+            } else if let Some(step) = forward_secs {
+                Self::record_player_osd(ctx, format!("\u{23e9} +{step}s"));
+            } else if let Some(pct) = pct_seek
+                && let Some(dur) = duration.filter(|d| d.is_finite() && *d > 0.0)
+            {
+                let target = dur * pct;
+                let icon = if target >= position {
+                    "\u{23e9}"
+                } else {
+                    "\u{23ea}"
+                };
+                Self::record_player_osd(ctx, format!("{icon} {}", format_time(target)));
+            }
+        }
+        next.paused = telemetry.paused;
+        ctx.data_mut(|d| d.insert_temp(Self::player_osd_snapshot_id(), next));
+    }
+
+    pub(crate) fn paint_player_osd_pill(ctx: &egui::Context, video_rect: egui::Rect) {
+        if video_rect.width() < 120.0 || video_rect.height() < 80.0 {
+            return;
+        }
+        let id = Self::player_osd_id();
+        let Some(feedback) = ctx.data(|d| d.get_temp::<PlayerOsdFeedback>(id)) else {
+            return;
+        };
+        const OSD_DURATION_MS: f32 = 550.0;
+        let elapsed_ms = feedback.shown_at.elapsed().as_secs_f32() * 1000.0;
+        if elapsed_ms >= OSD_DURATION_MS {
+            ctx.data_mut(|d| d.remove::<PlayerOsdFeedback>(id));
+            return;
+        }
+        ctx.request_repaint_after(Duration::from_millis(16));
+        let progress = (elapsed_ms / OSD_DURATION_MS).clamp(0.0, 1.0);
+        let fade_t = ((progress - 0.22) / 0.78).clamp(0.0, 1.0);
+        let alpha = 1.0 - fade_t * fade_t * (3.0 - 2.0 * fade_t);
+        let bg_alpha = (214.0 * alpha).round() as u8;
+        let border_alpha = (46.0 * alpha).round() as u8;
+        let text_alpha = (255.0 * alpha).round() as u8;
+
+        let layer_id = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("fasttube_player_osd_layer"),
+        );
+        let painter = ctx.layer_painter(layer_id).with_clip_rect(video_rect);
+        let font_size = if video_rect.width() < 360.0 {
+            13.0
+        } else {
+            15.0
+        };
+        let galley = painter.layout_no_wrap(
+            feedback.label,
+            egui::FontId::proportional(font_size),
+            Color32::from_rgba_unmultiplied(248, 250, 255, text_alpha),
+        );
+        let pad = egui::vec2(16.0, 9.0);
+        let pill_w = (galley.size().x + pad.x * 2.0)
+            .max(54.0)
+            .min((video_rect.width() - 24.0).max(40.0));
+        let pill_h = (galley.size().y + pad.y * 2.0).max(34.0);
+        let center_y = (video_rect.min.y + (video_rect.height() * 0.22).clamp(28.0, 108.0))
+            .min(video_rect.max.y - pill_h * 0.5 - 8.0);
+        let pill_rect = egui::Rect::from_center_size(
+            egui::pos2(video_rect.center().x, center_y),
+            egui::vec2(pill_w, pill_h),
+        );
+        let corner_radius = (pill_rect.height() * 0.5).round().clamp(14.0, 28.0);
+        painter.rect_filled(
+            pill_rect,
+            corner_radius,
+            Color32::from_rgba_unmultiplied(15, 17, 23, bg_alpha),
+        );
+        painter.rect_stroke(
+            pill_rect,
+            corner_radius,
+            egui::Stroke::new(
+                1.0,
+                Color32::from_rgba_unmultiplied(255, 255, 255, border_alpha),
+            ),
+            egui::StrokeKind::Inside,
+        );
+        let text_pos = egui::pos2(
+            pill_rect.center().x - galley.size().x * 0.5,
+            pill_rect.center().y - galley.size().y * 0.5,
+        );
+        painter.galley(
+            text_pos,
+            galley,
+            Color32::from_rgba_unmultiplied(248, 250, 255, text_alpha),
+        );
+    }
+
+    pub(crate) fn paint_hairline_divider(ui: &mut egui::Ui, palette: &ThemePalette) {
+        let width = ui.available_width().max(1.0);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
+        ui.painter().line_segment(
+            [
+                egui::pos2(rect.left(), rect.center().y),
+                egui::pos2(rect.right(), rect.center().y),
+            ],
+            egui::Stroke::new(1.0, palette.card_alt_stroke),
+        );
+    }
+
+    pub(crate) fn paint_comment_avatar_ring(ui: &egui::Ui, rect: egui::Rect) {
+        ui.painter().circle_stroke(
+            rect.center(),
+            (rect.width().min(rect.height()) * 0.5 - 0.5).max(1.0),
+            egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(128, 128, 128, 45)),
+        );
+    }
+}
+
+#[derive(Clone)]
+struct PlayerOsdFeedback {
+    label: String,
+    shown_at: Instant,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct PlayerOsdSnapshot {
+    video_url: String,
+    paused: bool,
+    muted: bool,
+    volume_rounded: i32,
+    speed_hundredths: i32,
+}
+
+impl FastTube {
     #[cfg(windows)]
     pub(crate) fn player_surface_and_telemetry(
         &mut self,
@@ -150,11 +403,12 @@ impl FastTube {
         };
         let (rect, response) = ui.allocate_exact_size(size, sense);
         response.surrender_focus();
-        let corner_radius = if fullscreen || theater || mini_player {
-            0.0
-        } else {
-            4.0
-        };
+        let corner_radius =
+            if fullscreen || theater || mini_player || self.playback.in_app_mini_player {
+                0.0
+            } else {
+                12.0
+            };
         ui.painter()
             .rect_filled(rect, corner_radius, Color32::BLACK);
         if settings_open {
@@ -207,6 +461,8 @@ impl FastTube {
             (vp.inner_rect, vp.outer_rect, vp.maximized, vp.monitor_size)
         });
         if !self.playback.mini_player {
+            self.playback.in_app_mini_player = false;
+            self.playback.player_context_menu = None;
             let was_fullscreen = self.playback.fullscreen;
             if was_fullscreen {
                 self.playback.fullscreen = false;
@@ -264,6 +520,7 @@ impl FastTube {
                 }
             }
             self.playback.mini_player = false;
+            self.playback.player_context_menu = None;
             self.playback.mini_player_pending_enter = None;
             self.playback.mini_player_settled = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
@@ -719,6 +976,7 @@ impl FastTube {
         telemetry: &PlayerTelemetry,
         actions: &mut FullscreenControlsActions,
     ) {
+        let selected_url = self.selected.as_ref().map(|v| v.url.clone());
         let Some(player) = &self.player else {
             return;
         };
@@ -748,6 +1006,24 @@ impl FastTube {
                 };
                 match result {
                     Ok(()) => {
+                        let next_paused = if telemetry.ended {
+                            false
+                        } else {
+                            !telemetry.paused
+                        };
+                        Self::record_player_osd(
+                            ui.ctx(),
+                            if next_paused {
+                                "\u{23f8} Pausado"
+                            } else {
+                                "\u{25b6} Reproduzindo"
+                            },
+                        );
+                        if let Some(url) = selected_url.as_deref() {
+                            Self::update_player_osd_snapshot_state(ui.ctx(), url, |snap| {
+                                snap.paused = next_paused;
+                            });
+                        }
                         if telemetry.ended {
                             actions.manual_seek_recorded = Some(0.0);
                         } else if !telemetry.paused {
@@ -758,8 +1034,7 @@ impl FastTube {
                 }
             }
         }
-        if ui
-            .add_enabled(bar.has_queued, egui::Button::new("⏭ Próximo"))
+        if styled_compact_button_enabled(ui, bar.has_queued, "⏭ Próximo", false, &bar.palette)
             .on_hover_text("Avançar manualmente para o próximo vídeo da fila")
             .clicked()
         {
@@ -768,25 +1043,25 @@ impl FastTube {
         if !bar.is_live {
             let step = self.seek_step_secs();
             let step_f = f64::from(step);
-            if ui
-                .button(format!("−{step}s"))
+            if styled_compact_button(ui, &format!("−{step}s"), false, &bar.palette)
                 .on_hover_text(format!("Retroceder {step} segundos (←)"))
                 .clicked()
             {
                 match player.seek(-step_f, "relative") {
                     Ok(()) => {
+                        Self::record_player_osd(ui.ctx(), format!("\u{23ea} -{step}s"));
                         actions.manual_seek_recorded = Some((bar.position - step_f).max(0.0));
                     }
                     Err(error) => self.message = error,
                 }
             }
-            if ui
-                .button(format!("+{step}s"))
+            if styled_compact_button(ui, &format!("+{step}s"), false, &bar.palette)
                 .on_hover_text(format!("Avançar {step} segundos (→)"))
                 .clicked()
             {
                 match player.seek(step_f, "relative") {
                     Ok(()) => {
+                        Self::record_player_osd(ui.ctx(), format!("\u{23e9} +{step}s"));
                         let next = bar
                             .duration
                             .map(|dur| (bar.position + step_f).min(dur))
@@ -851,21 +1126,28 @@ impl FastTube {
         position: f64,
         library_changed: &mut bool,
     ) {
+        let palette = self.palette();
         ui.add_sized(
-            [90.0, 20.0],
+            [90.0, 22.0],
             egui::TextEdit::singleline(&mut self.library.bookmark_note)
                 .hint_text("Nota do marcador"),
         );
-        if ui.small_button("＋ Marcador").clicked() && self.add_current_bookmark(video, position) {
+        if styled_compact_button(ui, "＋ Marcador", false, &palette).clicked()
+            && self.add_current_bookmark(video, position)
+        {
             *library_changed = true;
         }
-        if ui
-            .small_button(if self.playback.mini_player {
+        if styled_compact_button(
+            ui,
+            if self.playback.mini_player {
                 "Sair do mini"
             } else {
                 "Mini player"
-            })
-            .clicked()
+            },
+            self.playback.mini_player,
+            &palette,
+        )
+        .clicked()
         {
             self.toggle_mini_player(ctx);
         }
@@ -879,20 +1161,39 @@ impl FastTube {
         muted: bool,
         palette: ThemePalette,
     ) {
+        let selected_url = self.selected.as_ref().map(|v| v.url.clone());
         let Some(player) = &self.player else {
             return;
         };
         ui.add_space(6.0);
         let sound_icon = if muted { Icon::Muted } else { Icon::Volume };
+        let mut volume = player.number("volume").unwrap_or(100.0).clamp(0.0, 100.0);
         if ui
             .add(egui::Button::image(sound_icon.image(palette.icon_fg, 17.0)))
             .on_hover_text("Silenciar ou ativar som (M)")
             .clicked()
-            && let Err(error) = player.set("mute", if muted { "no" } else { "yes" })
         {
-            self.message = error;
+            match player.set("mute", if muted { "no" } else { "yes" }) {
+                Ok(()) => {
+                    let next_muted = !muted;
+                    let vol_rounded = volume.round() as i32;
+                    Self::record_player_osd(
+                        ui.ctx(),
+                        if next_muted || vol_rounded == 0 {
+                            "\u{1f507} Mudo".to_owned()
+                        } else {
+                            format!("\u{1f50a} {vol_rounded}%")
+                        },
+                    );
+                    if let Some(url) = selected_url.as_deref() {
+                        Self::update_player_osd_snapshot_state(ui.ctx(), url, |snap| {
+                            snap.muted = next_muted;
+                        });
+                    }
+                }
+                Err(error) => self.message = error,
+            }
         }
-        let mut volume = player.number("volume").unwrap_or(100.0).clamp(0.0, 100.0);
         if ui
             .add_sized(
                 [76.0, 20.0],
@@ -900,9 +1201,26 @@ impl FastTube {
             )
             .on_hover_text(format!("Volume: {:.0}%", volume))
             .changed()
-            && let Err(error) = player.set("volume", &format!("{volume:.0}"))
         {
-            self.message = error;
+            match player.set("volume", &format!("{volume:.0}")) {
+                Ok(()) => {
+                    let vol_rounded = volume.round() as i32;
+                    Self::record_player_osd(
+                        ui.ctx(),
+                        if vol_rounded == 0 {
+                            "\u{1f507} Mudo".to_owned()
+                        } else {
+                            format!("\u{1f50a} {vol_rounded}%")
+                        },
+                    );
+                    if let Some(url) = selected_url.as_deref() {
+                        Self::update_player_osd_snapshot_state(ui.ctx(), url, |snap| {
+                            snap.volume_rounded = vol_rounded;
+                        });
+                    }
+                }
+                Err(error) => self.message = error,
+            }
         }
         ui.separator();
         let mut speed = player.number("speed").unwrap_or(1.0);
@@ -919,8 +1237,16 @@ impl FastTube {
                         .changed()
                     {
                         self.playback.speed = choice;
-                        if let Err(error) = player.set("speed", &format!("{choice}")) {
-                            self.message = error;
+                        match player.set("speed", &format!("{choice}")) {
+                            Ok(()) => {
+                                Self::record_player_osd(ui.ctx(), format!("\u{26a1} {choice:.2}x"));
+                                if let Some(url) = selected_url.as_deref() {
+                                    Self::update_player_osd_snapshot_state(ui.ctx(), url, |snap| {
+                                        snap.speed_hundredths = (choice * 100.0).round() as i32;
+                                    });
+                                }
+                            }
+                            Err(error) => self.message = error,
                         }
                     }
                 }
@@ -943,6 +1269,10 @@ impl FastTube {
                             && let Some(time) = player.number(&format!("chapter-list/{index}/time"))
                         {
                             let _ = player.seek(time, "absolute");
+                            Self::record_player_osd(
+                                ui.ctx(),
+                                format!("\u{23e9} {}", format_time(time)),
+                            );
                         }
                     }
                 });
@@ -1326,6 +1656,23 @@ impl FastTube {
                 Err(error) => self.message = error,
             }
         }
+        if self
+            .playback
+            .active
+            .as_ref()
+            .is_some_and(|active| active.has_live_sample && active.url == video.url)
+            && pending_seek.is_none()
+        {
+            self.sync_player_osd_from_telemetry(
+                ctx,
+                &video,
+                &telemetry,
+                position,
+                duration,
+                is_live,
+                is_live_dvr,
+            );
+        }
 
         let next_fallback_video = if self.queue.data.is_empty() {
             if mode == WatchLayoutMode::Short {
@@ -1340,7 +1687,30 @@ impl FastTube {
         let palette = self.palette();
         let mut actions = FullscreenControlsActions::default();
         // Show external control bar only when falling back to a native HWND.
-        if video_area.is_none() && !settings_open {
+        let show_hwnd_fullscreen_bar = if video_area.is_none() && !settings_open && fullscreen {
+            let stage_rect = ctx.input(|i| i.content_rect());
+            self.update_player_overlay_pointer_activity(ctx, stage_rect);
+            let idle_secs = self.playback.overlay_last_activity.elapsed().as_secs_f64();
+            let bar_visible = overlay::overlay_visible_with_state(
+                false,
+                telemetry.paused,
+                telemetry.ended,
+                self.playback.player_context_menu.is_some(),
+                self.playback.seek_drag.is_some(),
+                idle_secs,
+            );
+            if !bar_visible
+                && !self.autoscroll.is_active()
+                && !self.ui.shortcuts_open
+                && !self.ui.command_palette.open
+            {
+                ctx.set_cursor_icon(egui::CursorIcon::None);
+            }
+            bar_visible
+        } else {
+            true
+        };
+        if video_area.is_none() && !settings_open && show_hwnd_fullscreen_bar {
             self.fullscreen_seek_ui(
                 ui,
                 width,
@@ -1371,13 +1741,23 @@ impl FastTube {
             self.save_library();
         }
 
-        let overlay_active = video_area.as_ref().is_some_and(|(rect, response)| {
-            let hovered = response.hovered() || ui.rect_contains_pointer(*rect);
+        if let Some((rect, _)) = video_area.as_ref()
+            && !self.autoscroll.is_active()
+        {
+            self.update_player_overlay_pointer_activity(ctx, *rect);
+        }
+        let overlay_active = video_area.as_ref().is_some_and(|(rect, _)| {
+            let pointer_pos =
+                ui.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()));
+            let pointer_keeps_visible =
+                overlay::should_keep_overlay_visible_for_pointer(fullscreen, pointer_pos, *rect);
+            let any_menu_open =
+                self.playback.player_menu.is_some() || self.playback.player_context_menu.is_some();
             overlay::overlay_visible_with_state(
-                hovered,
+                pointer_keeps_visible,
                 telemetry.paused,
                 telemetry.ended,
-                self.playback.player_menu.is_some(),
+                any_menu_open,
                 self.playback.seek_drag.is_some(),
                 self.playback.overlay_last_activity.elapsed().as_secs_f64(),
             )
@@ -1427,9 +1807,13 @@ impl FastTube {
             raw_position: telemetry.raw_position,
             now,
         };
+        let osd_video_rect = video_area.as_ref().map(|(rect, _)| *rect);
         let overlay_action = self.player_overlay_ui(ui, video_area, &overlay_ctx, ctx);
         if let Some(action) = overlay_action {
             self.handle_player_overlay_action(action, &overlay_ctx, ctx);
+        }
+        if !settings_open && let Some(video_rect) = osd_video_rect {
+            Self::paint_player_osd_pill(ctx, video_rect);
         }
 
         if actions.go_live_clicked {
@@ -1518,6 +1902,143 @@ impl FastTube {
                 )
             })
             .inner;
+        if seekable
+            && (response.hovered() || response.dragged())
+            && response.rect.width() > 2.0
+            && let Some(dur) = duration.filter(|d| d.is_finite() && *d > 0.0)
+        {
+            let pointer_x = if response.dragged() {
+                Some(
+                    response.rect.left()
+                        + response.rect.width() * ((seek / dur) as f32).clamp(0.0, 1.0),
+                )
+            } else {
+                ui.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()))
+                    .map(|p| p.x)
+            };
+            if let Some(anchor_x) = pointer_x {
+                let frac =
+                    ((anchor_x - response.rect.left()) / response.rect.width()).clamp(0.0, 1.0);
+                let preview_secs = f64::from(frac) * dur;
+                let time_text = if is_live {
+                    if frac >= 0.985 {
+                        "Ao vivo".to_owned()
+                    } else {
+                        overlay::format_live_behind((dur - preview_secs).max(0.0))
+                    }
+                } else {
+                    format_time(preview_secs)
+                };
+                let storyboard_frame = if !is_live
+                    && self.playback.storyboard_video_url.as_deref() == Some(video.url.as_str())
+                    && let Some((sheet_url, uv, aspect_ratio)) =
+                        self.playback.storyboard.as_ref().and_then(|spec| {
+                            let aspect = if spec.thumb_width > 0 && spec.thumb_height > 0 {
+                                spec.thumb_width as f32 / spec.thumb_height as f32
+                            } else {
+                                16.0 / 9.0
+                            };
+                            spec.lookup(preview_secs)
+                                .map(|(url, uv)| (url.to_owned(), uv, aspect))
+                        })
+                    && let Some((texture_id, _)) = self
+                        .thumbnails
+                        .resolve_storyboard_texture(ui.ctx(), &sheet_url)
+                {
+                    Some((texture_id, uv, aspect_ratio))
+                } else {
+                    None
+                };
+
+                let window_rect = ui.ctx().content_rect();
+                let bounds_left = response.rect.left().max(window_rect.left() + 6.0);
+                let bounds_right = response.rect.right().min(window_rect.right() - 6.0);
+                let max_inner_w = (bounds_right - bounds_left - 16.0).max(48.0);
+                let thumb_size = storyboard_frame.map(|(_, _, aspect_ratio)| {
+                    let ratio = if aspect_ratio.is_finite() && aspect_ratio > 0.2 {
+                        aspect_ratio.clamp(0.5, 3.0)
+                    } else {
+                        16.0 / 9.0
+                    };
+                    let mut w = (response.rect.width() * 0.24)
+                        .clamp(112.0, 168.0)
+                        .min(max_inner_w);
+                    let mut h = w / ratio;
+                    if h > 102.0 {
+                        h = 102.0;
+                        w = (h * ratio).min(max_inner_w);
+                    }
+                    egui::vec2(w.round(), h.round())
+                });
+                let fg_layer =
+                    egui::LayerId::new(egui::Order::Foreground, ui.id().with("seek_hover_preview"));
+                let painter = ui.ctx().layer_painter(fg_layer);
+                let time_galley = painter.layout_no_wrap(
+                    time_text,
+                    egui::FontId::proportional(11.5),
+                    Color32::WHITE,
+                );
+                let pad = egui::vec2(8.0, 6.0);
+                let thumb_gap = if thumb_size.is_some() { 6.0 } else { 0.0 };
+                let content_w = thumb_size
+                    .map_or(0.0, |sz| sz.x)
+                    .max(time_galley.size().x)
+                    .min(max_inner_w);
+                let content_h =
+                    thumb_size.map_or(0.0, |sz| sz.y + thumb_gap) + time_galley.size().y;
+                let pill_w = content_w + pad.x * 2.0;
+                let pill_h = content_h + pad.y * 2.0;
+                let pill_x = if bounds_right - bounds_left <= pill_w {
+                    bounds_left
+                } else {
+                    (anchor_x - pill_w * 0.5).clamp(bounds_left, bounds_right - pill_w)
+                };
+                let pill_y = (response.rect.top() - pill_h - 8.0).max(window_rect.top() + 6.0);
+                let pill_rect = egui::Rect::from_min_size(
+                    egui::pos2(pill_x, pill_y),
+                    egui::vec2(pill_w, pill_h),
+                );
+                painter.rect_filled(
+                    pill_rect,
+                    egui::CornerRadius::same(10),
+                    Color32::from_rgba_unmultiplied(15, 16, 20, 240),
+                );
+                painter.rect_stroke(
+                    pill_rect,
+                    egui::CornerRadius::same(10),
+                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 42)),
+                    egui::StrokeKind::Inside,
+                );
+                let mut cursor_y = pill_rect.top() + pad.y;
+                if let (Some((texture_id, uv, _)), Some(thumb_sz)) = (storyboard_frame, thumb_size)
+                {
+                    let thumb_x = pill_rect.center().x - thumb_sz.x * 0.5;
+                    let thumb_rect =
+                        egui::Rect::from_min_size(egui::pos2(thumb_x, cursor_y), thumb_sz);
+                    ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .layer_id(fg_layer)
+                            .max_rect(thumb_rect),
+                        |ui| {
+                            egui::Image::from_texture((texture_id, thumb_sz))
+                                .uv(uv)
+                                .corner_radius(8.0)
+                                .paint_at(ui, thumb_rect);
+                        },
+                    );
+                    painter.rect_stroke(
+                        thumb_rect,
+                        egui::CornerRadius::same(8),
+                        egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 44)),
+                        egui::StrokeKind::Inside,
+                    );
+                    cursor_y += thumb_sz.y + thumb_gap;
+                }
+                let time_pos =
+                    egui::pos2(pill_rect.center().x - time_galley.size().x * 0.5, cursor_y);
+                painter.galley(time_pos, time_galley, Color32::WHITE);
+            }
+        }
         if seekable && response.dragged() {
             self.playback.seek_drag = Some(seek);
         }
@@ -1542,10 +2063,366 @@ impl FastTube {
                 .map(|player| player.seek(target, "absolute+exact"))
                 .unwrap_or(Ok(()));
             match seek_res {
-                Ok(()) => self.record_manual_seek(target, duration, now),
+                Ok(()) => {
+                    let icon = if target >= position {
+                        "\u{23e9}"
+                    } else {
+                        "\u{23ea}"
+                    };
+                    Self::record_player_osd(ui.ctx(), format!("{icon} {}", format_time(target)));
+                    self.record_manual_seek(target, duration, now);
+                }
                 Err(error) => self.message = error,
             }
             self.playback.seek_drag = None;
+        }
+    }
+
+    pub(crate) fn update_player_overlay_pointer_activity(
+        &mut self,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+    ) {
+        let (pointer_pos, any_down, any_btn_edge, wheel_scrolled) = ctx.input(|i| {
+            let pos = i.pointer.hover_pos().or_else(|| i.pointer.interact_pos());
+            let wheel = i
+                .raw
+                .events
+                .iter()
+                .any(|ev| matches!(ev, egui::Event::MouseWheel { .. }));
+            let btn_edge = i.pointer.any_pressed() || i.pointer.any_released();
+            (pos, i.pointer.any_down(), btn_edge, wheel)
+        });
+        if let Some(pos) = pointer_pos.filter(|p| rect.contains(*p)) {
+            let moved = self
+                .playback
+                .overlay_last_pointer_pos
+                .is_none_or(|prev| prev.distance_sq(pos) > 0.25);
+            if moved || any_down || any_btn_edge || wheel_scrolled {
+                self.playback.overlay_last_activity = Instant::now();
+            }
+            self.playback.overlay_last_pointer_pos = Some(pos);
+        } else {
+            self.playback.overlay_last_pointer_pos = None;
+        }
+    }
+
+    pub(crate) fn refresh_stats_for_nerds(&mut self, force: bool) {
+        if !force
+            && self
+                .playback
+                .stats_for_nerds_last_poll
+                .is_some_and(|t| t.elapsed() < Duration::from_millis(500))
+        {
+            return;
+        }
+        self.playback.stats_for_nerds_last_poll = Some(Instant::now());
+        #[cfg(windows)]
+        if let Some(player) = &self.player {
+            let configured_fallback = self
+                .settings
+                .prefs
+                .value
+                .hwdec_mode
+                .as_mpv_value()
+                .to_owned();
+            self.playback.diagnostics = diagnostics::collect_from_property_reader(|prop| {
+                player.property(prop).or_else(|| {
+                    (prop == diagnostics::PROP_HWDEC).then(|| configured_fallback.clone())
+                })
+            });
+            self.playback.stats_for_nerds = app_state::PlayerNerdsStats {
+                audio_codec: player.property("audio-codec-name"),
+                fps: player
+                    .double_cstr(c"estimated-vf-fps")
+                    .or_else(|| player.double_cstr(c"container-fps"))
+                    .filter(|v| v.is_finite() && *v > 0.0),
+                dropped_frames: player
+                    .int_cstr(c"frame-drop-count")
+                    .map(|v| v.max(0) as u64),
+                video_bitrate_bps: player
+                    .double_cstr(c"video-bitrate")
+                    .filter(|v| v.is_finite() && *v > 0.0),
+                audio_bitrate_bps: player
+                    .double_cstr(c"audio-bitrate")
+                    .filter(|v| v.is_finite() && *v > 0.0),
+            };
+        }
+    }
+
+    fn viewport_pixel_size(video_rect: egui::Rect, ctx: &egui::Context) -> Option<VideoSize> {
+        let ppp = ctx.pixels_per_point().max(0.1);
+        let w = (video_rect.width() * ppp).round().max(0.0) as u32;
+        let h = (video_rect.height() * ppp).round().max(0.0) as u32;
+        VideoSize::new(w, h)
+    }
+
+    fn build_youtube_url_at_current_time(video_url: &str, position_secs: f64) -> String {
+        let secs = if position_secs.is_finite() && position_secs >= 0.0 {
+            position_secs.floor() as u64
+        } else {
+            0
+        };
+        if let Some(id) = history::youtube_video_id(video_url) {
+            format!("https://youtu.be/{id}?t={secs}")
+        } else {
+            crate::build_youtube_share_url(video_url, Some(secs))
+        }
+    }
+
+    pub(crate) fn build_current_player_debug_info_json(
+        &mut self,
+        video_rect: Option<egui::Rect>,
+        playback: &OverlayPlaybackContext,
+        ctx: &egui::Context,
+    ) -> String {
+        self.refresh_stats_for_nerds(true);
+        let video_id = history::youtube_video_id(&playback.video.url);
+        let viewport_size = video_rect.and_then(|r| Self::viewport_pixel_size(r, ctx));
+        #[cfg(windows)]
+        let backend = if self
+            .player
+            .as_ref()
+            .is_some_and(player::Player::is_render_api)
+        {
+            "libmpv-opengl"
+        } else {
+            "libmpv-hwnd"
+        };
+        #[cfg(not(windows))]
+        let backend = "unavailable";
+
+        let failure_category =
+            (!self.message.trim().is_empty()).then(|| diagnostics::classify_failure(&self.message));
+        let buffer_profile = buffer_profile_name(self.settings.buffer.profile);
+        diagnostics::player_debug_info_json(&diagnostics::PlayerDebugInfoInput {
+            app_version: env!("CARGO_PKG_VERSION"),
+            video_id: video_id.as_deref(),
+            video_size: self.playback.diagnostics.size,
+            viewport_size,
+            fps: self.playback.stats_for_nerds.fps,
+            dropped_frames: self.playback.stats_for_nerds.dropped_frames,
+            video_codec: self.playback.diagnostics.codec.as_deref(),
+            audio_codec: self.playback.stats_for_nerds.audio_codec.as_deref(),
+            hwdec_configured: self.playback.diagnostics.configured_hwdec.as_deref(),
+            hwdec_effective: &self.playback.diagnostics.effective_decoding,
+            speed: playback.speed,
+            volume_percent: playback.raw_volume as f32,
+            muted: playback.muted,
+            buffer_profile,
+            buffer_ahead_secs: playback.buffered_secs,
+            is_live: playback.is_live,
+            audio_only: self.playback.audio_only,
+            loop_video: playback.loop_video,
+            player_backend: backend,
+            failure_category,
+        })
+    }
+
+    pub(crate) fn build_stats_for_nerds_data(
+        &self,
+        video_rect: egui::Rect,
+        playback: &OverlayPlaybackContext,
+        ctx: &egui::Context,
+    ) -> overlay::StatsForNerdsData {
+        let pt = self.ui_pt();
+        let video_id = history::youtube_video_id(&playback.video.url)
+            .unwrap_or_else(|| self.pick("indispon\u{00ed}vel", "unavailable").to_owned());
+        let vp_str = Self::viewport_pixel_size(video_rect, ctx)
+            .map(|s| format!("{}x{}", s.width, s.height))
+            .unwrap_or_else(|| "--".to_owned());
+        let dropped = self.playback.stats_for_nerds.dropped_frames.unwrap_or(0);
+        let viewport_and_frames = if pt {
+            format!("{vp_str} / {dropped} descartados")
+        } else {
+            format!("{vp_str} / {dropped} dropped")
+        };
+
+        let res_str = self
+            .playback
+            .diagnostics
+            .size
+            .map(|s| format!("{}x{}", s.width, s.height))
+            .or_else(|| playback.current_height.map(|h| format!("{h}p")))
+            .unwrap_or_else(|| "--".to_owned());
+        let fps_str = self
+            .playback
+            .stats_for_nerds
+            .fps
+            .map(|f| format!(" @ {:.0} fps", f.round()))
+            .unwrap_or_default();
+        let current_res = format!("{res_str}{fps_str}");
+
+        let volume_and_speed = if playback.muted {
+            format!(
+                "0% ({}) / {:.2}x",
+                self.pick("mudo", "muted"),
+                playback.speed
+            )
+        } else {
+            format!(
+                "{:.0}% / {:.2}x",
+                playback.raw_volume.round(),
+                playback.speed
+            )
+        };
+
+        let v_codec = self.playback.diagnostics.codec.as_deref().unwrap_or("--");
+        let a_codec = self
+            .playback
+            .stats_for_nerds
+            .audio_codec
+            .as_deref()
+            .unwrap_or("--");
+        let codecs = format!("{v_codec} / {a_codec}");
+        let decoding = self
+            .playback
+            .diagnostics
+            .effective_decoding
+            .short_label_for_lang(self.settings.prefs.value.language);
+
+        let profile_label = buffer_profile_name(self.settings.buffer.profile);
+        let buffer_health = match playback
+            .buffered_secs
+            .filter(|s| s.is_finite() && *s >= 0.0)
+        {
+            Some(secs) => format!("{secs:.1}s ({profile_label})"),
+            None => format!("-- ({profile_label})"),
+        };
+
+        let total_bps = self
+            .playback
+            .stats_for_nerds
+            .video_bitrate_bps
+            .unwrap_or(0.0)
+            + self
+                .playback
+                .stats_for_nerds
+                .audio_bitrate_bps
+                .unwrap_or(0.0);
+        let bitrate = if total_bps >= 1_000_000.0 {
+            Some(format!("{:.2} Mbps", total_bps / 1_000_000.0))
+        } else if total_bps >= 1_000.0 {
+            Some(format!("{:.0} kbps", total_bps / 1_000.0))
+        } else {
+            None
+        };
+
+        overlay::StatsForNerdsData {
+            pt,
+            video_id,
+            viewport_and_frames,
+            current_res,
+            volume_and_speed,
+            codecs,
+            decoding,
+            buffer_health,
+            bitrate,
+        }
+    }
+
+    pub(crate) fn handle_player_context_action(
+        &mut self,
+        action: overlay::PlayerContextAction,
+        playback: &OverlayPlaybackContext,
+        video_rect: egui::Rect,
+        ctx: &egui::Context,
+    ) {
+        use overlay::{OverlayAction, PlayerContextAction};
+        match action {
+            PlayerContextAction::ToggleLoop => {
+                self.handle_player_overlay_action(OverlayAction::ToggleLoop, playback, ctx);
+                if !playback.is_live {
+                    let msg = if self.playback.loop_video {
+                        self.pick("Repetição ativada.", "Loop enabled.")
+                    } else {
+                        self.pick("Repetição desativada.", "Loop disabled.")
+                    };
+                    self.toasts.push(toast::ToastKind::Info, msg);
+                }
+            }
+            PlayerContextAction::ToggleMiniPlayer => {
+                self.toggle_mini_player(ctx);
+            }
+            PlayerContextAction::CopyVideoUrl => {
+                let url = crate::build_youtube_share_url(&playback.video.url, None);
+                match copy_text_to_clipboard(ctx, &url) {
+                    Ok(()) => {
+                        self.toasts.push(
+                            toast::ToastKind::Success,
+                            self.pick("URL do v\u{00ed}deo copiada.", "Video URL copied."),
+                        );
+                    }
+                    Err(err) => self.message = err,
+                }
+            }
+            PlayerContextAction::CopyVideoUrlAtCurrentTime => {
+                let url =
+                    Self::build_youtube_url_at_current_time(&playback.video.url, playback.position);
+                match copy_text_to_clipboard(ctx, &url) {
+                    Ok(()) => {
+                        self.toasts.push(
+                            toast::ToastKind::Success,
+                            self.pick(
+                                "URL com o momento atual copiada.",
+                                "Timestamped video URL copied.",
+                            ),
+                        );
+                    }
+                    Err(err) => self.message = err,
+                }
+            }
+            PlayerContextAction::CopyEmbedCode => {
+                if let Some(id) = history::youtube_video_id(&playback.video.url) {
+                    let embed = crate::build_youtube_embed_code(&id, &playback.video.title, None);
+                    match copy_text_to_clipboard(ctx, &embed) {
+                        Ok(()) => {
+                            self.toasts.push(
+                                toast::ToastKind::Success,
+                                self.pick(
+                                    "C\u{00f3}digo de incorporação copiado.",
+                                    "Embed code copied.",
+                                ),
+                            );
+                        }
+                        Err(err) => self.message = err,
+                    }
+                }
+            }
+            PlayerContextAction::CopyDebugInfo => {
+                let json =
+                    self.build_current_player_debug_info_json(Some(video_rect), playback, ctx);
+                match copy_text_to_clipboard(ctx, &json) {
+                    Ok(()) => {
+                        self.toasts.push(
+                            toast::ToastKind::Success,
+                            self.pick(
+                                "Informa\u{00e7}\u{00f5}es de depura\u{00e7}\u{00e3}o copiadas.",
+                                "Debug info copied.",
+                            ),
+                        );
+                    }
+                    Err(err) => self.message = err,
+                }
+            }
+            PlayerContextAction::TroubleshootPlayback => {
+                if self.playback.fullscreen {
+                    self.toggle_fullscreen(ctx);
+                }
+                if self.playback.mini_player {
+                    self.toggle_mini_player(ctx);
+                }
+                self.playback.player_menu = None;
+                self.playback.player_context_menu = None;
+                self.open_settings_tab(app_state::SettingsTab::BackupDiagnostics, ctx);
+            }
+            PlayerContextAction::ToggleStatsForNerds => {
+                let next = !self.playback.stats_for_nerds_open;
+                self.playback.stats_for_nerds_open = next;
+                if next {
+                    self.refresh_stats_for_nerds(true);
+                }
+            }
         }
     }
 
@@ -1557,22 +2434,30 @@ impl FastTube {
         ctx: &egui::Context,
     ) -> Option<overlay::OverlayAction> {
         let mut overlay_action = None;
+        let was_context_menu_open = self.playback.player_context_menu.is_some();
         if let Some((rect, response)) = video_area {
-            let hovered = response.hovered() || ui.rect_contains_pointer(rect);
-            if hovered {
-                self.playback.overlay_last_activity = Instant::now();
+            if !self.autoscroll.is_active() {
+                self.update_player_overlay_pointer_activity(ctx, rect);
             }
+            let pointer_pos =
+                ui.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()));
+            let pointer_keeps_visible = overlay::should_keep_overlay_visible_for_pointer(
+                playback.fullscreen,
+                pointer_pos,
+                rect,
+            );
             let idle_secs = self.playback.overlay_last_activity.elapsed().as_secs_f64();
             let menu_open = self.playback.player_menu.is_some();
+            let context_menu_open = self.playback.player_context_menu.is_some();
             let scrubbing = self.playback.seek_drag.is_some()
                 || ui.input(|i| {
                     i.pointer.any_down() && i.pointer.hover_pos().is_some_and(|p| rect.contains(p))
                 });
             let visible = overlay::overlay_visible_with_state(
-                hovered,
+                pointer_keeps_visible,
                 playback.paused,
                 playback.ended,
-                menu_open,
+                menu_open || context_menu_open,
                 scrubbing,
                 idle_secs,
             );
@@ -1649,7 +2534,8 @@ impl FastTube {
                     self.playback.audio_tracks_last_poll = Some(Instant::now());
                 }
             }
-            let hover_pointer = ui.input(|i| i.pointer.hover_pos());
+            let hover_pointer =
+                ui.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()));
             let storyboard_preview = if !playback.is_live
                 && self.playback.storyboard_video_url.as_deref()
                     == Some(playback.video.url.as_str())
@@ -1723,35 +2609,133 @@ impl FastTube {
                 live_behind_secs: playback.live_behind_secs,
                 menu: self.playback.player_menu,
             };
-            let (action, over_bar) = overlay::show(ui, rect, &telemetry, &style, visible);
-            if let Some(action) = action {
-                self.playback.overlay_last_activity = Instant::now();
-                overlay_action = Some(action);
-            } else if response.double_clicked() && !over_bar {
-                self.playback.overlay_last_activity = Instant::now();
-                if !menu_open {
-                    self.handle_player_overlay_action(
-                        overlay::OverlayAction::TogglePlay,
-                        playback,
-                        ctx,
-                    );
+            let (action, mut over_bar) = overlay::show(ui, rect, &telemetry, &style, visible);
+            let mut over_stats = false;
+            if self.playback.stats_for_nerds_open {
+                self.refresh_stats_for_nerds(false);
+                let stats_data = self.build_stats_for_nerds_data(rect, playback, ctx);
+                let (stats_action, pointer_over_stats) =
+                    overlay::show_stats_for_nerds(ui, rect, &stats_data, &style);
+                over_stats = pointer_over_stats;
+                over_bar |= over_stats;
+                if let Some(act) = stats_action {
+                    self.playback.overlay_last_activity = Instant::now();
+                    match act {
+                        overlay::StatsForNerdsAction::CopyDebugInfo => {
+                            self.handle_player_context_action(
+                                overlay::PlayerContextAction::CopyDebugInfo,
+                                playback,
+                                rect,
+                                ctx,
+                            );
+                        }
+                        overlay::StatsForNerdsAction::Close => {
+                            self.playback.stats_for_nerds_open = false;
+                        }
+                    }
                 }
-                overlay_action = Some(overlay::OverlayAction::ToggleFullscreen);
-            } else if playback.mini_player
-                && !over_bar
-                && !menu_open
-                && self.playback.seek_drag.is_none()
-                && response.drag_started_by(egui::PointerButton::Primary)
+            }
+
+            let secondary_click_pos = ui.input(|i| {
+                i.pointer
+                    .button_clicked(egui::PointerButton::Secondary)
+                    .then(|| i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()))
+                    .flatten()
+            });
+            let mut just_opened_context_menu = false;
+            if let Some(click_pos) = secondary_click_pos {
+                if rect.contains(click_pos) && !self.autoscroll.is_active() {
+                    self.playback.player_context_menu = Some(click_pos);
+                    self.playback.player_menu = None;
+                    self.playback.overlay_last_activity = Instant::now();
+                    just_opened_context_menu = true;
+                } else {
+                    self.playback.player_context_menu = None;
+                }
+            }
+
+            if let Some(anchor) = self.playback.player_context_menu {
+                let menu_state = overlay::PlayerContextMenuState {
+                    pt: self.ui_pt(),
+                    is_live: playback.is_live,
+                    loop_video: playback.loop_video,
+                    mini_player: playback.mini_player,
+                    can_copy_embed: history::youtube_video_id(&playback.video.url).is_some(),
+                    stats_for_nerds_open: self.playback.stats_for_nerds_open,
+                };
+                let (ctx_action, menu_rect) =
+                    overlay::show_context_menu(ctx, anchor, &menu_state, &style);
+                if pointer_pos.is_some_and(|p| menu_rect.contains(p)) {
+                    over_bar = true;
+                }
+                if let Some(act) = ctx_action {
+                    self.playback.player_context_menu = None;
+                    self.playback.overlay_last_activity = Instant::now();
+                    self.handle_player_context_action(act, playback, rect, ctx);
+                } else if was_context_menu_open
+                    && !just_opened_context_menu
+                    && ui.input(|i| {
+                        i.pointer.button_released(egui::PointerButton::Primary)
+                            && i.pointer
+                                .interact_pos()
+                                .or_else(|| i.pointer.hover_pos())
+                                .is_some_and(|p| !menu_rect.contains(p))
+                    })
+                {
+                    self.playback.player_context_menu = None;
+                    self.playback.overlay_last_activity = Instant::now();
+                }
+            }
+
+            if let Some(action) = action
+                && !was_context_menu_open
+                && !just_opened_context_menu
             {
                 self.playback.overlay_last_activity = Instant::now();
-                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-            } else if response.clicked() && !over_bar {
-                self.playback.overlay_last_activity = Instant::now();
-                overlay_action = if menu_open {
-                    Some(overlay::OverlayAction::SetMenu(None))
-                } else {
-                    Some(overlay::OverlayAction::TogglePlay)
-                };
+                overlay_action = Some(action);
+            } else if !was_context_menu_open
+                && !just_opened_context_menu
+                && self.playback.player_context_menu.is_none()
+                && !over_bar
+            {
+                if response.double_clicked() {
+                    self.playback.overlay_last_activity = Instant::now();
+                    if !menu_open {
+                        self.handle_player_overlay_action(
+                            overlay::OverlayAction::TogglePlay,
+                            playback,
+                            ctx,
+                        );
+                    }
+                    overlay_action = Some(overlay::OverlayAction::ToggleFullscreen);
+                } else if playback.mini_player
+                    && !menu_open
+                    && self.playback.seek_drag.is_none()
+                    && response.drag_started_by(egui::PointerButton::Primary)
+                {
+                    self.playback.overlay_last_activity = Instant::now();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                } else if response.clicked() {
+                    self.playback.overlay_last_activity = Instant::now();
+                    overlay_action = if menu_open {
+                        Some(overlay::OverlayAction::SetMenu(None))
+                    } else {
+                        Some(overlay::OverlayAction::TogglePlay)
+                    };
+                }
+            }
+
+            let effective_visible = visible || self.playback.player_context_menu.is_some();
+            let hide_fullscreen_cursor = playback.fullscreen
+                && !effective_visible
+                && !over_stats
+                && !self.autoscroll.is_active()
+                && !self.ui.shortcuts_open
+                && !self.ui.command_palette.open
+                && !self.ui.settings_open
+                && pointer_pos.is_some_and(|p| rect.contains(p));
+            if hide_fullscreen_cursor {
+                ctx.set_cursor_icon(egui::CursorIcon::None);
             }
         }
         overlay_action
@@ -1794,6 +2778,26 @@ impl FastTube {
                     };
                     match result {
                         Ok(()) => {
+                            let next_paused = if playback.ended {
+                                false
+                            } else {
+                                !playback.paused
+                            };
+                            Self::record_player_osd(
+                                ctx,
+                                if next_paused {
+                                    "\u{23f8} Pausado"
+                                } else {
+                                    "\u{25b6} Reproduzindo"
+                                },
+                            );
+                            Self::update_player_osd_snapshot_state(
+                                ctx,
+                                &playback.video.url,
+                                |snap| {
+                                    snap.paused = next_paused;
+                                },
+                            );
                             if playback.ended {
                                 self.record_manual_seek(0.0, playback.duration, playback.now);
                             } else if !playback.paused {
@@ -1808,7 +2812,8 @@ impl FastTube {
                 if playback.is_live && !playback.is_live_dvr {
                     return;
                 }
-                let step = f64::from(self.seek_step_secs());
+                let step_u32 = self.seek_step_secs();
+                let step = f64::from(step_u32);
                 #[cfg(windows)]
                 {
                     let result = self
@@ -1817,11 +2822,14 @@ impl FastTube {
                         .map(|player| player.seek(-step, "relative"))
                         .unwrap_or(Ok(()));
                     match result {
-                        Ok(()) => self.record_manual_seek(
-                            (playback.position - step).max(0.0),
-                            playback.duration,
-                            playback.now,
-                        ),
+                        Ok(()) => {
+                            Self::record_player_osd(ctx, format!("\u{23ea} -{step_u32}s"));
+                            self.record_manual_seek(
+                                (playback.position - step).max(0.0),
+                                playback.duration,
+                                playback.now,
+                            );
+                        }
                         Err(error) => self.message = error,
                     }
                 }
@@ -1830,7 +2838,8 @@ impl FastTube {
                 if playback.is_live && !playback.is_live_dvr {
                     return;
                 }
-                let step = f64::from(self.seek_step_secs());
+                let step_u32 = self.seek_step_secs();
+                let step = f64::from(step_u32);
                 if playback.is_live
                     && let Some(dur) = playback.duration
                     && (dur <= 1.5 || playback.position + step >= (dur - 1.5).max(0.0))
@@ -1862,6 +2871,7 @@ impl FastTube {
                         .unwrap_or(Ok(()));
                     match result {
                         Ok(()) => {
+                            Self::record_player_osd(ctx, format!("\u{23e9} +{step_u32}s"));
                             self.record_manual_seek(target, playback.duration, playback.now);
                         }
                         Err(error) => self.message = error,
@@ -1895,7 +2905,18 @@ impl FastTube {
                         .map(|player| player.seek(clamped, "absolute+exact"))
                         .unwrap_or(Ok(()));
                     match result {
-                        Ok(()) => self.record_manual_seek(clamped, playback.duration, playback.now),
+                        Ok(()) => {
+                            let icon = if clamped >= playback.position {
+                                "\u{23e9}"
+                            } else {
+                                "\u{23ea}"
+                            };
+                            Self::record_player_osd(
+                                ctx,
+                                format!("{icon} {}", format_time(clamped)),
+                            );
+                            self.record_manual_seek(clamped, playback.duration, playback.now);
+                        }
                         Err(error) => self.message = error,
                     }
                 }
@@ -1940,8 +2961,27 @@ impl FastTube {
                         .as_ref()
                         .map(|player| player.set("mute", if playback.muted { "no" } else { "yes" }))
                         .unwrap_or(Ok(()));
-                    if let Err(error) = result {
-                        self.message = error;
+                    match result {
+                        Ok(()) => {
+                            let next_muted = !playback.muted;
+                            let vol_rounded = playback.raw_volume.round() as i32;
+                            Self::record_player_osd(
+                                ctx,
+                                if next_muted || vol_rounded == 0 {
+                                    "\u{1f507} Mudo".to_owned()
+                                } else {
+                                    format!("\u{1f50a} {vol_rounded}%")
+                                },
+                            );
+                            Self::update_player_osd_snapshot_state(
+                                ctx,
+                                &playback.video.url,
+                                |snap| {
+                                    snap.muted = next_muted;
+                                },
+                            );
+                        }
+                        Err(error) => self.message = error,
                     }
                 }
             }
@@ -1953,8 +2993,26 @@ impl FastTube {
                         .as_ref()
                         .map(|player| player.set("volume", &format!("{volume:.0}")))
                         .unwrap_or(Ok(()));
-                    if let Err(error) = result {
-                        self.message = error;
+                    match result {
+                        Ok(()) => {
+                            let vol_rounded = f64::from(volume).round() as i32;
+                            Self::record_player_osd(
+                                ctx,
+                                if vol_rounded == 0 {
+                                    "\u{1f507} Mudo".to_owned()
+                                } else {
+                                    format!("\u{1f50a} {vol_rounded}%")
+                                },
+                            );
+                            Self::update_player_osd_snapshot_state(
+                                ctx,
+                                &playback.video.url,
+                                |snap| {
+                                    snap.volume_rounded = vol_rounded;
+                                },
+                            );
+                        }
+                        Err(error) => self.message = error,
                     }
                 }
             }
@@ -2083,7 +3141,13 @@ impl FastTube {
                 }
             }
             OverlayAction::SetSpeed(speed) => {
-                self.set_player_speed(speed);
+                let clamped = speed.clamp(0.25, 3.0);
+                self.set_player_speed(clamped);
+                Self::record_player_osd(ctx, format!("\u{26a1} {clamped:.2}x"));
+                #[cfg(windows)]
+                Self::update_player_osd_snapshot_state(ctx, &playback.video.url, |snap| {
+                    snap.speed_hundredths = (clamped * 100.0).round() as i32;
+                });
             }
             OverlayAction::SelectQuality(quality) => {
                 #[cfg(windows)]
@@ -2106,7 +3170,15 @@ impl FastTube {
                         .map(|player| player.seek(target, "absolute"))
                         .unwrap_or(Ok(()));
                     match result {
-                        Ok(()) => self.record_manual_seek(target, playback.duration, playback.now),
+                        Ok(()) => {
+                            let icon = if target >= playback.position {
+                                "\u{23e9}"
+                            } else {
+                                "\u{23ea}"
+                            };
+                            Self::record_player_osd(ctx, format!("{icon} {}", format_time(target)));
+                            self.record_manual_seek(target, playback.duration, playback.now);
+                        }
                         Err(error) => self.message = error,
                     }
                 }
@@ -2382,12 +3454,15 @@ impl FastTube {
             if self.playback.fullscreen || self.playback.theater || self.playback.mini_player {
                 0.0
             } else {
-                4.0
+                12.0
             };
         ui.painter()
             .rect_filled(rect, corner_radius, Color32::BLACK);
         let compact_controls = watch_controls_are_compact(player_size.x);
         self.paint_hidden_video_notice(ui, rect);
+        if !self.ui.settings_open {
+            Self::paint_player_osd_pill(ctx, rect);
+        }
         ui.add_space(6.0);
         let mut theater_toggled = false;
         let mut fullscreen_toggled = false;
@@ -2409,20 +3484,18 @@ impl FastTube {
         let palette = self.palette();
         egui::Frame::new()
             .fill(palette.player_bar_bg)
-            .corner_radius(6)
-            .inner_margin(egui::Margin::symmetric(8, 6))
+            .corner_radius(10)
+            .inner_margin(egui::Margin::symmetric(10, 6))
             .show(ui, |ui| {
                 ui.set_max_width(player_size.x);
                 ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add_enabled(has_queued, egui::Button::new("⏭ Próximo"))
+                    if styled_compact_button_enabled(ui, has_queued, "⏭ Próximo", false, &palette)
                         .on_hover_text("Avançar para o próximo vídeo")
                         .clicked()
                     {
                         next_clicked = true;
                     }
-                    if ui
-                        .button("⚙")
+                    if styled_icon_chip_button(ui, true, "⚙", &palette)
                         .on_hover_text("Abrir ou fechar configurações do player")
                         .clicked()
                     {
@@ -2436,19 +3509,33 @@ impl FastTube {
                         "▭ Teatro"
                     };
                     let theater_button = egui::Button::new(
-                        RichText::new(theater_button_label).color(if theater_mode {
-                            palette.active_button_fg
-                        } else {
-                            palette.theater_inactive_fg
-                        }),
+                        RichText::new(theater_button_label)
+                            .size(12.0)
+                            .strong()
+                            .color(if theater_mode {
+                                palette.active_button_fg
+                            } else {
+                                palette.theater_inactive_fg
+                            }),
                     )
                     .fill(if theater_mode {
                         palette.active_button_bg
                     } else {
                         palette.theater_inactive_bg
-                    });
+                    })
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        if theater_mode {
+                            palette.active_button_bg
+                        } else {
+                            palette.card_alt_stroke
+                        },
+                    ))
+                    .corner_radius(13)
+                    .min_size(egui::vec2(0.0, 25.0));
                     if ui
                         .add_enabled(!fullscreen, theater_button)
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .on_hover_text(if fullscreen {
                             "Modo teatro indisponível enquanto a tela cheia estiver ativa"
                         } else if theater_mode {
@@ -2466,18 +3553,28 @@ impl FastTube {
                         Icon::Maximize
                     };
                     if ui
-                        .add(egui::Button::image(
-                            screen_icon.image(palette.icon_fg, 17.0),
-                        ))
+                        .add(
+                            egui::Button::image(screen_icon.image(palette.icon_fg, 16.0))
+                                .fill(palette.header_button_bg)
+                                .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+                                .corner_radius(8)
+                                .min_size(egui::vec2(26.0, 25.0)),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .on_hover_text("Tela cheia (F ou Esc para sair)")
                         .clicked()
                     {
                         fullscreen_toggled = true;
                     }
                     if ui
-                        .add(egui::Button::image(
-                            Icon::Close.image(palette.icon_fg, 17.0),
-                        ))
+                        .add(
+                            egui::Button::image(Icon::Close.image(palette.icon_fg, 16.0))
+                                .fill(palette.header_button_bg)
+                                .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+                                .corner_radius(8)
+                                .min_size(egui::vec2(26.0, 25.0)),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .on_hover_text("Fechar vídeo")
                         .clicked()
                     {
@@ -2527,7 +3624,7 @@ impl FastTube {
     }
 
     pub(crate) fn format_watch_metadata_stats(
-        video: &Video,
+        _video: &Video,
         metadata: Option<&VideoMetadata>,
         live_info: Option<&live_chat::WatchLiveInfo>,
         is_live: bool,
@@ -2568,9 +3665,6 @@ impl FastTube {
             .and_then(|date| recommendations::format_youtube_relative_time(date, None))
         {
             stats.push(relative_date);
-        }
-        if !video.duration.is_empty() && !is_live_duration_label(&video.duration) {
-            stats.push(format!("Dura\u{00e7}\u{00e3}o {}", video.duration));
         }
         stats
     }
@@ -2651,6 +3745,7 @@ impl FastTube {
             {
                 open_channel_target = display.channel_target.cloned();
             }
+            let _ = display.stats;
             if let Some(subs) = display
                 .subscriber_count_text
                 .map(str::trim)
@@ -2658,16 +3753,6 @@ impl FastTube {
             {
                 let response = ui.label(
                     RichText::new(subs)
-                        .size(12.0)
-                        .color(palette.neutral_status_fg),
-                );
-                if let Some(technical) = display.technical_resolution {
-                    response.on_hover_text(technical);
-                }
-            } else if !display.stats.is_empty() {
-                let stats_line = display.stats.join("  \u{00b7}  ");
-                let response = ui.label(
-                    RichText::new(stats_line)
                         .size(12.0)
                         .color(palette.neutral_status_fg),
                 );
@@ -2750,61 +3835,12 @@ impl FastTube {
             } else {
                 "👍 Like".to_owned()
             };
-            let like_button =
-                egui::Button::new(RichText::new(like_text).size(12.5).strong().color(
-                    if like_active {
-                        palette.active_button_fg
-                    } else {
-                        palette.header_button_fg
-                    },
-                ))
-                .fill(if like_active {
-                    palette.active_button_bg
-                } else {
-                    palette.header_button_bg
-                })
-                .min_size(egui::vec2(86.0, 36.0))
-                .corner_radius(18);
-            let like_clicked = ui
-                .add_enabled_ui(!state.rating_pending && state.video_id.is_some(), |ui| {
-                    ui.add(like_button)
-                })
-                .inner
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(if state.pt {
-                    "Marcar Gostei no YouTube"
-                } else {
-                    "Like on YouTube"
-                })
-                .clicked();
-            if like_clicked {
-                flags.rating_to_apply = Some(if like_active {
-                    None
-                } else {
-                    Some(oauth::VideoRating::Like)
-                });
-            }
-
             let dislike_active = state.current_rating == Some(oauth::VideoRating::Dislike);
             let dislike_text = if let Some(ryd) = state.ryd_stats {
                 format!("👎 {}", format_thousands(ryd.dislikes))
             } else {
                 "👎".to_owned()
             };
-            let dislike_button = egui::Button::new(RichText::new(dislike_text).size(13.5).color(
-                if dislike_active {
-                    palette.active_button_fg
-                } else {
-                    palette.header_button_fg
-                },
-            ))
-            .fill(if dislike_active {
-                palette.active_button_bg
-            } else {
-                palette.header_button_bg
-            })
-            .min_size(egui::vec2(44.0, 36.0))
-            .corner_radius(18);
             let dislike_hover = if let Some(ryd) = state.ryd_stats {
                 if state.pt {
                     format!(
@@ -2826,41 +3862,105 @@ impl FastTube {
             } else {
                 "Dislike on YouTube".to_owned()
             };
-            let dislike_clicked = ui
-                .add_enabled_ui(!state.rating_pending && state.video_id.is_some(), |ui| {
-                    ui.add(dislike_button)
-                })
-                .inner
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(dislike_hover)
-                .clicked();
-            if dislike_clicked {
-                flags.rating_to_apply = Some(if dislike_active {
-                    None
-                } else {
-                    Some(oauth::VideoRating::Dislike)
-                });
-            }
 
-            let queue_button = egui::Button::new(
-                RichText::new(if state.pt { "Fila" } else { "Queue" })
-                    .size(13.0)
-                    .color(palette.header_button_fg),
-            )
-            .fill(palette.header_button_bg)
-            .corner_radius(18);
-            if ui
-                .add_sized([64.0, 36.0], queue_button)
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(if state.pt {
-                    "Adicionar este vídeo à fila"
-                } else {
-                    "Add this video to queue"
-                })
-                .clicked()
-            {
-                flags.enqueue_video = true;
-            }
+            egui::Frame::new()
+                .fill(palette.header_button_bg)
+                .corner_radius(18)
+                .inner_margin(egui::Margin::ZERO)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let like_button =
+                            egui::Button::new(RichText::new(like_text).size(12.5).strong().color(
+                                if like_active {
+                                    palette.active_button_fg
+                                } else {
+                                    palette.header_button_fg
+                                },
+                            ))
+                            .fill(if like_active {
+                                palette.active_button_bg
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .stroke(egui::Stroke::NONE)
+                            .min_size(egui::vec2(78.0, 36.0))
+                            .corner_radius(egui::CornerRadius {
+                                nw: 18,
+                                sw: 18,
+                                ne: 0,
+                                se: 0,
+                            });
+                        let like_clicked = ui
+                            .add_enabled_ui(
+                                !state.rating_pending && state.video_id.is_some(),
+                                |ui| ui.add(like_button),
+                            )
+                            .inner
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text(if state.pt {
+                                "Marcar Gostei no YouTube"
+                            } else {
+                                "Like on YouTube"
+                            })
+                            .clicked();
+                        if like_clicked {
+                            flags.rating_to_apply = Some(if like_active {
+                                None
+                            } else {
+                                Some(oauth::VideoRating::Like)
+                            });
+                        }
+
+                        let (sep_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(1.0, 22.0), egui::Sense::hover());
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(sep_rect.center().x, sep_rect.top()),
+                                egui::pos2(sep_rect.center().x, sep_rect.bottom()),
+                            ],
+                            egui::Stroke::new(1.0, palette.card_alt_stroke),
+                        );
+
+                        let dislike_button =
+                            egui::Button::new(RichText::new(dislike_text).size(13.5).color(
+                                if dislike_active {
+                                    palette.active_button_fg
+                                } else {
+                                    palette.header_button_fg
+                                },
+                            ))
+                            .fill(if dislike_active {
+                                palette.active_button_bg
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .stroke(egui::Stroke::NONE)
+                            .min_size(egui::vec2(46.0, 36.0))
+                            .corner_radius(egui::CornerRadius {
+                                nw: 0,
+                                sw: 0,
+                                ne: 18,
+                                se: 18,
+                            });
+                        let dislike_clicked = ui
+                            .add_enabled_ui(
+                                !state.rating_pending && state.video_id.is_some(),
+                                |ui| ui.add(dislike_button),
+                            )
+                            .inner
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text(dislike_hover)
+                            .clicked();
+                        if dislike_clicked {
+                            flags.rating_to_apply = Some(if dislike_active {
+                                None
+                            } else {
+                                Some(oauth::VideoRating::Dislike)
+                            });
+                        }
+                    });
+                });
 
             let share_label = if state.share_recently_copied {
                 if state.pt {
@@ -2900,39 +4000,6 @@ impl FastTube {
                 flags.share_video = true;
             }
 
-            let save_label = if state.saved_in_library {
-                if state.pt { "✓ Salvo" } else { "✓ Saved" }
-            } else if state.pt {
-                "Salvar"
-            } else {
-                "Save"
-            };
-            let save_button = egui::Button::new(RichText::new(save_label).size(13.0).color(
-                if state.save_menu_open {
-                    palette.active_button_fg
-                } else {
-                    palette.header_button_fg
-                },
-            ))
-            .fill(if state.save_menu_open {
-                palette.active_button_bg
-            } else {
-                palette.header_button_bg
-            })
-            .corner_radius(18);
-            if ui
-                .add_sized([80.0, 36.0], save_button)
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(if state.pt {
-                    "Salvar em Assistir depois ou playlists"
-                } else {
-                    "Save to Watch later or playlists"
-                })
-                .clicked()
-            {
-                flags.toggle_save_menu = true;
-            }
-
             let download_btn = egui::Button::new(
                 RichText::new(if state.pt {
                     "⬇ Baixar"
@@ -2967,6 +4034,101 @@ impl FastTube {
                     }
                 }
             });
+
+            let save_label = if state.saved_in_library {
+                if state.pt { "✓ Salvo" } else { "✓ Saved" }
+            } else if state.pt {
+                "Salvar"
+            } else {
+                "Save"
+            };
+            let save_button = egui::Button::new(RichText::new(save_label).size(13.0).color(
+                if state.save_menu_open {
+                    palette.active_button_fg
+                } else {
+                    palette.header_button_fg
+                },
+            ))
+            .fill(if state.save_menu_open {
+                palette.active_button_bg
+            } else {
+                palette.header_button_bg
+            })
+            .corner_radius(18);
+            if ui
+                .add_sized([80.0, 36.0], save_button)
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(if state.pt {
+                    "Salvar em Assistir mais tarde ou playlists"
+                } else {
+                    "Save to Watch later or playlists"
+                })
+                .clicked()
+            {
+                flags.toggle_save_menu = true;
+            }
+
+            let more_button = egui::Button::new(
+                RichText::new("\u{22ef}")
+                    .size(16.0)
+                    .strong()
+                    .color(palette.header_button_fg),
+            )
+            .fill(palette.header_button_bg)
+            .corner_radius(18);
+            let more_resp = ui
+                .add_sized([36.0, 36.0], more_button)
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(if state.pt {
+                    "Mais a\u{00e7}\u{00f5}es"
+                } else {
+                    "More actions"
+                });
+            egui::Popup::menu(&more_resp).show(|ui| {
+                ui.set_min_width(210.0);
+                if styled_menu_item_button(
+                    ui,
+                    if state.pt {
+                        "Adicionar \u{00e0} fila"
+                    } else {
+                        "Add to queue"
+                    },
+                    false,
+                    palette,
+                )
+                .clicked()
+                {
+                    flags.enqueue_video = true;
+                    ui.close();
+                }
+                if styled_menu_item_button(
+                    ui,
+                    if state.pt {
+                        "Mostrar transcri\u{00e7}\u{00e3}o"
+                    } else {
+                        "Show transcript"
+                    },
+                    false,
+                    palette,
+                )
+                .clicked()
+                {
+                    flags.open_transcript = true;
+                    ui.close();
+                }
+                ui.separator();
+                if styled_menu_item_button(
+                    ui,
+                    if state.pt { "Denunciar" } else { "Report" },
+                    false,
+                    palette,
+                )
+                .clicked()
+                {
+                    flags.open_report_modal = true;
+                    ui.close();
+                }
+            });
         });
     }
 
@@ -2992,6 +4154,7 @@ impl FastTube {
             let mut seek_to: Option<f64> = None;
             egui::Frame::new()
                 .fill(palette.card_alt_bg)
+                .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
                 .corner_radius(10)
                 .inner_margin(egui::Margin::symmetric(10, 8))
                 .show(ui, |ui| {
@@ -3021,11 +4184,32 @@ impl FastTube {
         });
     }
 
+    #[cfg(test)]
     pub(crate) fn watch_metadata_description_ui(
         &mut self,
         ui: &mut egui::Ui,
         video_url: &str,
         content_width: f32,
+        palette: &ThemePalette,
+    ) {
+        let stats = self.watch.metadata_cache.stats.clone();
+        self.watch_metadata_description_with_stats_ui(
+            ui,
+            video_url,
+            content_width,
+            &stats,
+            None,
+            palette,
+        );
+    }
+
+    pub(crate) fn watch_metadata_description_with_stats_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        video_url: &str,
+        content_width: f32,
+        stats: &[String],
+        technical_resolution: Option<&str>,
         palette: &ThemePalette,
     ) {
         let chapters = self.watch.metadata_cache.description_chapters.clone();
@@ -3037,44 +4221,148 @@ impl FastTube {
                 palette,
             );
         }
-        if self.watch.metadata_cache.cleaned_description.is_some() {
-            ui.add_space(8.0);
-            egui::CollapsingHeader::new(
-                RichText::new("Descri\u{00e7}\u{00e3}o").size(14.0).strong(),
-            )
-            .id_salt(("watch_description", video_url))
-            .default_open(false)
-            .show(ui, |ui| {
-                if self.watch.metadata_cache.description_lines.is_none() {
-                    let parsed = self
-                        .watch
-                        .metadata_cache
-                        .cleaned_description
-                        .as_deref()
-                        .map(watch_extras::parse_timestamp_lines)
-                        .unwrap_or_default();
-                    self.watch.metadata_cache.description_lines = Some(parsed);
-                }
-                let lines = std::mem::take(&mut self.watch.metadata_cache.description_lines);
-                egui::Frame::new()
-                    .fill(palette.card_alt_bg)
-                    .corner_radius(12)
-                    .inner_margin(egui::Margin::symmetric(12, 10))
-                    .show(ui, |ui| {
-                        ui.set_max_width((content_width - 24.0).max(1.0));
-                        if let Some(lines) = lines.as_deref() {
-                            self.render_cached_timestamp_lines_ui(
-                                ui,
-                                lines,
-                                palette.description_fg,
-                                13.0,
-                            );
+        let has_desc = self.watch.metadata_cache.cleaned_description.is_some();
+        if !stats.is_empty() || has_desc {
+            ui.add_space(10.0);
+            if has_desc && self.watch.metadata_cache.description_lines.is_none() {
+                let parsed = self
+                    .watch
+                    .metadata_cache
+                    .cleaned_description
+                    .as_deref()
+                    .map(watch_extras::parse_timestamp_lines)
+                    .unwrap_or_default();
+                self.watch.metadata_cache.description_lines = Some(parsed);
+            }
+            let lines = std::mem::take(&mut self.watch.metadata_cache.description_lines);
+            let card_inner_w = (content_width - 24.0).max(1.0);
+            let pt = self.ui_pt();
+            let mut next_expanded: Option<bool> = None;
+            let mut open_transcript = false;
+            egui::Frame::new()
+                .fill(palette.card_alt_bg)
+                .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+                .corner_radius(12)
+                .inner_margin(egui::Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.set_min_width(card_inner_w);
+                    ui.set_max_width(card_inner_w);
+                    if !stats.is_empty() {
+                        let stats_line = stats.join("  \u{00b7}  ");
+                        let response = ui.label(
+                            RichText::new(stats_line)
+                                .size(13.0)
+                                .strong()
+                                .color(palette.channel_fg),
+                        );
+                        if let Some(technical) = technical_resolution {
+                            response.on_hover_text(technical);
                         }
-                    });
-                if self.watch.metadata_cache.video_url.as_deref() == Some(video_url) {
-                    self.watch.metadata_cache.description_lines = lines;
+                    }
+                    if let Some(lines) = lines.as_deref()
+                        && !lines.is_empty()
+                    {
+                        if !stats.is_empty() {
+                            ui.add_space(6.0);
+                        }
+                        const COLLAPSED_LINES: usize = 3;
+                        let needs_collapse = lines.len() > COLLAPSED_LINES;
+                        let expanded =
+                            self.watch.metadata_cache.description_expanded || !needs_collapse;
+                        let visible_lines = if expanded {
+                            lines
+                        } else {
+                            &lines[..COLLAPSED_LINES]
+                        };
+                        self.render_cached_timestamp_lines_ui(
+                            ui,
+                            visible_lines,
+                            palette.description_fg,
+                            13.0,
+                        );
+                        if expanded {
+                            ui.add_space(12.0);
+                            Self::paint_hairline_divider(ui, palette);
+                            ui.add_space(10.0);
+                            ui.label(
+                                RichText::new(if pt { "Transcrição" } else { "Transcript" })
+                                    .size(14.0)
+                                    .strong()
+                                    .color(palette.channel_fg),
+                            );
+                            ui.add_space(2.0);
+                            ui.label(
+                                RichText::new(if pt {
+                                    "Acompanhe usando a transcrição."
+                                } else {
+                                    "Follow along using the transcript."
+                                })
+                                .size(12.5)
+                                .color(palette.neutral_status_fg),
+                            );
+                            ui.add_space(6.0);
+                            let transcript_active = self.watch.extras.sidebar_tab
+                                == watch_extras::SidebarTab::Transcript;
+                            if styled_pill_button(
+                                ui,
+                                if pt {
+                                    "Mostrar transcrição"
+                                } else {
+                                    "Show transcript"
+                                },
+                                transcript_active,
+                                palette,
+                            )
+                            .clicked()
+                            {
+                                open_transcript = true;
+                            }
+                        }
+                        if needs_collapse {
+                            ui.add_space(8.0);
+                            let toggle_label = if expanded {
+                                if pt { "Mostrar menos" } else { "Show less" }
+                            } else if pt {
+                                "...mais"
+                            } else {
+                                "...more"
+                            };
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(toggle_label)
+                                            .size(13.0)
+                                            .strong()
+                                            .color(palette.channel_fg),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                next_expanded = Some(!expanded);
+                            }
+                        }
+                    }
+                });
+            if let Some(expanded) = next_expanded {
+                self.watch.metadata_cache.description_expanded = expanded;
+            }
+            if open_transcript {
+                self.channels.view_open = false;
+                self.watch.extras.sidebar_tab = watch_extras::SidebarTab::Transcript;
+                self.watch.extras.tab = watch_extras::Tab::Results;
+                if !self.watch.extras.subtitles_loaded
+                    && self.watch.extras.subtitles_loading.is_none()
+                    && self.playback.quality_rx.is_none()
+                {
+                    let ctx = ui.ctx().clone();
+                    self.watch.extras.start_subtitles(&ctx);
                 }
-            });
+            }
+            if self.watch.metadata_cache.video_url.as_deref() == Some(video_url) {
+                self.watch.metadata_cache.description_lines = lines;
+            }
         }
     }
 
@@ -3110,8 +4398,7 @@ impl FastTube {
             let mut remove_idx: Option<usize> = None;
             let mut save_edit: Option<(usize, String)> = None;
             ui.horizontal(|ui| {
-                if ui
-                    .small_button("Copiar marcadores (Markdown)")
+                if styled_compact_button(ui, "Copiar marcadores (Markdown)", false, palette)
                     .on_hover_text("Copiar os marcadores deste vídeo em formato Markdown")
                     .clicked()
                 {
@@ -3127,7 +4414,8 @@ impl FastTube {
                 let timestamp = format_time(mark.time_ms as f64 / 1000.0);
                 egui::Frame::new()
                     .fill(palette.card_alt_bg)
-                    .corner_radius(8)
+                    .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+                    .corner_radius(10)
                     .inner_margin(egui::Margin::symmetric(10, 6))
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
@@ -3141,11 +4429,11 @@ impl FastTube {
                                     )
                                     .hint_text("Nota do marcador"),
                                 );
-                                if ui.small_button("Salvar").clicked() {
+                                if styled_compact_button(ui, "Salvar", true, palette).clicked() {
                                     save_edit =
                                         Some((*idx, self.library.editing_bookmark_note.clone()));
                                 }
-                                if ui.small_button("Cancelar").clicked() {
+                                if styled_ghost_button(ui, "Cancelar", palette).clicked() {
                                     self.library.editing_bookmark_idx = None;
                                     self.library.editing_bookmark_note.clear();
                                 }
@@ -3172,15 +4460,13 @@ impl FastTube {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if ui
-                                            .small_button("✕")
+                                        if styled_icon_chip_button(ui, true, "✕", palette)
                                             .on_hover_text("Excluir marcador")
                                             .clicked()
                                         {
                                             remove_idx = Some(*idx);
                                         }
-                                        if ui
-                                            .small_button("Editar")
+                                        if styled_compact_button(ui, "Editar", false, palette)
                                             .on_hover_text("Editar nota do marcador")
                                             .clicked()
                                         {
@@ -3303,6 +4589,9 @@ impl FastTube {
             .as_deref()
             .map(watch_extras::extract_description_chapters)
             .unwrap_or_default();
+        let preserve_expanded = self.watch.metadata_cache.video_url.as_deref()
+            == Some(video.url.as_str())
+            && self.watch.metadata_cache.description_expanded;
         self.watch.metadata_cache = app_state::WatchMetadataUiCache {
             valid: true,
             video_url: Some(video.url.clone()),
@@ -3319,6 +4608,7 @@ impl FastTube {
             cleaned_description,
             description_lines: None,
             description_chapters,
+            description_expanded: preserve_expanded,
         };
     }
 
@@ -3465,26 +4755,19 @@ impl FastTube {
                 self.watch_metadata_actions_ui(ui, &action_state, &mut action_flags);
             });
 
-            if subscriber_count_text.is_some() && !stats.is_empty() {
-                ui.add_space(8.0);
-                let stats_line = stats.join("  \u{00b7}  ");
-                let response = ui.label(
-                    RichText::new(stats_line)
-                        .size(12.5)
-                        .strong()
-                        .color(palette.channel_fg),
-                );
-                if let Some(technical) = technical_resolution.as_deref() {
-                    response.on_hover_text(technical);
-                }
-            }
-
             if save_menu_open {
                 ui.add_space(8.0);
                 self.save_menu_ui(ui, video, &ctx);
             }
 
-            self.watch_metadata_description_ui(ui, &video.url, content_width, &palette);
+            self.watch_metadata_description_with_stats_ui(
+                ui,
+                &video.url,
+                content_width,
+                &stats,
+                technical_resolution.as_deref(),
+                &palette,
+            );
             if let Some(id) = video_id.as_deref() {
                 self.watch_video_bookmarks_ui(ui, &ctx, id, &palette);
             }
@@ -3503,7 +4786,9 @@ impl FastTube {
                     .start_comments(self.auth.session.as_ref(), false, &ctx);
             }
 
-            ui.add_space(18.0);
+            ui.add_space(14.0);
+            Self::paint_hairline_divider(ui, &palette);
+            ui.add_space(12.0);
             self.comments_ui(ui, &ctx, "watch_primary_comments");
             ui.add_space(12.0);
         });
@@ -3558,6 +4843,22 @@ impl FastTube {
         if action_flags.enqueue_video {
             let _ = self.enqueue_video(video.clone());
         }
+        if action_flags.open_transcript {
+            self.channels.view_open = false;
+            self.watch.extras.sidebar_tab = watch_extras::SidebarTab::Transcript;
+            self.watch.extras.tab = watch_extras::Tab::Results;
+            if !self.watch.extras.subtitles_loaded
+                && self.watch.extras.subtitles_loading.is_none()
+                && self.playback.quality_rx.is_none()
+            {
+                self.watch.extras.start_subtitles(&ctx);
+            }
+        }
+        if action_flags.open_report_modal {
+            self.feed.search_report_reason = None;
+            self.feed.search_report_details.clear();
+            self.feed.search_report_modal_video = Some(video.clone());
+        }
         if let Some(format) = action_flags.download_format {
             self.start_download_video(video.clone(), format, &ctx);
         }
@@ -3597,21 +4898,16 @@ impl FastTube {
         let panel_width = width.min(ui.available_width()).max(220.0);
 
         if watch_loading && !has_chat {
+            let dark_theme = self.settings.theme.value == Theme::Dark;
             egui::Frame::new()
                 .fill(palette.card_bg)
-                .stroke(egui::Stroke::new(1.0, palette.card_stroke))
+                .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
                 .corner_radius(12)
                 .inner_margin(egui::Margin::symmetric(12, 10))
                 .show(ui, |ui| {
-                    ui.set_width((panel_width - 24.0).max(180.0));
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(
-                            RichText::new("Carregando chat ao vivo...")
-                                .size(12.5)
-                                .color(palette.neutral_status_fg),
-                        );
-                    });
+                    let inner_w = (panel_width - 24.0).max(180.0);
+                    ui.set_width(inner_w);
+                    skeleton::live_chat_skeleton(ui, inner_w, dark_theme);
                 });
             return true;
         }
@@ -3620,7 +4916,7 @@ impl FastTube {
             if let Some(err) = self.watch.live.watch_info_error.as_deref() {
                 egui::Frame::new()
                     .fill(palette.card_bg)
-                    .stroke(egui::Stroke::new(1.0, palette.card_stroke))
+                    .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
                     .corner_radius(12)
                     .inner_margin(egui::Margin::symmetric(12, 8))
                     .show(ui, |ui| {
@@ -3645,7 +4941,7 @@ impl FastTube {
                     .color(palette.header_button_fg),
             )
             .fill(palette.header_button_bg)
-            .stroke(egui::Stroke::new(1.0, palette.card_stroke))
+            .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
             .corner_radius(18);
             if ui
                 .add_sized([panel_width, 36.0], show_btn)
@@ -3665,7 +4961,7 @@ impl FastTube {
 
         egui::Frame::new()
             .fill(palette.card_bg)
-            .stroke(egui::Stroke::new(1.0, palette.card_stroke))
+            .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
             .corner_radius(12)
             .inner_margin(egui::Margin::symmetric(12, 10))
             .show(ui, |ui| {
@@ -3705,18 +5001,7 @@ impl FastTube {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let hide_btn = egui::Button::new(
-                            RichText::new("Ocultar chat")
-                                .size(12.0)
-                                .color(palette.neutral_status_fg),
-                        )
-                        .fill(palette.header_button_bg)
-                        .corner_radius(14);
-                        if ui
-                            .add(hide_btn)
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .clicked()
-                        {
+                        if styled_compact_button(ui, "Ocultar chat", false, &palette).clicked() {
                             hide_chat = true;
                         }
                     });
@@ -3752,9 +5037,9 @@ impl FastTube {
                         self.watch.live.filter_query.clear();
                     }
                 });
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(4.0);
+                ui.add_space(6.0);
+                Self::paint_hairline_divider(ui, &palette);
+                ui.add_space(6.0);
 
                 let list_height = (max_height - 160.0).clamp(160.0, 420.0);
                 let stick_bottom = self.watch.live.auto_scroll;
@@ -3772,30 +5057,42 @@ impl FastTube {
                     .show(ui, |ui| {
                         ui.set_width((panel_width - 34.0).max(160.0));
                         if messages.is_empty() {
-                            ui.add_space(16.0);
-                            ui.vertical_centered(|ui| {
-                                if chat_loading {
-                                    ui.spinner();
-                                    ui.add_space(6.0);
-                                    ui.label(
-                                        RichText::new("Carregando mensagens do chat...")
-                                            .size(12.0)
-                                            .color(palette.neutral_status_fg),
-                                    );
-                                } else if let Some(err) = chat_error.as_deref() {
-                                    ui.label(
-                                        RichText::new(err)
-                                            .size(12.0)
-                                            .color(Color32::from_rgb(235, 110, 110)),
-                                    );
-                                } else {
-                                    ui.label(
-                                        RichText::new("Aguardando mensagens do chat ao vivo...")
-                                            .size(12.0)
-                                            .color(palette.neutral_status_fg),
-                                    );
-                                }
-                            });
+                            if chat_loading {
+                                ui.add_space(6.0);
+                                let dark_theme = self.settings.theme.value == Theme::Dark;
+                                skeleton::live_chat_skeleton(
+                                    ui,
+                                    (panel_width - 34.0).max(160.0),
+                                    dark_theme,
+                                );
+                            } else {
+                                ui.add_space(12.0);
+                                egui::Frame::new()
+                                    .fill(palette.card_alt_bg)
+                                    .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+                                    .corner_radius(12)
+                                    .inner_margin(egui::Margin::symmetric(14, 12))
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        ui.vertical_centered(|ui| {
+                                            if let Some(err) = chat_error.as_deref() {
+                                                ui.label(
+                                                    RichText::new(err)
+                                                        .size(12.0)
+                                                        .color(Color32::from_rgb(235, 110, 110)),
+                                                );
+                                            } else {
+                                                ui.label(
+                                                    RichText::new(
+                                                        "Aguardando mensagens do chat ao vivo...",
+                                                    )
+                                                    .size(12.0)
+                                                    .color(palette.neutral_status_fg),
+                                                );
+                                            }
+                                        });
+                                    });
+                            }
                             return;
                         }
 
@@ -4014,14 +5311,22 @@ impl FastTube {
                             }
                         }
                         if has_filter && matched_count == 0 {
-                            ui.add_space(16.0);
-                            ui.vertical_centered(|ui| {
-                                ui.label(
-                                    RichText::new("Nenhuma mensagem corresponde ao filtro.")
-                                        .size(12.0)
-                                        .color(palette.neutral_status_fg),
-                                );
-                            });
+                            ui.add_space(12.0);
+                            egui::Frame::new()
+                                .fill(palette.card_alt_bg)
+                                .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+                                .corner_radius(12)
+                                .inner_margin(egui::Margin::symmetric(14, 12))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(
+                                            RichText::new("Nenhuma mensagem corresponde ao filtro.")
+                                                .size(12.0)
+                                                .color(palette.neutral_status_fg),
+                                        );
+                                    });
+                                });
                         }
                     });
 
@@ -4104,7 +5409,7 @@ impl FastTube {
                 }
 
                 ui.add_space(6.0);
-                ui.separator();
+                Self::paint_hairline_divider(ui, &palette);
                 ui.add_space(6.0);
 
                 if self.watch.live.send_params.is_some() {
@@ -4166,28 +5471,45 @@ impl FastTube {
         ctx: &egui::Context,
         palette: &ThemePalette,
     ) {
+        let pt = self.ui_pt();
         let current_channel = self
             .selected
             .as_ref()
             .map(|v| v.channel.trim())
             .filter(|ch| !ch.is_empty())
-            .map(|ch| format!("De {}", truncate_text_chars(ch, 20)))
-            .unwrap_or_else(|| "Deste canal".to_owned());
+            .map(|ch| {
+                format!(
+                    "{} {}",
+                    if pt { "De" } else { "From" },
+                    truncate_text_chars(ch, 20)
+                )
+            })
+            .unwrap_or_else(|| {
+                if pt {
+                    "Deste canal"
+                } else {
+                    "From this channel"
+                }
+                .to_owned()
+            });
 
         let tabs = [
-            ("Todos".to_owned(), watch_extras::SidebarTab::All),
-            (current_channel, watch_extras::SidebarTab::FromChannel),
-            ("Relacionados".to_owned(), watch_extras::SidebarTab::Related),
             (
-                "Para voc\u{00ea}".to_owned(),
-                watch_extras::SidebarTab::ForYou,
+                if pt { "Todos" } else { "All" }.to_owned(),
+                watch_extras::SidebarTab::All,
+            ),
+            (current_channel, watch_extras::SidebarTab::FromChannel),
+            (
+                if pt { "Relacionados" } else { "Related" }.to_owned(),
+                watch_extras::SidebarTab::Related,
             ),
             (
-                "Transcri\u{00e7}\u{00e3}o".to_owned(),
-                watch_extras::SidebarTab::Transcript,
+                if pt { "Para voc\u{00ea}" } else { "For you" }.to_owned(),
+                watch_extras::SidebarTab::ForYou,
             ),
         ];
 
+        let _ = ctx;
         let mut clicked_tab = None;
         egui::ScrollArea::horizontal()
             .id_salt("watch_sidebar_filter_chips")
@@ -4199,22 +5521,32 @@ impl FastTube {
                     for (label, tab) in &tabs {
                         let is_selected =
                             self.watch.extras.sidebar_tab == *tab && !self.channels.view_open;
-                        let (bg, fg) = if is_selected {
-                            (palette.active_button_bg, palette.active_button_fg)
+                        let (bg, fg, stroke_col) = if is_selected {
+                            (
+                                palette.active_button_bg,
+                                palette.active_button_fg,
+                                palette.active_button_bg,
+                            )
                         } else {
-                            (palette.header_button_bg, palette.header_button_fg)
+                            (
+                                palette.header_button_bg,
+                                palette.header_button_fg,
+                                palette.card_alt_stroke,
+                            )
                         };
                         let text = if is_selected {
                             RichText::new(label).size(13.0).strong().color(fg)
                         } else {
                             RichText::new(label).size(13.0).color(fg)
                         };
-                        let btn = egui::Button::new(text).fill(bg).corner_radius(8);
-                        if ui
+                        let btn = egui::Button::new(text)
+                            .fill(bg)
+                            .stroke(egui::Stroke::new(1.0, stroke_col))
+                            .corner_radius(8);
+                        let resp = ui
                             .add_sized([0.0, 32.0], btn)
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .clicked()
-                        {
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if resp.clicked() {
                             clicked_tab = Some(*tab);
                         }
                     }
@@ -4250,17 +5582,32 @@ impl FastTube {
 
     pub(crate) fn watch_sidebar_queue_section_ui(&mut self, ui: &mut egui::Ui, scroll_id: &str) {
         if !self.queue.data.is_empty() {
+            let palette = self.palette();
             let summary = self.queue.data.format_duration_summary();
-            egui::CollapsingHeader::new(
-                RichText::new(format!("Fila de reprodu\u{00e7}\u{00e3}o ({summary})"))
-                    .size(14.0)
-                    .strong(),
-            )
-            .id_salt(("watch_queue", scroll_id))
-            .default_open(false)
-            .show(ui, |ui| {
-                self.queue_section_ui(ui, &format!("{scroll_id}_queue"), true, None, Some(180.0));
-            });
+            egui::Frame::new()
+                .fill(palette.info_box_bg)
+                .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+                .corner_radius(10)
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    egui::CollapsingHeader::new(
+                        RichText::new(format!("Fila de reprodu\u{00e7}\u{00e3}o ({summary})"))
+                            .size(14.0)
+                            .strong(),
+                    )
+                    .id_salt(("watch_queue", scroll_id))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        self.queue_section_ui(
+                            ui,
+                            &format!("{scroll_id}_queue"),
+                            true,
+                            None,
+                            Some(180.0),
+                        );
+                    });
+                });
             ui.add_space(8.0);
         }
     }
@@ -4409,21 +5756,24 @@ impl FastTube {
     ) -> Option<Video> {
         self.ensure_watch_sidebar_cache();
         if self.watch.sidebar_cache.cards.is_empty() {
-            let text = if self.feed.search.rx.is_some() {
-                "Pesquisando v\u{00ed}deos..."
+            let loading_feed = self.feed.search.rx.is_some()
+                || self.feed.home.batch_rx.is_some()
+                || self.feed.home.rx.is_some();
+            if loading_feed {
+                let dark_theme = self.settings.theme.value == Theme::Dark;
+                skeleton::watch_sidebar_skeleton(ui, ui.available_width(), dark_theme);
             } else {
-                "Nenhuma recomenda\u{00e7}\u{00e3}o no momento."
-            };
-            ui.label(RichText::new(text).weak());
-            if !self.history.data.entries().is_empty() {
-                ui.add_space(10.0);
-                return self.history_section_ui(
-                    ui,
-                    &format!("{scroll_id}_history"),
-                    true,
-                    None,
-                    None,
-                );
+                ui.label(RichText::new("Nenhuma recomendação no momento.").weak());
+                if !self.history.data.entries().is_empty() {
+                    ui.add_space(10.0);
+                    return self.history_section_ui(
+                        ui,
+                        &format!("{scroll_id}_history"),
+                        true,
+                        None,
+                        None,
+                    );
+                }
             }
             return None;
         }
@@ -4518,15 +5868,17 @@ impl FastTube {
         self.sync_theme_visuals(ctx);
         self.ensure_history_synchronized();
         let palette = self.palette();
+        if !self.channels.view_open
+            && self.watch.extras.sidebar_tab == watch_extras::SidebarTab::Transcript
+        {
+            self.subtitles_ui(ui, ctx, scroll_id);
+            return None;
+        }
         self.watch_sidebar_tabs_ui(ui, ctx, &palette);
         ui.add_space(10.0);
         self.watch_sidebar_queue_section_ui(ui, scroll_id);
         if self.channels.view_open {
             return self.channel_section_ui(ui, ctx, &format!("{scroll_id}_channel"), true, None);
-        }
-        if self.watch.extras.sidebar_tab == watch_extras::SidebarTab::Transcript {
-            self.subtitles_ui(ui, ctx, scroll_id);
-            return None;
         }
         self.watch_sidebar_feed_ui(ui, ctx, scroll_id)
     }
@@ -4882,7 +6234,12 @@ impl FastTube {
             }
 
             if rating_busy_here {
-                ui.spinner();
+                let _ = skeleton::skeleton_box(
+                    ui,
+                    egui::vec2(26.0, 14.0),
+                    7.0,
+                    self.settings.theme.value == Theme::Dark,
+                );
             }
 
             if can_reply {
@@ -4975,19 +6332,15 @@ impl FastTube {
                     .color(palette.header_button_fg),
             );
 
-            let sort_btn = egui::Button::new(
-                RichText::new("\u{2261}  Ordenar por")
-                    .size(14.0)
-                    .strong()
-                    .color(palette.header_button_fg),
+            if styled_compact_button_enabled(
+                ui,
+                self.watch.extras.comments_loading.is_none(),
+                "\u{2261}  Ordenar por",
+                self.watch.extras.comments_order_menu_open,
+                &palette,
             )
-            .fill(Color32::TRANSPARENT)
-            .frame(false);
-            if ui
-                .add_enabled(self.watch.extras.comments_loading.is_none(), sort_btn)
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text("Escolher ordena\u{00e7}\u{00e3}o dos coment\u{00e1}rios")
-                .clicked()
+            .on_hover_text("Escolher ordena\u{00e7}\u{00e3}o dos coment\u{00e1}rios")
+            .clicked()
             {
                 self.watch.extras.comments_order_menu_open =
                     !self.watch.extras.comments_order_menu_open;
@@ -4997,16 +6350,7 @@ impl FastTube {
                 && self.watch.extras.comments_loading.is_none()
                 && !needs_reauth
             {
-                let load_btn = egui::Button::new(
-                    RichText::new("Carregar coment\u{00e1}rios")
-                        .size(12.5)
-                        .color(palette.header_button_fg),
-                )
-                .fill(palette.card_alt_bg)
-                .corner_radius(14);
-                if ui
-                    .add(load_btn)
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                if styled_compact_button(ui, "Carregar coment\u{00e1}rios", false, &palette)
                     .clicked()
                 {
                     self.watch
@@ -5014,19 +6358,15 @@ impl FastTube {
                         .start_comments(self.auth.session.as_ref(), false, ctx);
                 }
             } else if self.watch.extras.comments_loaded
-                && ui
-                    .add_enabled(
-                        self.watch.extras.comments_loading.is_none(),
-                        egui::Button::new(
-                            RichText::new("\u{21bb}")
-                                .size(14.0)
-                                .color(palette.neutral_status_fg),
-                        )
-                        .frame(false),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .on_hover_text("Atualizar coment\u{00e1}rios")
-                    .clicked()
+                && styled_compact_button_enabled(
+                    ui,
+                    self.watch.extras.comments_loading.is_none(),
+                    "\u{21bb}",
+                    false,
+                    &palette,
+                )
+                .on_hover_text("Atualizar coment\u{00e1}rios")
+                .clicked()
             {
                 self.watch
                     .extras
@@ -5037,10 +6377,10 @@ impl FastTube {
         if self.watch.extras.comments_order_menu_open {
             ui.add_space(6.0);
             egui::Frame::new()
-                .fill(Color32::from_rgb(40, 40, 40))
+                .fill(palette.card_bg)
                 .corner_radius(12)
-                .inner_margin(egui::Margin::symmetric(0, 8))
-                .stroke(egui::Stroke::new(1.0, Color32::from_rgb(62, 62, 62)))
+                .inner_margin(egui::Margin::symmetric(6, 6))
+                .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
                 .show(ui, |ui| {
                     ui.set_max_width(340.0);
                     for (title, subtitle, order) in [
@@ -5057,13 +6397,14 @@ impl FastTube {
                     ] {
                         let selected = self.watch.extras.comments_order == order;
                         let item_fill = if selected {
-                            Color32::from_rgb(68, 68, 68)
+                            palette.header_button_bg
                         } else {
                             Color32::TRANSPARENT
                         };
                         let resp = egui::Frame::new()
                             .fill(item_fill)
-                            .inner_margin(egui::Margin::symmetric(16, 10))
+                            .corner_radius(8)
+                            .inner_margin(egui::Margin::symmetric(12, 9))
                             .show(ui, |ui| {
                                 ui.set_min_width(308.0);
                                 ui.vertical(|ui| {
@@ -5072,12 +6413,12 @@ impl FastTube {
                                         RichText::new(title)
                                             .size(14.0)
                                             .strong()
-                                            .color(Color32::from_rgb(241, 241, 241)),
+                                            .color(palette.header_button_fg),
                                     );
                                     ui.label(
                                         RichText::new(subtitle)
                                             .size(12.0)
-                                            .color(Color32::from_rgb(170, 170, 170)),
+                                            .color(palette.neutral_status_fg),
                                     );
                                 });
                             })
@@ -5103,13 +6444,15 @@ impl FastTube {
         if needs_reauth {
             if self.auth.reauth_rx.is_some() {
                 ui.horizontal(|ui| {
-                    ui.spinner();
+                    skeleton::skeleton_circle(ui, 16.0, self.settings.theme.value == Theme::Dark);
                     ui.label("Aguardando autoriza\u{00e7}\u{00e3}o no navegador...");
-                    if ui.button("Cancelar").clicked() {
+                    if styled_ghost_button(ui, "Cancelar", &palette).clicked() {
                         self.cancel_reauth();
                     }
                 });
-            } else if ui.button("Autorizar coment\u{00e1}rios").clicked() {
+            } else if styled_pill_button(ui, "Autorizar coment\u{00e1}rios", false, &palette)
+                .clicked()
+            {
                 self.start_reauth(ctx);
             }
         } else if can_write_comments {
@@ -5129,7 +6472,7 @@ impl FastTube {
             let composer_id = ui.make_persistent_id((scroll_id, "comment_composer_input"));
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 14.0;
-                let _ = self.paint_avatar_or_initials(
+                let composer_avatar_resp = self.paint_avatar_or_initials(
                     ui,
                     ctx,
                     user_avatar_url.as_deref(),
@@ -5137,6 +6480,7 @@ impl FastTube {
                     40.0,
                     false,
                 );
+                Self::paint_comment_avatar_ring(ui, composer_avatar_resp.rect);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     let has_draft = !self.watch.extras.comment_draft.trim().is_empty();
@@ -5290,7 +6634,8 @@ impl FastTube {
         } else if !self.auth.authenticated {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 14.0;
-                let _ = self.paint_avatar_or_initials(ui, ctx, None, "FT", 40.0, false);
+                let avatar_resp = self.paint_avatar_or_initials(ui, ctx, None, "FT", 40.0, false);
+                Self::paint_comment_avatar_ring(ui, avatar_resp.rect);
                 ui.vertical(|ui| {
                     let row = ui.horizontal(|ui| {
                         ui.label(
@@ -5299,19 +6644,7 @@ impl FastTube {
                                 .color(palette.neutral_status_fg),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let enter_btn = egui::Button::new(
-                                RichText::new("Entrar")
-                                    .size(12.5)
-                                    .strong()
-                                    .color(palette.header_button_fg),
-                            )
-                            .fill(palette.header_button_bg)
-                            .corner_radius(16);
-                            if ui
-                                .add(enter_btn)
-                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                .clicked()
-                            {
+                            if styled_pill_button(ui, "Entrar", false, &palette).clicked() {
                                 self.start_reauth(ctx);
                             }
                         });
@@ -5328,19 +6661,37 @@ impl FastTube {
             });
         }
 
-        ui.add_space(14.0);
+        ui.add_space(10.0);
+        Self::paint_hairline_divider(ui, &palette);
+        ui.add_space(10.0);
 
         if let Some(error) = &self.watch.extras.comments_error {
-            ui.colored_label(palette.warning_fg, error);
+            egui::Frame::new()
+                .fill(palette.card_alt_bg)
+                .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+                .corner_radius(12)
+                .inner_margin(egui::Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.colored_label(palette.warning_fg, error);
+                });
         }
         if self.watch.extras.comments_loaded
             && self.watch.extras.comments.is_empty()
             && self.watch.extras.comments_error.is_none()
         {
-            ui.label(
-                RichText::new("Nenhum coment\u{00e1}rio dispon\u{00ed}vel.")
-                    .color(palette.neutral_status_fg),
-            );
+            egui::Frame::new()
+                .fill(palette.card_alt_bg)
+                .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+                .corner_radius(12)
+                .inner_margin(egui::Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.label(
+                        RichText::new("Nenhum coment\u{00e1}rio dispon\u{00ed}vel.")
+                            .color(palette.neutral_status_fg),
+                    );
+                });
         }
 
         let render_comments_body = |this: &mut Self, ui: &mut egui::Ui| {
@@ -5372,7 +6723,7 @@ impl FastTube {
                 } else {
                     let row_resp = ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = 12.0;
-                        let _ = this.paint_avatar_or_initials(
+                        let avatar_resp = this.paint_avatar_or_initials(
                             ui,
                             ctx,
                             comment.author_avatar.as_deref(),
@@ -5380,6 +6731,7 @@ impl FastTube {
                             36.0,
                             false,
                         );
+                        Self::paint_comment_avatar_ring(ui, avatar_resp.rect);
 
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 4.0;
@@ -5581,7 +6933,13 @@ impl FastTube {
                                                 );
                                             }
                                             if state.is_posting_reply() {
-                                                ui.spinner();
+                                                ui.add_space(4.0);
+                                                skeleton::comments_skeleton(
+                                                    ui,
+                                                    ui.available_width(),
+                                                    1,
+                                                    this.settings.theme.value == Theme::Dark,
+                                                );
                                             }
                                             if let Some(err) = &state.reply_post_error {
                                                 ui.colored_label(palette.warning_fg, err);
@@ -5687,11 +7045,24 @@ impl FastTube {
                                     })
                                     .unwrap_or_default();
                                 if loading {
-                                    ui.spinner();
+                                    ui.add_space(4.0);
+                                    skeleton::comments_skeleton(
+                                        ui,
+                                        ui.available_width(),
+                                        2,
+                                        this.settings.theme.value == Theme::Dark,
+                                    );
                                 }
                                 if let Some(error) = error {
                                     ui.colored_label(palette.warning_fg, error);
-                                    if ui.button("Tentar novamente").clicked() {
+                                    if styled_compact_button(
+                                        ui,
+                                        "Tentar novamente",
+                                        false,
+                                        &palette,
+                                    )
+                                    .clicked()
+                                    {
                                         let retry_next = this
                                             .watch
                                             .extras
@@ -5729,13 +7100,17 @@ impl FastTube {
                                         ui.add_space(6.0);
                                         ui.horizontal_top(|ui| {
                                             ui.spacing_mut().item_spacing.x = 10.0;
-                                            let _ = this.paint_avatar_or_initials(
+                                            let reply_avatar_resp = this.paint_avatar_or_initials(
                                                 ui,
                                                 ctx,
                                                 reply.author_avatar.as_deref(),
                                                 &r_meta.avatar_name,
                                                 26.0,
                                                 false,
+                                            );
+                                            Self::paint_comment_avatar_ring(
+                                                ui,
+                                                reply_avatar_resp.rect,
                                             );
                                             ui.vertical(|ui| {
                                                 ui.spacing_mut().item_spacing.y = 3.0;
@@ -5812,18 +7187,18 @@ impl FastTube {
                 this.watch.extras.comment_render_cache = comment_metas;
             }
 
-            if this.watch.extras.comments_loading.is_some()
-                || this.watch.extras.is_posting_comment()
-            {
+            if this.watch.extras.comments_loading.is_some() {
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(
-                        RichText::new("Carregando coment\u{00e1}rios...")
-                            .size(12.5)
-                            .color(palette.neutral_status_fg),
-                    );
-                });
+                let dark_theme = this.settings.theme.value == Theme::Dark;
+                skeleton::comments_skeleton(ui, ui.available_width(), 4, dark_theme);
+            } else if this.watch.extras.is_posting_comment() {
+                ui.add_space(6.0);
+                skeleton::comments_skeleton(
+                    ui,
+                    ui.available_width(),
+                    1,
+                    this.settings.theme.value == Theme::Dark,
+                );
             }
 
             if this.watch.extras.comments_next.is_some() {
@@ -5834,17 +7209,15 @@ impl FastTube {
                     && this.watch.extras.comments_loading.is_none()
                     && this.watch.extras.comments_error.is_none();
                 let manual_click = ui
-                    .add_enabled(
-                        this.watch.extras.comments_loading.is_none(),
-                        egui::Button::new(
-                            RichText::new("Carregar mais 50 coment\u{00e1}rios")
-                                .size(12.5)
-                                .color(palette.header_button_fg),
+                    .add_enabled_ui(this.watch.extras.comments_loading.is_none(), |ui| {
+                        styled_pill_button(
+                            ui,
+                            "Carregar mais 50 coment\u{00e1}rios",
+                            false,
+                            &palette,
                         )
-                        .fill(palette.card_alt_bg)
-                        .corner_radius(16),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    })
+                    .inner
                     .clicked();
                 if auto_trigger || manual_click {
                     this.watch
@@ -5902,84 +7275,129 @@ impl FastTube {
         #[cfg(not(windows))]
         let has_active_player_subtitle = self.watch.extras.active_subtitle_url.is_some();
 
-        ui.horizontal(|ui| {
-            ui.heading("Legendas");
-            if ui
-                .add_enabled(
-                    self.watch.extras.subtitles_loading.is_none(),
-                    egui::Button::new("↻ Buscar novamente"),
-                )
-                .clicked()
-            {
-                self.watch.extras.start_subtitles(ctx);
-            }
-            if has_active_player_subtitle && ui.button("Desativar").clicked() {
-                self.watch.extras.active_subtitle_url = None;
-                self.watch.extras.active_subtitle_cues.clear();
-                self.watch.extras.subtitles_error = None;
-                #[cfg(windows)]
-                if let Some(player) = &self.player
-                    && let Err(error) = player.disable_subtitles()
-                {
-                    self.watch.extras.subtitles_error = Some(error);
-                }
-            }
-        });
-        ui.label(
-            RichText::new("Faixas do YouTube obtidas pelo yt-dlp; disponibilidade pode variar.")
-                .small()
-                .weak(),
-        );
-        if self.watch.extras.subtitles_loading.is_some() || self.watch.extras.is_subtitle_applying()
-        {
-            ui.spinner();
-        }
-        if let Some(error) = &self.watch.extras.subtitles_error {
-            ui.colored_label(self.palette().warning_fg, error);
-        }
-        if self.watch.extras.subtitles_loaded
-            && self.watch.extras.subtitles.is_empty()
-            && self.watch.extras.subtitles_error.is_none()
-        {
-            ui.label("Nenhuma legenda compatível encontrada.");
-        }
+        let palette = self.palette();
+        let dark_theme = self.settings.theme.value == Theme::Dark;
         let mut chosen = None;
         let mut transcript_track = None;
-        let active_url = self.watch.extras.active_subtitle_url.as_deref();
-        egui::ScrollArea::vertical()
-            .id_salt(format!("{scroll_id}_subtitles"))
-            .max_height(150.0)
+        egui::Frame::new()
+            .fill(palette.info_box_bg)
+            .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+            .corner_radius(12)
+            .inner_margin(egui::Margin::symmetric(12, 10))
             .show(ui, |ui| {
-                for track in &self.watch.extras.subtitles {
-                    let is_active =
-                        has_active_player_subtitle && active_url == Some(track.url.as_str());
-                    let label = format!(
-                        "{}{}",
-                        track.language,
-                        if track.automatic {
-                            " (automática)"
-                        } else {
-                            ""
-                        }
-                    );
-                    let button_text = if is_active {
-                        RichText::new(format!("{label} ✓")).strong()
-                    } else {
-                        RichText::new(&label)
-                    };
-                    ui.horizontal(|ui| {
-                        if ui.button(button_text).clicked() {
-                            chosen = Some((track.clone(), label.clone()));
-                        }
-                        if ui
-                            .small_button("Transcrição")
-                            .on_hover_text("Baixar, pesquisar e acompanhar o WebVTT desta faixa")
-                            .clicked()
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.heading("Legendas");
+                    if styled_compact_button_enabled(
+                        ui,
+                        self.watch.extras.subtitles_loading.is_none(),
+                        "↻ Buscar novamente",
+                        false,
+                        &palette,
+                    )
+                    .clicked()
+                    {
+                        self.watch.extras.start_subtitles(ctx);
+                    }
+                    if has_active_player_subtitle
+                        && styled_ghost_button(ui, "Desativar", &palette).clicked()
+                    {
+                        self.watch.extras.active_subtitle_url = None;
+                        self.watch.extras.active_subtitle_cues.clear();
+                        self.watch.extras.subtitles_error = None;
+                        #[cfg(windows)]
+                        if let Some(player) = &self.player
+                            && let Err(error) = player.disable_subtitles()
                         {
-                            transcript_track = Some(track.clone());
+                            self.watch.extras.subtitles_error = Some(error);
+                        }
+                    }
+                });
+                ui.label(
+                    RichText::new(
+                        "Faixas do YouTube obtidas pelo yt-dlp; disponibilidade pode variar.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(6.0);
+                Self::paint_hairline_divider(ui, &palette);
+                ui.add_space(6.0);
+                if self.watch.extras.subtitles_loading.is_some()
+                    || self.watch.extras.is_subtitle_applying()
+                {
+                    ui.add_space(4.0);
+                    skeleton::transcript_skeleton(ui, ui.available_width(), dark_theme);
+                    ui.add_space(4.0);
+                }
+                if let Some(error) = &self.watch.extras.subtitles_error {
+                    egui::Frame::new()
+                        .fill(palette.card_alt_bg)
+                        .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+                        .corner_radius(12)
+                        .inner_margin(egui::Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.colored_label(palette.warning_fg, error);
+                        });
+                }
+                if self.watch.extras.subtitles_loaded
+                    && self.watch.extras.subtitles.is_empty()
+                    && self.watch.extras.subtitles_error.is_none()
+                {
+                    egui::Frame::new()
+                        .fill(palette.card_alt_bg)
+                        .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+                        .corner_radius(12)
+                        .inner_margin(egui::Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.label(
+                                RichText::new("Nenhuma legenda compatível encontrada.")
+                                    .color(palette.neutral_status_fg),
+                            );
+                        });
+                }
+                let active_url = self.watch.extras.active_subtitle_url.as_deref();
+                egui::ScrollArea::vertical()
+                    .id_salt(format!("{scroll_id}_subtitles"))
+                    .max_height(150.0)
+                    .show(ui, |ui| {
+                        for track in &self.watch.extras.subtitles {
+                            let is_active = has_active_player_subtitle
+                                && active_url == Some(track.url.as_str());
+                            let label = format!(
+                                "{}{}",
+                                track.language,
+                                if track.automatic {
+                                    " (automática)"
+                                } else {
+                                    ""
+                                }
+                            );
+                            let button_text = if is_active {
+                                format!("{label} ✓")
+                            } else {
+                                label.clone()
+                            };
+                            ui.horizontal(|ui| {
+                                if styled_compact_button(ui, &button_text, is_active, &palette)
+                                    .clicked()
+                                {
+                                    chosen = Some((track.clone(), label.clone()));
+                                }
+                                if styled_ghost_button(ui, "Transcrição", &palette)
+                                    .on_hover_text(
+                                        "Baixar, pesquisar e acompanhar o WebVTT desta faixa",
+                                    )
+                                    .clicked()
+                                {
+                                    transcript_track = Some(track.clone());
+                                }
+                            });
+                            ui.add_space(3.0);
                         }
                     });
-                }
             });
         if let Some((track, label)) = chosen {
             self.watch.extras.active_subtitle_url = Some(track.url.clone());
@@ -6021,7 +7439,7 @@ impl FastTube {
         egui::Frame::new()
             .fill(fill)
             .stroke(egui::Stroke::new(1.0, stroke))
-            .corner_radius(6)
+            .corner_radius(10)
             .inner_margin(egui::Margin::symmetric(10, 8))
             .show(ui, |ui| {
                 ui.label(
@@ -6065,7 +7483,19 @@ impl FastTube {
     ) -> Option<u64> {
         let matches = transcript::search(&self.watch.extras.transcript, query);
         if matches.is_empty() {
-            ui.label("Nenhum trecho corresponde à busca.");
+            let palette = self.palette();
+            egui::Frame::new()
+                .fill(palette.card_alt_bg)
+                .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+                .corner_radius(12)
+                .inner_margin(egui::Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.label(
+                        RichText::new("Nenhum trecho corresponde à busca.")
+                            .color(palette.neutral_status_fg),
+                    );
+                });
             return None;
         }
         ui.label(
@@ -6190,105 +7620,189 @@ impl FastTube {
                 &chapters,
                 &palette,
             );
-            ui.add_space(6.0);
-            ui.separator();
+            ui.add_space(8.0);
         }
         self.subtitles_tracks_list_ui(ui, ctx, scroll_id);
-        ui.separator();
-        ui.heading("Transcrição acessível");
-        ui.label(
-            RichText::new(
-                "Use a busca para navegar ou acompanhe o trecho ativo sem tirar os olhos do vídeo.",
-            )
-            .small()
-            .weak(),
-        );
+        ui.add_space(8.0);
+        let palette = self.palette();
+        let dark_theme = self.settings.theme.value == Theme::Dark;
         let has_transcript = !self.watch.extras.transcript.is_empty();
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(has_transcript, egui::Button::new("Copiar transcrição"))
-                .on_hover_text(
-                    "Copiar todos os trechos com timestamps para a área de transferência",
-                )
-                .clicked()
-            {
-                let formatted = transcript::format_txt(&self.watch.extras.transcript);
-                let _ = copy_text_to_clipboard(ctx, &formatted);
-                self.watch.extras.transcript_export_status = Some((
-                    true,
-                    format!(
-                        "{} trecho(s) copiados para a área de transferência.",
-                        self.watch.extras.transcript.len()
-                    ),
-                ));
-            }
-            if ui
-                .add_enabled(
-                    has_transcript && !self.watch.extras.is_exporting_transcript(),
-                    egui::Button::new("Exportar (.txt / .md)"),
-                )
-                .on_hover_text("Salvar transcrição em arquivo .txt ou Markdown (.md)")
-                .clicked()
-            {
-                let title = self
-                    .selected
-                    .as_ref()
-                    .map(|v| v.title.as_str())
-                    .unwrap_or("Transcricao")
-                    .to_owned();
-                let cues = self.watch.extras.transcript.clone();
-                self.watch
-                    .extras
-                    .start_transcript_export(&title, &cues, ctx);
-            }
-            if self.watch.extras.is_exporting_transcript() {
-                ui.spinner();
-            }
-        });
-        if let Some((ok, status)) = &self.watch.extras.transcript_export_status {
-            let color = if *ok {
-                self.palette().notice_fg
-            } else {
-                self.palette().warning_fg
-            };
-            ui.colored_label(color, status);
-        }
-        ui.horizontal(|ui| {
-            ui.label("Buscar:");
-            ui.text_edit_singleline(&mut self.watch.extras.transcript_query);
-            if !self.watch.extras.transcript_query.is_empty() && ui.small_button("Limpar").clicked()
-            {
-                self.watch.extras.transcript_query.clear();
-            }
-            if self.watch.extras.transcript_loading {
-                ui.spinner();
-            }
-        });
-        let (font_size, high_contrast) = self.transcript_settings_ui(ui);
-        if let Some(error) = &self.watch.extras.transcript_error {
-            ui.colored_label(self.palette().warning_fg, error);
-        }
-        if !self.watch.extras.transcript_loading
-            && self.watch.extras.transcript.is_empty()
-            && self.watch.extras.transcript_error.is_none()
-        {
-            ui.label("Escolha Transcrição em uma faixa acima para carregar o texto.");
-        }
-        let position_ms = self.current_player_live_pos_ms();
-        let active_index = position_ms.and_then(|position| {
-            transcript::active_cue_index(&self.watch.extras.transcript, position)
-        });
-        let mut seek_to_ms = active_index.and_then(|index| {
-            self.transcript_active_cue_card_ui(ui, index, font_size, high_contrast)
-        });
-        let query = self.watch.extras.transcript_query.trim().to_owned();
-        if !query.is_empty() {
-            seek_to_ms =
-                seek_to_ms.or_else(|| self.transcript_matches_ui(ui, scroll_id, &query, font_size));
-        } else if !self.watch.extras.transcript.is_empty() {
-            seek_to_ms = seek_to_ms.or_else(|| {
-                self.transcript_cues_list_ui(ui, scroll_id, active_index, font_size, high_contrast)
+        let mut seek_to_ms = None;
+        let mut close_transcript = false;
+        egui::Frame::new()
+            .fill(palette.info_box_bg)
+            .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+            .corner_radius(12)
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                let pt = self.ui_pt();
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(if pt {
+                            "Transcri\u{00e7}\u{00e3}o"
+                        } else {
+                            "Transcript"
+                        })
+                        .size(18.0)
+                        .strong()
+                        .color(palette.channel_fg),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if styled_icon_chip_button(ui, true, "\u{2715}", &palette)
+                            .on_hover_text(if pt {
+                                "Fechar transcri\u{00e7}\u{00e3}o"
+                            } else {
+                                "Close transcript"
+                            })
+                            .clicked()
+                        {
+                            close_transcript = true;
+                        }
+                    });
+                });
+                ui.label(
+                    RichText::new(
+                        "Use a busca para navegar ou acompanhe o trecho ativo sem tirar os olhos do vídeo.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if styled_compact_button_enabled(
+                        ui,
+                        has_transcript,
+                        "Copiar transcrição",
+                        false,
+                        &palette,
+                    )
+                    .on_hover_text(
+                        "Copiar todos os trechos com timestamps para a área de transferência",
+                    )
+                    .clicked()
+                    {
+                        let formatted = transcript::format_txt(&self.watch.extras.transcript);
+                        let _ = copy_text_to_clipboard(ctx, &formatted);
+                        self.watch.extras.transcript_export_status = Some((
+                            true,
+                            format!(
+                                "{} trecho(s) copiados para a área de transferência.",
+                                self.watch.extras.transcript.len()
+                            ),
+                        ));
+                    }
+                    if styled_compact_button_enabled(
+                        ui,
+                        has_transcript && !self.watch.extras.is_exporting_transcript(),
+                        "Exportar (.txt / .md)",
+                        false,
+                        &palette,
+                    )
+                    .on_hover_text("Salvar transcrição em arquivo .txt ou Markdown (.md)")
+                    .clicked()
+                    {
+                        let title = self
+                            .selected
+                            .as_ref()
+                            .map(|v| v.title.as_str())
+                            .unwrap_or("Transcricao")
+                            .to_owned();
+                        let cues = self.watch.extras.transcript.clone();
+                        self.watch
+                            .extras
+                            .start_transcript_export(&title, &cues, ctx);
+                    }
+                    if self.watch.extras.is_exporting_transcript() {
+                        let _ = skeleton::skeleton_box(
+                            ui,
+                            egui::vec2(48.0, 14.0),
+                            7.0,
+                            self.settings.theme.value == Theme::Dark,
+                        );
+                    }
+                });
+                if let Some((ok, status)) = &self.watch.extras.transcript_export_status {
+                    let color = if *ok {
+                        palette.notice_fg
+                    } else {
+                        palette.warning_fg
+                    };
+                    ui.colored_label(color, status);
+                }
+                ui.add_space(6.0);
+                Self::paint_hairline_divider(ui, &palette);
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Buscar:");
+                    ui.text_edit_singleline(&mut self.watch.extras.transcript_query);
+                    if !self.watch.extras.transcript_query.is_empty()
+                        && styled_ghost_button(ui, "Limpar", &palette).clicked()
+                    {
+                        self.watch.extras.transcript_query.clear();
+                    }
+                });
+                let (font_size, high_contrast) = self.transcript_settings_ui(ui);
+                if self.watch.extras.transcript_loading {
+                    ui.add_space(6.0);
+                    skeleton::transcript_skeleton(ui, ui.available_width(), dark_theme);
+                    ui.add_space(6.0);
+                }
+                if let Some(error) = &self.watch.extras.transcript_error {
+                    egui::Frame::new()
+                        .fill(palette.card_alt_bg)
+                        .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+                        .corner_radius(12)
+                        .inner_margin(egui::Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.colored_label(palette.warning_fg, error);
+                        });
+                }
+                if !self.watch.extras.transcript_loading
+                    && self.watch.extras.transcript.is_empty()
+                    && self.watch.extras.transcript_error.is_none()
+                {
+                    egui::Frame::new()
+                        .fill(palette.card_alt_bg)
+                        .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+                        .corner_radius(12)
+                        .inner_margin(egui::Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.label(
+                                RichText::new(
+                                    "Escolha Transcrição em uma faixa acima para carregar o texto.",
+                                )
+                                .color(palette.neutral_status_fg),
+                            );
+                        });
+                }
+                let position_ms = self.current_player_live_pos_ms();
+                let active_index = position_ms.and_then(|position| {
+                    transcript::active_cue_index(&self.watch.extras.transcript, position)
+                });
+                seek_to_ms = active_index.and_then(|index| {
+                    self.transcript_active_cue_card_ui(ui, index, font_size, high_contrast)
+                });
+                let query = self.watch.extras.transcript_query.trim().to_owned();
+                if !query.is_empty() {
+                    seek_to_ms = seek_to_ms
+                        .or_else(|| self.transcript_matches_ui(ui, scroll_id, &query, font_size));
+                } else if !self.watch.extras.transcript.is_empty() {
+                    seek_to_ms = seek_to_ms.or_else(|| {
+                        self.transcript_cues_list_ui(
+                            ui,
+                            scroll_id,
+                            active_index,
+                            font_size,
+                            high_contrast,
+                        )
+                    });
+                }
             });
+        if close_transcript {
+            self.watch.extras.sidebar_tab = watch_extras::SidebarTab::All;
         }
         if let Some(start_ms) = seek_to_ms {
             self.seek_to_seconds(start_ms as f64 / 1000.0);
@@ -6565,7 +8079,7 @@ impl FastTube {
             if let Some((index, total)) = details.short_index_and_total {
                 egui::Frame::new()
                     .fill(palette.card_alt_bg)
-                    .stroke(egui::Stroke::new(1.0, palette.card_stroke))
+                    .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
                     .corner_radius(14)
                     .inner_margin(egui::Margin::symmetric(10, 4))
                     .show(ui, |ui| {
@@ -6676,6 +8190,7 @@ impl FastTube {
             ui.add_space(14.0);
             egui::Frame::new()
                 .fill(palette.card_alt_bg)
+                .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
                 .corner_radius(12)
                 .inner_margin(egui::Margin::symmetric(14, 12))
                 .show(ui, |ui| {
@@ -6686,28 +8201,19 @@ impl FastTube {
             ui.add_space(12.0);
             egui::Frame::new()
                 .fill(palette.card_alt_bg)
+                .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
                 .corner_radius(12)
                 .inner_margin(egui::Margin::symmetric(12, 10))
                 .show(ui, |ui| {
                     self.comments_ui(ui, ctx, "shorts_comments");
                 });
         }
-        if !self.message.is_empty() {
+        if is_actionable_inline_message(&self.message) {
             ui.add_space(8.0);
-            ui.label(
-                RichText::new(&self.message)
-                    .size(12.0)
-                    .color(palette.neutral_status_fg),
-            );
+            if inline_error_banner_ui(ui, &self.message, palette) {
+                self.message.clear();
+            }
         }
-        ui.add_space(12.0);
-        ui.label(
-            RichText::new(
-                "Use ↑ / ↓ ou J / K para navegar entre Shorts, ou os controles sobre o vídeo para pausar e ajustar o volume.",
-            )
-            .size(12.0)
-            .color(palette.neutral_status_fg),
-        );
     }
 
     pub(crate) fn shorts_watch_page_ui(
@@ -6941,9 +8447,12 @@ impl FastTube {
                             available_height,
                             WatchLayoutMode::SideBySide,
                         );
-                        if !self.message.is_empty() {
+                        if is_actionable_inline_message(&self.message) {
                             ui.add_space(6.0);
-                            ui.label(&self.message);
+                            let palette = self.palette();
+                            if inline_error_banner_ui(ui, &self.message, &palette) {
+                                self.message.clear();
+                            }
                         }
                     });
                     ui.add_space(columns.gap);
@@ -6985,9 +8494,12 @@ impl FastTube {
                     available_height,
                     WatchLayoutMode::Short,
                 );
-                if !self.message.is_empty() {
+                if is_actionable_inline_message(&self.message) {
                     ui.add_space(6.0);
-                    ui.label(&self.message);
+                    let palette = self.palette();
+                    if inline_error_banner_ui(ui, &self.message, &palette) {
+                        self.message.clear();
+                    }
                 }
                 ui.add_space(8.0);
                 ui.separator();
@@ -7060,9 +8572,12 @@ impl FastTube {
                                         resolution_badge.as_deref(),
                                     );
                                 }
-                                if !self.message.is_empty() {
+                                if is_actionable_inline_message(&self.message) {
                                     ui.add_space(6.0);
-                                    ui.label(&self.message);
+                                    let palette = self.palette();
+                                    if inline_error_banner_ui(ui, &self.message, &palette) {
+                                        self.message.clear();
+                                    }
                                 }
                             });
                             ui.add_space(below_columns.gap);
@@ -7098,9 +8613,12 @@ impl FastTube {
                                         resolution_badge.as_deref(),
                                     );
                                 }
-                                if !self.message.is_empty() {
+                                if is_actionable_inline_message(&self.message) {
                                     ui.add_space(6.0);
-                                    ui.label(&self.message);
+                                    let palette = self.palette();
+                                    if inline_error_banner_ui(ui, &self.message, &palette) {
+                                        self.message.clear();
+                                    }
                                 }
                                 if self.watch_live_chat_panel_ui(
                                     ui,
@@ -7141,9 +8659,12 @@ impl FastTube {
                             available_height,
                             WatchLayoutMode::Stacked,
                         );
-                        if !self.message.is_empty() {
+                        if is_actionable_inline_message(&self.message) {
                             ui.add_space(6.0);
-                            ui.label(&self.message);
+                            let palette = self.palette();
+                            if inline_error_banner_ui(ui, &self.message, &palette) {
+                                self.message.clear();
+                            }
                         }
                         if self.watch_live_chat_panel_ui(ui, ctx, columns.primary_width, 420.0) {
                             ui.add_space(8.0);
@@ -7185,4 +8706,745 @@ impl FastTube {
             }
         }
     }
+
+    fn mini_player_thumbnail_surface(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        video: &Video,
+        size: egui::Vec2,
+    ) -> (egui::Rect, bool) {
+        let thumb_url = if !video.thumbnail.trim().is_empty() {
+            video.thumbnail.clone()
+        } else if let Some(vid) = history::youtube_video_id(&video.url) {
+            format!("https://i.ytimg.com/vi/{vid}/hqdefault.jpg")
+        } else {
+            String::new()
+        };
+        self.thumbnails.begin_pass();
+        let resp = if !thumb_url.is_empty() {
+            self.thumbnails.show_rounded(ui, ctx, &thumb_url, size, 0.0)
+        } else {
+            let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+            ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
+            resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        };
+        self.thumbnails.end_pass(ctx);
+        (resp.rect, resp.clicked())
+    }
+
+    pub(crate) fn in_app_mini_player_ui(&mut self, ctx: &egui::Context) {
+        const MINI_PLAYER_FOOTER_HEIGHT: f32 = 82.0;
+        let Some(video) = self.selected.clone() else {
+            return;
+        };
+        self.sync_player_window_visibility();
+        let palette = self.palette();
+        let pt = self.ui_pt();
+        let content = ctx.input(|i| i.content_rect());
+        let card_w = (content.width() * 0.27)
+            .clamp(300.0, 384.0)
+            .min((content.width() - 24.0).max(240.0));
+        let video_h = (card_w * 9.0 / 16.0).round();
+
+        let mut expand_clicked = false;
+        let mut toggle_pause_clicked = false;
+        let mut prev_clicked = false;
+        let mut next_clicked = false;
+        let mut toggle_mute_clicked = false;
+        let mut set_volume_target: Option<f32> = None;
+        let mut desktop_pip_clicked = false;
+        let mut close_clicked = false;
+        let mut seek_target_secs: Option<f64> = None;
+
+        let mut paused = self.playback.mini_player_paused;
+        let mut muted = self.playback.mini_player_muted;
+        let mut volume_percent = self.playback.mini_player_volume;
+        let mut position = self
+            .playback
+            .active
+            .as_ref()
+            .map_or(0.0, |a| a.position_ms as f64 / 1000.0);
+        let mut duration = self
+            .playback
+            .active
+            .as_ref()
+            .and_then(|a| a.duration_ms)
+            .filter(|&d| d > 0)
+            .map(|d| d as f64 / 1000.0);
+        let mut is_live = self.playback.active.as_ref().is_some_and(|a| a.is_live);
+        let can_prev_video = self.has_previous_video_target();
+        let can_next = self.has_next_video_target();
+        let has_queue = !self.queue.data.is_empty();
+
+        egui::Area::new(egui::Id::new("fasttube_in_app_mini_player"))
+            .order(egui::Order::Middle)
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-18.0, -18.0))
+            .default_size(egui::vec2(
+                card_w + 2.0,
+                video_h + MINI_PLAYER_FOOTER_HEIGHT + 2.0,
+            ))
+            .movable(false)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(palette.card_bg)
+                    .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
+                    .corner_radius(12.0)
+                    .shadow(egui::Shadow {
+                        offset: [0, 6],
+                        blur: 20,
+                        spread: 2,
+                        color: Color32::from_black_alpha(110),
+                    })
+                    .inner_margin(egui::Margin::ZERO)
+                    .show(ui, |ui| {
+                        ui.set_width(card_w);
+                        ui.set_max_width(card_w);
+                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+
+                        let mut video_rect_opt: Option<egui::Rect> = None;
+                        let mut surface_clicked = false;
+                        let mut can_overlay_hover = true;
+
+                        #[cfg(windows)]
+                        if self.player.is_some() {
+                            let is_render_api = self
+                                .player
+                                .as_ref()
+                                .is_some_and(player::Player::is_render_api);
+                            can_overlay_hover = is_render_api;
+                            let hide_video = !is_render_api
+                                && (self.has_modal_covering_mini_player()
+                                    || self.ui.navigation_open);
+                            let surface = self.player_surface_and_telemetry(
+                                ui,
+                                ctx,
+                                egui::vec2(card_w, video_h),
+                                hide_video,
+                            );
+                            if let Some((video_area, telemetry)) = surface {
+                                for event in telemetry.events.iter().cloned() {
+                                    self.handle_queue_player_event(event);
+                                }
+                                if let Some(error) = telemetry.poll_error.clone() {
+                                    self.message = error;
+                                    self.report_pending_queue_load_error();
+                                }
+                                let now = Instant::now();
+                                let (pos, dur, pending_seek, clear_start_option) = self
+                                    .process_player_telemetry(
+                                        &video,
+                                        telemetry.raw_path.as_deref(),
+                                        telemetry.raw_position,
+                                        telemetry.raw_duration,
+                                        telemetry.ended,
+                                        now,
+                                    );
+                                self.update_live_playback_state(
+                                    telemetry.paused,
+                                    telemetry.raw_position,
+                                    telemetry.raw_duration,
+                                    telemetry.seekable,
+                                    now,
+                                );
+                                if !telemetry.ended
+                                    && self.queue.pending_video.as_ref() == Some(&video)
+                                    && self.playback.active.as_ref().is_some_and(|active| {
+                                        active.has_live_sample
+                                            && active.url == video.url
+                                            && telemetry.raw_path.as_deref().is_some_and(|path| {
+                                                path == video.url
+                                                    || (history::youtube_video_id(path).is_some()
+                                                        && history::youtube_video_id(path)
+                                                            == history::youtube_video_id(
+                                                                &video.url,
+                                                            ))
+                                            })
+                                    })
+                                {
+                                    self.report_pending_queue_playback_observed();
+                                }
+                                if clear_start_option && let Some(player) = &self.player {
+                                    let _ = player.set("options/start", "none");
+                                }
+                                if let Some(target_secs) = pending_seek
+                                    && let Some(player) = &self.player
+                                    && let Err(error) = player.seek(target_secs, "absolute+exact")
+                                {
+                                    if let Some(active) = &mut self.playback.active {
+                                        active.resume_seek_pending = true;
+                                    }
+                                    self.message = error;
+                                }
+                                paused = telemetry.paused;
+                                muted = telemetry.muted;
+                                volume_percent = telemetry.raw_volume as f32;
+                                self.playback.mini_player_paused = paused;
+                                self.playback.mini_player_muted = muted;
+                                self.playback.mini_player_volume = volume_percent;
+                                position = pos;
+                                duration = dur;
+                                if let Some(active) = &self.playback.active {
+                                    is_live = active.is_live;
+                                }
+                                if let Some((rect, resp)) = video_area {
+                                    let resp = if can_overlay_hover {
+                                        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    } else {
+                                        resp
+                                    };
+                                    video_rect_opt = Some(rect);
+                                    surface_clicked = resp.clicked();
+                                }
+                            }
+                        } else {
+                            let (rect, clicked) = self.mini_player_thumbnail_surface(
+                                ui,
+                                ctx,
+                                &video,
+                                egui::vec2(card_w, video_h),
+                            );
+                            video_rect_opt = Some(rect);
+                            surface_clicked = clicked;
+                        }
+
+                        #[cfg(not(windows))]
+                        {
+                            let (rect, clicked) = self.mini_player_thumbnail_surface(
+                                ui,
+                                ctx,
+                                &video,
+                                egui::vec2(card_w, video_h),
+                            );
+                            video_rect_opt = Some(rect);
+                            surface_clicked = clicked;
+                        }
+
+                        if let Some(vrect) = video_rect_opt
+                            && can_overlay_hover
+                        {
+                            let mut consumed_click = false;
+                            let mut seek_hot = false;
+                            let mut overlay_ui =
+                                ui.new_child(egui::UiBuilder::new().max_rect(vrect));
+                            overlay_ui.set_clip_rect(vrect.intersect(ui.clip_rect()));
+
+                            if !is_live && let Some(dur) = duration.filter(|&d| d > 0.0) {
+                                let seek_hit_rect = egui::Rect::from_min_max(
+                                    egui::pos2(
+                                        vrect.left(),
+                                        (vrect.bottom() - 8.0).max(vrect.top()),
+                                    ),
+                                    vrect.max,
+                                );
+                                let mut seek_ui = overlay_ui
+                                    .new_child(egui::UiBuilder::new().max_rect(seek_hit_rect));
+                                seek_ui.set_clip_rect(seek_hit_rect.intersect(ui.clip_rect()));
+                                let (_, seek_resp) = seek_ui.allocate_exact_size(
+                                    seek_hit_rect.size(),
+                                    egui::Sense::click_and_drag(),
+                                );
+                                let seek_resp =
+                                    seek_resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                                seek_hot = seek_resp.hovered() || seek_resp.dragged();
+                                if (seek_resp.clicked() || seek_resp.dragged())
+                                    && let Some(pos) = seek_resp.interact_pointer_pos()
+                                {
+                                    let pct = ((pos.x - vrect.left()) / vrect.width().max(1.0))
+                                        .clamp(0.0, 1.0)
+                                        as f64;
+                                    seek_target_secs = Some(dur * pct);
+                                    consumed_click = true;
+                                }
+                            }
+
+                            let hovered_video = ui.rect_contains_pointer(vrect);
+                            if hovered_video && !seek_hot {
+                                let painter = overlay_ui.painter();
+                                painter.rect_filled(vrect, 0.0, Color32::from_black_alpha(64));
+                                let center = vrect.center();
+                                painter.circle_filled(center, 22.0, Color32::from_black_alpha(165));
+                                painter.circle_stroke(
+                                    center,
+                                    22.0,
+                                    egui::Stroke::new(
+                                        1.0,
+                                        Color32::from_rgba_unmultiplied(255, 255, 255, 45),
+                                    ),
+                                );
+                                if paused {
+                                    let tri = vec![
+                                        egui::pos2(center.x - 5.5, center.y - 8.0),
+                                        egui::pos2(center.x - 5.5, center.y + 8.0),
+                                        egui::pos2(center.x + 8.0, center.y),
+                                    ];
+                                    painter.add(egui::Shape::convex_polygon(
+                                        tri,
+                                        Color32::WHITE,
+                                        egui::Stroke::NONE,
+                                    ));
+                                } else {
+                                    let left_bar = egui::Rect::from_min_max(
+                                        egui::pos2(center.x - 6.0, center.y - 7.5),
+                                        egui::pos2(center.x - 1.8, center.y + 7.5),
+                                    );
+                                    let right_bar = egui::Rect::from_min_max(
+                                        egui::pos2(center.x + 1.8, center.y - 7.5),
+                                        egui::pos2(center.x + 6.0, center.y + 7.5),
+                                    );
+                                    painter.rect_filled(left_bar, 1.0, Color32::WHITE);
+                                    painter.rect_filled(right_bar, 1.0, Color32::WHITE);
+                                }
+                            }
+
+                            let bar_h = if seek_hot { 5.0 } else { 3.0 };
+                            let bar_rect = egui::Rect::from_min_max(
+                                egui::pos2(vrect.left(), vrect.bottom() - bar_h),
+                                vrect.max,
+                            );
+                            overlay_ui.painter().rect_filled(
+                                bar_rect,
+                                0.0,
+                                Color32::from_rgba_unmultiplied(255, 255, 255, 65),
+                            );
+                            let frac = if is_live {
+                                1.0
+                            } else if let Some(dur) = duration.filter(|&d| d > 0.0) {
+                                (position / dur).clamp(0.0, 1.0) as f32
+                            } else {
+                                0.0
+                            };
+                            if frac > 0.0 {
+                                let fill_rect = egui::Rect::from_min_max(
+                                    bar_rect.min,
+                                    egui::pos2(
+                                        bar_rect.left() + bar_rect.width() * frac,
+                                        bar_rect.bottom(),
+                                    ),
+                                );
+                                overlay_ui.painter().rect_filled(
+                                    fill_rect,
+                                    0.0,
+                                    Color32::from_rgb(255, 0, 51),
+                                );
+                                if seek_hot {
+                                    overlay_ui.painter().circle_filled(
+                                        egui::pos2(fill_rect.right(), bar_rect.center().y),
+                                        5.0,
+                                        Color32::from_rgb(255, 0, 51),
+                                    );
+                                }
+                            }
+                            if surface_clicked && !consumed_click {
+                                toggle_pause_clicked = true;
+                            }
+                        }
+
+                        let can_prev = can_prev_video || (!is_live && position > 1.0);
+                        let inner_w = (card_w - 20.0).max(200.0);
+                        egui::Frame::new()
+                            .inner_margin(egui::Margin::symmetric(10, 8))
+                            .show(ui, |ui| {
+                                ui.set_width(inner_w);
+                                ui.set_max_width(inner_w);
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(inner_w, 34.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        ui.set_max_width(inner_w);
+                                        ui.set_min_height(34.0);
+                                        ui.spacing_mut().item_spacing.y = 2.0;
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&video.title)
+                                                    .size(13.0)
+                                                    .strong()
+                                                    .color(palette.channel_fg),
+                                            )
+                                            .truncate(),
+                                        );
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&video.channel)
+                                                    .size(11.5)
+                                                    .color(palette.neutral_status_fg),
+                                            )
+                                            .truncate(),
+                                        );
+                                    },
+                                );
+                                ui.add_space(6.0);
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(inner_w, 26.0),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.set_width(inner_w);
+                                        ui.set_min_height(26.0);
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        let prev_tip = if can_prev_video {
+                                            if pt {
+                                                "Vídeo anterior"
+                                            } else {
+                                                "Previous video"
+                                            }
+                                        } else if can_prev {
+                                            if pt {
+                                                "Reiniciar vídeo"
+                                            } else {
+                                                "Restart video"
+                                            }
+                                        } else if pt {
+                                            "Nenhum vídeo anterior"
+                                        } else {
+                                            "No previous video"
+                                        };
+                                        if mini_player_icon_chip_button(
+                                            ui,
+                                            can_prev,
+                                            MiniPlayerIcon::Previous,
+                                            &palette,
+                                        )
+                                        .on_hover_text(prev_tip)
+                                        .clicked()
+                                        {
+                                            prev_clicked = true;
+                                        }
+
+                                        let next_tip = if can_next {
+                                            if has_queue {
+                                                if pt {
+                                                    "Próximo da fila"
+                                                } else {
+                                                    "Next in queue"
+                                                }
+                                            } else if pt {
+                                                "Próximo vídeo"
+                                            } else {
+                                                "Next video"
+                                            }
+                                        } else if pt {
+                                            "Nenhum próximo vídeo"
+                                        } else {
+                                            "No next video"
+                                        };
+                                        if mini_player_icon_chip_button(
+                                            ui,
+                                            can_next,
+                                            MiniPlayerIcon::Next,
+                                            &palette,
+                                        )
+                                        .on_hover_text(next_tip)
+                                        .clicked()
+                                        {
+                                            next_clicked = true;
+                                        }
+
+                                        ui.add_space(4.0);
+
+                                        let mute_tip = if muted || volume_percent <= 0.5 {
+                                            if pt { "Ativar som (M)" } else { "Unmute (M)" }
+                                        } else if pt {
+                                            "Silenciar (M)"
+                                        } else {
+                                            "Mute (M)"
+                                        };
+                                        let mute_resp = mini_player_icon_chip_button(
+                                            ui,
+                                            true,
+                                            MiniPlayerIcon::Volume {
+                                                muted,
+                                                volume_percent,
+                                            },
+                                            &palette,
+                                        )
+                                        .on_hover_text(mute_tip);
+                                        if mute_resp.clicked() {
+                                            toggle_mute_clicked = true;
+                                        }
+
+                                        let slider_w = (inner_w - 196.0).clamp(36.0, 96.0);
+                                        let (new_vol, vol_resp) = mini_player_volume_slider(
+                                            ui,
+                                            slider_w,
+                                            volume_percent,
+                                            muted,
+                                            &palette,
+                                        );
+                                        if let Some(vol) = new_vol {
+                                            set_volume_target = Some(vol);
+                                        } else if mute_resp.hovered() || vol_resp.hovered() {
+                                            let wheel_y = ctx.input(|i| i.smooth_scroll_delta.y);
+                                            if wheel_y.abs() >= 1.0 {
+                                                let base = if muted { 0.0 } else { volume_percent };
+                                                let step = if wheel_y > 0.0 { 5.0 } else { -5.0 };
+                                                set_volume_target =
+                                                    Some((base + step).clamp(0.0, 100.0));
+                                            }
+                                        }
+
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.spacing_mut().item_spacing.x = 4.0;
+                                                if styled_icon_chip_button(
+                                                    ui, true, "\u{2715}", &palette,
+                                                )
+                                                .on_hover_text(if pt {
+                                                    "Fechar miniplayer"
+                                                } else {
+                                                    "Close miniplayer"
+                                                })
+                                                .clicked()
+                                                {
+                                                    close_clicked = true;
+                                                }
+                                                if styled_icon_chip_button(
+                                                    ui, true, "\u{29c9}", &palette,
+                                                )
+                                                .on_hover_text(if pt {
+                                                    "Picture-in-Picture na área de trabalho"
+                                                } else {
+                                                    "Desktop Picture-in-Picture"
+                                                })
+                                                .clicked()
+                                                {
+                                                    desktop_pip_clicked = true;
+                                                }
+                                                if styled_icon_chip_button(
+                                                    ui, true, "\u{2922}", &palette,
+                                                )
+                                                .on_hover_text(if pt {
+                                                    "Ampliar player"
+                                                } else {
+                                                    "Expand player"
+                                                })
+                                                .clicked()
+                                                {
+                                                    expand_clicked = true;
+                                                }
+                                            },
+                                        );
+                                    },
+                                );
+                            });
+                    });
+            });
+
+        if let Some(target) = seek_target_secs {
+            self.seek_to_seconds(target);
+        }
+        if let Some(vol) = set_volume_target {
+            self.set_in_app_mini_player_volume(vol);
+        }
+        if toggle_mute_clicked {
+            self.toggle_in_app_mini_player_mute();
+        }
+        if toggle_pause_clicked {
+            self.toggle_in_app_mini_player_playback();
+        }
+        if prev_clicked {
+            self.trigger_in_app_mini_player_previous(is_live, position);
+        } else if next_clicked {
+            self.trigger_in_app_mini_player_next();
+        }
+        if close_clicked {
+            self.close_video(ctx);
+        } else if desktop_pip_clicked {
+            self.toggle_mini_player(ctx);
+        } else if expand_clicked {
+            self.exit_in_app_mini_player(ctx);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MiniPlayerIcon {
+    Previous,
+    Next,
+    Volume { muted: bool, volume_percent: f32 },
+}
+
+fn mini_player_icon_chip_button(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    icon: MiniPlayerIcon,
+    palette: &ThemePalette,
+) -> egui::Response {
+    let size = egui::vec2(26.0, 24.0);
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    let response = if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    };
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let bg = if enabled && (response.hovered() || response.is_pointer_button_down_on()) {
+            palette.card_alt_bg
+        } else {
+            palette.header_button_bg
+        };
+        let stroke_color = if enabled && response.hovered() {
+            palette.header_button_fg.gamma_multiply(0.45)
+        } else {
+            palette.card_alt_stroke
+        };
+        painter.rect_filled(rect, 8.0, bg);
+        painter.rect_stroke(
+            rect,
+            8.0,
+            egui::Stroke::new(1.0, stroke_color),
+            egui::StrokeKind::Inside,
+        );
+        let fg = if enabled {
+            palette.header_button_fg
+        } else {
+            palette.neutral_status_fg.gamma_multiply(0.5)
+        };
+        let c = rect.center();
+        match icon {
+            MiniPlayerIcon::Previous => {
+                let bar = egui::Rect::from_min_max(
+                    egui::pos2(c.x - 5.5, c.y - 4.5),
+                    egui::pos2(c.x - 3.5, c.y + 4.5),
+                );
+                painter.rect_filled(bar, 0.5, fg);
+                let tri = vec![
+                    egui::pos2(c.x + 5.0, c.y - 4.5),
+                    egui::pos2(c.x + 5.0, c.y + 4.5),
+                    egui::pos2(c.x - 2.0, c.y),
+                ];
+                painter.add(egui::Shape::convex_polygon(tri, fg, egui::Stroke::NONE));
+            }
+            MiniPlayerIcon::Next => {
+                let tri = vec![
+                    egui::pos2(c.x - 5.0, c.y - 4.5),
+                    egui::pos2(c.x - 5.0, c.y + 4.5),
+                    egui::pos2(c.x + 2.0, c.y),
+                ];
+                painter.add(egui::Shape::convex_polygon(tri, fg, egui::Stroke::NONE));
+                let bar = egui::Rect::from_min_max(
+                    egui::pos2(c.x + 3.5, c.y - 4.5),
+                    egui::pos2(c.x + 5.5, c.y + 4.5),
+                );
+                painter.rect_filled(bar, 0.5, fg);
+            }
+            MiniPlayerIcon::Volume {
+                muted,
+                volume_percent,
+            } => {
+                let speaker = vec![
+                    egui::pos2(c.x - 6.0, c.y - 2.0),
+                    egui::pos2(c.x - 3.2, c.y - 2.0),
+                    egui::pos2(c.x + 0.5, c.y - 5.0),
+                    egui::pos2(c.x + 0.5, c.y + 5.0),
+                    egui::pos2(c.x - 3.2, c.y + 2.0),
+                    egui::pos2(c.x - 6.0, c.y + 2.0),
+                ];
+                painter.add(egui::Shape::convex_polygon(speaker, fg, egui::Stroke::NONE));
+                if muted || volume_percent <= 0.5 {
+                    painter.line_segment(
+                        [
+                            egui::pos2(c.x + 2.5, c.y - 2.8),
+                            egui::pos2(c.x + 6.5, c.y + 2.8),
+                        ],
+                        egui::Stroke::new(1.5, fg),
+                    );
+                    painter.line_segment(
+                        [
+                            egui::pos2(c.x + 6.5, c.y - 2.8),
+                            egui::pos2(c.x + 2.5, c.y + 2.8),
+                        ],
+                        egui::Stroke::new(1.5, fg),
+                    );
+                } else {
+                    let arc1 = vec![
+                        egui::pos2(c.x + 2.4, c.y - 2.4),
+                        egui::pos2(c.x + 3.6, c.y),
+                        egui::pos2(c.x + 2.4, c.y + 2.4),
+                    ];
+                    painter.add(egui::Shape::line(arc1, egui::Stroke::new(1.4, fg)));
+                    if volume_percent > 45.0 {
+                        let arc2 = vec![
+                            egui::pos2(c.x + 4.5, c.y - 4.2),
+                            egui::pos2(c.x + 6.5, c.y),
+                            egui::pos2(c.x + 4.5, c.y + 4.2),
+                        ];
+                        painter.add(egui::Shape::line(arc2, egui::Stroke::new(1.4, fg)));
+                    }
+                }
+            }
+        }
+    }
+    response
+}
+
+fn mini_player_volume_slider(
+    ui: &mut egui::Ui,
+    width: f32,
+    volume_percent: f32,
+    muted: bool,
+    palette: &ThemePalette,
+) -> (Option<f32>, egui::Response) {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, 24.0), egui::Sense::click_and_drag());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let effective = if muted {
+        0.0
+    } else {
+        volume_percent.clamp(0.0, 100.0)
+    };
+    let ratio = (effective / 100.0).clamp(0.0, 1.0);
+    let mut new_volume = None;
+    if (response.dragged() || response.clicked())
+        && rect.width() > 10.0
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let track_left = rect.left() + 5.0;
+        let track_right = (rect.right() - 5.0).max(track_left + 1.0);
+        let frac = ((pos.x - track_left) / (track_right - track_left)).clamp(0.0, 1.0);
+        new_volume = Some((frac * 100.0).round());
+    }
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let track_left = rect.left() + 5.0;
+        let track_right = (rect.right() - 5.0).max(track_left + 1.0);
+        let cy = rect.center().y;
+        let track_rect = egui::Rect::from_min_max(
+            egui::pos2(track_left, cy - 1.5),
+            egui::pos2(track_right, cy + 1.5),
+        );
+        painter.rect_filled(
+            track_rect,
+            1.5,
+            palette.neutral_status_fg.gamma_multiply(0.35),
+        );
+        let shown_ratio = new_volume.map(|v| v / 100.0).unwrap_or(ratio);
+        let fill_x = track_left + (track_right - track_left) * shown_ratio;
+        if fill_x > track_left {
+            let fill_rect = egui::Rect::from_min_max(
+                egui::pos2(track_left, cy - 1.5),
+                egui::pos2(fill_x, cy + 1.5),
+            );
+            painter.rect_filled(fill_rect, 1.5, palette.header_button_fg);
+        }
+        let thumb_radius = if response.hovered() || response.dragged() {
+            5.5
+        } else {
+            4.5
+        };
+        painter.circle_filled(
+            egui::pos2(fill_x, cy),
+            thumb_radius,
+            palette.header_button_fg,
+        );
+    }
+    let resp = response.on_hover_text(format!("Volume: {:.0}%", effective));
+    (new_volume, resp)
 }

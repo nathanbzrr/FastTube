@@ -35,7 +35,8 @@ function New-PortableBundle {
         [Parameter(Mandatory)][string] $Executable,
         [Parameter(Mandatory)][string] $YtDlp,
         [Parameter(Mandatory)][object[]] $MpvDlls,
-        [Parameter(Mandatory)][string] $Destination
+        [Parameter(Mandatory)][string] $Destination,
+        [string[]] $AdditionalFiles = @()
     )
 
     if (Test-Path -LiteralPath $Destination) {
@@ -51,6 +52,10 @@ function New-PortableBundle {
     Copy-Item -LiteralPath $YtDlp -Destination (Join-Path $Destination 'yt-dlp.exe')
     foreach ($dll in $MpvDlls) {
         Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $Destination $dll.Name)
+    }
+    foreach ($file in $AdditionalFiles) {
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Distribution notice is missing: $file" }
+        Copy-Item -LiteralPath $file -Destination (Join-Path $Destination ([IO.Path]::GetFileName($file)))
     }
 }
 

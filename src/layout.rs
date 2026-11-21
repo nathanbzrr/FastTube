@@ -12,6 +12,23 @@ pub(crate) const SINGLE_COLUMN_BROWSE_MAX_WIDTH: f32 = 680.0;
 pub(crate) const COMPACT_NAVIGATION_WIDTH: f32 = 72.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewportBreakpoint {
+    Compact,
+    Medium,
+    Wide,
+}
+
+pub(crate) fn viewport_breakpoint(viewport_width: f32) -> ViewportBreakpoint {
+    if viewport_width < COMPACT_NAVIGATION_MIN_VIEWPORT_WIDTH {
+        ViewportBreakpoint::Compact
+    } else if viewport_width < PERSISTENT_SIDEBAR_MIN_VIEWPORT_WIDTH {
+        ViewportBreakpoint::Medium
+    } else {
+        ViewportBreakpoint::Wide
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HeaderLayoutMode {
     SingleRow,
     TwoRows,
@@ -59,13 +76,10 @@ pub(crate) fn should_show_compact_navigation_for_page(
     if fullscreen || has_selected_video || theater_mode {
         return false;
     }
-    if viewport_width < COMPACT_NAVIGATION_MIN_VIEWPORT_WIDTH {
-        return false;
-    }
-    if viewport_width < PERSISTENT_SIDEBAR_MIN_VIEWPORT_WIDTH {
-        true
-    } else {
-        !navigation_open
+    match viewport_breakpoint(viewport_width) {
+        ViewportBreakpoint::Compact => false,
+        ViewportBreakpoint::Medium => true,
+        ViewportBreakpoint::Wide => !navigation_open,
     }
 }
 
@@ -77,7 +91,7 @@ pub(crate) fn should_show_navigation_drawer(
 ) -> bool {
     navigation_open
         && !fullscreen
-        && (has_selected_video || viewport_width < PERSISTENT_SIDEBAR_MIN_VIEWPORT_WIDTH)
+        && (has_selected_video || viewport_breakpoint(viewport_width) != ViewportBreakpoint::Wide)
 }
 
 pub(crate) fn compute_home_grid_columns(available_width: f32) -> usize {
@@ -85,14 +99,6 @@ pub(crate) fn compute_home_grid_columns(available_width: f32) -> usize {
         1
     } else {
         (((available_width + 16.0) / 320.0).floor() as usize).clamp(1, 5)
-    }
-}
-
-pub(crate) fn compute_continue_watching_columns(available_width: f32) -> usize {
-    if available_width < SINGLE_COLUMN_BROWSE_MAX_WIDTH {
-        1
-    } else {
-        (((available_width + 16.0) / 260.0).floor() as usize).clamp(1, 4)
     }
 }
 
@@ -301,4 +307,65 @@ pub(crate) fn compute_navigation_width(viewport_width: f32) -> f32 {
 
 pub(crate) fn compute_youtube_sidebar_width(viewport_width: f32) -> f32 {
     if viewport_width < 480.0 { 216.0 } else { 240.0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn viewport_breakpoint_classifies_boundaries() {
+        assert_eq!(viewport_breakpoint(0.0), ViewportBreakpoint::Compact);
+        assert_eq!(viewport_breakpoint(480.0), ViewportBreakpoint::Compact);
+        assert_eq!(viewport_breakpoint(759.9), ViewportBreakpoint::Compact);
+        assert_eq!(viewport_breakpoint(760.0), ViewportBreakpoint::Medium);
+        assert_eq!(viewport_breakpoint(1024.0), ViewportBreakpoint::Medium);
+        assert_eq!(
+            viewport_breakpoint(PERSISTENT_SIDEBAR_MIN_VIEWPORT_WIDTH - 0.1),
+            ViewportBreakpoint::Medium
+        );
+        assert_eq!(
+            viewport_breakpoint(PERSISTENT_SIDEBAR_MIN_VIEWPORT_WIDTH),
+            ViewportBreakpoint::Wide
+        );
+        assert_eq!(viewport_breakpoint(1920.0), ViewportBreakpoint::Wide);
+    }
+
+    #[test]
+    fn viewport_breakpoint_matches_navigation_and_drawer_modes() {
+        assert!(!should_show_compact_navigation_for_page(
+            759.9, false, false, false, false
+        ));
+        assert!(should_show_compact_navigation_for_page(
+            760.0, true, false, false, false
+        ));
+        assert!(should_show_compact_navigation_for_page(
+            PERSISTENT_SIDEBAR_MIN_VIEWPORT_WIDTH,
+            false,
+            false,
+            false,
+            false
+        ));
+        assert!(!should_show_compact_navigation_for_page(
+            PERSISTENT_SIDEBAR_MIN_VIEWPORT_WIDTH,
+            true,
+            false,
+            false,
+            false
+        ));
+
+        assert!(should_show_navigation_drawer(760.0, true, false, false));
+        assert!(!should_show_navigation_drawer(
+            PERSISTENT_SIDEBAR_MIN_VIEWPORT_WIDTH,
+            true,
+            false,
+            false
+        ));
+        assert!(should_show_navigation_drawer(
+            PERSISTENT_SIDEBAR_MIN_VIEWPORT_WIDTH,
+            true,
+            false,
+            true
+        ));
+    }
 }

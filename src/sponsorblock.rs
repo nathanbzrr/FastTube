@@ -78,6 +78,25 @@ impl SponsorCategory {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn label_en(self) -> &'static str {
+        match self {
+            Self::Sponsor => "Sponsor",
+            Self::SelfPromo => "Self-Promotion / Merch",
+            Self::Interaction => "Subscribe / Like Reminder",
+            Self::Intro => "Intro / Intermission",
+            Self::Outro => "Outro / Credits",
+            Self::Preview => "Preview / Recap",
+            Self::MusicOfftopic => "Non-Music Section",
+            Self::Filler => "Filler / Tangent",
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn label(self, pt: bool) -> &'static str {
+        if pt { self.label_pt() } else { self.label_en() }
+    }
+
     pub fn description_pt(self) -> &'static str {
         match self {
             Self::Sponsor => {
@@ -96,6 +115,33 @@ impl SponsorCategory {
                 "Trechos falados, intros longas ou pausas sem música dentro de videoclipes."
             }
             Self::Filler => "Tangentes e piadas fora do assunto principal do vídeo.",
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn description_en(self) -> &'static str {
+        match self {
+            Self::Sponsor => "Paid reads, ad placements, and sponsor-promoted segments.",
+            Self::SelfPromo => {
+                "Promotion of own products, courses, affiliate links, or other channels."
+            }
+            Self::Interaction => "Explicit mid-video requests to like, subscribe, or comment.",
+            Self::Intro => "Animated title cards or repetitive openings before the main content.",
+            Self::Outro => "End screens, thank-yous, and credits at the end of the video.",
+            Self::Preview => "Quick recaps or previews of what happens later in the video.",
+            Self::MusicOfftopic => {
+                "Spoken sections, long intros, or non-music breaks inside music videos."
+            }
+            Self::Filler => "Tangents and off-topic jokes outside the video's main subject.",
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn description(self, pt: bool) -> &'static str {
+        if pt {
+            self.description_pt()
+        } else {
+            self.description_en()
         }
     }
 
@@ -140,6 +186,20 @@ impl SponsorSkipMode {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn label_en(self) -> &'static str {
+        match self {
+            Self::AutoSkip => "Auto-skip",
+            Self::ManualButton => "Show skip button",
+            Self::HighlightOnly => "Highlight on bar only",
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn label(self, pt: bool) -> &'static str {
+        if pt { self.label_pt() } else { self.label_en() }
+    }
+
     pub fn description_pt(self) -> &'static str {
         match self {
             Self::AutoSkip => "Avança automaticamente ao entrar em um segmento marcado.",
@@ -149,6 +209,28 @@ impl SponsorSkipMode {
             Self::HighlightOnly => {
                 "Mostra apenas as marcações coloridas na barra de progresso, sem pular."
             }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn description_en(self) -> &'static str {
+        match self {
+            Self::AutoSkip => "Automatically jumps ahead when entering a marked segment.",
+            Self::ManualButton => {
+                "Shows a floating button over the player so you can skip manually."
+            }
+            Self::HighlightOnly => {
+                "Only shows colored markers on the progress bar without skipping."
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn description(self, pt: bool) -> &'static str {
+        if pt {
+            self.description_pt()
+        } else {
+            self.description_en()
         }
     }
 }
@@ -344,6 +426,38 @@ impl SponsorBlockRuntime {
             .find(|segment| segment.contains(pos_secs))
     }
 
+    #[allow(dead_code)]
+    pub fn coalesced_skip_target(
+        &self,
+        pos_secs: f64,
+        settings: &SponsorBlockSettings,
+    ) -> Option<(f64, Vec<String>, SponsorCategory)> {
+        let first = self
+            .filtered_segments(settings)
+            .find(|seg| seg.contains(pos_secs) && !self.auto_skipped_uuids.contains(&seg.uuid))?;
+        let mut target_end = first.end_secs;
+        let mut uuids = vec![first.uuid.clone()];
+        let primary_category = first.category;
+        loop {
+            let mut extended = false;
+            for seg in self.filtered_segments(settings) {
+                if !uuids.contains(&seg.uuid)
+                    && !self.auto_skipped_uuids.contains(&seg.uuid)
+                    && seg.start_secs <= target_end + 0.35
+                    && seg.end_secs > target_end
+                {
+                    target_end = seg.end_secs;
+                    uuids.push(seg.uuid.clone());
+                    extended = true;
+                }
+            }
+            if !extended {
+                break;
+            }
+        }
+        Some((target_end, uuids, primary_category))
+    }
+
     pub fn active_skip_toast(&self, now: Instant) -> Option<&str> {
         self.last_skip_notice.as_ref().and_then(|(label, at)| {
             (now.saturating_duration_since(*at) < SKIP_TOAST_DURATION).then_some(label.as_str())
@@ -537,5 +651,93 @@ mod tests {
             Some("real")
         );
         assert!(runtime.segment_at(44.95, &settings).is_none());
+    }
+
+    #[test]
+    fn coalesces_adjacent_sponsor_segments_into_single_jump() {
+        let settings = SponsorBlockSettings::default();
+        let mut runtime = SponsorBlockRuntime {
+            segments: vec![
+                SponsorSegment {
+                    uuid: "intro".into(),
+                    start_secs: 5.0,
+                    end_secs: 15.0,
+                    category: SponsorCategory::Intro,
+                },
+                SponsorSegment {
+                    uuid: "sponsor".into(),
+                    start_secs: 15.2,
+                    end_secs: 40.0,
+                    category: SponsorCategory::Sponsor,
+                },
+                SponsorSegment {
+                    uuid: "far".into(),
+                    start_secs: 40.5,
+                    end_secs: 50.0,
+                    category: SponsorCategory::SelfPromo,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            runtime.coalesced_skip_target(6.0, &settings),
+            Some((
+                40.0,
+                vec!["intro".into(), "sponsor".into()],
+                SponsorCategory::Intro
+            ))
+        );
+
+        // Segments already marked as skipped are ignored during coalescing.
+        runtime.auto_skipped_uuids.insert("sponsor".into());
+        assert_eq!(
+            runtime.coalesced_skip_target(6.0, &settings),
+            Some((15.0, vec!["intro".into()], SponsorCategory::Intro))
+        );
+
+        runtime.auto_skipped_uuids.insert("intro".into());
+        assert_eq!(runtime.coalesced_skip_target(6.0, &settings), None);
+    }
+
+    #[test]
+    fn bilingual_labels_and_descriptions_are_non_empty() {
+        let mut cat_labels_en = HashSet::new();
+        let mut cat_labels_pt = HashSet::new();
+        let mut cat_descs_en = HashSet::new();
+        let mut cat_descs_pt = HashSet::new();
+        for cat in SponsorCategory::ALL {
+            assert!(!cat.label_en().trim().is_empty());
+            assert!(!cat.label_pt().trim().is_empty());
+            assert!(!cat.description_en().trim().is_empty());
+            assert!(!cat.description_pt().trim().is_empty());
+            assert_eq!(cat.label(false), cat.label_en());
+            assert_eq!(cat.label(true), cat.label_pt());
+            assert_eq!(cat.description(false), cat.description_en());
+            assert_eq!(cat.description(true), cat.description_pt());
+            assert!(cat_labels_en.insert(cat.label_en()));
+            assert!(cat_labels_pt.insert(cat.label_pt()));
+            assert!(cat_descs_en.insert(cat.description_en()));
+            assert!(cat_descs_pt.insert(cat.description_pt()));
+        }
+
+        let mut mode_labels_en = HashSet::new();
+        let mut mode_labels_pt = HashSet::new();
+        let mut mode_descs_en = HashSet::new();
+        let mut mode_descs_pt = HashSet::new();
+        for mode in SponsorSkipMode::ALL {
+            assert!(!mode.label_en().trim().is_empty());
+            assert!(!mode.label_pt().trim().is_empty());
+            assert!(!mode.description_en().trim().is_empty());
+            assert!(!mode.description_pt().trim().is_empty());
+            assert_eq!(mode.label(false), mode.label_en());
+            assert_eq!(mode.label(true), mode.label_pt());
+            assert_eq!(mode.description(false), mode.description_en());
+            assert_eq!(mode.description(true), mode.description_pt());
+            assert!(mode_labels_en.insert(mode.label_en()));
+            assert!(mode_labels_pt.insert(mode.label_pt()));
+            assert!(mode_descs_en.insert(mode.description_en()));
+            assert!(mode_descs_pt.insert(mode.description_pt()));
+        }
     }
 }

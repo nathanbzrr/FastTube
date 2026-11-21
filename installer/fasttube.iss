@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "0.3.0"
+  #define AppVersion "0.3.5"
 #endif
 #ifndef StagingDir
   #define StagingDir "..\target\installer-staging"
@@ -73,6 +73,9 @@ Source: "{#StagingDir}\fasttube.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StagingDir}\yt-dlp.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StagingDir}\*.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RepoRoot}\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#RepoRoot}\LICENSE-MIT"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#RepoRoot}\LICENSE-APACHE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#RepoRoot}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\FastTube"; Filename: "{app}\fasttube.exe"

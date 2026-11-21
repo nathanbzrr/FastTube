@@ -22,7 +22,7 @@ $resolvedTarget = [IO.Path]::GetFullPath($targetPath)
 if ($resolvedTarget.TrimEnd('\') -ieq $standardTarget.TrimEnd('\')) {
     throw "TargetDirectory deve ser isolado; o diretório padrão do Cargo não pode ser usado: $standardTarget"
 }
-$cargoArgs = @('build', '--release', '--manifest-path', (Join-Path $repoRoot 'Cargo.toml'), '--target-dir', $TargetDirectory)
+$cargoArgs = @('build', '--release', '--locked', '--manifest-path', (Join-Path $repoRoot 'Cargo.toml'), '--target-dir', $TargetDirectory)
 if ($TargetTriple) { $cargoArgs += @('--target', $TargetTriple) }
 
 Push-Location $repoRoot
@@ -42,5 +42,11 @@ if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
     throw "O build não produziu o executável Windows esperado: $executable"
 }
 
-New-PortableBundle -Executable $executable -YtDlp $ytDlp -MpvDlls $mpvDlls -Destination $BundleDirectory
+$distributionFiles = @(
+    (Join-Path $repoRoot 'README.md'),
+    (Join-Path $repoRoot 'LICENSE-MIT'),
+    (Join-Path $repoRoot 'LICENSE-APACHE'),
+    (Join-Path $repoRoot 'THIRD_PARTY_NOTICES.md')
+)
+New-PortableBundle -Executable $executable -YtDlp $ytDlp -MpvDlls $mpvDlls -AdditionalFiles $distributionFiles -Destination $BundleDirectory
 Write-Host "Bundle portátil criado em: $((Resolve-Path -LiteralPath $BundleDirectory).Path)"

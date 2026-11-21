@@ -15,7 +15,7 @@ pub const THUMBNAIL_HEIGHT: f32 = 90.0;
 #[cfg(test)]
 pub const THUMBNAIL_SIZE: Vec2 = egui::vec2(THUMBNAIL_WIDTH, THUMBNAIL_HEIGHT);
 
-pub const MAX_RETAINED_THUMBNAILS: usize = 48;
+pub const MAX_RETAINED_THUMBNAILS: usize = 36;
 pub const MAX_CONCURRENT_LOADS: usize = 6;
 pub const MAX_NEW_LOADS_PER_PASS: usize = 3;
 pub const LOAD_START_INTERVAL: Duration = Duration::from_millis(20);
@@ -24,11 +24,12 @@ pub const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub const DEFAULT_DISK_CACHE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_CACHED_IMAGE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_THUMBNAIL_DECODE_WIDTH: u32 = 1280;
-const MAX_THUMBNAIL_DECODE_HEIGHT: u32 = 720;
-const MAX_AVATAR_DECODE_SIZE: u32 = 256;
+const MAX_THUMBNAIL_DECODE_WIDTH: u32 = 640;
+const MAX_THUMBNAIL_DECODE_HEIGHT: u32 = 360;
+const MAX_AVATAR_DECODE_SIZE: u32 = 96;
 const MAX_STORYBOARD_DECODE_SIZE: u32 = 2048;
 const MAX_RETAINED_STORYBOARD_SHEETS: usize = 12;
+const THUMBNAIL_FADE_DURATION_SECS: f32 = 0.14;
 const IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(12);
 const MTIME_TOUCH_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -99,8 +100,13 @@ fn decode_color_image(
     max_height: u32,
 ) -> Result<egui::ColorImage, image::ImageError> {
     let mut img = image::load_from_memory(bytes)?;
-    if img.width() > max_width || img.height() > max_height {
-        img = img.resize(max_width, max_height, image::imageops::FilterType::Triangle);
+    let (limit_w, limit_h) = if img.height() > img.width() && max_width > max_height {
+        (max_height, max_width)
+    } else {
+        (max_width, max_height)
+    };
+    if img.width() > limit_w || img.height() > limit_h {
+        img = img.resize(limit_w, limit_h, image::imageops::FilterType::Triangle);
     }
     let rgba = img.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
@@ -413,6 +419,7 @@ enum EntryState {
 struct CacheEntry {
     state: EntryState,
     texture: Option<egui::TextureHandle>,
+    ready_at: Option<Instant>,
     last_visible_pass: u64,
     last_access_tick: u64,
 }
@@ -537,6 +544,15 @@ impl ThumbnailCache {
         self.storyboard_sheets.clear(ctx);
     }
 
+    pub fn evict_all_gpu_textures(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let forgotten = self.drain_all_for_reset(now);
+        for uri in forgotten {
+            ctx.forget_image(&uri);
+        }
+        self.storyboard_sheets.clear(ctx);
+    }
+
     fn bump_tick(&mut self) -> u64 {
         self.access_counter = self.access_counter.wrapping_add(1);
         self.access_counter
@@ -642,10 +658,12 @@ impl ThumbnailCache {
                         texture_id: Some(texture.id()),
                     };
                     entry.texture = Some(texture);
+                    entry.ready_at = Some(Instant::now());
                 }
                 Err(()) => {
                     entry.state = EntryState::Failed;
                     entry.texture = None;
+                    entry.ready_at = None;
                 }
             }
         }
@@ -688,6 +706,7 @@ impl ThumbnailCache {
             if let Some(entry) = self.entries.get_mut(&uri) {
                 entry.state = EntryState::Failed;
                 entry.texture = None;
+                entry.ready_at = None;
             }
             self.push_retired_in_flight(&uri, now);
             to_forget.push(uri);
@@ -780,18 +799,25 @@ impl ThumbnailCache {
         }
 
         let uses_disk_worker = self.disk_cache.is_some() && uri_uses_disk_worker(uri);
-        let state = self.entries.get(uri).map(|entry| entry.state);
+        let (state, ready_at) = match self.entries.get(uri) {
+            Some(entry) => (Some(entry.state), entry.ready_at),
+            None => (None, None),
+        };
         match state {
             Some(EntryState::Ready {
                 size,
                 texture_id: Some(texture_id),
             }) => {
                 if is_visible {
-                    if cover {
-                        paint_cover_texture_rounded(ui, rect, texture_id, size, corner_radius);
-                    } else {
-                        paint_fitted_texture_rounded(ui, rect, texture_id, size, corner_radius);
-                    }
+                    paint_ready_thumbnail(
+                        ui,
+                        rect,
+                        texture_id,
+                        size,
+                        corner_radius,
+                        cover,
+                        ready_at,
+                    );
                 }
             }
             Some(EntryState::Ready { .. } | EntryState::Loading { .. }) => {
@@ -802,30 +828,24 @@ impl ThumbnailCache {
                 } else if is_near_viewport || matches!(state, Some(EntryState::Loading { .. })) {
                     match Self::poll_texture(ctx, uri) {
                         PollOutcome::Ready { texture_id, size } => {
+                            let now = Instant::now();
                             if let Some(entry) = self.entries.get_mut(uri) {
                                 entry.state = EntryState::Ready {
                                     size,
                                     texture_id: Some(texture_id),
                                 };
+                                entry.ready_at = Some(now);
                             }
                             if is_visible {
-                                if cover {
-                                    paint_cover_texture_rounded(
-                                        ui,
-                                        rect,
-                                        texture_id,
-                                        size,
-                                        corner_radius,
-                                    );
-                                } else {
-                                    paint_fitted_texture_rounded(
-                                        ui,
-                                        rect,
-                                        texture_id,
-                                        size,
-                                        corner_radius,
-                                    );
-                                }
+                                paint_ready_thumbnail(
+                                    ui,
+                                    rect,
+                                    texture_id,
+                                    size,
+                                    corner_radius,
+                                    cover,
+                                    Some(now),
+                                );
                             }
                         }
                         PollOutcome::Pending => {
@@ -841,6 +861,7 @@ impl ThumbnailCache {
                         PollOutcome::Failed => {
                             if let Some(entry) = self.entries.get_mut(uri) {
                                 entry.state = EntryState::Failed;
+                                entry.ready_at = None;
                             }
                             ctx.forget_image(uri);
                             if is_visible {
@@ -920,12 +941,14 @@ impl ThumbnailCache {
                             size,
                             texture_id: Some(texture_id),
                         };
+                        entry.ready_at = Some(now);
                     }
                 }
                 PollOutcome::Pending => {}
                 PollOutcome::Failed => {
                     if let Some(entry) = self.entries.get_mut(&uri) {
                         entry.state = EntryState::Failed;
+                        entry.ready_at = None;
                     }
                     ctx.forget_image(&uri);
                 }
@@ -1023,6 +1046,7 @@ impl ThumbnailCache {
                 CacheEntry {
                     state: EntryState::Loading { started_at: now },
                     texture: None,
+                    ready_at: None,
                     last_visible_pass: self.pass_index,
                     last_access_tick: tick,
                 },
@@ -1059,8 +1083,8 @@ impl ThumbnailCache {
 
     fn poll_texture(ctx: &egui::Context, uri: &str) -> PollOutcome {
         let size_hint = egui::SizeHint::Size {
-            width: 1280,
-            height: 720,
+            width: MAX_THUMBNAIL_DECODE_WIDTH,
+            height: MAX_THUMBNAIL_DECODE_HEIGHT,
             maintain_aspect_ratio: true,
         };
         match ctx.try_load_texture(uri, egui::TextureOptions::LINEAR, size_hint) {
@@ -1139,21 +1163,60 @@ pub fn fit_aspect_rect(bounds: Rect, intrinsic_size: [u32; 2]) -> Rect {
     Rect::from_center_size(bounds.center(), target_size)
 }
 
+fn thumbnail_fade_alpha(ready_at: Option<Instant>) -> f32 {
+    let Some(ready_at) = ready_at else {
+        return 1.0;
+    };
+    let elapsed = ready_at.elapsed().as_secs_f32();
+    if elapsed >= THUMBNAIL_FADE_DURATION_SECS {
+        1.0
+    } else {
+        (elapsed / THUMBNAIL_FADE_DURATION_SECS).clamp(0.15, 1.0)
+    }
+}
+
+fn paint_ready_thumbnail(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    texture_id: egui::TextureId,
+    size: [u32; 2],
+    corner_radius: f32,
+    cover: bool,
+    ready_at: Option<Instant>,
+) {
+    let fade = thumbnail_fade_alpha(ready_at);
+    let tint = if fade < 1.0 {
+        paint_placeholder(ui, rect, PlaceholderKind::Loading, corner_radius);
+        ui.ctx().request_repaint_after(Duration::from_millis(16));
+        let alpha = (fade * 255.0).round().clamp(1.0, 255.0) as u8;
+        Color32::from_white_alpha(alpha)
+    } else {
+        Color32::WHITE
+    };
+    if cover {
+        paint_cover_texture_rounded(ui, rect, texture_id, size, corner_radius, tint);
+    } else {
+        paint_fitted_texture_rounded(ui, rect, texture_id, size, corner_radius, tint);
+    }
+}
+
 fn paint_fitted_texture_rounded(
     ui: &mut egui::Ui,
     bounds: Rect,
     texture_id: egui::TextureId,
     intrinsic_size: [u32; 2],
     corner_radius: f32,
+    tint: Color32,
 ) {
     let target = fit_aspect_rect(bounds, intrinsic_size);
     if corner_radius > 0.0 {
         egui::Image::from_texture((texture_id, target.size()))
             .corner_radius(corner_radius)
+            .tint(tint)
             .paint_at(ui, target);
     } else {
         let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
-        ui.painter().image(texture_id, target, uv, Color32::WHITE);
+        ui.painter().image(texture_id, target, uv, tint);
     }
 }
 
@@ -1163,6 +1226,7 @@ fn paint_cover_texture_rounded(
     texture_id: egui::TextureId,
     intrinsic_size: [u32; 2],
     corner_radius: f32,
+    tint: Color32,
 ) {
     let tex_w = intrinsic_size[0].max(1) as f32;
     let tex_h = intrinsic_size[1].max(1) as f32;
@@ -1185,13 +1249,23 @@ fn paint_cover_texture_rounded(
         egui::Image::from_texture((texture_id, bounds.size()))
             .uv(uv)
             .corner_radius(corner_radius)
+            .tint(tint)
             .paint_at(ui, bounds);
     } else {
-        ui.painter().image(texture_id, bounds, uv, Color32::WHITE);
+        ui.painter().image(texture_id, bounds, uv, tint);
     }
 }
 
-pub const MAX_RETAINED_AVATARS: usize = 128;
+fn paint_avatar_circle_ring(ui: &egui::Ui, rect: Rect) {
+    let radius = (rect.width().min(rect.height()) * 0.5 - 0.5).max(0.5);
+    ui.painter().circle_stroke(
+        rect.center(),
+        radius,
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(128, 128, 128, 48)),
+    );
+}
+
+pub const MAX_RETAINED_AVATARS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AvatarEntryState {
@@ -1252,6 +1326,13 @@ impl AvatarCache {
 
     pub fn set_disk_cache(&mut self, disk_cache: Option<Arc<DiskImageCache>>) {
         self.disk_cache = disk_cache;
+    }
+
+    pub fn evict_all_gpu_textures(&mut self, ctx: &egui::Context) {
+        for uri in self.entries.keys() {
+            ctx.forget_image(uri);
+        }
+        self.entries.clear();
     }
 
     pub fn has_pending_work(&self) -> bool {
@@ -1369,7 +1450,9 @@ impl AvatarCache {
                             texture_id,
                             size,
                             rect.width().min(rect.height()) * 0.5,
+                            Color32::WHITE,
                         );
+                        paint_avatar_circle_ring(ui, rect);
                     }
                     return true;
                 }
@@ -1410,8 +1493,8 @@ impl AvatarCache {
         }
 
         let size_hint = egui::SizeHint::Size {
-            width: 176,
-            height: 176,
+            width: MAX_AVATAR_DECODE_SIZE,
+            height: MAX_AVATAR_DECODE_SIZE,
             maintain_aspect_ratio: true,
         };
         match ctx.try_load_texture(trimmed, egui::TextureOptions::LINEAR, size_hint) {
@@ -1433,7 +1516,9 @@ impl AvatarCache {
                         texture.id,
                         size,
                         rect.width().min(rect.height()) * 0.5,
+                        Color32::WHITE,
                     );
+                    paint_avatar_circle_ring(ui, rect);
                 }
                 true
             }
@@ -1645,25 +1730,31 @@ impl StoryboardSheetCache {
 }
 
 fn paint_placeholder(ui: &egui::Ui, rect: Rect, kind: PlaceholderKind, corner_radius: f32) {
-    let painter = ui.painter();
-    if matches!(kind, PlaceholderKind::Loading) {
-        let time = ui.input(|i| i.time);
-        let phase = (time * 1.4).fract() as f32;
-        let pulse = 0.5 + 0.5 * (phase * std::f32::consts::TAU).sin();
-        let sheen_alpha = (10.0 + 12.0 * pulse).round() as u8;
-        painter.rect_filled(
-            rect,
-            corner_radius,
-            Color32::from_rgba_unmultiplied(255, 255, 255, sheen_alpha),
-        );
+    let dark_theme = ui.style().visuals.dark_mode;
+    if matches!(kind, PlaceholderKind::Loading | PlaceholderKind::Pending) {
+        crate::skeleton::paint_skeleton_rect(ui, rect, corner_radius, dark_theme);
+        return;
     }
+
+    let painter = ui.painter();
+    let base_fill = if dark_theme {
+        Color32::from_rgb(30, 30, 34)
+    } else {
+        Color32::from_rgb(232, 232, 236)
+    };
+    painter.rect_filled(rect, corner_radius, base_fill);
 
     let center = rect.center();
     let accent = match kind {
-        PlaceholderKind::Empty => Color32::from_rgb(62, 62, 68),
-        PlaceholderKind::Pending => Color32::from_rgb(76, 76, 84),
-        PlaceholderKind::Loading => Color32::from_rgb(138, 102, 106),
-        PlaceholderKind::Failed => Color32::from_rgb(96, 58, 58),
+        PlaceholderKind::Empty => {
+            if dark_theme {
+                Color32::from_rgb(76, 76, 84)
+            } else {
+                Color32::from_rgb(165, 165, 175)
+            }
+        }
+        PlaceholderKind::Failed => Color32::from_rgb(140, 74, 74),
+        PlaceholderKind::Pending | PlaceholderKind::Loading => unreachable!(),
     };
     painter.circle_stroke(center, 13.0, Stroke::new(1.2, accent));
 
@@ -1677,10 +1768,17 @@ fn paint_placeholder(ui: &egui::Ui, rect: Rect, kind: PlaceholderKind, corner_ra
 }
 
 fn paint_hover_outline_rounded(ui: &egui::Ui, rect: Rect, hovered: bool, corner_radius: f32) {
+    let dark_theme = ui.style().visuals.dark_mode;
     let color = if hovered {
-        Color32::from_rgb(95, 95, 105)
-    } else {
+        if dark_theme {
+            Color32::from_rgb(95, 95, 105)
+        } else {
+            Color32::from_rgb(175, 175, 185)
+        }
+    } else if dark_theme {
         Color32::from_rgb(32, 32, 36)
+    } else {
+        Color32::from_rgb(228, 228, 232)
     };
     ui.painter().rect_stroke(
         rect,
@@ -1710,6 +1808,7 @@ mod tests {
                 size: [320, 180],
                 texture_id: None,
             };
+            entry.ready_at = Some(Instant::now());
         }
     }
 
@@ -1723,6 +1822,7 @@ mod tests {
             CacheEntry {
                 state: EntryState::Loading { started_at: now },
                 texture: None,
+                ready_at: None,
                 last_visible_pass: 0,
                 last_access_tick: 1,
             },
@@ -1735,6 +1835,7 @@ mod tests {
                     texture_id: None,
                 },
                 texture: None,
+                ready_at: None,
                 last_visible_pass: 0,
                 last_access_tick: 2,
             },
@@ -2138,5 +2239,102 @@ mod tests {
                 .and_then(|e| e.texture.as_ref())
                 .is_some()
         );
+    }
+
+    #[test]
+    fn evict_all_gpu_textures_drops_retained_textures_but_keeps_disk_cache() {
+        let dir = TempCacheDir::new("evict_gpu");
+        let disk_cache = Arc::new(DiskImageCache::new(dir.0.clone(), 1024 * 1024));
+        let thumb_uri = "https://i.ytimg.com/vi/gpu_evict/hqdefault.jpg";
+        let avatar_uri = "https://yt3.ggpht.com/avatar_evict.jpg";
+        let png = encode_test_png(32, 18);
+        disk_cache.write_bytes(thumb_uri, &png).expect("seed thumb");
+        disk_cache
+            .write_bytes(avatar_uri, &png)
+            .expect("seed avatar");
+
+        let ctx = egui::Context::default();
+        let mut thumbs = ThumbnailCache::with_limits(4, 2, 2, Duration::ZERO)
+            .with_disk_cache(Some(disk_cache.clone()));
+        let color_image = decode_color_image(&png, 32, 18).expect("decode test png");
+        let texture = ctx.load_texture("thumb:test", color_image, egui::TextureOptions::LINEAR);
+        thumbs.entries.insert(
+            thumb_uri.to_owned(),
+            CacheEntry {
+                state: EntryState::Ready {
+                    size: [32, 18],
+                    texture_id: Some(texture.id()),
+                },
+                texture: Some(texture.clone()),
+                ready_at: Some(Instant::now()),
+                last_visible_pass: 0,
+                last_access_tick: 1,
+            },
+        );
+        thumbs.storyboard_sheets.entries.insert(
+            "https://i.ytimg.com/sb/1/M0.jpg".to_owned(),
+            AvatarEntry {
+                state: AvatarEntryState::Ready {
+                    size: [32, 18],
+                    texture_id: Some(texture.id()),
+                },
+                texture: Some(texture.clone()),
+                last_access_tick: 1,
+            },
+        );
+
+        let mut avatars = AvatarCache::with_limit(4);
+        avatars.set_disk_cache(Some(disk_cache.clone()));
+        avatars.entries.insert(
+            avatar_uri.to_owned(),
+            AvatarEntry {
+                state: AvatarEntryState::Ready {
+                    size: [32, 18],
+                    texture_id: Some(texture.id()),
+                },
+                texture: Some(texture),
+                last_access_tick: 1,
+            },
+        );
+
+        thumbs.evict_all_gpu_textures(&ctx);
+        avatars.evict_all_gpu_textures(&ctx);
+
+        assert_eq!(thumbs.retained_count(), 0);
+        assert!(thumbs.storyboard_sheets.entries.is_empty());
+        assert!(avatars.entries.is_empty());
+        assert!(disk_cache.entry_path_for_uri(thumb_uri).is_file());
+        assert!(disk_cache.entry_path_for_uri(avatar_uri).is_file());
+    }
+
+    #[test]
+    fn thumbnail_fade_alpha_progresses_cleanly() {
+        assert!((thumbnail_fade_alpha(None) - 1.0).abs() < f32::EPSILON);
+        let immediate = thumbnail_fade_alpha(Some(Instant::now()));
+        assert!((0.15..1.0).contains(&immediate));
+        if let Some(past) = Instant::now().checked_sub(Duration::from_millis(200)) {
+            assert!((thumbnail_fade_alpha(Some(past)) - 1.0).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn decode_color_image_preserves_portrait_shorts_detail() {
+        let png = encode_test_png(405, 720);
+        let decoded = decode_color_image(
+            &png,
+            MAX_THUMBNAIL_DECODE_WIDTH,
+            MAX_THUMBNAIL_DECODE_HEIGHT,
+        )
+        .expect("decode portrait png");
+        assert_eq!(decoded.size, [360, 640]);
+
+        let landscape_png = encode_test_png(1280, 720);
+        let decoded_landscape = decode_color_image(
+            &landscape_png,
+            MAX_THUMBNAIL_DECODE_WIDTH,
+            MAX_THUMBNAIL_DECODE_HEIGHT,
+        )
+        .expect("decode landscape png");
+        assert_eq!(decoded_landscape.size, [640, 360]);
     }
 }

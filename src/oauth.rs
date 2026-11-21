@@ -10,6 +10,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 #[cfg(not(test))]
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
 
@@ -18,7 +19,10 @@ const SUBSCRIPTION_PAGE_SIZE: usize = 50;
 const MAX_SUBSCRIPTIONS: usize = 500;
 const MAX_UPLOADS_PER_CHANNEL: usize = 5;
 const MAX_PLAYLISTS: usize = 100;
-const MAX_PLAYLIST_VIDEOS: usize = 200;
+const MAX_PLAYLIST_VIDEOS: usize = 5_000;
+const MAX_PLAYLIST_PAGES: usize = 120;
+const SHORTS_MAX_DURATION_SECS: u64 = 181;
+const SHORT_PROBE_WORKERS: usize = 8;
 const PROGRESS_CHANNEL_BATCH: usize = 5;
 const PROGRESS_LATER_CHANNEL_BATCH: usize = 15;
 const SUBSCRIPTION_WORKER_COUNT: usize = 24;
@@ -1390,27 +1394,95 @@ fn add_video_to_playlist_at(
         .ok_or_else(|| "Resposta ao adicionar item na playlist inválida.".to_owned())
 }
 
-fn parse_iso8601_duration(raw: &str) -> String {
-    let Some(rest) = raw.strip_prefix("PT") else {
-        return String::new();
-    };
+#[derive(Clone, Debug)]
+pub struct PlaylistFeedProgress {
+    pub batch: Vec<SearchResult>,
+    pub total_results: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlaylistFeedOutput {
+    pub items: Vec<SearchResult>,
+    pub total_results: Option<u64>,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShortProbeOutcome {
+    ShortWithVerticalThumb = 0,
+    ShortOnly = 1,
+    NotShort = 2,
+    RateLimited = 3,
+    TransientError = 4,
+}
+
+impl ShortProbeOutcome {
+    fn from_u8(val: u8) -> Self {
+        match val {
+            0 => Self::ShortWithVerticalThumb,
+            1 => Self::ShortOnly,
+            2 => Self::NotShort,
+            3 => Self::RateLimited,
+            _ => Self::TransientError,
+        }
+    }
+}
+
+fn extract_youtube_video_id(url: &str) -> Option<&str> {
+    let candidate = url
+        .strip_prefix("https://www.youtube.com/watch?v=")
+        .or_else(|| url.strip_prefix("https://www.youtube.com/shorts/"))?;
+    let id = candidate.split(['&', '?']).next().unwrap_or("");
+    valid_id(id).then_some(id)
+}
+
+fn is_auth_or_cancel_error(err: &str) -> bool {
+    err.starts_with("Consulta cancelada")
+        || err.starts_with("Sess\u{00e3}o expirada")
+        || err.starts_with("Sua sess\u{00e3}o Google")
+}
+
+fn has_shorts_hashtag(title: &str) -> bool {
+    let lower = title.to_ascii_lowercase();
+    lower.contains("#shorts") || lower.contains("#short")
+}
+
+fn parse_iso8601_duration_hms(raw: &str) -> Option<(u64, u64, u64)> {
+    let rest = raw.strip_prefix("PT")?;
+    if rest.is_empty() {
+        return None;
+    }
     let mut hours = 0u64;
     let mut minutes = 0u64;
     let mut seconds = 0u64;
     let mut current = 0u64;
+    let mut has_digit = false;
+    let mut has_unit = false;
     for ch in rest.chars() {
         if let Some(digit) = ch.to_digit(10) {
             current = current.saturating_mul(10).saturating_add(u64::from(digit));
-        } else {
+            has_digit = true;
+        } else if has_digit {
             match ch {
                 'H' => hours = current,
                 'M' => minutes = current,
                 'S' => seconds = current,
-                _ => return String::new(),
+                _ => return None,
             }
             current = 0;
+            has_digit = false;
+            has_unit = true;
+        } else {
+            return None;
         }
     }
+    (!has_digit && has_unit).then_some((hours, minutes, seconds))
+}
+
+fn parse_iso8601_duration(raw: &str) -> String {
+    let Some((hours, minutes, seconds)) = parse_iso8601_duration_hms(raw) else {
+        return String::new();
+    };
     if hours > 0 {
         format!("{hours}:{minutes:02}:{seconds:02}")
     } else if minutes > 0 || seconds > 0 {
@@ -1420,7 +1492,45 @@ fn parse_iso8601_duration(raw: &str) -> String {
     }
 }
 
-fn parse_liked_video_item(item: &Value) -> Option<SearchResult> {
+fn parse_display_duration_seconds(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut parts = trimmed.split(':');
+    let first = parts.next()?.parse::<u64>().ok()?;
+    let second = parts.next()?.parse::<u64>().ok()?;
+    let total = if let Some(third_raw) = parts.next() {
+        if parts.next().is_some() {
+            return None;
+        }
+        let third = third_raw.parse::<u64>().ok()?;
+        first
+            .saturating_mul(3600)
+            .saturating_add(second.saturating_mul(60))
+            .saturating_add(third)
+    } else {
+        first.saturating_mul(60).saturating_add(second)
+    };
+    (total > 0).then_some(total)
+}
+
+fn json_u64(val: &Value) -> Option<u64> {
+    val.as_u64()
+        .or_else(|| val.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+}
+
+fn is_vertical_player(item: &Value) -> bool {
+    let Some(w) = json_u64(&item["player"]["embedWidth"]).filter(|&w| w > 0) else {
+        return false;
+    };
+    let Some(h) = json_u64(&item["player"]["embedHeight"]).filter(|&h| h > 0) else {
+        return false;
+    };
+    h >= w
+}
+
+fn parse_liked_video_item_with_vertical(item: &Value) -> Option<(SearchResult, bool)> {
     let id = item.get("id")?.as_str()?;
     if !valid_id(id) {
         return None;
@@ -1428,13 +1538,20 @@ fn parse_liked_video_item(item: &Value) -> Option<SearchResult> {
     let snippet = item.get("snippet")?;
     let title = snippet["title"].as_str()?;
     let date = snippet["publishedAt"].as_str().unwrap_or("").to_owned();
-    let thumbnail = snippet
-        .pointer("/thumbnails/medium/url")
-        .or_else(|| snippet.pointer("/thumbnails/default/url"))
-        .and_then(Value::as_str)
-        .filter(|url| url.starts_with("https://i.ytimg.com/"))
-        .unwrap_or("")
-        .to_owned();
+    let thumbnail = [
+        "/thumbnails/high/url",
+        "/thumbnails/medium/url",
+        "/thumbnails/default/url",
+    ]
+    .into_iter()
+    .find_map(|ptr| {
+        snippet
+            .pointer(ptr)
+            .and_then(Value::as_str)
+            .filter(|url| url.starts_with("https://i.ytimg.com/"))
+    })
+    .unwrap_or("")
+    .to_owned();
     let channel_id = snippet["channelId"]
         .as_str()
         .filter(|id| valid_id(id))
@@ -1448,50 +1565,397 @@ fn parse_liked_video_item(item: &Value) -> Option<SearchResult> {
         .pointer("/statistics/viewCount")
         .and_then(Value::as_str)
         .and_then(|s| s.parse::<u64>().ok());
-    Some(SearchResult {
-        video: Video {
-            title: title.chars().take(512).collect(),
-            channel: snippet["channelTitle"]
-                .as_str()
-                .unwrap_or("")
-                .chars()
-                .take(256)
-                .collect(),
-            url: format!("https://www.youtube.com/watch?v={id}"),
-            thumbnail,
-            duration,
+    let vertical = is_vertical_player(item);
+    Some((
+        SearchResult {
+            video: Video {
+                title: title.chars().take(512).collect(),
+                channel: snippet["channelTitle"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(256)
+                    .collect(),
+                url: format!("https://www.youtube.com/watch?v={id}"),
+                thumbnail,
+                duration,
+            },
+            metadata: VideoMetadata {
+                view_count,
+                upload_date: (!date.is_empty()).then_some(date),
+                description: snippet["description"]
+                    .as_str()
+                    .map(|d| d.chars().take(2048).collect()),
+                channel_id,
+                ..Default::default()
+            },
         },
-        metadata: VideoMetadata {
-            view_count,
-            upload_date: (!date.is_empty()).then_some(date),
-            description: snippet["description"]
-                .as_str()
-                .map(|d| d.chars().take(2048).collect()),
-            channel_id,
-            ..Default::default()
-        },
-    })
+        vertical,
+    ))
 }
 
-pub fn liked_videos_feed(token: &str, cancel: &Cancellation) -> Result<HomeFeed, String> {
-    let client = http_client()?;
-    liked_videos_feed_with(cancel, |params| api(&client, token, "videos", params))
+fn short_probe_http_client() -> Option<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(4))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+        .build()
+        .ok()
 }
 
-fn liked_videos_feed_with<F>(cancel: &Cancellation, mut fetch: F) -> Result<HomeFeed, String>
+fn probe_short_video_http(
+    client: &reqwest::blocking::Client,
+    video_id: &str,
+    duration_secs: Option<u64>,
+    cancel: &Cancellation,
+) -> ShortProbeOutcome {
+    if cancel.cancelled() || !valid_id(video_id) {
+        return ShortProbeOutcome::TransientError;
+    }
+    let oar_url = format!("https://i.ytimg.com/vi/{video_id}/oardefault.jpg");
+    match client.head(&oar_url).send() {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            if status == 200
+                && resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|ct| ct.starts_with("image/"))
+            {
+                return ShortProbeOutcome::ShortWithVerticalThumb;
+            }
+            if status == 429 || status == 503 {
+                return ShortProbeOutcome::RateLimited;
+            }
+        }
+        Err(_) => return ShortProbeOutcome::TransientError,
+    }
+    if cancel.cancelled() {
+        return ShortProbeOutcome::TransientError;
+    }
+    if !duration_secs.is_some_and(|secs| secs > 0 && secs <= SHORTS_MAX_DURATION_SECS) {
+        return ShortProbeOutcome::NotShort;
+    }
+    let shorts_url = format!("https://www.youtube.com/shorts/{video_id}");
+    match client.head(&shorts_url).send() {
+        Ok(resp) => match resp.status().as_u16() {
+            200 => ShortProbeOutcome::ShortOnly,
+            301..=303 => ShortProbeOutcome::NotShort,
+            429 | 503 => ShortProbeOutcome::RateLimited,
+            _ => ShortProbeOutcome::NotShort,
+        },
+        Err(_) => ShortProbeOutcome::TransientError,
+    }
+}
+
+fn enrich_playlist_batch_with<F>(
+    items: &mut [SearchResult],
+    cancel: &Cancellation,
+    fetch_videos: &mut F,
+) -> Result<Vec<bool>, String>
 where
     F: FnMut(&[(&str, &str)]) -> Result<Value, String>,
 {
+    let mut vertical_flags = vec![false; items.len()];
+    let mut unique_ids = Vec::new();
+    let mut seen = HashSet::new();
+    for item in items.iter() {
+        if let Some(id) = extract_youtube_video_id(&item.video.url)
+            && seen.insert(id.to_owned())
+        {
+            unique_ids.push(id.to_owned());
+        }
+    }
+    if unique_ids.is_empty() {
+        return Ok(vertical_flags);
+    }
+
+    let mut details: HashMap<String, (String, Option<u64>, bool)> =
+        HashMap::with_capacity(unique_ids.len());
+    for chunk in unique_ids.chunks(50) {
+        if cancel.cancelled() {
+            return Err("Consulta cancelada.".into());
+        }
+        let ids_csv = chunk.join(",");
+        let params = [
+            ("part", "contentDetails,statistics,player"),
+            ("id", ids_csv.as_str()),
+            ("maxHeight", "1920"),
+            ("maxWidth", "1920"),
+        ];
+        let response = match fetch_videos(&params) {
+            Ok(val) => val,
+            Err(err) => {
+                if cancel.cancelled() || is_auth_or_cancel_error(&err) {
+                    return Err(err);
+                }
+                continue;
+            }
+        };
+        if cancel.cancelled() {
+            return Err("Consulta cancelada.".into());
+        }
+        if let Some(rows) = response["items"].as_array() {
+            for row in rows {
+                let Some(id) = row
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| valid_id(id))
+                else {
+                    continue;
+                };
+                let duration = row
+                    .pointer("/contentDetails/duration")
+                    .and_then(Value::as_str)
+                    .map(parse_iso8601_duration)
+                    .unwrap_or_default();
+                let view_count = row
+                    .pointer("/statistics/viewCount")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.parse::<u64>().ok());
+                let vertical = is_vertical_player(row);
+                details.insert(id.to_owned(), (duration, view_count, vertical));
+            }
+        }
+    }
+
+    for (idx, item) in items.iter_mut().enumerate() {
+        let Some(id) = extract_youtube_video_id(&item.video.url) else {
+            continue;
+        };
+        if let Some((duration, view_count, vertical)) = details.get(id) {
+            if !duration.is_empty() {
+                item.video.duration = duration.clone();
+            }
+            if let Some(views) = view_count {
+                item.metadata.view_count = Some(*views);
+            }
+            vertical_flags[idx] = *vertical;
+        }
+    }
+    Ok(vertical_flags)
+}
+
+fn classify_playlist_page_shorts_with<P>(
+    items: &mut [SearchResult],
+    vertical_flags: &[bool],
+    cancel: &Cancellation,
+    probe: P,
+) where
+    P: Fn(&str, Option<u64>) -> ShortProbeOutcome + Sync,
+{
+    let mut probe_targets: Vec<(usize, String, Option<u64>)> = Vec::new();
+    let mut duration_secs_by_idx = vec![None; items.len()];
+
+    for (idx, item) in items.iter_mut().enumerate() {
+        let dur_secs = parse_display_duration_seconds(&item.video.duration);
+        duration_secs_by_idx[idx] = dur_secs;
+        let is_vertical = vertical_flags.get(idx).copied().unwrap_or(false);
+        if dur_secs.is_some_and(|secs| secs > SHORTS_MAX_DURATION_SECS) {
+            item.metadata.kind = SearchResultKind::Video;
+            continue;
+        }
+        let should_probe = dur_secs
+            .is_some_and(|secs| secs > 0 && secs <= SHORTS_MAX_DURATION_SECS)
+            || is_vertical
+            || item.video.url.contains("/shorts/");
+        if should_probe && let Some(video_id) = extract_youtube_video_id(&item.video.url) {
+            probe_targets.push((idx, video_id.to_owned(), dur_secs));
+        } else {
+            item.metadata.kind = SearchResultKind::Video;
+        }
+    }
+
+    if probe_targets.is_empty() || cancel.cancelled() {
+        return;
+    }
+
+    let outcomes: Vec<AtomicU8> = (0..probe_targets.len())
+        .map(|_| AtomicU8::new(ShortProbeOutcome::TransientError as u8))
+        .collect();
+    let cursor = AtomicUsize::new(0);
+    let rate_limited = AtomicBool::new(false);
+    let worker_count = SHORT_PROBE_WORKERS.min(probe_targets.len()).max(1);
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            scope.spawn(|| {
+                loop {
+                    if cancel.cancelled() || rate_limited.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let slot = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some((_, video_id, dur_secs)) = probe_targets.get(slot) else {
+                        break;
+                    };
+                    let outcome = probe(video_id, *dur_secs);
+                    if outcome == ShortProbeOutcome::RateLimited {
+                        rate_limited.store(true, Ordering::Relaxed);
+                    }
+                    outcomes[slot].store(outcome as u8, Ordering::Relaxed);
+                }
+            });
+        }
+    });
+
+    for (slot, (idx, video_id, dur_secs)) in probe_targets.into_iter().enumerate() {
+        let outcome = ShortProbeOutcome::from_u8(outcomes[slot].load(Ordering::Relaxed));
+        let item = &mut items[idx];
+        let is_vertical = vertical_flags.get(idx).copied().unwrap_or(false);
+        match outcome {
+            ShortProbeOutcome::ShortWithVerticalThumb => {
+                item.metadata.kind = SearchResultKind::Short;
+                item.video.url = format!("https://www.youtube.com/shorts/{video_id}");
+                item.video.thumbnail = format!("https://i.ytimg.com/vi/{video_id}/oardefault.jpg");
+            }
+            ShortProbeOutcome::ShortOnly => {
+                item.metadata.kind = SearchResultKind::Short;
+                item.video.url = format!("https://www.youtube.com/shorts/{video_id}");
+            }
+            ShortProbeOutcome::NotShort => {
+                item.metadata.kind = SearchResultKind::Video;
+            }
+            ShortProbeOutcome::RateLimited | ShortProbeOutcome::TransientError => {
+                let fallback_short = is_vertical
+                    || has_shorts_hashtag(&item.video.title)
+                    || dur_secs.is_some_and(|secs| secs <= 62);
+                if fallback_short {
+                    item.metadata.kind = SearchResultKind::Short;
+                    item.video.url = format!("https://www.youtube.com/shorts/{video_id}");
+                } else {
+                    item.metadata.kind = SearchResultKind::Video;
+                }
+            }
+        }
+    }
+}
+
+pub fn liked_videos_feed(token: &str, cancel: &Cancellation) -> Result<HomeFeed, String> {
+    let output = liked_videos_feed_progressive(token, cancel, |_| {})?;
+    Ok(HomeFeed {
+        items: output.items,
+        playlists: Vec::new(),
+        channels: Vec::new(),
+    })
+}
+
+pub fn liked_videos_feed_progressive(
+    token: &str,
+    cancel: &Cancellation,
+    on_progress: impl FnMut(PlaylistFeedProgress),
+) -> Result<PlaylistFeedOutput, String> {
+    let client = http_client()?;
+    let probe_client = short_probe_http_client();
+    liked_videos_feed_progressive_with(
+        cancel,
+        on_progress,
+        |resource, params| api(&client, token, resource, params),
+        |video_id, dur_secs| match probe_client.as_ref() {
+            Some(c) => probe_short_video_http(c, video_id, dur_secs, cancel),
+            None => ShortProbeOutcome::TransientError,
+        },
+    )
+}
+
+fn liked_videos_feed_progressive_with<F, P>(
+    cancel: &Cancellation,
+    mut on_progress: impl FnMut(PlaylistFeedProgress),
+    mut fetch_api: F,
+    probe_short: P,
+) -> Result<PlaylistFeedOutput, String>
+where
+    F: FnMut(&str, &[(&str, &str)]) -> Result<Value, String>,
+    P: Fn(&str, Option<u64>) -> ShortProbeOutcome + Sync,
+{
+    let emitted_any = std::cell::Cell::new(false);
+    let mut track_progress = |progress: PlaylistFeedProgress| {
+        if !progress.batch.is_empty() {
+            emitted_any.set(true);
+        }
+        on_progress(progress);
+    };
+
+    let primary_err = match playlist_videos_feed_progressive_with(
+        "LL",
+        cancel,
+        &mut track_progress,
+        &mut fetch_api,
+        &probe_short,
+    ) {
+        Ok(output) => return Ok(output),
+        Err(err) => err,
+    };
+
+    if cancel.cancelled() || is_auth_or_cancel_error(&primary_err) || emitted_any.get() {
+        return Err(primary_err);
+    }
+
+    if let Ok(channels) = fetch_api(
+        "channels",
+        &[
+            ("part", "contentDetails"),
+            ("mine", "true"),
+            ("maxResults", "1"),
+        ],
+    ) && let Some(likes_id) = channels["items"]
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|ch| ch.pointer("/contentDetails/relatedPlaylists/likes"))
+        .and_then(Value::as_str)
+        .filter(|id| valid_id(id) && *id != "LL")
+    {
+        match playlist_videos_feed_progressive_with(
+            likes_id,
+            cancel,
+            &mut track_progress,
+            &mut fetch_api,
+            &probe_short,
+        ) {
+            Ok(output) => return Ok(output),
+            Err(err)
+                if cancel.cancelled() || is_auth_or_cancel_error(&err) || emitted_any.get() =>
+            {
+                return Err(err);
+            }
+            Err(_) => {}
+        }
+    }
+
+    liked_videos_via_rating_with(
+        cancel,
+        &mut track_progress,
+        |params| fetch_api("videos", params),
+        &probe_short,
+    )
+}
+
+fn liked_videos_via_rating_with<F, P>(
+    cancel: &Cancellation,
+    mut on_progress: impl FnMut(PlaylistFeedProgress),
+    mut fetch: F,
+    probe_short: P,
+) -> Result<PlaylistFeedOutput, String>
+where
+    F: FnMut(&[(&str, &str)]) -> Result<Value, String>,
+    P: Fn(&str, Option<u64>) -> ShortProbeOutcome + Sync,
+{
     let mut items = Vec::new();
+    let mut seen_ids = HashSet::new();
     let mut page = None;
+    let mut pages = 0usize;
+    let mut total_results: Option<u64> = None;
     loop {
         if cancel.cancelled() {
             return Err("Consulta cancelada.".into());
         }
+        pages += 1;
         let mut params = vec![
-            ("part", "snippet,contentDetails,statistics"),
+            ("part", "snippet,contentDetails,statistics,player"),
             ("myRating", "like"),
             ("maxResults", "50"),
+            ("maxHeight", "1920"),
+            ("maxWidth", "1920"),
         ];
         if let Some(token) = page.as_deref() {
             params.push(("pageToken", token));
@@ -1500,27 +1964,51 @@ where
         if cancel.cancelled() {
             return Err("Consulta cancelada.".into());
         }
+        total_results = total_results.or_else(|| {
+            response
+                .pointer("/pageInfo/totalResults")
+                .and_then(Value::as_u64)
+        });
         let rows = response["items"]
             .as_array()
             .ok_or("Lista de vídeos com Gostei inválida.")?;
-        items.extend(
-            rows.iter()
-                .take(MAX_PLAYLIST_VIDEOS - items.len())
-                .filter_map(parse_liked_video_item),
-        );
+        let remaining = MAX_PLAYLIST_VIDEOS.saturating_sub(items.len());
+        let mut batch = Vec::new();
+        let mut vertical_flags = Vec::new();
+        for row in rows {
+            if batch.len() >= remaining {
+                break;
+            }
+            if let Some((res, vertical)) = parse_liked_video_item_with_vertical(row) {
+                let key = extract_youtube_video_id(&res.video.url)
+                    .unwrap_or(res.video.url.as_str())
+                    .to_owned();
+                if seen_ids.insert(key) {
+                    batch.push(res);
+                    vertical_flags.push(vertical);
+                }
+            }
+        }
+        if !batch.is_empty() {
+            classify_playlist_page_shorts_with(&mut batch, &vertical_flags, cancel, &probe_short);
+            on_progress(PlaylistFeedProgress {
+                batch: batch.clone(),
+                total_results,
+            });
+            items.extend(batch);
+        }
         let next = response["nextPageToken"]
             .as_str()
             .filter(|v| !v.is_empty() && v.len() <= 1024)
             .map(str::to_owned);
-        if items.len() >= MAX_PLAYLIST_VIDEOS || next.is_none() {
+        if items.len() >= MAX_PLAYLIST_VIDEOS || next.is_none() || pages >= MAX_PLAYLIST_PAGES {
             break;
         }
         page = next;
     }
-    Ok(HomeFeed {
+    Ok(PlaylistFeedOutput {
         items,
-        playlists: Vec::new(),
-        channels: Vec::new(),
+        total_results,
     })
 }
 
@@ -1790,7 +2278,14 @@ fn report_video_abuse_at(
 
 fn parse_upload(item: &Value) -> Option<(String, SearchResult)> {
     let snippet = item.get("snippet")?;
-    let id = snippet.pointer("/resourceId/videoId")?.as_str()?;
+    let id = item
+        .pointer("/contentDetails/videoId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            snippet
+                .pointer("/resourceId/videoId")
+                .and_then(Value::as_str)
+        })?;
     if !valid_id(id) {
         return None;
     }
@@ -1798,24 +2293,51 @@ fn parse_upload(item: &Value) -> Option<(String, SearchResult)> {
     if title == "Private video" || title == "Deleted video" {
         return None;
     }
-    let date = snippet["publishedAt"].as_str().unwrap_or("").to_owned();
-    let thumbnail = snippet
-        .pointer("/thumbnails/medium/url")
-        .or_else(|| snippet.pointer("/thumbnails/default/url"))
+    let date = item
+        .pointer("/contentDetails/videoPublishedAt")
         .and_then(Value::as_str)
-        .filter(|url| url.starts_with("https://i.ytimg.com/"))
+        .or_else(|| snippet["publishedAt"].as_str())
         .unwrap_or("")
         .to_owned();
-    let channel_id = snippet["channelId"]
+    let thumbnail = [
+        "/thumbnails/high/url",
+        "/thumbnails/medium/url",
+        "/thumbnails/default/url",
+    ]
+    .into_iter()
+    .find_map(|ptr| {
+        snippet
+            .pointer(ptr)
+            .and_then(Value::as_str)
+            .filter(|url| url.starts_with("https://i.ytimg.com/"))
+    })
+    .unwrap_or("")
+    .to_owned();
+    let channel = snippet["videoOwnerChannelTitle"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            snippet["channelTitle"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("")
+        .chars()
+        .take(256)
+        .collect();
+    let channel_id = snippet["videoOwnerChannelId"]
         .as_str()
         .filter(|id| valid_id(id))
+        .or_else(|| snippet["channelId"].as_str().filter(|id| valid_id(id)))
         .map(str::to_owned);
     Some((
         date.clone(),
         SearchResult {
             video: Video {
-                title: title.to_owned(),
-                channel: snippet["channelTitle"].as_str().unwrap_or("").to_owned(),
+                title: title.chars().take(512).collect(),
+                channel,
                 url: format!("https://www.youtube.com/watch?v={id}"),
                 thumbnail,
                 duration: String::new(),
@@ -1919,68 +2441,109 @@ where
     })
 }
 
-pub fn playlist_videos_feed(
+pub fn playlist_videos_feed_progressive(
     token: &str,
     playlist_id: &str,
     cancel: &Cancellation,
-) -> Result<HomeFeed, String> {
+    on_progress: impl FnMut(PlaylistFeedProgress),
+) -> Result<PlaylistFeedOutput, String> {
     if !valid_id(playlist_id) {
         return Err("Playlist inválida.".into());
     }
     let client = http_client()?;
-    playlist_videos_feed_with(playlist_id, cancel, |params| {
-        api(&client, token, "playlistItems", params)
-    })
+    let probe_client = short_probe_http_client();
+    playlist_videos_feed_progressive_with(
+        playlist_id,
+        cancel,
+        on_progress,
+        |resource, params| api(&client, token, resource, params),
+        |video_id, dur_secs| match probe_client.as_ref() {
+            Some(c) => probe_short_video_http(c, video_id, dur_secs, cancel),
+            None => ShortProbeOutcome::TransientError,
+        },
+    )
 }
 
-fn playlist_videos_feed_with<F>(
+fn playlist_videos_feed_progressive_with<F, P>(
     playlist_id: &str,
     cancel: &Cancellation,
-    mut fetch: F,
-) -> Result<HomeFeed, String>
+    mut on_progress: impl FnMut(PlaylistFeedProgress),
+    mut fetch_api: F,
+    probe_short: P,
+) -> Result<PlaylistFeedOutput, String>
 where
-    F: FnMut(&[(&str, &str)]) -> Result<Value, String>,
+    F: FnMut(&str, &[(&str, &str)]) -> Result<Value, String>,
+    P: Fn(&str, Option<u64>) -> ShortProbeOutcome + Sync,
 {
     let mut items = Vec::new();
+    let mut seen_ids = HashSet::new();
     let mut page = None;
+    let mut pages = 0usize;
+    let mut total_results: Option<u64> = None;
     loop {
         if cancel.cancelled() {
             return Err("Consulta cancelada.".into());
         }
+        pages += 1;
         let mut params = vec![
-            ("part", "snippet"),
+            ("part", "snippet,contentDetails"),
             ("playlistId", playlist_id),
             ("maxResults", "50"),
         ];
         if let Some(token) = page.as_deref() {
             params.push(("pageToken", token));
         }
-        let response = fetch(&params)?;
+        let response = fetch_api("playlistItems", &params)?;
         if cancel.cancelled() {
             return Err("Consulta cancelada.".into());
         }
+        total_results = total_results.or_else(|| {
+            response
+                .pointer("/pageInfo/totalResults")
+                .and_then(Value::as_u64)
+        });
         let rows = response["items"]
             .as_array()
             .ok_or("Lista de vídeos da playlist inválida.")?;
-        items.extend(
-            rows.iter()
-                .take(MAX_PLAYLIST_VIDEOS - items.len())
-                .filter_map(parse_upload)
-                .map(|(_, item)| item),
-        );
+        let remaining = MAX_PLAYLIST_VIDEOS.saturating_sub(items.len());
+        let mut batch = Vec::new();
+        for row in rows {
+            if batch.len() >= remaining {
+                break;
+            }
+            if let Some((_, res)) = parse_upload(row) {
+                let key = extract_youtube_video_id(&res.video.url)
+                    .unwrap_or(res.video.url.as_str())
+                    .to_owned();
+                if seen_ids.insert(key) {
+                    batch.push(res);
+                }
+            }
+        }
+        if !batch.is_empty() {
+            let vertical_flags =
+                enrich_playlist_batch_with(&mut batch, cancel, &mut |video_params| {
+                    fetch_api("videos", video_params)
+                })?;
+            classify_playlist_page_shorts_with(&mut batch, &vertical_flags, cancel, &probe_short);
+            on_progress(PlaylistFeedProgress {
+                batch: batch.clone(),
+                total_results,
+            });
+            items.extend(batch);
+        }
         let next = response["nextPageToken"]
             .as_str()
             .filter(|v| !v.is_empty() && v.len() <= 1024)
             .map(str::to_owned);
-        if items.len() >= MAX_PLAYLIST_VIDEOS || next.is_none() {
+        if items.len() >= MAX_PLAYLIST_VIDEOS || next.is_none() || pages >= MAX_PLAYLIST_PAGES {
             break;
         }
         page = next;
     }
-    Ok(HomeFeed {
+    Ok(PlaylistFeedOutput {
         items,
-        playlists: Vec::new(),
-        channels: Vec::new(),
+        total_results,
     })
 }
 
@@ -3334,17 +3897,78 @@ mod tests {
     }
 
     #[test]
-    fn google_playlist_videos_paginate_and_stop_at_200() {
+    fn google_playlist_videos_paginate_up_to_5000() {
         let cancel = Cancellation::default();
-        let mut calls = 0;
-        let feed = playlist_videos_feed_with("PL00000001", &cancel, |params| {
-            calls += 1;
-            assert!(params.contains(&("playlistId", "PL00000001")));
-            assert!(params.contains(&("maxResults", "50")));
-            Ok(serde_json::json!({"items": (0..50).map(|index| serde_json::json!({"snippet": {"resourceId": {"videoId": format!("video{index:05}")}, "title": format!("Video {index}"), "channelTitle": "Owner"}})).collect::<Vec<_>>(), "nextPageToken": format!("page-{calls}")}))
-        }).unwrap();
-        assert_eq!(calls, 4);
-        assert_eq!(feed.items.len(), 200);
+        let mut playlist_calls = 0usize;
+        let mut loaded_total = 0usize;
+        let mut batch_count = 0usize;
+        let output = playlist_videos_feed_progressive_with(
+            "PL00000001",
+            &cancel,
+            |progress| {
+                batch_count += 1;
+                loaded_total += progress.batch.len();
+            },
+            |resource, params| match resource {
+                "playlistItems" => {
+                    playlist_calls += 1;
+                    assert!(params.contains(&("playlistId", "PL00000001")));
+                    assert!(params.contains(&("maxResults", "50")));
+                    let base = (playlist_calls - 1) * 50;
+                    Ok(serde_json::json!({
+                        "pageInfo": {"totalResults": 5200},
+                        "items": (0..50).map(|index| {
+                            let global = base + index;
+                            serde_json::json!({
+                                "snippet": {
+                                    "resourceId": {"videoId": format!("vid{global:08}")},
+                                    "title": format!("Video {global}"),
+                                    "channelTitle": "Playlist Owner",
+                                    "videoOwnerChannelTitle": format!("Creator {global}"),
+                                    "videoOwnerChannelId": "UC0000000000000000000009"
+                                },
+                                "contentDetails": {"videoId": format!("vid{global:08}")}
+                            })
+                        }).collect::<Vec<_>>(),
+                        "nextPageToken": format!("page-{playlist_calls}")
+                    }))
+                }
+                "videos" => {
+                    let ids = params
+                        .iter()
+                        .find(|(k, _)| *k == "id")
+                        .map(|(_, v)| *v)
+                        .unwrap_or("");
+                    let rows = ids
+                        .split(',')
+                        .filter(|id| !id.is_empty())
+                        .map(|id| {
+                            serde_json::json!({
+                                "id": id,
+                                "contentDetails": {"duration": "PT4M15S"},
+                                "statistics": {"viewCount": "4200"}
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    Ok(serde_json::json!({"items": rows}))
+                }
+                other => panic!("unexpected resource {other}"),
+            },
+            |_, _| ShortProbeOutcome::NotShort,
+        )
+        .unwrap();
+        assert_eq!(playlist_calls, 100);
+        assert_eq!(output.items.len(), 5_000);
+        assert_eq!(output.total_results, Some(5_200));
+        assert_eq!(batch_count, 100);
+        assert_eq!(loaded_total, 5_000);
+        assert_eq!(output.items[0].video.channel, "Creator 0");
+        assert_eq!(
+            output.items[0].metadata.channel_id.as_deref(),
+            Some("UC0000000000000000000009")
+        );
+        assert_eq!(output.items[0].video.duration, "4:15");
+        assert_eq!(output.items[0].metadata.view_count, Some(4200));
     }
 
     #[test]
@@ -3361,10 +3985,16 @@ mod tests {
         );
         assert!(!called);
         assert!(
-            playlist_videos_feed_with("PL00000001", &cancel, |_| {
-                called = true;
-                Ok(Value::Null)
-            })
+            playlist_videos_feed_progressive_with(
+                "PL00000001",
+                &cancel,
+                |_| {},
+                |_, _| {
+                    called = true;
+                    Ok(Value::Null)
+                },
+                |_, _| ShortProbeOutcome::NotShort,
+            )
             .is_err()
         );
         assert!(!called);
@@ -3380,10 +4010,16 @@ mod tests {
         assert!(matches!(result, Err(error) if error == "Consulta cancelada."));
 
         let cancel = Cancellation::default();
-        let result = playlist_videos_feed_with("PL00000001", &cancel, |_| {
-            cancel.cancel();
-            Ok(serde_json::json!({"items": []}))
-        });
+        let result = playlist_videos_feed_progressive_with(
+            "PL00000001",
+            &cancel,
+            |_| {},
+            |_, _| {
+                cancel.cancel();
+                Ok(serde_json::json!({"items": []}))
+            },
+            |_, _| ShortProbeOutcome::NotShort,
+        );
         assert!(matches!(result, Err(error) if error == "Consulta cancelada."));
     }
 
@@ -3827,42 +4463,300 @@ mod tests {
     }
 
     #[test]
-    fn liked_videos_feed_paginates_and_filters_invalid_items() {
+    fn liked_videos_via_rating_paginates_and_filters_invalid_items() {
         let cancel = Cancellation::default();
         let mut calls = 0;
-        let feed = liked_videos_feed_with(&cancel, |params| {
-            calls += 1;
-            assert!(params.contains(&("myRating", "like")));
-            if calls == 1 {
-                Ok(serde_json::json!({
-                    "nextPageToken": "p2",
-                    "items": [
-                        {
-                            "id": "dQw4w9WgXcQ",
-                            "snippet": {
-                                "title": "Rust Demo",
-                                "channelTitle": "Canal Rust",
-                                "channelId": "UC0000000000000000000001",
-                                "publishedAt": "2026-02-01T10:00:00Z",
-                                "thumbnails": {"medium": {"url": "https://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg"}}
+        let output = liked_videos_via_rating_with(
+            &cancel,
+            |_| {},
+            |params| {
+                calls += 1;
+                assert!(params.contains(&("myRating", "like")));
+                if calls == 1 {
+                    Ok(serde_json::json!({
+                        "pageInfo": {"totalResults": 1},
+                        "nextPageToken": "p2",
+                        "items": [
+                            {
+                                "id": "dQw4w9WgXcQ",
+                                "snippet": {
+                                    "title": "Rust Demo",
+                                    "channelTitle": "Canal Rust",
+                                    "channelId": "UC0000000000000000000001",
+                                    "publishedAt": "2026-02-01T10:00:00Z",
+                                    "thumbnails": {"medium": {"url": "https://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg"}}
+                                },
+                                "contentDetails": {"duration": "PT4M12S"},
+                                "statistics": {"viewCount": "12345"}
                             },
-                            "contentDetails": {"duration": "PT4M12S"},
-                            "statistics": {"viewCount": "12345"}
-                        },
-                        {"id": "bad id!", "snippet": {"title": "Invalid"}}
-                    ]
-                }))
-            } else {
-                assert!(params.contains(&("pageToken", "p2")));
-                Ok(serde_json::json!({"items": []}))
-            }
-        })
+                            {"id": "bad id!", "snippet": {"title": "Invalid"}}
+                        ]
+                    }))
+                } else {
+                    assert!(params.contains(&("pageToken", "p2")));
+                    Ok(serde_json::json!({"items": []}))
+                }
+            },
+            |_, _| ShortProbeOutcome::NotShort,
+        )
         .unwrap();
         assert_eq!(calls, 2);
-        assert_eq!(feed.items.len(), 1);
-        assert_eq!(feed.items[0].video.title, "Rust Demo");
-        assert_eq!(feed.items[0].video.duration, "4:12");
-        assert_eq!(feed.items[0].metadata.view_count, Some(12345));
+        assert_eq!(output.items.len(), 1);
+        assert_eq!(output.total_results, Some(1));
+        assert_eq!(output.items[0].video.title, "Rust Demo");
+        assert_eq!(output.items[0].video.duration, "4:12");
+        assert_eq!(output.items[0].metadata.view_count, Some(12345));
+    }
+
+    #[test]
+    fn liked_videos_feed_progressive_returns_exact_count_skips_private_and_classifies_shorts() {
+        let cancel = Cancellation::default();
+        let probed_ids = std::sync::Mutex::new(Vec::new());
+        let mut pages = Vec::new();
+        let mut loaded_so_far = 0usize;
+        let output = liked_videos_feed_progressive_with(
+            &cancel,
+            |progress| {
+                loaded_so_far += progress.batch.len();
+                pages.push((progress.batch.len(), loaded_so_far, progress.total_results));
+            },
+            |resource, params| match resource {
+                "playlistItems" => {
+                    assert!(params.contains(&("playlistId", "LL")));
+                    let page_token = params.iter().find(|(k, _)| *k == "pageToken").map(|(_, v)| *v);
+                    match page_token {
+                        None => {
+                            let mut rows = (0..48)
+                                .map(|i| {
+                                    serde_json::json!({
+                                        "snippet": {
+                                            "title": format!("Long Video {i}"),
+                                            "channelTitle": "nathan",
+                                            "videoOwnerChannelTitle": "Creator Channel",
+                                            "videoOwnerChannelId": "UC0000000000000000000002",
+                                            "resourceId": {"videoId": format!("longVid{i:04}")},
+                                            "thumbnails": {"high": {"url": format!("https://i.ytimg.com/vi/longVid{i:04}/hqdefault.jpg")}}
+                                        },
+                                        "contentDetails": {"videoId": format!("longVid{i:04}")}
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            rows.push(serde_json::json!({
+                                "snippet": {
+                                    "title": "Private video",
+                                    "resourceId": {"videoId": "privVid0001"}
+                                }
+                            }));
+                            rows.push(serde_json::json!({
+                                "snippet": {
+                                    "title": "Deleted video",
+                                    "resourceId": {"videoId": "delVid00001"}
+                                }
+                            }));
+                            Ok(serde_json::json!({
+                                "pageInfo": {"totalResults": 127},
+                                "nextPageToken": "p2",
+                                "items": rows
+                            }))
+                        }
+                        Some("p2") => {
+                            let rows = vec![
+                                serde_json::json!({
+                                    "snippet": {
+                                        "title": "FIZEMOS o ALHO NEGRO de R$ 500!",
+                                        "channelTitle": "nathan",
+                                        "videoOwnerChannelTitle": "Manual do Mundo",
+                                        "resourceId": {"videoId": "f0UuuLmAhQk"}
+                                    },
+                                    "contentDetails": {"videoId": "f0UuuLmAhQk"}
+                                }),
+                                serde_json::json!({
+                                    "snippet": {
+                                        "title": "Me at the zoo",
+                                        "channelTitle": "nathan",
+                                        "videoOwnerChannelTitle": "jawed",
+                                        "resourceId": {"videoId": "jNQXAC9IVRw"},
+                                        "thumbnails": {"high": {"url": "https://i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg"}}
+                                    },
+                                    "contentDetails": {"videoId": "jNQXAC9IVRw"}
+                                }),
+                            ];
+                            Ok(serde_json::json!({
+                                "nextPageToken": "p3",
+                                "items": rows
+                            }))
+                        }
+                        Some("p3") => {
+                            let rows = (0..75)
+                                .map(|i| {
+                                    serde_json::json!({
+                                        "snippet": {
+                                            "title": format!("Final Video {i}"),
+                                            "channelTitle": "nathan",
+                                            "videoOwnerChannelTitle": "Creator Channel",
+                                            "resourceId": {"videoId": format!("finlVid{i:04}")}
+                                        },
+                                        "contentDetails": {"videoId": format!("finlVid{i:04}")}
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            Ok(serde_json::json!({"items": rows}))
+                        }
+                        Some(other) => panic!("unexpected pageToken {other}"),
+                    }
+                }
+                "videos" => {
+                    let ids = params.iter().find(|(k, _)| *k == "id").map(|(_, v)| *v).unwrap_or("");
+                    let rows = ids
+                        .split(',')
+                        .filter(|id| !id.is_empty())
+                        .map(|id| match id {
+                            "f0UuuLmAhQk" => serde_json::json!({
+                                "id": id,
+                                "contentDetails": {"duration": "PT2M27S"},
+                                "statistics": {"viewCount": "461000"},
+                                "player": {"embedWidth": "1080", "embedHeight": "1920"}
+                            }),
+                            "jNQXAC9IVRw" => serde_json::json!({
+                                "id": id,
+                                "contentDetails": {"duration": "PT19S"},
+                                "statistics": {"viewCount": "300000000"},
+                                "player": {"embedWidth": "480", "embedHeight": "360"}
+                            }),
+                            _ => serde_json::json!({
+                                "id": id,
+                                "contentDetails": {"duration": "PT5M10S"},
+                                "statistics": {"viewCount": "1000"}
+                            }),
+                        })
+                        .collect::<Vec<_>>();
+                    Ok(serde_json::json!({"items": rows}))
+                }
+                other => panic!("unexpected resource {other}"),
+            },
+            |video_id, _dur| {
+                probed_ids.lock().unwrap().push(video_id.to_owned());
+                if video_id == "f0UuuLmAhQk" {
+                    ShortProbeOutcome::ShortWithVerticalThumb
+                } else {
+                    ShortProbeOutcome::NotShort
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(output.items.len(), 125);
+        assert_eq!(output.total_results, Some(127));
+        assert_eq!(
+            pages,
+            vec![
+                (48, 48, Some(127)),
+                (2, 50, Some(127)),
+                (75, 125, Some(127))
+            ]
+        );
+
+        let short_item = output
+            .items
+            .iter()
+            .find(|item| item.video.title.contains("ALHO NEGRO"))
+            .unwrap();
+        assert_eq!(short_item.metadata.kind, SearchResultKind::Short);
+        assert_eq!(
+            short_item.video.url,
+            "https://www.youtube.com/shorts/f0UuuLmAhQk"
+        );
+        assert_eq!(
+            short_item.video.thumbnail,
+            "https://i.ytimg.com/vi/f0UuuLmAhQk/oardefault.jpg"
+        );
+        assert_eq!(short_item.video.channel, "Manual do Mundo");
+        assert_eq!(short_item.metadata.view_count, Some(461_000));
+
+        let regular_short_dur = output
+            .items
+            .iter()
+            .find(|item| item.video.title == "Me at the zoo")
+            .unwrap();
+        assert_eq!(regular_short_dur.metadata.kind, SearchResultKind::Video);
+        assert_eq!(
+            regular_short_dur.video.url,
+            "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+        );
+
+        let probed = probed_ids.lock().unwrap();
+        assert!(probed.contains(&"f0UuuLmAhQk".to_owned()));
+        assert!(probed.contains(&"jNQXAC9IVRw".to_owned()));
+        assert_eq!(probed.len(), 2, "5:10 regular videos must not be probed");
+    }
+
+    #[test]
+    fn liked_videos_feed_progressive_falls_back_through_related_playlists_and_my_rating() {
+        let cancel = Cancellation::default();
+        let out_related = liked_videos_feed_progressive_with(
+            &cancel,
+            |_| {},
+            |resource, params| match resource {
+                "playlistItems" => {
+                    let pl = params
+                        .iter()
+                        .find(|(k, _)| *k == "playlistId")
+                        .map(|(_, v)| *v);
+                    if pl == Some("LL") {
+                        Err("O recurso solicitado não foi encontrado no YouTube.".into())
+                    } else {
+                        assert_eq!(pl, Some("LLcustom99"));
+                        Ok(serde_json::json!({
+                            "pageInfo": {"totalResults": 1},
+                            "items": [{
+                                "snippet": {
+                                    "title": "Related Short",
+                                    "videoOwnerChannelTitle": "Creator",
+                                    "resourceId": {"videoId": "relShort001"}
+                                },
+                                "contentDetails": {"videoId": "relShort001"}
+                            }]
+                        }))
+                    }
+                }
+                "channels" => Ok(serde_json::json!({
+                    "items": [{"contentDetails": {"relatedPlaylists": {"likes": "LLcustom99"}}}]
+                })),
+                "videos" => Ok(serde_json::json!({
+                    "items": [{"id": "relShort001", "contentDetails": {"duration": "PT42S"}}]
+                })),
+                other => panic!("unexpected {other}"),
+            },
+            |_, _| ShortProbeOutcome::ShortOnly,
+        )
+        .unwrap();
+        assert_eq!(out_related.items.len(), 1);
+        assert_eq!(out_related.items[0].metadata.kind, SearchResultKind::Short);
+
+        let out_rating = liked_videos_feed_progressive_with(
+            &cancel,
+            |_| {},
+            |resource, params| match resource {
+                "playlistItems" => Err("A API do YouTube recusou a consulta (HTTP 403).".into()),
+                "channels" => Err("A API do YouTube recusou a consulta (HTTP 403).".into()),
+                "videos" => {
+                    assert!(params.contains(&("myRating", "like")));
+                    Ok(serde_json::json!({
+                        "pageInfo": {"totalResults": 1},
+                        "items": [{
+                            "id": "ratVid00001",
+                            "snippet": {"title": "Fallback Rated Video", "channelTitle": "Owner"},
+                            "contentDetails": {"duration": "PT3M10S"}
+                        }]
+                    }))
+                }
+                other => panic!("unexpected {other}"),
+            },
+            |_, _| ShortProbeOutcome::NotShort,
+        )
+        .unwrap();
+        assert_eq!(out_rating.items.len(), 1);
+        assert_eq!(out_rating.items[0].video.title, "Fallback Rated Video");
     }
 
     #[test]

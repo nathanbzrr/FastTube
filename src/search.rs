@@ -3096,17 +3096,37 @@ fn fetch_channel_page_for_target(
     fetch_channel_page_for_target_cancel(target, effective_limit, &Cancellation::default())
 }
 
+pub fn empty_channel_page_for_target(target: &ChannelTarget) -> ChannelPage {
+    let handle = match target {
+        ChannelTarget::Handle(h) => Some(h.clone()),
+        ChannelTarget::ChannelId(_) => None,
+    };
+    let channel_id = match target {
+        ChannelTarget::ChannelId(id) => Some(id.clone()),
+        ChannelTarget::Handle(_) => None,
+    };
+    ChannelPage {
+        target: target.clone(),
+        channel_id,
+        title: None,
+        handle,
+        canonical_url: target.canonical_url(),
+        ..ChannelPage::default()
+    }
+}
+
 fn fetch_channel_page_for_target_cancel(
     target: &ChannelTarget,
     effective_limit: usize,
     cancellation: &Cancellation,
 ) -> Result<ChannelPage, String> {
-    if let Ok(page) = fetch_channel_page_html(target, effective_limit, cancellation)
+    let html_page = fetch_channel_page_html(target, effective_limit, cancellation).ok();
+    if let Some(page) = html_page.as_ref()
         && (!page.videos.is_empty()
             || !page.home_shelves.is_empty()
             || page.featured_video.is_some())
     {
-        return Ok(page);
+        return Ok(page.clone());
     }
     if cancellation.cancelled() {
         return Err("Operação cancelada.".to_owned());
@@ -3131,12 +3151,19 @@ fn fetch_channel_page_for_target_cancel(
         format!("Não foi possível executar yt-dlp: {error}. Verifique se ele está ao lado do app ou no PATH.")
     })?;
     if !output.status.success() {
-        return Err(format!(
-            "Não foi possível consultar o canal: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        if stderr.contains("does not have a") || stderr.contains("has no videos") {
+            return Ok(html_page.unwrap_or_else(|| empty_channel_page_for_target(target)));
+        }
+        return Err(format!("Não foi possível consultar o canal: {stderr}"));
     }
-    parse_channel_page(&output.stdout, target, effective_limit)
+    match parse_channel_page(&output.stdout, target, effective_limit) {
+        Ok(page) => Ok(page),
+        Err(_) if html_page.is_some() => {
+            Ok(html_page.unwrap_or_else(|| empty_channel_page_for_target(target)))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn fetch_youtube_initial_data_url(url: &str, cancellation: &Cancellation) -> Result<Value, String> {

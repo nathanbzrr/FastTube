@@ -283,6 +283,14 @@ pub fn extract_description_chapters(description: &str) -> Vec<DescriptionChapter
         };
         let before_raw = trimmed[..first.byte_start].trim();
         let before_clean = clean_chapter_piece(before_raw);
+        let before_num_trimmed = before_clean.trim_end_matches(['.', ')']);
+        let before_clean = if !before_num_trimmed.is_empty()
+            && before_num_trimmed.bytes().all(|b| b.is_ascii_digit())
+        {
+            String::new()
+        } else {
+            before_clean
+        };
         let prefix_words = before_clean.split_whitespace().count();
         if prefix_words > 4 || before_clean.len() > 36 {
             continue;
@@ -314,6 +322,7 @@ pub fn extract_description_chapters(description: &str) -> Vec<DescriptionChapter
             seconds: first.seconds,
         });
     }
+    chapters.sort_by_key(|c| c.seconds);
     chapters
 }
 
@@ -1113,6 +1122,12 @@ impl WatchExtras {
         self.transcript_error = None;
         self.transcript.clear();
         self.transcript_query.clear();
+        if self.active_subtitle_url.as_deref() == Some(track.url.as_str())
+            && !self.active_subtitle_cues.is_empty()
+        {
+            self.transcript = self.active_subtitle_cues.clone();
+            return;
+        }
         if let Some(vtt) = self.vtt_cache.get(&track.url) {
             match crate::transcript::parse_vtt(vtt).map_err(str::to_owned) {
                 Ok(cues) if cues.is_empty() => {
@@ -1193,12 +1208,11 @@ impl WatchExtras {
                         let Some(path) = maybe_path else {
                             return Ok(None);
                         };
-                        let is_markdown = path
-                            .extension()
-                            .and_then(|ext| ext.to_str())
-                            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
-                        let body = if is_markdown {
+                        let ext = path.extension().and_then(|ext| ext.to_str());
+                        let body = if ext.is_some_and(|ext| ext.eq_ignore_ascii_case("md")) {
                             crate::transcript::format_markdown(&title_owned, &cues_owned)
+                        } else if ext.is_some_and(|ext| ext.eq_ignore_ascii_case("srt")) {
+                            crate::transcript::format_srt(&cues_owned)
                         } else {
                             crate::transcript::format_txt(&cues_owned)
                         };
@@ -2099,16 +2113,67 @@ No vídeo anterior que gravamos lá pelas 12:30 falamos bastante sobre isso.
         assert_eq!(chapters[1].seconds, 85);
         assert_eq!(chapters[1].title, "Configuração inicial");
 
-        assert_eq!(chapters[2].label, "1:02:03");
-        assert_eq!(chapters[2].seconds, 3723);
-        assert_eq!(chapters[2].title, "Conclusão e próximos passos");
+        assert_eq!(chapters[2].label, "02:00");
+        assert_eq!(chapters[2].seconds, 120);
+        assert_eq!(chapters[2].title, "Intervalo técnico");
 
         assert_eq!(chapters[3].label, "05:10");
         assert_eq!(chapters[3].seconds, 310);
         assert_eq!(chapters[3].title, "Parte 2 — Detalhes avançados");
 
-        assert_eq!(chapters[4].label, "02:00");
-        assert_eq!(chapters[4].seconds, 120);
-        assert_eq!(chapters[4].title, "Intervalo técnico");
+        assert_eq!(chapters[4].label, "1:02:03");
+        assert_eq!(chapters[4].seconds, 3723);
+        assert_eq!(chapters[4].title, "Conclusão e próximos passos");
+    }
+
+    #[test]
+    fn extract_description_chapters_strips_numbered_prefixes_and_sorts_chronologically() {
+        let description = "\
+2) 01:30 Setup
+1. 00:00 Intro
+03) 00:45 Middle
+";
+        let chapters = extract_description_chapters(description);
+        assert_eq!(
+            chapters,
+            vec![
+                DescriptionChapter {
+                    title: "Intro".into(),
+                    label: "00:00".into(),
+                    seconds: 0,
+                },
+                DescriptionChapter {
+                    title: "Middle".into(),
+                    label: "00:45".into(),
+                    seconds: 45,
+                },
+                DescriptionChapter {
+                    title: "Setup".into(),
+                    label: "01:30".into(),
+                    seconds: 90,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn start_transcript_reuses_active_subtitle_cues_without_vtt_cache() {
+        let mut extras = WatchExtras::default();
+        let track = search::SubtitleTrack {
+            language: "pt-BR".into(),
+            automatic: false,
+            url: "https://www.youtube.com/api/timedtext?v=one&lang=pt-BR".into(),
+        };
+        let cue = crate::transcript::Cue {
+            start_ms: 1000,
+            end_ms: 3000,
+            text: "Legenda ativa".into(),
+        };
+        extras.active_subtitle_url = Some(track.url.clone());
+        extras.active_subtitle_cues = vec![cue.clone()];
+
+        extras.start_transcript(&track, &egui::Context::default());
+        assert!(!extras.transcript_loading);
+        assert_eq!(extras.transcript, vec![cue]);
     }
 }
