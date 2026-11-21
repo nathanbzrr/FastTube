@@ -3923,7 +3923,6 @@ fn integrated_overlay_actions_update_menu_theater_fullscreen_miniplayer_and_app_
         is_live_dvr: false,
         at_live_edge: false,
         live_behind_secs: 0.0,
-        can_bookmark: true,
         raw_path: Some(video.url.clone()),
         raw_position: Some(42.0),
         now: Instant::now(),
@@ -3992,7 +3991,7 @@ fn integrated_overlay_actions_update_menu_theater_fullscreen_miniplayer_and_app_
         &overlay_ctx,
         &ctx,
     );
-    app.handle_player_overlay_action(overlay::OverlayAction::AddBookmark, &overlay_ctx, &ctx);
+    assert!(app.add_current_bookmark(&video, overlay_ctx.position));
     assert_eq!(app.library.data.bookmarks.len(), 1);
     assert_eq!(app.library.data.bookmarks[0].time_ms, 42_000);
     assert!(app.library.error.is_none());
@@ -4681,6 +4680,274 @@ fn mini_player_viewport_settles_preserves_aspect_and_exits_on_maximize() {
     out3.textures_delta.clear();
     assert!(!app.playback.mini_player);
     assert!(!app.playback.mini_player_settled);
+}
+
+#[test]
+fn fullscreen_from_maximized_unmaximizes_clears_shadow_and_restores_on_exit() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    let window_cmds = |out: &egui::FullOutput| -> Vec<egui::ViewportCommand> {
+        out.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .filter(|cmd| !matches!(cmd, egui::ViewportCommand::SetTheme(_)))
+            .cloned()
+            .collect()
+    };
+
+    let mut raw_max = egui::RawInput::default();
+    if let Some(vp) = raw_max.viewports.get_mut(&egui::ViewportId::ROOT) {
+        vp.maximized = Some(true);
+        vp.fullscreen = Some(false);
+    }
+    let mut out1 = ctx.run_ui(raw_max, |ui| {
+        app.toggle_fullscreen(ui.ctx());
+    });
+    out1.textures_delta.clear();
+    assert_eq!(
+        window_cmds(&out1),
+        vec![
+            egui::ViewportCommand::Maximized(false),
+            egui::ViewportCommand::Fullscreen(true),
+            egui::ViewportCommand::Decorations(false),
+        ]
+    );
+    assert!(app.playback.fullscreen);
+    assert!(app.playback.fullscreen_restore_maximized);
+
+    let mut raw_fs = egui::RawInput::default();
+    if let Some(vp) = raw_fs.viewports.get_mut(&egui::ViewportId::ROOT) {
+        vp.maximized = Some(false);
+        vp.fullscreen = Some(true);
+    }
+    let mut out2 = ctx.run_ui(raw_fs, |ui| {
+        app.toggle_fullscreen(ui.ctx());
+    });
+    out2.textures_delta.clear();
+    assert_eq!(
+        window_cmds(&out2),
+        vec![
+            egui::ViewportCommand::Fullscreen(false),
+            egui::ViewportCommand::Decorations(false),
+            egui::ViewportCommand::Maximized(true),
+        ]
+    );
+    assert!(!app.playback.fullscreen);
+    assert!(!app.playback.fullscreen_restore_maximized);
+}
+
+#[test]
+fn fullscreen_from_normal_window_does_not_toggle_maximized() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    let window_cmds = |out: &egui::FullOutput| -> Vec<egui::ViewportCommand> {
+        out.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .filter(|cmd| !matches!(cmd, egui::ViewportCommand::SetTheme(_)))
+            .cloned()
+            .collect()
+    };
+
+    let mut raw_normal = egui::RawInput::default();
+    if let Some(vp) = raw_normal.viewports.get_mut(&egui::ViewportId::ROOT) {
+        vp.maximized = Some(false);
+        vp.fullscreen = Some(false);
+    }
+    let mut out1 = ctx.run_ui(raw_normal, |ui| {
+        app.toggle_fullscreen(ui.ctx());
+    });
+    out1.textures_delta.clear();
+    assert_eq!(
+        window_cmds(&out1),
+        vec![
+            egui::ViewportCommand::Fullscreen(true),
+            egui::ViewportCommand::Decorations(false),
+        ]
+    );
+    assert!(app.playback.fullscreen);
+    assert!(!app.playback.fullscreen_restore_maximized);
+
+    let mut raw_fs = egui::RawInput::default();
+    if let Some(vp) = raw_fs.viewports.get_mut(&egui::ViewportId::ROOT) {
+        vp.maximized = Some(false);
+        vp.fullscreen = Some(true);
+    }
+    let mut out2 = ctx.run_ui(raw_fs, |ui| {
+        app.toggle_fullscreen(ui.ctx());
+    });
+    out2.textures_delta.clear();
+    assert_eq!(
+        window_cmds(&out2),
+        vec![
+            egui::ViewportCommand::Fullscreen(false),
+            egui::ViewportCommand::Decorations(false),
+        ]
+    );
+    assert!(!app.playback.fullscreen);
+    assert!(!app.playback.fullscreen_restore_maximized);
+}
+
+#[test]
+fn sync_fullscreen_viewport_heals_maximized_state_with_bounded_retries() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    app.playback.fullscreen = true;
+    app.playback.fullscreen_sync_retries = 3;
+    let window_cmds = |out: &egui::FullOutput| -> Vec<egui::ViewportCommand> {
+        out.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .filter(|cmd| !matches!(cmd, egui::ViewportCommand::SetTheme(_)))
+            .cloned()
+            .collect()
+    };
+
+    for _ in 0..3 {
+        let mut raw = egui::RawInput::default();
+        if let Some(vp) = raw.viewports.get_mut(&egui::ViewportId::ROOT) {
+            vp.maximized = Some(true);
+            vp.fullscreen = Some(true);
+        }
+        let mut out = ctx.run_ui(raw, |ui| {
+            app.sync_fullscreen_viewport(ui.ctx());
+        });
+        out.textures_delta.clear();
+        assert_eq!(
+            window_cmds(&out),
+            vec![
+                egui::ViewportCommand::Fullscreen(false),
+                egui::ViewportCommand::Maximized(false),
+                egui::ViewportCommand::Fullscreen(true),
+                egui::ViewportCommand::Decorations(false),
+            ]
+        );
+        assert!(app.playback.fullscreen_restore_maximized);
+    }
+
+    let mut raw_exhausted = egui::RawInput::default();
+    if let Some(vp) = raw_exhausted.viewports.get_mut(&egui::ViewportId::ROOT) {
+        vp.maximized = Some(true);
+        vp.fullscreen = Some(true);
+    }
+    let mut out_exhausted = ctx.run_ui(raw_exhausted, |ui| {
+        app.sync_fullscreen_viewport(ui.ctx());
+    });
+    out_exhausted.textures_delta.clear();
+    assert!(window_cmds(&out_exhausted).is_empty());
+}
+
+#[test]
+fn fullscreen_and_mini_player_transitions_preserve_maximized_restore_state() {
+    let ctx_a = egui::Context::default();
+    let mut app_a = FastTube {
+        selected: Some(sample_videos().remove(0)),
+        ..Default::default()
+    };
+
+    let mut raw_max = egui::RawInput::default();
+    if let Some(vp) = raw_max.viewports.get_mut(&egui::ViewportId::ROOT) {
+        vp.maximized = Some(true);
+        vp.fullscreen = Some(false);
+    }
+    let mut out_a1 = ctx_a.run_ui(raw_max, |ui| {
+        app_a.toggle_fullscreen(ui.ctx());
+    });
+    out_a1.textures_delta.clear();
+    assert!(app_a.playback.fullscreen);
+    assert!(app_a.playback.fullscreen_restore_maximized);
+
+    let mut raw_fs = egui::RawInput::default();
+    if let Some(vp) = raw_fs.viewports.get_mut(&egui::ViewportId::ROOT) {
+        vp.maximized = Some(false);
+        vp.fullscreen = Some(true);
+    }
+    let mut out_a2 = ctx_a.run_ui(raw_fs, |ui| {
+        app_a.toggle_mini_player(ui.ctx());
+    });
+    out_a2.textures_delta.clear();
+    let cmds_a2 = &out_a2.viewport_output[&egui::ViewportId::ROOT].commands;
+    assert!(app_a.playback.mini_player);
+    assert!(!app_a.playback.fullscreen);
+    assert!(app_a.playback.mini_player_restore_maximized);
+    assert!(!app_a.playback.fullscreen_restore_maximized);
+    assert!(cmds_a2.contains(&egui::ViewportCommand::Fullscreen(false)));
+    assert!(cmds_a2.contains(&egui::ViewportCommand::Decorations(false)));
+
+    let ctx_b = egui::Context::default();
+    let mut app_b = FastTube {
+        selected: Some(sample_videos().remove(0)),
+        ..Default::default()
+    };
+
+    let mut raw_b1 = egui::RawInput::default();
+    if let Some(vp) = raw_b1.viewports.get_mut(&egui::ViewportId::ROOT) {
+        vp.maximized = Some(true);
+        vp.fullscreen = Some(false);
+    }
+    let mut out_b1 = ctx_b.run_ui(raw_b1, |ui| {
+        app_b.toggle_mini_player(ui.ctx());
+    });
+    out_b1.textures_delta.clear();
+    assert!(app_b.playback.mini_player);
+    assert!(app_b.playback.mini_player_restore_maximized);
+
+    let mut raw_b2 = egui::RawInput::default();
+    if let Some(vp) = raw_b2.viewports.get_mut(&egui::ViewportId::ROOT) {
+        vp.maximized = Some(false);
+        vp.fullscreen = Some(false);
+        vp.inner_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(800.0, 400.0),
+            egui::vec2(520.0, 292.5),
+        ));
+        vp.outer_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(792.0, 368.0),
+            egui::vec2(536.0, 332.5),
+        ));
+    }
+    let mut out_b2 = ctx_b.run_ui(raw_b2, |ui| {
+        app_b.sync_mini_player_viewport(ui.ctx());
+    });
+    out_b2.textures_delta.clear();
+    assert!(app_b.playback.mini_player_settled);
+
+    let mut raw_b3 = egui::RawInput::default();
+    if let Some(vp) = raw_b3.viewports.get_mut(&egui::ViewportId::ROOT) {
+        vp.maximized = Some(false);
+        vp.fullscreen = Some(false);
+    }
+    let mut out_b3 = ctx_b.run_ui(raw_b3, |ui| {
+        app_b.toggle_fullscreen(ui.ctx());
+    });
+    out_b3.textures_delta.clear();
+    let cmds_b3 = &out_b3.viewport_output[&egui::ViewportId::ROOT].commands;
+    assert!(!cmds_b3.contains(&egui::ViewportCommand::Maximized(true)));
+    assert!(cmds_b3.contains(&egui::ViewportCommand::Fullscreen(true)));
+    assert!(cmds_b3.contains(&egui::ViewportCommand::Decorations(false)));
+    assert!(app_b.playback.fullscreen);
+    assert!(!app_b.playback.mini_player);
+    assert!(app_b.playback.fullscreen_restore_maximized);
+    assert!(!app_b.playback.mini_player_restore_maximized);
+
+    let mut raw_b4 = egui::RawInput::default();
+    if let Some(vp) = raw_b4.viewports.get_mut(&egui::ViewportId::ROOT) {
+        vp.maximized = Some(false);
+        vp.fullscreen = Some(true);
+    }
+    let mut out_b4 = ctx_b.run_ui(raw_b4, |ui| {
+        app_b.toggle_fullscreen(ui.ctx());
+    });
+    out_b4.textures_delta.clear();
+    assert_eq!(
+        out_b4.viewport_output[&egui::ViewportId::ROOT].commands,
+        vec![
+            egui::ViewportCommand::Fullscreen(false),
+            egui::ViewportCommand::Decorations(false),
+            egui::ViewportCommand::Maximized(true),
+        ]
+    );
+    assert!(!app_b.playback.fullscreen);
+    assert!(!app_b.playback.fullscreen_restore_maximized);
 }
 
 #[test]
@@ -5978,7 +6245,6 @@ fn handle_player_overlay_action_live_non_dvr_disables_loop_autoplay_and_restores
         is_live_dvr: false,
         at_live_edge: false,
         live_behind_secs: 28.0,
-        can_bookmark: true,
         raw_path: Some(video.url.clone()),
         raw_position: Some(100.0),
         now: Instant::now(),
@@ -6872,62 +7138,24 @@ fn disk_image_cache_for_override_ignores_default_in_tests_and_uses_explicit_over
 #[test]
 fn ab_loop_overlay_actions_and_auto_seek_enforcer() {
     let mut app = FastTube::default();
-    let ctx = egui::Context::default();
     let mut video = sample_videos().remove(0);
     video.url = "https://www.youtube.com/watch?v=abLoopTest1".into();
     let now = Instant::now();
     app.selected = Some(video.clone());
     app.activate_video_playback(&video, Some(0), None, now);
 
-    let mut overlay_ctx = OverlayPlaybackContext {
-        video: video.clone(),
-        paused: false,
-        ended: false,
-        muted: false,
-        position: 20.0,
-        duration: Some(180.0),
-        buffered_secs: Some(30.0),
-        raw_volume: 100.0,
-        speed: 1.0,
-        current_height: Some(1080),
-        selected_quality: None,
-        qualities: vec![1080, 720],
-        qualities_loading: false,
-        has_queued: false,
-        has_active_subtitle: false,
-        subtitles: Vec::new(),
-        subtitles_loading: false,
-        chapters: Vec::new(),
-        theater: false,
-        fullscreen: false,
-        mini_player: false,
-        autoplay: false,
-        loop_video: false,
-        can_bookmark: true,
-        is_live: false,
-        is_live_dvr: false,
-        at_live_edge: false,
-        live_behind_secs: 0.0,
-        raw_path: Some(video.url.clone()),
-        raw_position: Some(20.0),
-        now,
-    };
-
-    app.handle_player_overlay_action(overlay::OverlayAction::SetLoopA, &overlay_ctx, &ctx);
+    app.set_ab_loop_point_a(20.0);
     assert_eq!(app.playback.loop_a_secs, Some(20.0));
     assert_eq!(app.playback.ab_loop_active(), None);
 
     // Setting B <= A clears A so an invalid inverted range cannot stay active.
-    overlay_ctx.position = 10.0;
-    app.handle_player_overlay_action(overlay::OverlayAction::SetLoopB, &overlay_ctx, &ctx);
+    app.set_ab_loop_point_b(10.0);
     assert_eq!(app.playback.loop_a_secs, None);
     assert_eq!(app.playback.loop_b_secs, Some(10.0));
 
     // Proper A < B activates the loop and auto-seeks back to A when reaching B.
-    overlay_ctx.position = 15.0;
-    app.handle_player_overlay_action(overlay::OverlayAction::SetLoopA, &overlay_ctx, &ctx);
-    overlay_ctx.position = 45.0;
-    app.handle_player_overlay_action(overlay::OverlayAction::SetLoopB, &overlay_ctx, &ctx);
+    app.set_ab_loop_point_a(15.0);
+    app.set_ab_loop_point_b(45.0);
     assert_eq!(app.playback.ab_loop_active(), Some((15.0, 45.0)));
 
     assert!(!app.enforce_ab_loop_seek(30.0, Some(180.0), false, now));
@@ -6949,7 +7177,7 @@ fn ab_loop_overlay_actions_and_auto_seek_enforcer() {
         now + std::time::Duration::from_millis(450)
     ));
 
-    app.handle_player_overlay_action(overlay::OverlayAction::ClearLoopAB, &overlay_ctx, &ctx);
+    app.clear_ab_loop_points();
     assert_eq!(app.playback.loop_a_secs, None);
     assert_eq!(app.playback.loop_b_secs, None);
 }
@@ -6990,7 +7218,6 @@ fn audio_only_mode_toggles_visibility_and_paints_placeholder() {
         mini_player: false,
         autoplay: false,
         loop_video: false,
-        can_bookmark: true,
         is_live: false,
         is_live_dvr: false,
         at_live_edge: false,
@@ -11843,7 +12070,6 @@ fn player_right_click_context_menu_and_stats_for_nerds_work_headlessly() {
             mini_player: false,
             autoplay: true,
             loop_video: app.playback.loop_video,
-            can_bookmark: true,
             is_live: false,
             is_live_dvr: false,
             at_live_edge: false,
@@ -12124,7 +12350,6 @@ fn fullscreen_player_auto_hides_overlay_and_cursor_when_mouse_is_idle() {
             mini_player: false,
             autoplay: true,
             loop_video: false,
-            can_bookmark: true,
             is_live: false,
             is_live_dvr: false,
             at_live_edge: false,
@@ -12197,4 +12422,135 @@ fn fullscreen_player_auto_hides_overlay_and_cursor_when_mouse_is_idle() {
         paused_out.platform_output.cursor_icon,
         egui::CursorIcon::None
     );
+}
+
+#[test]
+fn handle_watch_live_info_populates_qualities_subtitles_and_storyboard_without_yt_dlp() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    let video = Video {
+        title: "Video Teste".into(),
+        channel: "Canal".into(),
+        url: "https://www.youtube.com/watch?v=WatchMeta01".into(),
+        thumbnail: String::new(),
+        duration: "3:00".into(),
+    };
+    app.selected = Some(video.clone());
+    app.watch.extras.sync_video(Some(&video.url));
+    app.watch.live.video_url = Some(video.url.clone());
+    app.watch.live.session_id = 1;
+    app.watch.live.watch_info_loading = true;
+
+    let sb = search::StoryboardSpec {
+        rows: 5,
+        columns: 5,
+        thumb_width: 160,
+        thumb_height: 90,
+        fragments: vec![search::StoryboardFragment {
+            url: "https://i.ytimg.com/sb/WatchMeta01/storyboard3_L1/M0.jpg?sigh=abc".into(),
+            duration_secs: 50.0,
+        }],
+    };
+    let sub = search::SubtitleTrack {
+        language: "pt".into(),
+        automatic: false,
+        url: "https://www.youtube.com/api/timedtext?v=WatchMeta01&lang=pt&fmt=vtt".into(),
+    };
+    app.handle_watch_live_info_result(
+        1,
+        Ok(live_chat::WatchLiveInfo {
+            video_id: "WatchMeta01".into(),
+            heights: vec![1080, 720, 480],
+            subtitles: vec![sub.clone()],
+            subtitles_parsed: true,
+            storyboard: Some(sb.clone()),
+            ..Default::default()
+        }),
+        &ctx,
+    );
+
+    assert_eq!(app.playback.qualities, vec![1080, 720, 480]);
+    assert!(app.watch.extras.subtitles_loaded);
+    assert_eq!(app.watch.extras.subtitles, vec![sub]);
+    assert_eq!(app.playback.storyboard, Some(sb));
+    assert_eq!(app.playback.quality_fallback_url, None);
+    assert!(app.playback.quality_rx.is_none());
+}
+
+#[test]
+fn handle_watch_live_info_defers_quality_fallback_until_file_loaded() {
+    let ctx = egui::Context::default();
+    let mut app = FastTube::default();
+    let video = Video {
+        title: "Fallback Teste".into(),
+        channel: "Canal".into(),
+        url: "https://www.youtube.com/watch?v=WatchFall01".into(),
+        thumbnail: String::new(),
+        duration: "3:00".into(),
+    };
+    app.selected = Some(video.clone());
+    app.watch.live.video_url = Some(video.url.clone());
+    app.watch.live.session_id = 1;
+    app.playback.current_file_loaded = false;
+
+    app.handle_watch_live_info_result(
+        1,
+        Ok(live_chat::WatchLiveInfo {
+            video_id: "WatchFall01".into(),
+            heights: Vec::new(),
+            ..Default::default()
+        }),
+        &ctx,
+    );
+
+    assert_eq!(
+        app.playback.quality_fallback_url.as_deref(),
+        Some(video.url.as_str())
+    );
+    assert!(app.playback.quality_rx.is_none());
+
+    app.handle_queue_player_event(PlaybackEvent::FileLoaded);
+    assert!(app.playback.current_file_loaded);
+}
+
+#[test]
+fn prune_session_caches_trims_stale_metadata_while_preserving_active_references() {
+    let mut app = FastTube::default();
+    let selected_url = "https://www.youtube.com/watch?v=Sel12345678".to_owned();
+    let feed_url = "https://www.youtube.com/watch?v=Feed2345678".to_owned();
+    let queue_url = "https://www.youtube.com/watch?v=Queu3456789".to_owned();
+    let back_url = "https://www.youtube.com/watch?v=Back4567890".to_owned();
+
+    let mk_video = |url: &str| Video {
+        title: "T".into(),
+        channel: "C".into(),
+        url: url.to_owned(),
+        thumbnail: String::new(),
+        duration: "1:00".into(),
+    };
+
+    app.selected = Some(mk_video(&selected_url));
+    app.feed.videos.push(mk_video(&feed_url));
+    app.queue.data.add(mk_video(&queue_url)).unwrap();
+    app.playback.video_back_stack.push(mk_video(&back_url));
+
+    for url in [&selected_url, &feed_url, &queue_url, &back_url] {
+        app.video_metadata
+            .insert(url.clone(), VideoMetadata::default());
+    }
+    for idx in 0..260 {
+        app.video_metadata.insert(
+            format!("https://www.youtube.com/watch?v=Stale{idx:06}"),
+            VideoMetadata::default(),
+        );
+    }
+    assert!(app.video_metadata.len() > 250);
+
+    app.prune_session_caches();
+
+    assert_eq!(app.video_metadata.len(), 4);
+    assert!(app.video_metadata.contains_key(&selected_url));
+    assert!(app.video_metadata.contains_key(&feed_url));
+    assert!(app.video_metadata.contains_key(&queue_url));
+    assert!(app.video_metadata.contains_key(&back_url));
 }

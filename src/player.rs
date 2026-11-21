@@ -101,7 +101,7 @@ pub(crate) fn scaled_window_bounds(rect: Rect, scale: f32) -> (i32, i32, i32, i3
     )
 }
 
-pub use crate::overlay::{AspectZoomMode, AudioEqPreset, OverlayAudioTrack as AudioTrackOption};
+pub use crate::overlay::{AudioEqPreset, OverlayAudioTrack as AudioTrackOption};
 
 pub(crate) struct VideoWindow {
     hwnd: HWND,
@@ -703,6 +703,11 @@ impl Player {
                     return Err(format!("Não foi possível configurar {name}: {detail}"));
                 }
             }
+            for (name, value) in Self::tuning_options() {
+                if let (Ok(option_name), Ok(value)) = (CString::new(name), CString::new(value)) {
+                    let _ = (api.set_option)(handle, option_name.as_ptr(), value.as_ptr());
+                }
+            }
             let result = (api.initialize)(handle);
             if result >= 0 {
                 for event_id in [6, 7, 8] {
@@ -770,6 +775,11 @@ impl Player {
                     return Err(format!("Não foi possível configurar {name}: {detail}"));
                 }
             }
+            for (name, value) in Self::tuning_options() {
+                if let (Ok(option_name), Ok(value)) = (CString::new(name), CString::new(value)) {
+                    let _ = (api.set_option)(handle, option_name.as_ptr(), value.as_ptr());
+                }
+            }
             let result = (api.initialize)(handle);
             if result >= 0 {
                 for event_id in [6, 7, 8] {
@@ -832,6 +842,15 @@ impl Player {
             options.push(("script-opts", crate::search::ytdl_hook_path_option(&yt_dlp)));
         }
         options
+    }
+
+    fn tuning_options() -> Vec<(&'static str, String)> {
+        vec![
+            ("cache-pause-initial", "yes".to_owned()),
+            ("cache-pause-wait", "1".to_owned()),
+            ("network-timeout", "15".to_owned()),
+            ("ytdl-raw-options", crate::search::ytdl_hook_raw_options()),
+        ]
     }
 
     pub fn play(&mut self, url: &str) -> Result<(), String> {
@@ -934,17 +953,6 @@ impl Player {
 
     pub fn set_audio_track(&self, id: &str) -> Result<(), String> {
         self.set("aid", id)
-    }
-
-    pub fn set_aspect_zoom(&self, mode: AspectZoomMode) -> Result<(), String> {
-        let (aspect, panscan) = match mode {
-            AspectZoomMode::Auto => ("-1", "0.0"),
-            AspectZoomMode::Ratio16_9 => ("16:9", "0.0"),
-            AspectZoomMode::Ratio21_9 => ("21:9", "0.0"),
-            AspectZoomMode::FillZoom => ("-1", "1.0"),
-        };
-        self.set("video-aspect-override", aspect)?;
-        self.set("panscan", panscan)
     }
 
     pub fn set_video_eq(
@@ -1404,5 +1412,31 @@ mod tests {
                 .any(|(name, value)| *name == "screenshot-format" && value == "png")
         );
         assert!(!embedded.iter().any(|(name, _)| *name == "vo"));
+    }
+
+    #[test]
+    fn tuning_options_enable_fast_start_and_no_playlist_ytdl_hook() {
+        let tuning = Player::tuning_options();
+        assert!(
+            tuning
+                .iter()
+                .any(|(name, value)| *name == "cache-pause-initial" && value == "yes")
+        );
+        assert!(
+            tuning
+                .iter()
+                .any(|(name, value)| *name == "cache-pause-wait" && value == "1")
+        );
+        assert!(
+            tuning
+                .iter()
+                .any(|(name, value)| *name == "network-timeout" && value == "15")
+        );
+        assert!(
+            tuning
+                .iter()
+                .any(|(name, value)| *name == "ytdl-raw-options"
+                    && value.starts_with("no-playlist="))
+        );
     }
 }

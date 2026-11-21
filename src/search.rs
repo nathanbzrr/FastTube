@@ -1,6 +1,6 @@
 use crate::process::{self, Cancellation};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::PathBuf;
@@ -12,7 +12,7 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(45);
 const BROWSER_FEED_TIMEOUT: Duration = Duration::from_secs(90);
 
 const RESOLUTION_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
-const RESOLUTION_CACHE_LIMIT: usize = 128;
+const RESOLUTION_CACHE_LIMIT: usize = 32;
 const RESOLUTION_CACHE_MAX_URL_BYTES: usize = 4096;
 const RESOLUTION_CACHE_MAX_HEIGHTS: usize = 256;
 
@@ -401,6 +401,10 @@ fn validate_subtitle_url(value: &str) -> Result<url::Url, String> {
     Ok(parsed)
 }
 
+pub(crate) fn is_allowed_subtitle_url(value: &str) -> bool {
+    validate_subtitle_url(value).is_ok()
+}
+
 fn is_auto_translated_url(parsed: &url::Url) -> bool {
     parsed.query_pairs().any(|(key, _)| key == "tlang")
 }
@@ -418,6 +422,88 @@ fn subtitle_hls_fallbacks() -> &'static Mutex<HashMap<String, String>> {
     SUBTITLE_HLS_FALLBACKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn canonical_subtitle_language(language: &str, automatic: bool) -> String {
+    if automatic
+        && language.len() > 5
+        && language[language.len() - 5..].eq_ignore_ascii_case("-orig")
+    {
+        language[..language.len() - 5].to_owned()
+    } else {
+        language.to_owned()
+    }
+}
+
+fn valid_sub_lang_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn url_has_asr_kind(parsed: &url::Url) -> bool {
+    if parsed
+        .query_pairs()
+        .any(|(key, value)| key == "kind" && value.eq_ignore_ascii_case("asr"))
+    {
+        return true;
+    }
+    let lower_path = parsed.path().to_ascii_lowercase();
+    lower_path.contains("kind%3dasr") || lower_path.contains("kind=asr")
+}
+
+fn register_hls_fallback(direct_url: &str, hls_url: &str) {
+    if let Ok(mut map) = subtitle_hls_fallbacks().lock() {
+        if map.len() > 128 {
+            map.clear();
+        }
+        map.insert(direct_url.to_owned(), hls_url.to_owned());
+    }
+}
+
+pub(crate) fn sanitize_subtitle_tracks(tracks: Vec<SubtitleTrack>) -> Vec<SubtitleTrack> {
+    let mut best_by_key: HashMap<(bool, String), (bool, usize, SubtitleTrack)> = HashMap::new();
+    for (idx, mut track) in tracks.into_iter().enumerate() {
+        let canonical = canonical_subtitle_language(&track.language, track.automatic);
+        let from_orig_alias = track.automatic && canonical != track.language;
+        track.language = canonical;
+        let key = (track.automatic, track.language.to_ascii_lowercase());
+        match best_by_key.get(&key) {
+            Some((existing_orig, existing_idx, _))
+                if (*existing_orig, *existing_idx) <= (from_orig_alias, idx) => {}
+            _ => {
+                best_by_key.insert(key, (from_orig_alias, idx, track));
+            }
+        }
+    }
+    let mut out: Vec<SubtitleTrack> = best_by_key.into_values().map(|(_, _, t)| t).collect();
+    out.sort_by(|left, right| {
+        (
+            left.automatic,
+            left.language.to_ascii_lowercase(),
+            &left.language,
+        )
+            .cmp(&(
+                right.automatic,
+                right.language.to_ascii_lowercase(),
+                &right.language,
+            ))
+    });
+    let mut seen_urls = HashSet::with_capacity(out.len());
+    out.retain(|track| seen_urls.insert(track.url.clone()));
+    out.truncate(80);
+    out
+}
+
+#[derive(Clone)]
+struct ParsedSubtitleCandidate {
+    track: SubtitleTrack,
+    translated: bool,
+    is_hls_only: bool,
+    has_asr_kind: bool,
+    from_orig_alias: bool,
+}
+
 fn parse_subtitles(value: &Value) -> Vec<SubtitleTrack> {
     let mut candidates = Vec::new();
     for (field, automatic) in [("subtitles", false), ("automatic_captions", true)] {
@@ -425,66 +511,163 @@ fn parse_subtitles(value: &Value) -> Vec<SubtitleTrack> {
             continue;
         };
         for (language, formats) in languages {
-            if language.is_empty()
-                || language.len() > 64
-                || !language
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-            {
+            if !valid_sub_lang_token(language) {
                 continue;
             }
-            let Some((url, parsed)) = formats.as_array().and_then(|formats| {
-                let mut direct = None;
-                let mut hls = None;
-                for format in formats {
-                    if format["ext"].as_str() != Some("vtt") {
-                        continue;
-                    }
-                    let Some(value) = format["url"].as_str() else {
-                        continue;
-                    };
-                    let Ok(parsed) = validate_subtitle_url(value) else {
-                        continue;
-                    };
-                    if is_hls_playlist_format(format, &parsed) {
-                        if hls.is_none() {
-                            hls = Some((value, parsed));
+            let Some((url, parsed, translated, is_hls_only)) =
+                formats.as_array().and_then(|formats| {
+                    let mut native_direct: Option<(&str, url::Url)> = None;
+                    let mut native_hls: Option<(&str, url::Url)> = None;
+                    let mut translated_direct: Option<(&str, url::Url)> = None;
+                    let mut translated_hls: Option<(&str, url::Url)> = None;
+                    for format in formats {
+                        if format["ext"].as_str() != Some("vtt") {
+                            continue;
                         }
-                    } else if direct.is_none() {
-                        direct = Some((value, parsed));
+                        let Some(value) = format["url"].as_str() else {
+                            continue;
+                        };
+                        let Ok(parsed) = validate_subtitle_url(value) else {
+                            continue;
+                        };
+                        let translated = is_auto_translated_url(&parsed);
+                        let hls = is_hls_playlist_format(format, &parsed);
+                        match (translated, hls) {
+                            (false, false) if native_direct.is_none() => {
+                                native_direct = Some((value, parsed));
+                            }
+                            (false, true) if native_hls.is_none() => {
+                                native_hls = Some((value, parsed));
+                            }
+                            (true, false) if translated_direct.is_none() => {
+                                translated_direct = Some((value, parsed));
+                            }
+                            (true, true) if translated_hls.is_none() => {
+                                translated_hls = Some((value, parsed));
+                            }
+                            _ => {}
+                        }
                     }
-                }
-                if let (Some((d_url, _)), Some((h_url, _))) = (&direct, &hls)
-                    && let Ok(mut map) = subtitle_hls_fallbacks().lock()
-                {
-                    if map.len() > 512 {
-                        map.clear();
+                    if let Some((d_url, d_parsed)) = native_direct {
+                        if let Some((h_url, _)) = native_hls {
+                            register_hls_fallback(d_url, h_url);
+                        }
+                        Some((d_url, d_parsed, false, false))
+                    } else if let Some((h_url, h_parsed)) = native_hls {
+                        Some((h_url, h_parsed, false, true))
+                    } else if let Some((d_url, d_parsed)) = translated_direct {
+                        if let Some((h_url, _)) = translated_hls {
+                            register_hls_fallback(d_url, h_url);
+                        }
+                        Some((d_url, d_parsed, true, false))
+                    } else if let Some((h_url, h_parsed)) = translated_hls {
+                        Some((h_url, h_parsed, true, true))
+                    } else {
+                        None
                     }
-                    map.insert((*d_url).to_owned(), (*h_url).to_owned());
-                }
-                direct.or(hls)
-            }) else {
+                })
+            else {
                 continue;
             };
-            let translated = is_auto_translated_url(&parsed);
-            candidates.push((
-                SubtitleTrack {
-                    language: language.clone(),
+            let canonical_lang = canonical_subtitle_language(language, automatic);
+            let from_orig_alias = automatic && canonical_lang != *language;
+            let has_asr_kind = url_has_asr_kind(&parsed);
+            candidates.push(ParsedSubtitleCandidate {
+                track: SubtitleTrack {
+                    language: canonical_lang,
                     automatic,
                     url: url.to_owned(),
                 },
                 translated,
-            ));
+                is_hls_only,
+                has_asr_kind,
+                from_orig_alias,
+            });
         }
     }
-    let has_native_tracks = candidates.iter().any(|(_, translated)| !translated);
-    let mut tracks: Vec<SubtitleTrack> = candidates
-        .into_iter()
-        .filter_map(|(track, translated)| (!has_native_tracks || !translated).then_some(track))
-        .collect();
-    tracks.sort_by(|left, right| {
-        (left.automatic, &left.language).cmp(&(right.automatic, &right.language))
+
+    // YouTube injects non-ASR HLS mirrors of manual subtitles into `automatic_captions`.
+    // Register them as HLS fallbacks for the matching manual track instead of listing duplicates.
+    let mut manual_direct_urls: HashMap<String, Option<String>> = HashMap::new();
+    for candidate in &candidates {
+        if !candidate.track.automatic {
+            let key = candidate.track.language.to_ascii_lowercase();
+            let direct_url = (!candidate.is_hls_only).then(|| candidate.track.url.clone());
+            manual_direct_urls
+                .entry(key)
+                .and_modify(|existing| {
+                    if existing.is_none() {
+                        *existing = direct_url.clone();
+                    }
+                })
+                .or_insert(direct_url);
+        }
+    }
+    candidates.retain(|candidate| {
+        if candidate.track.automatic
+            && !candidate.translated
+            && candidate.is_hls_only
+            && !candidate.has_asr_kind
+            && let Some(maybe_direct) =
+                manual_direct_urls.get(&candidate.track.language.to_ascii_lowercase())
+        {
+            if let Some(manual_direct_url) = maybe_direct {
+                let already_registered = subtitle_hls_fallbacks()
+                    .lock()
+                    .map(|map| map.contains_key(manual_direct_url))
+                    .unwrap_or(false);
+                if !already_registered {
+                    register_hls_fallback(manual_direct_url, &candidate.track.url);
+                }
+            }
+            return false;
+        }
+        true
     });
+
+    let has_native_tracks = candidates.iter().any(|candidate| !candidate.translated);
+    let mut deduped: HashMap<(bool, String), ParsedSubtitleCandidate> = HashMap::new();
+    for candidate in candidates {
+        if has_native_tracks && candidate.translated {
+            continue;
+        }
+        let key = (
+            candidate.track.automatic,
+            candidate.track.language.to_ascii_lowercase(),
+        );
+        let rank = (
+            candidate.translated,
+            candidate.is_hls_only,
+            candidate.from_orig_alias,
+        );
+        match deduped.get(&key) {
+            Some(existing)
+                if (
+                    existing.translated,
+                    existing.is_hls_only,
+                    existing.from_orig_alias,
+                ) <= rank => {}
+            _ => {
+                deduped.insert(key, candidate);
+            }
+        }
+    }
+
+    let mut tracks: Vec<SubtitleTrack> = deduped.into_values().map(|c| c.track).collect();
+    tracks.sort_by(|left, right| {
+        (
+            left.automatic,
+            left.language.to_ascii_lowercase(),
+            &left.language,
+        )
+            .cmp(&(
+                right.automatic,
+                right.language.to_ascii_lowercase(),
+                &right.language,
+            ))
+    });
+    let mut seen_urls = HashSet::with_capacity(tracks.len());
+    tracks.retain(|track| seen_urls.insert(track.url.clone()));
     tracks.truncate(80);
     tracks
 }
@@ -530,16 +713,13 @@ fn subtitle_parser_prefers_direct_vtt_and_filters_tlang_when_native_exists() {
     );
 }
 
-pub fn youtube_subtitles(
+pub fn youtube_subtitles_fresh(
     video_url: &str,
     cancel: &Cancellation,
 ) -> Result<Vec<SubtitleTrack>, String> {
     let id = crate::history::youtube_video_id(video_url)
         .ok_or("Legendas disponíveis somente para vídeos do YouTube.")?;
     let url = crate::history::youtube_watch_url(&id).ok_or("URL de vídeo inválida.")?;
-    if let Some(cached) = get_cached_subtitle_tracks(&url) {
-        return Ok(cached);
-    }
     let output = process::output(
         yt_dlp().args([
             "--dump-single-json",
@@ -561,6 +741,19 @@ pub fn youtube_subtitles(
     let tracks = parse_subtitles(&json);
     store_cached_subtitle_tracks(&url, &tracks);
     Ok(tracks)
+}
+
+pub fn youtube_subtitles(
+    video_url: &str,
+    cancel: &Cancellation,
+) -> Result<Vec<SubtitleTrack>, String> {
+    let id = crate::history::youtube_video_id(video_url)
+        .ok_or("Legendas disponíveis somente para vídeos do YouTube.")?;
+    let url = crate::history::youtube_watch_url(&id).ok_or("URL de vídeo inválida.")?;
+    if let Some(cached) = get_cached_subtitle_tracks(&url) {
+        return Ok(sanitize_subtitle_tracks(cached));
+    }
+    youtube_subtitles_fresh(video_url, cancel)
 }
 
 fn fetch_subtitle_text(
@@ -654,6 +847,17 @@ fn hls_vtt_segment_merger_strips_duplicate_headers() {
     assert!(merged.contains("Mundo"));
 }
 
+fn validate_vtt_payload(body: String) -> Result<String, String> {
+    if body.trim().is_empty() {
+        return Err("A faixa selecionada não contém texto de legenda.".into());
+    }
+    let cues = crate::transcript::parse_vtt(&body).map_err(str::to_owned)?;
+    if cues.is_empty() {
+        return Err("A faixa selecionada não contém texto de legenda.".into());
+    }
+    Ok(body)
+}
+
 fn download_vtt_single(url: &str) -> Result<String, String> {
     let parsed = validate_subtitle_url(url)?;
     let client = reqwest::blocking::Client::builder()
@@ -663,7 +867,7 @@ fn download_vtt_single(url: &str) -> Result<String, String> {
         .map_err(|_| "Não foi possível preparar o download da legenda.".to_owned())?;
     let body = fetch_subtitle_text(&client, parsed.clone(), SUBTITLE_MAX_BYTES)?;
     if !body.trim_start_matches('\u{feff}').starts_with("#EXTM3U") {
-        return Ok(body);
+        return validate_vtt_payload(body);
     }
     let mut segment_urls = Vec::new();
     for line in body.lines() {
@@ -689,31 +893,60 @@ fn download_vtt_single(url: &str) -> Result<String, String> {
         remaining = remaining.saturating_sub(segment_text.len());
         segments.push(segment_text);
     }
-    Ok(merge_vtt_segments(segments.iter().map(String::as_str)))
+    validate_vtt_payload(merge_vtt_segments(segments.iter().map(String::as_str)))
 }
 
-fn download_vtt_via_yt_dlp(url: &str) -> Option<String> {
-    let parsed = validate_subtitle_url(url).ok()?;
-    let mut video_id = None;
-    let mut lang = None;
-    let mut tlang = None;
+fn resolve_yt_dlp_sub_request(
+    video_url: Option<&str>,
+    sub_url: &str,
+    preferred_lang: Option<&str>,
+    automatic: Option<bool>,
+) -> Option<(String, String, &'static [&'static str])> {
+    let parsed = validate_subtitle_url(sub_url).ok()?;
+    let mut url_video_id = None;
+    let mut url_lang = None;
+    let mut url_tlang = None;
     for (k, v) in parsed.query_pairs() {
         match k.as_ref() {
-            "v" if !v.is_empty() => video_id = Some(v.into_owned()),
-            "lang" if !v.is_empty() => lang = Some(v.into_owned()),
-            "tlang" if !v.is_empty() => tlang = Some(v.into_owned()),
+            "v" if !v.is_empty() => url_video_id = Some(v.into_owned()),
+            "lang" if !v.is_empty() => url_lang = Some(v.into_owned()),
+            "tlang" if !v.is_empty() => url_tlang = Some(v.into_owned()),
             _ => {}
         }
     }
-    let video_id = video_id?;
+    let video_id = video_url
+        .and_then(crate::history::youtube_video_id)
+        .or(url_video_id)?;
     let watch_url = crate::history::youtube_watch_url(&video_id)?;
-    let target_lang = tlang.or(lang)?;
-    if !target_lang
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
+    let strip_orig = automatic != Some(false);
+    let preferred_clean = preferred_lang
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| canonical_subtitle_language(s, strip_orig));
+    let target_lang = url_tlang
+        .filter(|l| valid_sub_lang_token(l))
+        .or_else(|| preferred_clean.filter(|l| valid_sub_lang_token(l)))
+        .or_else(|| url_lang.filter(|l| valid_sub_lang_token(l)))?;
+    let write_flags: &'static [&'static str] = match automatic {
+        Some(false) => &["--write-subs"],
+        Some(true) => &["--write-auto-subs"],
+        None => &["--write-subs", "--write-auto-subs"],
+    };
+    Some((watch_url, target_lang, write_flags))
+}
+
+fn download_vtt_via_yt_dlp_with_context(
+    video_url: Option<&str>,
+    sub_url: &str,
+    preferred_lang: Option<&str>,
+    automatic: Option<bool>,
+    cancel: &Cancellation,
+) -> Option<String> {
+    if cancel.cancelled() {
         return None;
     }
+    let (watch_url, target_lang, write_flags) =
+        resolve_yt_dlp_sub_request(video_url, sub_url, preferred_lang, automatic)?;
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let temp_dir =
@@ -727,44 +960,89 @@ fn download_vtt_via_yt_dlp(url: &str) -> Option<String> {
     }
     let _guard = TempDirGuard(temp_dir.clone());
     let out_tmpl = temp_dir.join("sub.%(ext)s");
-    let cancel = Cancellation::default();
-    let _ = process::output(
-        yt_dlp().args([
-            "--skip-download",
-            "--write-subs",
-            "--write-auto-subs",
-            "--sub-langs",
-            &target_lang,
-            "--sub-format",
-            "vtt",
-            "--no-playlist",
-            "--no-warnings",
-            "-o",
-            &out_tmpl.to_string_lossy(),
-            "--",
-            &watch_url,
-        ]),
-        &cancel,
-        QUERY_TIMEOUT,
-    )
-    .ok()?;
+    let mut cmd = yt_dlp();
+    cmd.arg("--skip-download");
+    cmd.args(write_flags);
+    cmd.args([
+        "--sub-langs",
+        &target_lang,
+        "--sub-format",
+        "vtt",
+        "--no-playlist",
+        "--no-warnings",
+        "-o",
+        &out_tmpl.to_string_lossy(),
+        "--",
+        &watch_url,
+    ]);
+    let _ = process::output(&mut cmd, cancel, QUERY_TIMEOUT).ok()?;
+    if cancel.cancelled() {
+        return None;
+    }
+    let expected_name = format!("sub.{target_lang}.vtt");
     let entries = std::fs::read_dir(&temp_dir).ok()?;
+    let mut fallback = None;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("vtt")
-            && let Ok(text) = std::fs::read_to_string(&path)
-            && !text.trim().is_empty()
+        if path.extension().and_then(|e| e.to_str()) != Some("vtt") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(validated) = validate_vtt_payload(text) else {
+            continue;
+        };
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case(&expected_name))
         {
-            return Some(text);
+            return Some(validated);
+        }
+        if fallback.is_none() {
+            fallback = Some(validated);
         }
     }
-    None
+    fallback
 }
 
-pub fn download_vtt(url: &str) -> Result<String, String> {
+fn find_matching_subtitle_track<'a>(
+    tracks: &'a [SubtitleTrack],
+    preferred_lang: Option<&str>,
+    automatic: Option<bool>,
+) -> Option<&'a SubtitleTrack> {
+    let lang = preferred_lang.map(str::trim).filter(|s| !s.is_empty())?;
+    let target = canonical_subtitle_language(lang, automatic != Some(false)).to_ascii_lowercase();
+    let matches = |track: &SubtitleTrack, auto: Option<bool>| {
+        auto.is_none_or(|expected| track.automatic == expected)
+            && canonical_subtitle_language(&track.language, track.automatic).to_ascii_lowercase()
+                == target
+    };
+    if automatic.is_none() {
+        tracks
+            .iter()
+            .find(|track| !track.automatic && matches(track, None))
+            .or_else(|| {
+                tracks
+                    .iter()
+                    .find(|track| track.automatic && matches(track, None))
+            })
+    } else {
+        tracks.iter().find(|track| matches(track, automatic))
+    }
+}
+
+fn try_download_vtt_with_hls(url: &str, cancel: &Cancellation) -> Result<String, String> {
+    if cancel.cancelled() {
+        return Err("Download da legenda cancelado.".into());
+    }
     match download_vtt_single(url) {
         Ok(vtt) => Ok(vtt),
-        Err(primary_err) => {
+        Err(err) => {
+            if cancel.cancelled() {
+                return Err("Download da legenda cancelado.".into());
+            }
             let fallback_hls = subtitle_hls_fallbacks()
                 .lock()
                 .ok()
@@ -774,12 +1052,79 @@ pub fn download_vtt(url: &str) -> Result<String, String> {
             {
                 return Ok(vtt);
             }
-            if let Some(vtt) = download_vtt_via_yt_dlp(url) {
-                return Ok(vtt);
-            }
-            Err(primary_err)
+            Err(err)
         }
     }
+}
+
+fn download_vtt_with_context(
+    video_url: Option<&str>,
+    sub_url: &str,
+    preferred_lang: Option<&str>,
+    automatic: Option<bool>,
+    cancel: &Cancellation,
+) -> Result<String, String> {
+    if cancel.cancelled() {
+        return Err("Download da legenda cancelado.".into());
+    }
+    let mut last_err = match try_download_vtt_with_hls(sub_url, cancel) {
+        Ok(vtt) => return Ok(vtt),
+        Err(err) => err,
+    };
+    let mut tried_urls = HashSet::from([sub_url.to_owned()]);
+    if let Some(v_url) = video_url
+        && preferred_lang.is_some_and(|lang| !lang.trim().is_empty())
+    {
+        if !cancel.cancelled()
+            && let Some(cached_tracks) = get_cached_subtitle_tracks(v_url)
+            && let Some(matched) =
+                find_matching_subtitle_track(&cached_tracks, preferred_lang, automatic)
+            && tried_urls.insert(matched.url.clone())
+        {
+            match try_download_vtt_with_hls(&matched.url, cancel) {
+                Ok(vtt) => return Ok(vtt),
+                Err(err) => last_err = err,
+            }
+        }
+        if !cancel.cancelled()
+            && let Ok(fresh_tracks) = youtube_subtitles_fresh(v_url, cancel)
+            && let Some(matched) =
+                find_matching_subtitle_track(&fresh_tracks, preferred_lang, automatic)
+            && tried_urls.insert(matched.url.clone())
+        {
+            match try_download_vtt_with_hls(&matched.url, cancel) {
+                Ok(vtt) => return Ok(vtt),
+                Err(err) => last_err = err,
+            }
+        }
+    }
+    if cancel.cancelled() {
+        return Err("Download da legenda cancelado.".into());
+    }
+    if let Some(vtt) =
+        download_vtt_via_yt_dlp_with_context(video_url, sub_url, preferred_lang, automatic, cancel)
+    {
+        return Ok(vtt);
+    }
+    if cancel.cancelled() {
+        Err("Download da legenda cancelado.".into())
+    } else {
+        Err(last_err)
+    }
+}
+
+pub fn download_vtt_for_track(
+    video_url: Option<&str>,
+    track: &SubtitleTrack,
+    cancel: &Cancellation,
+) -> Result<String, String> {
+    download_vtt_with_context(
+        video_url,
+        &track.url,
+        Some(&track.language),
+        Some(track.automatic),
+        cancel,
+    )
 }
 
 fn is_playlist_url(url: &str) -> bool {
@@ -1606,6 +1951,103 @@ pub(crate) fn ytdl_hook_path_option(path: &std::path::Path) -> String {
         .replace('\\', "\\\\")
         .replace(',', "\\,");
     format!("ytdl_hook-ytdl_path={value}")
+}
+
+fn format_ytdl_hook_raw_options(cache_dir: Option<&std::path::Path>) -> String {
+    let mut opts = String::from("no-playlist=");
+    if let Some(dir) = cache_dir
+        && let Some(raw) = dir.to_str().map(str::trim).filter(|s| !s.is_empty())
+        && !raw.contains([',', '=', '\n', '\r'])
+    {
+        opts.push_str(",cache-dir=");
+        opts.push_str(raw);
+    }
+    opts
+}
+
+pub(crate) fn ytdl_hook_raw_options() -> String {
+    let dir = effective_yt_dlp_cache_dir();
+    if let Some(path) = &dir {
+        let _ = std::fs::create_dir_all(path);
+    }
+    format_ytdl_hook_raw_options(dir.as_deref())
+}
+
+pub(crate) fn cached_playback_metadata(url: &str) -> Option<VideoPlaybackMetadata> {
+    let target_id = crate::history::youtube_video_id(url);
+    let heights = {
+        let cache_mutex = RESOLUTION_CACHE.get_or_init(|| Mutex::new(ResolutionCache::default()));
+        let mut cache = cache_mutex
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let now = Instant::now();
+        cache
+            .entries
+            .retain(|entry| now.duration_since(entry.inserted) < RESOLUTION_CACHE_TTL);
+        cache
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.url == url
+                    || (target_id.is_some()
+                        && crate::history::youtube_video_id(&entry.url) == target_id)
+            })
+            .map(|entry| entry.heights.clone())
+    }?;
+    if heights.is_empty() {
+        return None;
+    }
+    let extra = get_cached_playback_extra(url).unwrap_or_default();
+    Some(VideoPlaybackMetadata {
+        heights,
+        subtitles: get_cached_subtitle_tracks(url).unwrap_or_default(),
+        is_live: extra.is_live,
+        title: extra.title,
+        channel: extra.channel,
+        channel_id: extra.channel_id,
+        channel_url: extra.channel_url,
+        description: extra.description,
+        concurrent_view_count: extra.concurrent_view_count,
+        storyboard: extra.storyboard,
+    })
+}
+
+pub(crate) fn prime_playback_metadata_cache(
+    url: &str,
+    heights: &[u32],
+    subtitles: &[SubtitleTrack],
+    subtitles_parsed: bool,
+    extra: PlaybackExtraInfo,
+) {
+    if !heights.is_empty()
+        && url.len() <= RESOLUTION_CACHE_MAX_URL_BYTES
+        && heights.len() <= RESOLUTION_CACHE_MAX_HEIGHTS
+    {
+        let cache_mutex = RESOLUTION_CACHE.get_or_init(|| Mutex::new(ResolutionCache::default()));
+        let mut cache = cache_mutex
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let now = Instant::now();
+        let target_id = crate::history::youtube_video_id(url);
+        cache.entries.retain(|entry| {
+            let same_video = entry.url == url
+                || (target_id.is_some()
+                    && crate::history::youtube_video_id(&entry.url) == target_id);
+            !same_video && now.duration_since(entry.inserted) < RESOLUTION_CACHE_TTL
+        });
+        while cache.entries.len() >= RESOLUTION_CACHE_LIMIT {
+            cache.entries.remove(0);
+        }
+        cache.entries.push(CachedResolutions {
+            url: url.to_owned(),
+            heights: heights.to_vec(),
+            inserted: now,
+        });
+    }
+    if subtitles_parsed {
+        store_cached_subtitle_tracks(url, subtitles);
+    }
+    store_cached_playback_extra(url, extra);
 }
 
 pub fn playback_metadata_with_cancel(
@@ -7023,5 +7465,269 @@ mod tests {
         let results = fetch_search_suggestions_at(&endpoint, "rust egui", &cancel).unwrap();
         assert_eq!(results, vec!["rust egui tutorial", "rust egui table"]);
         let _ = handle.join();
+    }
+
+    #[test]
+    fn ytdl_raw_options_formats_no_playlist_and_safe_cache_dir() {
+        assert_eq!(format_ytdl_hook_raw_options(None), "no-playlist=");
+        assert_eq!(
+            format_ytdl_hook_raw_options(Some(std::path::Path::new(r"C:\FastTube\cache\yt-dlp"))),
+            r"no-playlist=,cache-dir=C:\FastTube\cache\yt-dlp"
+        );
+        assert_eq!(
+            format_ytdl_hook_raw_options(Some(std::path::Path::new(r"C:\Bad,Dir=1\yt-dlp"))),
+            "no-playlist="
+        );
+    }
+
+    #[test]
+    fn prime_and_read_cached_playback_metadata_round_trip() {
+        let url = "https://www.youtube.com/watch?v=CachePrim11";
+        let short_url = "https://youtu.be/CachePrim11";
+        let sub = SubtitleTrack {
+            language: "pt-BR".into(),
+            automatic: false,
+            url: "https://www.youtube.com/api/timedtext?v=CachePrim11&lang=pt-BR&fmt=vtt".into(),
+        };
+        let sb = StoryboardSpec {
+            rows: 5,
+            columns: 5,
+            thumb_width: 160,
+            thumb_height: 90,
+            fragments: vec![StoryboardFragment {
+                url: "https://i.ytimg.com/sb/CachePrim11/storyboard3_L2/M0.jpg?sigh=abc".into(),
+                duration_secs: 50.0,
+            }],
+        };
+        prime_playback_metadata_cache(
+            url,
+            &[1080, 720, 480],
+            std::slice::from_ref(&sub),
+            true,
+            PlaybackExtraInfo {
+                is_live: false,
+                title: Some("Primed Title".into()),
+                channel: Some("Primed Channel".into()),
+                channel_id: Some("UC1234567890123456789012".into()),
+                channel_url: Some(
+                    "https://www.youtube.com/channel/UC1234567890123456789012".into(),
+                ),
+                description: Some("Desc".into()),
+                concurrent_view_count: None,
+                storyboard: Some(sb.clone()),
+            },
+        );
+        let cached = cached_playback_metadata(short_url).expect("primed metadata should hit");
+        assert_eq!(cached.heights, vec![1080, 720, 480]);
+        assert_eq!(cached.subtitles, vec![sub]);
+        assert_eq!(cached.title.as_deref(), Some("Primed Title"));
+        assert_eq!(cached.storyboard, Some(sb));
+    }
+
+    #[test]
+    fn subtitle_parser_prefers_native_over_tlang_within_same_language_and_deduplicates_orig() {
+        let en_native =
+            "https://www.youtube.com/api/timedtext?v=TedrETAJeNM&kind=asr&lang=en&fmt=vtt";
+        let pt_native =
+            "https://www.youtube.com/api/timedtext?v=TedrETAJeNM&kind=asr&lang=pt&fmt=vtt";
+        let value = serde_json::json!({
+            "subtitles": {},
+            "automatic_captions": {
+                "en-orig": [
+                    { "ext": "vtt", "url": en_native }
+                ],
+                "en": [
+                    { "ext": "vtt", "url": en_native },
+                    { "ext": "vtt", "url": "https://www.youtube.com/api/timedtext?v=TedrETAJeNM&kind=asr&lang=pt&tlang=en&fmt=vtt" }
+                ],
+                "pt": [
+                    { "ext": "vtt", "url": "https://www.youtube.com/api/timedtext?v=TedrETAJeNM&kind=asr&lang=en&tlang=pt&fmt=vtt" },
+                    { "ext": "vtt", "url": pt_native }
+                ],
+                "pt-orig": [
+                    { "ext": "vtt", "url": pt_native }
+                ],
+                "es": [
+                    { "ext": "vtt", "url": "https://www.youtube.com/api/timedtext?v=TedrETAJeNM&kind=asr&lang=en&tlang=es&fmt=vtt" }
+                ]
+            }
+        });
+
+        let tracks = parse_subtitles(&value);
+        assert_eq!(
+            tracks,
+            vec![
+                SubtitleTrack {
+                    language: "en".into(),
+                    automatic: true,
+                    url: en_native.into(),
+                },
+                SubtitleTrack {
+                    language: "pt".into(),
+                    automatic: true,
+                    url: pt_native.into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn subtitle_parser_deduplicates_single_language_orig_alias_and_manual_hls_mirror() {
+        let single_pt_url =
+            "https://www.youtube.com/api/timedtext?v=Single00001&kind=asr&lang=pt&fmt=vtt";
+        let single_lang_json = serde_json::json!({
+            "subtitles": {},
+            "automatic_captions": {
+                "pt": [{ "ext": "vtt", "url": single_pt_url }],
+                "pt-orig": [{ "ext": "vtt", "url": single_pt_url }]
+            }
+        });
+        let single_tracks = parse_subtitles(&single_lang_json);
+        assert_eq!(
+            single_tracks,
+            vec![SubtitleTrack {
+                language: "pt".into(),
+                automatic: true,
+                url: single_pt_url.into(),
+            }]
+        );
+
+        let manual_pt_br = "https://www.youtube.com/api/timedtext?v=Mirror00001&lang=pt-BR&fmt=vtt";
+        let mirror_hls = "https://manifest.googlevideo.com/api/manifest/hls_timedtext_playlist/tts_params/caps%3Dasr%26lang%3Dpt-BR/playlist/index.m3u8";
+        let mirror_json = serde_json::json!({
+            "subtitles": {
+                "pt-BR": [{ "ext": "vtt", "url": manual_pt_br }]
+            },
+            "automatic_captions": {
+                "pt-BR": [
+                    { "ext": "vtt", "protocol": "m3u8_native", "url": mirror_hls }
+                ]
+            }
+        });
+        let mirror_tracks = parse_subtitles(&mirror_json);
+        assert_eq!(
+            mirror_tracks,
+            vec![SubtitleTrack {
+                language: "pt-BR".into(),
+                automatic: false,
+                url: manual_pt_br.into(),
+            }]
+        );
+        let registered_fallback = subtitle_hls_fallbacks()
+            .lock()
+            .unwrap()
+            .get(manual_pt_br)
+            .cloned();
+        assert_eq!(registered_fallback.as_deref(), Some(mirror_hls));
+    }
+
+    #[test]
+    fn subtitle_parser_prefers_native_hls_over_translated_direct() {
+        let native_hls = "https://manifest.googlevideo.com/api/manifest/hls_timedtext_playlist/tts_params/caps%3Dasr%26kind%3Dasr%26lang%3Dpt/playlist/index.m3u8";
+        let value = serde_json::json!({
+            "subtitles": {},
+            "automatic_captions": {
+                "pt": [
+                    { "ext": "vtt", "protocol": "m3u8_native", "url": native_hls },
+                    { "ext": "vtt", "url": "https://www.youtube.com/api/timedtext?v=HlsNative01&lang=en&tlang=pt&fmt=vtt" }
+                ]
+            }
+        });
+        let tracks = parse_subtitles(&value);
+        assert_eq!(
+            tracks,
+            vec![SubtitleTrack {
+                language: "pt".into(),
+                automatic: true,
+                url: native_hls.into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn validate_vtt_payload_rejects_empty_and_html_responses() {
+        assert!(validate_vtt_payload(String::new()).is_err());
+        assert!(validate_vtt_payload("   \r\n\t ".into()).is_err());
+        assert!(validate_vtt_payload("WEBVTT\n\n".into()).is_err());
+        assert!(
+            validate_vtt_payload("<html><body>429 Too Many Requests</body></html>".into()).is_err()
+        );
+
+        let valid = "WEBVTT\n\n00:00:01.000 --> 00:00:02.500\nOlá mundo\n".to_owned();
+        assert_eq!(validate_vtt_payload(valid.clone()).unwrap(), valid);
+    }
+
+    #[test]
+    fn resolve_yt_dlp_sub_request_handles_hls_and_splits_manual_vs_auto() {
+        let hls_url = "https://manifest.googlevideo.com/api/manifest/hls_timedtext_playlist/playlist/index.m3u8";
+        let (watch_url, lang, flags) = resolve_yt_dlp_sub_request(
+            Some("https://youtu.be/dQw4w9WgXcQ"),
+            hls_url,
+            Some("pt-BR"),
+            Some(false),
+        )
+        .expect("HLS URL with video_url should resolve");
+        assert_eq!(watch_url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+        assert_eq!(lang, "pt-BR");
+        assert_eq!(flags, &["--write-subs"]);
+
+        let (watch_url, lang, flags) = resolve_yt_dlp_sub_request(
+            Some("https://www.youtube.com/watch?v=TedrETAJeNM"),
+            hls_url,
+            Some("pt-orig"),
+            Some(true),
+        )
+        .expect("automatic -orig track should strip suffix and use --write-auto-subs");
+        assert_eq!(watch_url, "https://www.youtube.com/watch?v=TedrETAJeNM");
+        assert_eq!(lang, "pt");
+        assert_eq!(flags, &["--write-auto-subs"]);
+
+        let tlang_url =
+            "https://www.youtube.com/api/timedtext?v=TedrETAJeNM&lang=en&tlang=es&fmt=vtt";
+        let (_, lang, flags) = resolve_yt_dlp_sub_request(None, tlang_url, None, None)
+            .expect("tlang URL without video_url should resolve");
+        assert_eq!(lang, "es");
+        assert_eq!(flags, &["--write-subs", "--write-auto-subs"]);
+    }
+
+    #[test]
+    fn find_matching_subtitle_track_matches_canonical_lang_and_kind() {
+        let tracks = vec![
+            SubtitleTrack {
+                language: "pt".into(),
+                automatic: false,
+                url: "https://www.youtube.com/api/timedtext?v=1&lang=pt&fmt=vtt".into(),
+            },
+            SubtitleTrack {
+                language: "pt".into(),
+                automatic: true,
+                url: "https://www.youtube.com/api/timedtext?v=1&kind=asr&lang=pt&fmt=vtt".into(),
+            },
+            SubtitleTrack {
+                language: "en".into(),
+                automatic: true,
+                url: "https://www.youtube.com/api/timedtext?v=1&kind=asr&lang=en&fmt=vtt".into(),
+            },
+        ];
+
+        let en_auto = find_matching_subtitle_track(&tracks, Some("EN-ORIG"), Some(true))
+            .expect("EN-ORIG should match automatic en track");
+        assert_eq!(en_auto.url, tracks[2].url);
+
+        let pt_manual = find_matching_subtitle_track(&tracks, Some("pt"), Some(false))
+            .expect("manual pt should match manual track");
+        assert_eq!(pt_manual.url, tracks[0].url);
+
+        let pt_auto = find_matching_subtitle_track(&tracks, Some("pt-orig"), Some(true))
+            .expect("automatic pt-orig should match automatic pt track");
+        assert_eq!(pt_auto.url, tracks[1].url);
+
+        let pt_any = find_matching_subtitle_track(&tracks, Some("pt"), None)
+            .expect("unspecified automatic flag should prefer manual track");
+        assert_eq!(pt_any.url, tracks[0].url);
+
+        assert!(find_matching_subtitle_track(&tracks, Some("   "), None).is_none());
+        assert!(find_matching_subtitle_track(&tracks, Some("es"), None).is_none());
+        assert!(find_matching_subtitle_track(&tracks, Some("en"), Some(false)).is_none());
     }
 }

@@ -56,7 +56,7 @@ pub struct LiveChatMessage {
     pub kind: LiveChatMessageKind,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct WatchLiveInfo {
     pub video_id: String,
     pub is_live: bool,
@@ -75,6 +75,10 @@ pub struct WatchLiveInfo {
     pub initial_continuation: Option<String>,
     pub client_version: String,
     pub visitor_data: Option<String>,
+    pub heights: Vec<u32>,
+    pub subtitles: Vec<crate::search::SubtitleTrack>,
+    pub subtitles_parsed: bool,
+    pub storyboard: Option<crate::search::StoryboardSpec>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -682,7 +686,10 @@ pub fn fetch_watch_live_info(
     if bytes.len() > MAX_WATCH_HTML_BYTES {
         return Err("A p\u{00e1}gina do v\u{00ed}deo excedeu o limite de 8 MiB.".into());
     }
-    let html = String::from_utf8_lossy(&bytes).into_owned();
+    let html = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+    };
     if let Some(session) = web_session {
         if let Some(ver) = extract_json_string_field(&html, "INNERTUBE_CLIENT_VERSION") {
             session.client_version = ver;
@@ -692,33 +699,301 @@ pub fn fetch_watch_live_info(
         }
         session.client_config_refreshed = true;
     }
+    if cancel.cancelled() {
+        return Err("Consulta ao vivo cancelada.".into());
+    }
     parse_watch_live_info(video_id, &html)
 }
 
 pub fn parse_watch_live_info(video_id: &str, html: &str) -> Result<WatchLiveInfo, String> {
-    let player_response = extract_assigned_json_object(html, "ytInitialPlayerResponse");
-    let initial_data = extract_assigned_json_object(html, "ytInitialData");
-    if player_response.is_none() && initial_data.is_none() {
-        return Err("Dados da transmiss\u{00e3}o n\u{00e3}o encontrados na p\u{00e1}gina.".into());
-    }
-
     let client_version = extract_json_string_field(html, "INNERTUBE_CLIENT_VERSION")
         .unwrap_or_else(|| FALLBACK_CLIENT_VERSION.to_owned());
     let visitor_data = extract_json_string_field(html, "VISITOR_DATA");
 
-    Ok(build_watch_live_info(
+    let player_response = extract_assigned_json_object(html, "ytInitialPlayerResponse");
+    let has_player_response = player_response.is_some();
+    let mut info = build_watch_live_info_from_player_response(
         video_id,
         player_response.as_ref(),
-        initial_data.as_ref(),
         client_version,
         visitor_data,
-    ))
+    );
+    drop(player_response);
+
+    let initial_data = extract_assigned_json_object(html, "ytInitialData");
+    if !has_player_response && initial_data.is_none() {
+        return Err("Dados da transmiss\u{00e3}o n\u{00e3}o encontrados na p\u{00e1}gina.".into());
+    }
+    if let Some(data) = initial_data.as_ref() {
+        merge_initial_data_into_watch_live_info(&mut info, data);
+    }
+    drop(initial_data);
+
+    Ok(info)
 }
 
-pub fn build_watch_live_info(
+fn parse_player_response_heights(player_response: &Value) -> Vec<u32> {
+    let Some(streaming) = player_response.get("streamingData") else {
+        return Vec::new();
+    };
+    let mut heights = Vec::new();
+    for key in ["adaptiveFormats", "formats"] {
+        let Some(list) = streaming.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        for fmt in list {
+            let is_video = fmt
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .is_some_and(|m| m.starts_with("video/"));
+            if !is_video {
+                continue;
+            }
+            if let Some(h) = fmt
+                .get("height")
+                .and_then(Value::as_u64)
+                .filter(|&h| (1..=16_384).contains(&h))
+                .and_then(|h| u32::try_from(h).ok())
+            {
+                heights.push(h);
+            }
+        }
+    }
+    heights.sort_unstable_by(|a, b| b.cmp(a));
+    heights.dedup();
+    heights
+}
+
+fn normalize_vtt_subtitle_url(raw: &str) -> Option<(String, bool)> {
+    let mut parsed = url::Url::parse(raw).ok()?;
+    let mut has_tlang = false;
+    let pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .filter_map(|(k, v)| {
+            if k == "tlang" {
+                has_tlang = true;
+            }
+            if k == "fmt" {
+                None
+            } else {
+                Some((k.into_owned(), v.into_owned()))
+            }
+        })
+        .collect();
+    {
+        let mut qp = parsed.query_pairs_mut();
+        qp.clear();
+        for (k, v) in &pairs {
+            qp.append_pair(k, v);
+        }
+        qp.append_pair("fmt", "vtt");
+    }
+    let normalized = parsed.to_string();
+    crate::search::is_allowed_subtitle_url(&normalized).then_some((normalized, has_tlang))
+}
+
+fn parse_player_response_subtitles(player_response: &Value) -> Vec<crate::search::SubtitleTrack> {
+    let Some(caption_tracks) = player_response
+        .get("captions")
+        .and_then(|c| c.get("playerCaptionsTracklistRenderer"))
+        .and_then(|r| r.get("captionTracks"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    for track in caption_tracks {
+        let Some(language) = track.get("languageCode").and_then(Value::as_str) else {
+            continue;
+        };
+        if language.is_empty()
+            || language.len() > 64
+            || !language
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            continue;
+        }
+        let Some(base_url) = track.get("baseUrl").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some((url, translated)) = normalize_vtt_subtitle_url(base_url) else {
+            continue;
+        };
+        let automatic = track.get("kind").and_then(Value::as_str) == Some("asr");
+        candidates.push((
+            crate::search::SubtitleTrack {
+                language: language.to_owned(),
+                automatic,
+                url,
+            },
+            translated,
+        ));
+    }
+    let has_native_tracks = candidates.iter().any(|(_, translated)| !translated);
+    let mut tracks: Vec<crate::search::SubtitleTrack> = candidates
+        .into_iter()
+        .filter_map(|(track, translated)| (!has_native_tracks || !translated).then_some(track))
+        .collect();
+    tracks.sort_by(|left, right| {
+        (left.automatic, &left.language).cmp(&(right.automatic, &right.language))
+    });
+    tracks.dedup_by(|a, b| a.automatic == b.automatic && a.language == b.language);
+    tracks.truncate(80);
+    tracks
+}
+
+fn is_valid_ytimg_https_url(parsed: &url::Url) -> bool {
+    let host = parsed.host_str().unwrap_or("");
+    parsed.scheme() == "https"
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && (host == "ytimg.com" || host.ends_with(".ytimg.com"))
+}
+
+fn parse_player_response_storyboard(
+    player_response: &Value,
+) -> Option<crate::search::StoryboardSpec> {
+    let spec = player_response
+        .get("storyboards")?
+        .get("playerStoryboardSpecRenderer")?
+        .get("spec")?
+        .as_str()?
+        .trim();
+    if spec.is_empty() {
+        return None;
+    }
+    let length_val = player_response.get("videoDetails")?.get("lengthSeconds")?;
+    let length_secs = length_val
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| length_val.as_f64())
+        .filter(|d| d.is_finite() && *d > 0.0)?;
+    let mut segments = spec.split('|');
+    let base_url = segments.next()?.trim();
+    let parsed_base = url::Url::parse(base_url).ok()?;
+    if !is_valid_ytimg_https_url(&parsed_base) {
+        return None;
+    }
+
+    struct SbLevel<'a> {
+        index: usize,
+        width: u32,
+        height: u32,
+        total_count: usize,
+        columns: u32,
+        rows: u32,
+        interval_ms: u64,
+        name_pattern: &'a str,
+        sigh: &'a str,
+    }
+
+    let mut levels = Vec::new();
+    for (level_idx, raw_level) in segments.enumerate() {
+        let parts: Vec<&str> = raw_level.split('#').collect();
+        if parts.len() < 8 {
+            continue;
+        }
+        let Ok(width) = parts[0].parse::<u32>() else {
+            continue;
+        };
+        let Ok(height) = parts[1].parse::<u32>() else {
+            continue;
+        };
+        let Ok(total_count) = parts[2].parse::<usize>() else {
+            continue;
+        };
+        let Ok(columns) = parts[3].parse::<u32>() else {
+            continue;
+        };
+        let Ok(rows) = parts[4].parse::<u32>() else {
+            continue;
+        };
+        let Ok(interval_ms) = parts[5].parse::<u64>() else {
+            continue;
+        };
+        let name_pattern = parts[6].trim();
+        let sigh = parts[7].trim();
+        if width == 0
+            || height == 0
+            || !(1..=20_000).contains(&total_count)
+            || !(1..=20).contains(&columns)
+            || !(1..=20).contains(&rows)
+            || name_pattern.is_empty()
+        {
+            continue;
+        }
+        levels.push(SbLevel {
+            index: level_idx,
+            width,
+            height,
+            total_count,
+            columns,
+            rows,
+            interval_ms,
+            name_pattern,
+            sigh,
+        });
+    }
+    let chosen = levels
+        .iter()
+        .filter(|l| l.width <= 320)
+        .max_by_key(|l| l.width)
+        .or_else(|| levels.iter().max_by_key(|l| l.width))?;
+
+    let per_sheet = (chosen.rows as usize) * (chosen.columns as usize);
+    if per_sheet == 0 {
+        return None;
+    }
+    let sheet_count = chosen.total_count.div_ceil(per_sheet).min(512);
+    let frame_dur = if chosen.interval_ms > 0 {
+        chosen.interval_ms as f64 / 1000.0
+    } else {
+        (length_secs / chosen.total_count as f64).max(0.5)
+    };
+    let level_idx_str = chosen.index.to_string();
+    let mut fragments = Vec::with_capacity(sheet_count);
+    for sheet_idx in 0..sheet_count {
+        let sheet_name = chosen.name_pattern.replace("$M", &sheet_idx.to_string());
+        let raw_frag = base_url
+            .replace("$L", &level_idx_str)
+            .replace("$N", &sheet_name);
+        let mut parsed = url::Url::parse(&raw_frag).ok()?;
+        if !chosen.sigh.is_empty() {
+            parsed.query_pairs_mut().append_pair("sigh", chosen.sigh);
+        }
+        if !is_valid_ytimg_https_url(&parsed) {
+            return None;
+        }
+        let frames_in_sheet = if sheet_idx + 1 == sheet_count {
+            chosen
+                .total_count
+                .saturating_sub(sheet_idx * per_sheet)
+                .min(per_sheet)
+                .max(1)
+        } else {
+            per_sheet
+        };
+        fragments.push(crate::search::StoryboardFragment {
+            url: parsed.into(),
+            duration_secs: (frames_in_sheet as f64 * frame_dur).max(1.0),
+        });
+    }
+    if fragments.is_empty() {
+        return None;
+    }
+    Some(crate::search::StoryboardSpec {
+        rows: chosen.rows,
+        columns: chosen.columns,
+        thumb_width: chosen.width,
+        thumb_height: chosen.height,
+        fragments,
+    })
+}
+
+fn build_watch_live_info_from_player_response(
     video_id: &str,
     player_response: Option<&Value>,
-    initial_data: Option<&Value>,
     client_version: String,
     visitor_data: Option<String>,
 ) -> WatchLiveInfo {
@@ -728,7 +1003,7 @@ pub fn build_watch_live_info(
         .and_then(|v| v.get("playerMicroformatRenderer"));
     let live_details = microformat.and_then(|v| v.get("liveBroadcastDetails"));
 
-    let mut is_live = video_details
+    let is_live = video_details
         .and_then(|v| v.get("isLive"))
         .and_then(Value::as_bool)
         == Some(true)
@@ -748,19 +1023,19 @@ pub fn build_watch_live_info(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    let mut channel = video_details
+    let channel = video_details
         .and_then(|v| v.get("author"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    let mut channel_id = video_details
+    let channel_id = video_details
         .and_then(|v| v.get("channelId"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    let mut channel_url = channel_id
+    let channel_url = channel_id
         .as_deref()
         .map(|id| format!("{YOUTUBE_ORIGIN}/channel/{id}"));
     let description = video_details
@@ -770,118 +1045,15 @@ pub fn build_watch_live_info(
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
 
-    let mut channel_avatar_url = None;
-    let mut subscriber_count_text = None;
-    let mut view_count_text = None;
-    let mut concurrent_view_count = None;
-    let mut started_text = None;
-    let mut modes = Vec::new();
-    let mut initial_continuation = None;
-
-    if let Some(data) = initial_data {
-        let two_col = data
-            .get("contents")
-            .and_then(|c| c.get("twoColumnWatchNextResults"));
-
-        if let Some(contents) = two_col
-            .and_then(|tc| tc.get("results"))
-            .and_then(|r| r.get("results"))
-            .and_then(|r| r.get("contents"))
-            .and_then(Value::as_array)
-        {
-            for item in contents {
-                if let Some(primary) = item.get("videoPrimaryInfoRenderer") {
-                    if let Some(vc_renderer) = primary
-                        .get("viewCount")
-                        .and_then(|v| v.get("videoViewCountRenderer"))
-                    {
-                        if vc_renderer.get("isLive").and_then(Value::as_bool) == Some(true) {
-                            is_live = true;
-                        }
-                        if let Some(vc_text) = vc_renderer
-                            .get("viewCount")
-                            .and_then(extract_yt_text)
-                            .filter(|s| !s.is_empty())
-                        {
-                            if concurrent_view_count.is_none() {
-                                concurrent_view_count = parse_digits_count(&vc_text);
-                            }
-                            view_count_text = Some(vc_text);
-                        }
-                    }
-                    if let Some(date_text) = primary
-                        .get("dateText")
-                        .and_then(extract_yt_text)
-                        .filter(|s| !s.is_empty())
-                    {
-                        started_text = Some(date_text);
-                    }
-                }
-                if let Some(secondary) = item.get("videoSecondaryInfoRenderer")
-                    && let Some(owner) = secondary
-                        .get("owner")
-                        .and_then(|o| o.get("videoOwnerRenderer"))
-                {
-                    if channel.is_none() {
-                        channel = owner.get("title").and_then(extract_yt_text);
-                    }
-                    if channel_avatar_url.is_none() {
-                        channel_avatar_url =
-                            owner.get("thumbnail").and_then(extract_best_thumbnail_url);
-                    }
-                    if subscriber_count_text.is_none() {
-                        subscriber_count_text = owner
-                            .get("subscriberCountText")
-                            .and_then(extract_yt_text)
-                            .filter(|s| !s.is_empty());
-                    }
-                    if let Some(browse) = owner
-                        .get("navigationEndpoint")
-                        .and_then(|n| n.get("browseEndpoint"))
-                    {
-                        if channel_id.is_none() {
-                            channel_id = browse
-                                .get("browseId")
-                                .and_then(Value::as_str)
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                                .map(str::to_owned);
-                        }
-                        if let Some(canon) = browse
-                            .get("canonicalBaseUrl")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                        {
-                            channel_url = Some(if canon.starts_with("http") {
-                                canon.to_owned()
-                            } else {
-                                format!("{YOUTUBE_ORIGIN}{canon}")
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(chat_renderer) = two_col
-            .and_then(|tc| tc.get("conversationBar"))
-            .and_then(|cb| cb.get("liveChatRenderer"))
-        {
-            modes = parse_live_chat_modes(chat_renderer);
-            initial_continuation = chat_renderer
-                .get("continuations")
-                .and_then(Value::as_array)
-                .and_then(|arr| arr.iter().find_map(extract_continuation_from_entry))
-                .or_else(|| {
-                    modes
-                        .iter()
-                        .find(|m| m.selected)
-                        .or_else(|| modes.first())
-                        .map(|m| m.continuation.clone())
-                });
-        }
-    }
+    let (heights, subtitles, subtitles_parsed, storyboard) = match player_response {
+        Some(pr) => (
+            parse_player_response_heights(pr),
+            parse_player_response_subtitles(pr),
+            true,
+            parse_player_response_storyboard(pr),
+        ),
+        None => (Vec::new(), Vec::new(), false, None),
+    };
 
     WatchLiveInfo {
         video_id: video_id.to_owned(),
@@ -891,16 +1063,125 @@ pub fn build_watch_live_info(
         channel,
         channel_id,
         channel_url,
-        channel_avatar_url,
-        subscriber_count_text,
-        view_count_text,
-        concurrent_view_count,
-        started_text,
+        channel_avatar_url: None,
+        subscriber_count_text: None,
+        view_count_text: None,
+        concurrent_view_count: None,
+        started_text: None,
         description,
-        modes,
-        initial_continuation,
+        modes: Vec::new(),
+        initial_continuation: None,
         client_version,
         visitor_data,
+        heights,
+        subtitles,
+        subtitles_parsed,
+        storyboard,
+    }
+}
+
+fn merge_initial_data_into_watch_live_info(info: &mut WatchLiveInfo, data: &Value) {
+    let two_col = data
+        .get("contents")
+        .and_then(|c| c.get("twoColumnWatchNextResults"));
+
+    if let Some(contents) = two_col
+        .and_then(|tc| tc.get("results"))
+        .and_then(|r| r.get("results"))
+        .and_then(|r| r.get("contents"))
+        .and_then(Value::as_array)
+    {
+        for item in contents {
+            if let Some(primary) = item.get("videoPrimaryInfoRenderer") {
+                if let Some(vc_renderer) = primary
+                    .get("viewCount")
+                    .and_then(|v| v.get("videoViewCountRenderer"))
+                {
+                    if vc_renderer.get("isLive").and_then(Value::as_bool) == Some(true) {
+                        info.is_live = true;
+                    }
+                    if let Some(vc_text) = vc_renderer
+                        .get("viewCount")
+                        .and_then(extract_yt_text)
+                        .filter(|s| !s.is_empty())
+                    {
+                        if info.concurrent_view_count.is_none() {
+                            info.concurrent_view_count = parse_digits_count(&vc_text);
+                        }
+                        info.view_count_text = Some(vc_text);
+                    }
+                }
+                if let Some(date_text) = primary
+                    .get("dateText")
+                    .and_then(extract_yt_text)
+                    .filter(|s| !s.is_empty())
+                {
+                    info.started_text = Some(date_text);
+                }
+            }
+            if let Some(secondary) = item.get("videoSecondaryInfoRenderer")
+                && let Some(owner) = secondary
+                    .get("owner")
+                    .and_then(|o| o.get("videoOwnerRenderer"))
+            {
+                if info.channel.is_none() {
+                    info.channel = owner.get("title").and_then(extract_yt_text);
+                }
+                if info.channel_avatar_url.is_none() {
+                    info.channel_avatar_url =
+                        owner.get("thumbnail").and_then(extract_best_thumbnail_url);
+                }
+                if info.subscriber_count_text.is_none() {
+                    info.subscriber_count_text = owner
+                        .get("subscriberCountText")
+                        .and_then(extract_yt_text)
+                        .filter(|s| !s.is_empty());
+                }
+                if let Some(browse) = owner
+                    .get("navigationEndpoint")
+                    .and_then(|n| n.get("browseEndpoint"))
+                {
+                    if info.channel_id.is_none() {
+                        info.channel_id = browse
+                            .get("browseId")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned);
+                    }
+                    if let Some(canon) = browse
+                        .get("canonicalBaseUrl")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        info.channel_url = Some(if canon.starts_with("http") {
+                            canon.to_owned()
+                        } else {
+                            format!("{YOUTUBE_ORIGIN}{canon}")
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(chat_renderer) = two_col
+        .and_then(|tc| tc.get("conversationBar"))
+        .and_then(|cb| cb.get("liveChatRenderer"))
+    {
+        info.modes = parse_live_chat_modes(chat_renderer);
+        info.initial_continuation = chat_renderer
+            .get("continuations")
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.iter().find_map(extract_continuation_from_entry))
+            .or_else(|| {
+                info.modes
+                    .iter()
+                    .find(|m| m.selected)
+                    .or_else(|| info.modes.first())
+                    .map(|m| m.continuation.clone())
+            });
     }
 }
 
@@ -2037,5 +2318,81 @@ mod tests {
         let player_resp =
             extract_assigned_json_object(minified_html, "ytInitialPlayerResponse").unwrap();
         assert_eq!(player_resp["videoDetails"]["isLive"], json!(true));
+    }
+
+    #[test]
+    fn parses_heights_subtitles_and_storyboard_from_player_response() {
+        let html = r#"
+        <html><head><script>
+        var ytInitialPlayerResponse = {
+            "videoDetails": {
+                "videoId": "abc12345678",
+                "title": "Test Video",
+                "author": "Tester",
+                "channelId": "UC1234567890123456789012",
+                "lengthSeconds": "120"
+            },
+            "streamingData": {
+                "formats": [
+                    { "mimeType": "video/mp4; codecs=\"avc1\"", "height": 360 },
+                    { "mimeType": "video/mp4; codecs=\"avc1\"", "height": 720 }
+                ],
+                "adaptiveFormats": [
+                    { "mimeType": "video/webm; codecs=\"vp9\"", "height": 1080 },
+                    { "mimeType": "video/webm; codecs=\"vp9\"", "height": 720 },
+                    { "mimeType": "audio/webm; codecs=\"opus\"", "audioQuality": "AUDIO_QUALITY_MEDIUM" }
+                ]
+            },
+            "captions": {
+                "playerCaptionsTracklistRenderer": {
+                    "captionTracks": [
+                        {
+                            "baseUrl": "https://www.youtube.com/api/timedtext?v=abc12345678&lang=pt&fmt=srv3",
+                            "languageCode": "pt"
+                        },
+                        {
+                            "baseUrl": "https://www.youtube.com/api/timedtext?v=abc12345678&lang=en",
+                            "languageCode": "en",
+                            "kind": "asr"
+                        },
+                        {
+                            "baseUrl": "https://evil.example.com/api/timedtext?v=abc12345678&lang=fr",
+                            "languageCode": "fr"
+                        }
+                    ]
+                }
+            },
+            "storyboards": {
+                "playerStoryboardSpecRenderer": {
+                    "spec": "https://i.ytimg.com/sb/abc12345678/storyboard3_L$L/$N.jpg?sqp=123|48#27#100#10#10#0#default#S0|160#90#12#2#2#2000#M$M#S2"
+                }
+            }
+        };
+        </script></head></html>"#;
+
+        let info = parse_watch_live_info("abc12345678", html).unwrap();
+        assert_eq!(info.heights, vec![1080, 720, 360]);
+        assert!(info.subtitles_parsed);
+        assert_eq!(info.subtitles.len(), 2);
+        assert_eq!(info.subtitles[0].language, "pt");
+        assert!(!info.subtitles[0].automatic);
+        assert!(info.subtitles[0].url.contains("fmt=vtt"));
+        assert!(!info.subtitles[0].url.contains("fmt=srv3"));
+        assert_eq!(info.subtitles[1].language, "en");
+        assert!(info.subtitles[1].automatic);
+        assert!(info.subtitles[1].url.contains("fmt=vtt"));
+
+        let sb = info.storyboard.expect("storyboard should be parsed");
+        assert_eq!(sb.rows, 2);
+        assert_eq!(sb.columns, 2);
+        assert_eq!(sb.thumb_width, 160);
+        assert_eq!(sb.thumb_height, 90);
+        assert_eq!(sb.fragments.len(), 3);
+        assert_eq!(
+            sb.fragments[0].url,
+            "https://i.ytimg.com/sb/abc12345678/storyboard3_L1/M0.jpg?sqp=123&sigh=S2"
+        );
+        let (frag_url, _) = sb.lookup(10.0).unwrap();
+        assert_eq!(frag_url, sb.fragments[1].url);
     }
 }

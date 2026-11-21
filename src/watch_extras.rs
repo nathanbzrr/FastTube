@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 static SUBTITLE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
-const SUBTITLE_VTT_CACHE_LIMIT: usize = 16;
+const SUBTITLE_VTT_CACHE_LIMIT: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadySubtitle {
@@ -22,6 +22,7 @@ struct DownloadedSubtitle {
     label: String,
     language: String,
     vtt: String,
+    cues: Vec<crate::transcript::Cue>,
 }
 
 struct TranscriptPayload {
@@ -978,12 +979,27 @@ impl WatchExtras {
         });
     }
     pub fn start_subtitles(&mut self, ctx: &egui::Context) {
-        if self.subtitles_loading.is_some() {
+        self.start_subtitles_inner(false, ctx);
+    }
+
+    pub fn refresh_subtitles(&mut self, ctx: &egui::Context) {
+        self.start_subtitles_inner(true, ctx);
+    }
+
+    fn start_subtitles_inner(&mut self, force_refresh: bool, ctx: &egui::Context) {
+        if !force_refresh && self.subtitles_loading.is_some() {
             return;
         }
         let Some(url) = self.video_url.clone() else {
             return;
         };
+        if force_refresh {
+            if let Some(cancel) = self.subtitles_cancel.take() {
+                cancel.cancel();
+            }
+            self.subtitles_loading = None;
+            self.vtt_cache.clear();
+        }
         let cancel = process::Cancellation::default();
         self.subtitles_cancel = Some(cancel.clone());
         self.subtitles_error = None;
@@ -991,7 +1007,12 @@ impl WatchExtras {
         self.subtitles_loading = Some(receiver);
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let _ = sender.send(search::youtube_subtitles(&url, &cancel));
+            let result = if force_refresh {
+                search::youtube_subtitles_fresh(&url, &cancel)
+            } else {
+                search::youtube_subtitles(&url, &cancel)
+            };
+            let _ = sender.send(result);
             ctx.request_repaint();
         });
     }
@@ -1000,8 +1021,19 @@ impl WatchExtras {
         if self.subtitles_loaded || self.subtitles_loading.is_some() {
             return;
         }
-        self.subtitles = tracks;
+        self.subtitles = search::sanitize_subtitle_tracks(tracks);
         self.subtitles_loaded = true;
+        self.subtitles_error = None;
+    }
+
+    pub fn cancel_active_subtitle(&mut self) {
+        if let Some(cancel) = self.subtitle_apply_cancel.take() {
+            cancel.cancel();
+        }
+        self.subtitle_apply_rx = None;
+        self.ready_subtitle = None;
+        self.active_subtitle_url = None;
+        self.active_subtitle_cues.clear();
         self.subtitles_error = None;
     }
 
@@ -1068,25 +1100,40 @@ impl WatchExtras {
         self.subtitle_apply_rx = None;
         self.ready_subtitle = None;
         self.subtitles_error = None;
+        self.active_subtitle_cues.clear();
+        self.active_subtitle_url = Some(track.url.clone());
         if let Some(vtt) = self.vtt_cache.get(&track.url).cloned() {
-            if let Ok(cues) = crate::transcript::parse_vtt(&vtt) {
-                self.active_subtitle_cues = cues;
-            }
-            match self.ensure_temp_subtitle_file(&track.url, &vtt) {
-                Ok(path) => {
-                    self.ready_subtitle = Some(ReadySubtitle {
-                        url: track.url.clone(),
-                        path,
-                        label,
-                        language: track.language.clone(),
-                    });
+            match crate::transcript::parse_vtt(&vtt) {
+                Ok(cues) if !cues.is_empty() => {
+                    self.active_subtitle_cues = cues;
+                    match self.ensure_temp_subtitle_file(&track.url, &vtt) {
+                        Ok(path) => {
+                            self.ready_subtitle = Some(ReadySubtitle {
+                                url: track.url.clone(),
+                                path,
+                                label,
+                                language: track.language.clone(),
+                            });
+                        }
+                        Err(error) => {
+                            self.active_subtitle_url = None;
+                            self.active_subtitle_cues.clear();
+                            self.subtitles_error = Some(error);
+                        }
+                    }
                 }
-                Err(error) => self.subtitles_error = Some(error),
+                _ => {
+                    self.vtt_cache.remove(&track.url);
+                    self.active_subtitle_url = None;
+                    self.active_subtitle_cues.clear();
+                    self.subtitles_error =
+                        Some("A faixa selecionada não contém texto de legenda.".into());
+                }
             }
             return;
         }
-        let url = track.url.clone();
-        let language = track.language.clone();
+        let video_url = self.video_url.clone();
+        let track_owned = track.clone();
         let cancel = process::Cancellation::default();
         self.subtitle_apply_cancel = Some(cancel.clone());
         let (tx, rx) = mpsc::channel();
@@ -1096,18 +1143,20 @@ impl WatchExtras {
             let result = if cancel.cancelled() {
                 Err("Download da legenda cancelado.".into())
             } else {
-                search::download_vtt(&url).and_then(|vtt| {
-                    let cues = crate::transcript::parse_vtt(&vtt).map_err(str::to_owned)?;
-                    if cues.is_empty() {
-                        return Err("A faixa selecionada não contém texto de legenda.".into());
-                    }
-                    Ok(DownloadedSubtitle {
-                        url,
-                        label,
-                        language,
-                        vtt,
+                search::download_vtt_for_track(video_url.as_deref(), &track_owned, &cancel)
+                    .and_then(|vtt| {
+                        let cues = crate::transcript::parse_vtt(&vtt).map_err(str::to_owned)?;
+                        if cues.is_empty() {
+                            return Err("A faixa selecionada não contém texto de legenda.".into());
+                        }
+                        Ok(DownloadedSubtitle {
+                            url: track_owned.url,
+                            label,
+                            language: track_owned.language,
+                            vtt,
+                            cues,
+                        })
                     })
-                })
             };
             let _ = tx.send(result);
             ctx.request_repaint();
@@ -1140,7 +1189,8 @@ impl WatchExtras {
             return;
         }
         self.transcript_loading = true;
-        let url = track.url.clone();
+        let video_url = self.video_url.clone();
+        let track_owned = track.clone();
         let cancel = process::Cancellation::default();
         self.transcript_cancel = Some(cancel.clone());
         let (tx, rx) = mpsc::channel();
@@ -1150,13 +1200,18 @@ impl WatchExtras {
             let result = if cancel.cancelled() {
                 Err("Consulta cancelada.".into())
             } else {
-                search::download_vtt(&url).and_then(|vtt| {
-                    let cues = crate::transcript::parse_vtt(&vtt).map_err(str::to_owned)?;
-                    if cues.is_empty() {
-                        return Err("A faixa selecionada não contém trechos de legenda.".into());
-                    }
-                    Ok(TranscriptPayload { url, vtt, cues })
-                })
+                search::download_vtt_for_track(video_url.as_deref(), &track_owned, &cancel)
+                    .and_then(|vtt| {
+                        let cues = crate::transcript::parse_vtt(&vtt).map_err(str::to_owned)?;
+                        if cues.is_empty() {
+                            return Err("A faixa selecionada não contém trechos de legenda.".into());
+                        }
+                        Ok(TranscriptPayload {
+                            url: track_owned.url,
+                            vtt,
+                            cues,
+                        })
+                    })
             };
             let _ = tx.send(result);
             ctx.request_repaint();
@@ -1233,12 +1288,11 @@ impl WatchExtras {
         let subtitle_apply_result = self.subtitle_apply_rx.as_ref().map(Receiver::try_recv);
         match subtitle_apply_result {
             Some(Ok(Ok(downloaded))) => {
-                if let Ok(cues) = crate::transcript::parse_vtt(&downloaded.vtt) {
-                    self.active_subtitle_cues = cues;
-                }
+                self.active_subtitle_cues = downloaded.cues;
                 self.cache_vtt(&downloaded.url, downloaded.vtt.clone());
                 match self.ensure_temp_subtitle_file(&downloaded.url, &downloaded.vtt) {
                     Ok(path) => {
+                        self.active_subtitle_url = Some(downloaded.url.clone());
                         self.ready_subtitle = Some(ReadySubtitle {
                             url: downloaded.url,
                             path,
@@ -1246,17 +1300,25 @@ impl WatchExtras {
                             language: downloaded.language,
                         });
                     }
-                    Err(error) => self.subtitles_error = Some(error),
+                    Err(error) => {
+                        self.active_subtitle_url = None;
+                        self.active_subtitle_cues.clear();
+                        self.subtitles_error = Some(error);
+                    }
                 }
                 self.subtitle_apply_rx = None;
                 self.subtitle_apply_cancel = None;
             }
             Some(Ok(Err(error))) => {
+                self.active_subtitle_url = None;
+                self.active_subtitle_cues.clear();
                 self.subtitles_error = Some(error);
                 self.subtitle_apply_rx = None;
                 self.subtitle_apply_cancel = None;
             }
             Some(Err(TryRecvError::Disconnected)) => {
+                self.active_subtitle_url = None;
+                self.active_subtitle_cues.clear();
                 self.subtitles_error = Some("Download da legenda interrompido.".into());
                 self.subtitle_apply_rx = None;
                 self.subtitle_apply_cancel = None;
@@ -1418,8 +1480,9 @@ impl WatchExtras {
         }
         match self.subtitles_loading.as_ref().map(Receiver::try_recv) {
             Some(Ok(Ok(tracks))) => {
-                self.subtitles = tracks;
+                self.subtitles = search::sanitize_subtitle_tracks(tracks);
                 self.subtitles_loaded = true;
+                self.subtitles_error = None;
                 self.subtitles_loading = None;
                 self.subtitles_cancel = None;
             }
@@ -1811,6 +1874,7 @@ mod tests {
             url: "https://www.youtube.com/api/timedtext?v=one&lang=pt-BR".into(),
         };
         let vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nOlá mundo\n".to_owned();
+        let cues = crate::transcript::parse_vtt(&vtt).unwrap();
         let (tx, rx) = mpsc::channel();
         extras.subtitle_apply_rx = Some(rx);
         tx.send(Ok(DownloadedSubtitle {
@@ -1818,6 +1882,7 @@ mod tests {
             label: "pt-BR".into(),
             language: "pt-BR".into(),
             vtt,
+            cues,
         }))
         .unwrap();
 
@@ -2175,5 +2240,133 @@ No vídeo anterior que gravamos lá pelas 12:30 falamos bastante sobre isso.
         extras.start_transcript(&track, &egui::Context::default());
         assert!(!extras.transcript_loading);
         assert_eq!(extras.transcript, vec![cue]);
+    }
+
+    #[test]
+    fn switching_or_failing_subtitle_clears_stale_cues_and_active_url() {
+        let mut extras = WatchExtras::default();
+        extras.sync_video(Some("https://www.youtube.com/watch?v=video000001"));
+        let en_url = "https://www.youtube.com/api/timedtext?v=video000001&lang=en&fmt=vtt";
+        let pt_url = "https://www.youtube.com/api/timedtext?v=video000001&lang=pt&fmt=vtt";
+        extras.active_subtitle_url = Some(en_url.into());
+        extras.active_subtitle_cues = vec![crate::transcript::Cue {
+            start_ms: 0,
+            end_ms: 2_000,
+            text: "English line".into(),
+        }];
+
+        // Selecting a non-cached track (simulated here via invalid/unresolvable URL) clears old cues immediately.
+        let pt_track = search::SubtitleTrack {
+            language: "pt".into(),
+            automatic: true,
+            url: pt_url.into(),
+        };
+        let (tx, rx) = mpsc::channel();
+        extras.start_apply_subtitle(
+            &pt_track,
+            "pt (automática)".into(),
+            &egui::Context::default(),
+        );
+        assert!(extras.active_subtitle_cues.is_empty());
+        assert_eq!(extras.active_subtitle_url.as_deref(), Some(pt_url));
+
+        // Cancel real worker and inject simulated failure to verify failure cleanup deterministically.
+        if let Some(cancel) = extras.subtitle_apply_cancel.take() {
+            cancel.cancel();
+        }
+        extras.subtitle_apply_rx = Some(rx);
+        tx.send(Err("HTTP 429".into())).unwrap();
+        extras.poll();
+
+        assert!(extras.active_subtitle_url.is_none());
+        assert!(extras.active_subtitle_cues.is_empty());
+        assert_eq!(extras.subtitles_error.as_deref(), Some("HTTP 429"));
+
+        // Disconnected channel also clears active_subtitle_url and active_subtitle_cues.
+        extras.active_subtitle_url = Some(pt_url.into());
+        extras.active_subtitle_cues = vec![crate::transcript::Cue {
+            start_ms: 0,
+            end_ms: 1_000,
+            text: "Stale".into(),
+        }];
+        let (tx_drop, rx_drop) = mpsc::channel::<Result<DownloadedSubtitle, String>>();
+        drop(tx_drop);
+        extras.subtitle_apply_rx = Some(rx_drop);
+        extras.poll();
+        assert!(extras.active_subtitle_url.is_none());
+        assert!(extras.active_subtitle_cues.is_empty());
+        assert!(extras.subtitles_error.is_some());
+    }
+
+    #[test]
+    fn cancel_active_subtitle_cancels_inflight_download_and_clears_state() {
+        let mut extras = WatchExtras::default();
+        extras.sync_video(Some("https://www.youtube.com/watch?v=video000001"));
+        let cancel = process::Cancellation::default();
+        let (tx, rx) = mpsc::channel();
+        extras.subtitle_apply_cancel = Some(cancel.clone());
+        extras.subtitle_apply_rx = Some(rx);
+        extras.active_subtitle_url =
+            Some("https://www.youtube.com/api/timedtext?v=video000001&lang=en&fmt=vtt".into());
+        extras.active_subtitle_cues = vec![crate::transcript::Cue {
+            start_ms: 0,
+            end_ms: 2_000,
+            text: "Old cue".into(),
+        }];
+        extras.ready_subtitle = Some(ReadySubtitle {
+            url: "https://www.youtube.com/api/timedtext?v=video000001&lang=en&fmt=vtt".into(),
+            path: PathBuf::from("nonexistent.vtt"),
+            label: "en".into(),
+            language: "en".into(),
+        });
+        extras.subtitles_error = Some("Erro".into());
+
+        extras.cancel_active_subtitle();
+
+        assert!(cancel.cancelled());
+        assert!(extras.subtitle_apply_rx.is_none());
+        assert!(extras.take_ready_subtitle().is_none());
+        assert!(extras.active_subtitle_url.is_none());
+        assert!(extras.active_subtitle_cues.is_empty());
+        assert!(extras.subtitles_error.is_none());
+
+        let send_res = tx.send(Ok(DownloadedSubtitle {
+            url: "https://www.youtube.com/api/timedtext?v=video000001&lang=en&fmt=vtt".into(),
+            label: "en".into(),
+            language: "en".into(),
+            vtt: "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nLate\n".into(),
+            cues: vec![],
+        }));
+        assert!(send_res.is_err());
+        extras.poll();
+        assert!(extras.active_subtitle_url.is_none());
+        assert!(extras.active_subtitle_cues.is_empty());
+    }
+
+    #[test]
+    fn apply_preloaded_subtitles_deduplicates_orig_and_duplicate_urls() {
+        let mut extras = WatchExtras::default();
+        extras.sync_video(Some("https://www.youtube.com/watch?v=video000001"));
+        let pt_url = "https://www.youtube.com/api/timedtext?v=video000001&kind=asr&lang=pt&fmt=vtt";
+        extras.apply_preloaded_subtitles(vec![
+            search::SubtitleTrack {
+                language: "pt-orig".into(),
+                automatic: true,
+                url: pt_url.into(),
+            },
+            search::SubtitleTrack {
+                language: "pt".into(),
+                automatic: true,
+                url: pt_url.into(),
+            },
+        ]);
+        assert_eq!(
+            extras.subtitles,
+            vec![search::SubtitleTrack {
+                language: "pt".into(),
+                automatic: true,
+                url: pt_url.into(),
+            }]
+        );
     }
 }

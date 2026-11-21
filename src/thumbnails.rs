@@ -27,8 +27,8 @@ const MAX_CACHED_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_THUMBNAIL_DECODE_WIDTH: u32 = 640;
 const MAX_THUMBNAIL_DECODE_HEIGHT: u32 = 360;
 const MAX_AVATAR_DECODE_SIZE: u32 = 96;
-const MAX_STORYBOARD_DECODE_SIZE: u32 = 2048;
-const MAX_RETAINED_STORYBOARD_SHEETS: usize = 12;
+const MAX_STORYBOARD_DECODE_SIZE: u32 = 1024;
+const MAX_RETAINED_STORYBOARD_SHEETS: usize = 4;
 const THUMBNAIL_FADE_DURATION_SECS: f32 = 0.14;
 const IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(12);
 const MTIME_TOUCH_INTERVAL: Duration = Duration::from_secs(60);
@@ -108,7 +108,7 @@ fn decode_color_image(
     if img.width() > limit_w || img.height() > limit_h {
         img = img.resize(limit_w, limit_h, image::imageops::FilterType::Triangle);
     }
-    let rgba = img.to_rgba8();
+    let rgba = img.into_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     Ok(egui::ColorImage::from_rgba_unmultiplied(
         size,
@@ -1265,7 +1265,9 @@ fn paint_avatar_circle_ring(ui: &egui::Ui, rect: Rect) {
     );
 }
 
-pub const MAX_RETAINED_AVATARS: usize = 64;
+pub const MAX_RETAINED_AVATARS: usize = 48;
+const MAX_CONCURRENT_AVATAR_LOADS: usize = 4;
+const MAX_CONCURRENT_STORYBOARD_LOADS: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AvatarEntryState {
@@ -1474,6 +1476,17 @@ impl AvatarCache {
         }
 
         let is_new = !already_tracked;
+        if is_new && uses_disk_worker {
+            let in_flight = self
+                .entries
+                .values()
+                .filter(|entry| matches!(entry.state, AvatarEntryState::Loading { .. }))
+                .count();
+            if in_flight >= MAX_CONCURRENT_AVATAR_LOADS {
+                ctx.request_repaint_after(Duration::from_millis(60));
+                return false;
+            }
+        }
         if let Some(evicted) = self.touch_or_insert(trimmed, now) {
             ctx.forget_image(&evicted);
         }
@@ -1658,6 +1671,17 @@ impl StoryboardSheetCache {
         }
 
         let is_new = !already_tracked;
+        if is_new && uses_disk_worker {
+            let in_flight = self
+                .entries
+                .values()
+                .filter(|entry| matches!(entry.state, AvatarEntryState::Loading { .. }))
+                .count();
+            if in_flight >= MAX_CONCURRENT_STORYBOARD_LOADS {
+                ctx.request_repaint_after(Duration::from_millis(60));
+                return None;
+            }
+        }
         self.access_counter = self.access_counter.wrapping_add(1);
         let tick = self.access_counter;
         if is_new {

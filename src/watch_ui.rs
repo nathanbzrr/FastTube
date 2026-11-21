@@ -390,9 +390,12 @@ impl FastTube {
         let mut video_area: Option<(egui::Rect, egui::Response)> = None;
         let audio_only = self.playback.audio_only;
         let selected = self.selected.as_ref();
+        let selected_url = selected.map(|v| v.url.as_str());
         let fullscreen = self.playback.fullscreen;
         let theater = self.playback.theater;
         let mini_player = self.playback.mini_player;
+        let cached_raw_path = self.playback.cached_raw_path.clone();
+        let cached_raw_path_poll = self.playback.cached_raw_path_poll;
         let player = self.player.as_mut()?;
         let (events, poll_error) = player.poll_events();
 
@@ -430,6 +433,14 @@ impl FastTube {
         }
         player.resize(rect, ctx.pixels_per_point());
 
+        let refresh_raw_path = !events.is_empty()
+            || cached_raw_path.as_deref() != selected_url
+            || cached_raw_path_poll.is_none_or(|t| t.elapsed() >= Duration::from_millis(500));
+        let raw_path = if refresh_raw_path {
+            player.property_cstr(c"path")
+        } else {
+            cached_raw_path
+        };
         let width_num = player.double_cstr(c"width");
         let height_num = player.double_cstr(c"height");
         let video_size = VideoSize::from_numbers(width_num, height_num);
@@ -440,7 +451,7 @@ impl FastTube {
             muted: player.flag_cstr(c"mute").unwrap_or(false),
             ended: player.flag_cstr(c"eof-reached").unwrap_or(false),
             seekable: player.flag_cstr(c"seekable"),
-            raw_path: player.property_cstr(c"path"),
+            raw_path,
             raw_position: player.double_cstr(c"time-pos").filter(|&pos| pos >= 0.0),
             raw_duration: player.double_cstr(c"duration").filter(|&dur| dur > 0.0),
             buffered_secs: player.buffered_duration_secs(),
@@ -452,6 +463,10 @@ impl FastTube {
             current_height: height_num.map(|height| height as u32),
             video_size,
         };
+        if refresh_raw_path {
+            self.playback.cached_raw_path = telemetry.raw_path.clone();
+            self.playback.cached_raw_path_poll = Some(Instant::now());
+        }
         Some((video_area, telemetry))
     }
 
@@ -464,11 +479,15 @@ impl FastTube {
             self.playback.in_app_mini_player = false;
             self.playback.player_context_menu = None;
             let was_fullscreen = self.playback.fullscreen;
+            let fullscreen_restore_maximized =
+                std::mem::take(&mut self.playback.fullscreen_restore_maximized);
             if was_fullscreen {
                 self.playback.fullscreen = false;
+                self.playback.fullscreen_sync_retries = 0;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
             }
-            let was_maximized = maximized.unwrap_or(false);
+            let was_maximized = maximized.unwrap_or(false) || fullscreen_restore_maximized;
             self.playback.mini_player_restore_maximized = was_maximized;
             if !was_maximized && !was_fullscreen {
                 self.playback.mini_player_restore_size = inner_rect.map(|rect| rect.size());
@@ -564,6 +583,7 @@ impl FastTube {
             if (is_fullscreen || is_maximized) && pending.frames_left > 0 {
                 if is_fullscreen {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
                 }
                 if is_maximized {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
@@ -670,6 +690,7 @@ impl FastTube {
         match result {
             Ok(()) => {
                 self.playback.quality = quality;
+                self.playback.cached_raw_path_poll = None;
                 self.message.clear();
                 if let Some(active) = &mut self.playback.active {
                     let pos_ms = (position * 1000.0).round() as u64;
@@ -767,6 +788,18 @@ impl FastTube {
         self.watch.overlay_cache.chapters.clone()
     }
 
+    fn subtitle_track_label(track: &search::SubtitleTrack) -> String {
+        format!(
+            "{}{}",
+            track.language,
+            if track.automatic {
+                " (automática)"
+            } else {
+                ""
+            }
+        )
+    }
+
     pub(crate) fn collect_overlay_subtitles(
         &mut self,
     ) -> (bool, Vec<overlay::OverlaySubtitleOption>) {
@@ -856,17 +889,13 @@ impl FastTube {
             }
         }
 
+        let mut matched_yt = false;
         for track in &self.watch.extras.subtitles {
-            let label = format!(
-                "{}{}",
-                track.language,
-                if track.automatic {
-                    " (automática)"
-                } else {
-                    ""
-                }
-            );
-            let active = active_yt_url == Some(track.url.as_str());
+            let label = Self::subtitle_track_label(track);
+            let active = !matched_yt && active_yt_url == Some(track.url.as_str());
+            if active {
+                matched_yt = true;
+            }
             options.push(overlay::OverlaySubtitleOption {
                 id: format!("yt:{}", track.url),
                 label,
@@ -885,8 +914,7 @@ impl FastTube {
             if let Some(active) = options.into_iter().find(|opt| opt.active) {
                 self.playback.last_subtitle_id = Some(active.id);
             }
-            self.watch.extras.active_subtitle_url = None;
-            self.watch.extras.active_subtitle_cues.clear();
+            self.watch.extras.cancel_active_subtitle();
             #[cfg(windows)]
             if let Some(player) = &self.player
                 && let Err(error) = player.disable_subtitles()
@@ -897,8 +925,7 @@ impl FastTube {
         };
 
         if let Some(sid) = raw.strip_prefix("mpv:") {
-            self.watch.extras.active_subtitle_url = None;
-            self.watch.extras.active_subtitle_cues.clear();
+            self.watch.extras.cancel_active_subtitle();
             self.playback.last_subtitle_id = Some(raw.to_owned());
             #[cfg(windows)]
             if let Some(player) = &self.player {
@@ -920,17 +947,18 @@ impl FastTube {
                 .find(|t| t.url == url)
                 .cloned()
         {
-            let label = format!(
-                "{}{}",
-                track.language,
-                if track.automatic {
-                    " (automática)"
-                } else {
-                    ""
-                }
-            );
+            if self.watch.extras.active_subtitle_url.as_deref() == Some(track.url.as_str())
+                && !self.watch.extras.active_subtitle_cues.is_empty()
+                && !self.watch.extras.is_subtitle_applying()
+            {
+                return;
+            }
+            let label = Self::subtitle_track_label(&track);
+            #[cfg(windows)]
+            if let Some(player) = &self.player {
+                let _ = player.disable_subtitles();
+            }
             self.playback.last_subtitle_id = Some(raw.to_owned());
-            self.watch.extras.active_subtitle_url = Some(track.url.clone());
             self.watch.extras.start_apply_subtitle(&track, label, ctx);
             self.apply_ready_subtitle();
         }
@@ -960,7 +988,7 @@ impl FastTube {
         } else {
             if !self.watch.extras.subtitles_loaded
                 && self.watch.extras.subtitles_loading.is_none()
-                && self.playback.quality_rx.is_none()
+                && !self.is_playback_metadata_loading()
             {
                 self.watch.extras.start_subtitles(ctx);
             }
@@ -1314,7 +1342,7 @@ impl FastTube {
                     .unwrap_or_else(|| format!("Qualidade: {preferred} (não confirmada)"))
             }
         };
-        let quality_tip = if self.playback.quality_rx.is_some() {
+        let quality_tip = if self.is_playback_metadata_loading() {
             "Consultando as resoluções disponíveis...".to_owned()
         } else {
             self.playback
@@ -1392,8 +1420,8 @@ impl FastTube {
                     }
                 });
             if selected != current {
+                self.watch.extras.cancel_active_subtitle();
                 let result = if selected == "no" {
-                    self.watch.extras.active_subtitle_url = None;
                     player.disable_subtitles()
                 } else {
                     player
@@ -1578,6 +1606,7 @@ impl FastTube {
         for event in telemetry.events.iter().cloned() {
             self.handle_queue_player_event(event);
         }
+        self.maybe_start_deferred_quality_fallback(ctx);
         if let Some(error) = telemetry.poll_error.clone() {
             self.message = error;
             self.report_pending_queue_load_error();
@@ -1785,20 +1814,19 @@ impl FastTube {
             current_height: telemetry.current_height,
             selected_quality: self.playback.quality,
             qualities: self.playback.qualities.clone(),
-            qualities_loading: self.playback.quality_rx.is_some(),
+            qualities_loading: self.is_playback_metadata_loading(),
             has_queued,
             has_active_subtitle,
             subtitles,
             subtitles_loading: self.watch.extras.subtitles_loading.is_some()
                 || self.watch.extras.is_subtitle_applying()
-                || (!self.watch.extras.subtitles_loaded && self.playback.quality_rx.is_some()),
+                || (!self.watch.extras.subtitles_loaded && self.is_playback_metadata_loading()),
             chapters,
             theater: theater_mode,
             fullscreen,
             mini_player: self.playback.mini_player,
             autoplay: self.playback.autoplay,
             loop_video: self.playback.loop_video,
-            can_bookmark: history::youtube_video_id(&video.url).is_some(),
             is_live,
             is_live_dvr,
             at_live_edge,
@@ -2584,7 +2612,6 @@ impl FastTube {
                 subtitles: playback.subtitles.clone(),
                 subtitles_loading: playback.subtitles_loading,
                 audio_tracks: self.playback.audio_tracks.clone(),
-                aspect_zoom: self.playback.aspect_zoom,
                 audio_eq: self.playback.audio_eq,
                 brightness: self.playback.brightness,
                 contrast: self.playback.contrast,
@@ -2602,7 +2629,6 @@ impl FastTube {
                 loop_a_secs: self.playback.loop_a_secs,
                 loop_b_secs: self.playback.loop_b_secs,
                 audio_only: self.playback.audio_only,
-                can_bookmark: playback.can_bookmark,
                 is_live: playback.is_live,
                 is_live_dvr: playback.is_live_dvr,
                 at_live_edge: playback.at_live_edge,
@@ -3053,24 +3079,8 @@ impl FastTube {
                     }
                 }
             }
-            OverlayAction::SetLoopA => {
-                if !playback.is_live {
-                    self.set_ab_loop_point_a(playback.position);
-                }
-            }
-            OverlayAction::SetLoopB => {
-                if !playback.is_live {
-                    self.set_ab_loop_point_b(playback.position);
-                }
-            }
-            OverlayAction::ClearLoopAB => {
-                self.clear_ab_loop_points();
-            }
             OverlayAction::ToggleAudioOnly => {
                 self.toggle_audio_only_mode();
-            }
-            OverlayAction::CaptureScreenshot => {
-                self.capture_player_screenshot(&playback.video, playback.position);
             }
             OverlayAction::ToggleCaptions => self.toggle_player_captions(ctx),
             OverlayAction::SelectSubtitle(id) => {
@@ -3090,15 +3100,6 @@ impl FastTube {
                 }
                 #[cfg(not(windows))]
                 let _ = id;
-            }
-            OverlayAction::SetAspectZoom(mode) => {
-                self.playback.aspect_zoom = mode;
-                #[cfg(windows)]
-                if let Some(player) = &self.player
-                    && let Err(error) = player.set_aspect_zoom(mode)
-                {
-                    self.message = error;
-                }
             }
             OverlayAction::SetAudioEq(preset) => {
                 self.playback.audio_eq = preset;
@@ -3185,11 +3186,6 @@ impl FastTube {
                 #[cfg(not(windows))]
                 let _ = target;
             }
-            OverlayAction::AddBookmark => {
-                if self.add_current_bookmark(&playback.video, playback.position) {
-                    self.save_library();
-                }
-            }
             OverlayAction::OpenAppSettings => {
                 if self.playback.fullscreen {
                     self.toggle_fullscreen(ctx);
@@ -3202,10 +3198,17 @@ impl FastTube {
                 self.sync_player_window_visibility();
             }
             OverlayAction::SetMenu(menu) => {
+                if menu == Some(overlay::OverlayMenu::Quality)
+                    && self.playback.qualities.is_empty()
+                    && self.playback.quality_rx.is_none()
+                    && let Some(url) = self.playback.quality_fallback_url.take()
+                {
+                    self.start_quality_metadata_fallback(url, ctx);
+                }
                 if menu == Some(overlay::OverlayMenu::Subtitles)
                     && !self.watch.extras.subtitles_loaded
                     && self.watch.extras.subtitles_loading.is_none()
-                    && self.playback.quality_rx.is_none()
+                    && !self.is_playback_metadata_loading()
                 {
                     self.watch.extras.start_subtitles(ctx);
                 }
@@ -4354,7 +4357,7 @@ impl FastTube {
                 self.watch.extras.tab = watch_extras::Tab::Results;
                 if !self.watch.extras.subtitles_loaded
                     && self.watch.extras.subtitles_loading.is_none()
-                    && self.playback.quality_rx.is_none()
+                    && !self.is_playback_metadata_loading()
                 {
                     let ctx = ui.ctx().clone();
                     self.watch.extras.start_subtitles(&ctx);
@@ -4849,7 +4852,7 @@ impl FastTube {
             self.watch.extras.tab = watch_extras::Tab::Results;
             if !self.watch.extras.subtitles_loaded
                 && self.watch.extras.subtitles_loading.is_none()
-                && self.playback.quality_rx.is_none()
+                && !self.is_playback_metadata_loading()
             {
                 self.watch.extras.start_subtitles(&ctx);
             }
@@ -7297,14 +7300,12 @@ impl FastTube {
                     )
                     .clicked()
                     {
-                        self.watch.extras.start_subtitles(ctx);
+                        self.watch.extras.refresh_subtitles(ctx);
                     }
                     if has_active_player_subtitle
                         && styled_ghost_button(ui, "Desativar", &palette).clicked()
                     {
-                        self.watch.extras.active_subtitle_url = None;
-                        self.watch.extras.active_subtitle_cues.clear();
-                        self.watch.extras.subtitles_error = None;
+                        self.watch.extras.cancel_active_subtitle();
                         #[cfg(windows)]
                         if let Some(player) = &self.player
                             && let Err(error) = player.disable_subtitles()
@@ -7366,15 +7367,7 @@ impl FastTube {
                         for track in &self.watch.extras.subtitles {
                             let is_active = has_active_player_subtitle
                                 && active_url == Some(track.url.as_str());
-                            let label = format!(
-                                "{}{}",
-                                track.language,
-                                if track.automatic {
-                                    " (automática)"
-                                } else {
-                                    ""
-                                }
-                            );
+                            let label = Self::subtitle_track_label(track);
                             let button_text = if is_active {
                                 format!("{label} ✓")
                             } else {
@@ -7400,7 +7393,11 @@ impl FastTube {
                     });
             });
         if let Some((track, label)) = chosen {
-            self.watch.extras.active_subtitle_url = Some(track.url.clone());
+            #[cfg(windows)]
+            if let Some(player) = &self.player {
+                let _ = player.disable_subtitles();
+            }
+            self.playback.last_subtitle_id = Some(format!("yt:{}", track.url));
             self.watch.extras.start_apply_subtitle(&track, label, ctx);
             self.apply_ready_subtitle();
         }

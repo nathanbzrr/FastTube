@@ -1205,7 +1205,6 @@ pub(crate) struct OverlayPlaybackContext {
     pub(crate) mini_player: bool,
     pub(crate) autoplay: bool,
     pub(crate) loop_video: bool,
-    pub(crate) can_bookmark: bool,
     pub(crate) is_live: bool,
     pub(crate) is_live_dvr: bool,
     pub(crate) at_live_edge: bool,
@@ -2259,27 +2258,38 @@ impl FastTube {
                 .value
                 .preferred_subtitle_lang
                 .trim()
-                .to_ascii_lowercase();
+                .to_ascii_lowercase()
+                .replace('_', "-");
             let pref = if pref.is_empty() { "pt" } else { pref.as_str() };
-            let matches_pref = |lang: &str| {
-                let lower = lang.trim().to_ascii_lowercase();
+            let matches_exact_or_region = |lang: &str| {
+                let lower = lang.trim().to_ascii_lowercase().replace('_', "-");
                 lower == pref
                     || lower
                         .strip_prefix(pref)
-                        .is_some_and(|rest| rest.starts_with('-') || rest.starts_with('_'))
+                        .is_some_and(|rest| rest.starts_with('-'))
             };
-            let chosen = self
-                .watch
-                .extras
-                .subtitles
+            let base_pref = pref.split_once('-').map(|(base, _)| base);
+            let matches_base = |lang: &str| {
+                let Some(base) = base_pref else {
+                    return false;
+                };
+                lang.trim().to_ascii_lowercase().replace('_', "-") == base
+            };
+            let subs = &self.watch.extras.subtitles;
+            let chosen = subs
                 .iter()
-                .filter(|t| !t.automatic && matches_pref(&t.language))
+                .filter(|t| !t.automatic && matches_exact_or_region(&t.language))
                 .chain(
-                    self.watch
-                        .extras
-                        .subtitles
-                        .iter()
-                        .filter(|t| t.automatic && matches_pref(&t.language)),
+                    subs.iter()
+                        .filter(|t| !t.automatic && matches_base(&t.language)),
+                )
+                .chain(
+                    subs.iter()
+                        .filter(|t| t.automatic && matches_exact_or_region(&t.language)),
+                )
+                .chain(
+                    subs.iter()
+                        .filter(|t| t.automatic && matches_base(&t.language)),
                 )
                 .next()
                 .cloned();
@@ -2791,6 +2801,7 @@ impl FastTube {
                 self.message = error;
                 return;
             }
+            self.playback.cached_raw_path_poll = None;
             let _ = player.set("pause", "no");
         }
         #[cfg(not(windows))]
@@ -3022,6 +3033,141 @@ impl FastTube {
         }
     }
 
+    pub(crate) fn is_playback_metadata_loading(&self) -> bool {
+        self.playback.quality_rx.is_some()
+            || (self.watch.live.watch_info_loading && self.playback.qualities.is_empty())
+    }
+
+    pub(crate) fn start_quality_metadata_fallback(&mut self, url: String, ctx: &egui::Context) {
+        if let Some(cancel) = self.playback.quality_cancel.take() {
+            cancel.cancel();
+        }
+        let cancel = process::Cancellation::default();
+        let (sender, receiver) = mpsc::channel();
+        self.playback.quality_cancel = Some(cancel.clone());
+        self.playback.quality_rx = Some(receiver);
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(search::playback_metadata_with_cancel(&url, &cancel));
+            ctx_clone.request_repaint();
+        });
+    }
+
+    pub(crate) fn maybe_start_deferred_quality_fallback(&mut self, ctx: &egui::Context) {
+        if self.playback.quality_rx.is_some() || !self.playback.current_file_loaded {
+            return;
+        }
+        let Some(url) = self.playback.quality_fallback_url.take() else {
+            return;
+        };
+        if self.selected.as_ref().is_some_and(|v| v.url == url) {
+            self.start_quality_metadata_fallback(url, ctx);
+        }
+    }
+
+    pub(crate) fn prune_session_caches(&mut self) {
+        if self.video_metadata.len() > 250 {
+            let mut keep_urls = HashSet::new();
+            if let Some(selected) = &self.selected {
+                keep_urls.insert(selected.url.clone());
+            }
+            for video in &self.feed.videos {
+                keep_urls.insert(video.url.clone());
+            }
+            for video in self.queue.data.videos() {
+                keep_urls.insert(video.url.clone());
+            }
+            for video in &self.playback.video_back_stack {
+                keep_urls.insert(video.url.clone());
+            }
+            for video in &self.playback.video_forward_stack {
+                keep_urls.insert(video.url.clone());
+            }
+            if let Some(page) = &self.channels.page {
+                for item in &page.videos {
+                    keep_urls.insert(item.video.url.clone());
+                }
+                if let Some(featured) = &page.featured_video {
+                    keep_urls.insert(featured.video.url.clone());
+                }
+                for shelf in &page.home_shelves {
+                    for item in &shelf.items {
+                        keep_urls.insert(item.video.url.clone());
+                    }
+                }
+            }
+            for item in &self.channels.videos.sorted_items {
+                keep_urls.insert(item.video.url.clone());
+            }
+            for item in &self.channels.shorts.items {
+                keep_urls.insert(item.video.url.clone());
+            }
+            for item in &self.channels.streams.items {
+                keep_urls.insert(item.video.url.clone());
+            }
+            for item in &self.channels.search.items {
+                keep_urls.insert(item.video.url.clone());
+            }
+            for item in &self.channels.playlist_detail.items {
+                keep_urls.insert(item.video.url.clone());
+            }
+            for item in &self.library.liked_videos.items {
+                keep_urls.insert(item.video.url.clone());
+            }
+            for item in &self.followed_channels.feed_items {
+                keep_urls.insert(item.video.url.clone());
+            }
+            self.video_metadata.retain(|url, _| keep_urls.contains(url));
+            let min_cap = self.video_metadata.len().max(64);
+            if self.video_metadata.capacity() > min_cap.saturating_mul(4) {
+                self.video_metadata.shrink_to(min_cap);
+            }
+        }
+        if self.feed.home.channel_avatars.len() > 300 {
+            let mut keep_channels = HashSet::new();
+            for ch in &self.feed.home.subscription_channels {
+                let key = recommendations::normalize_channel_key(&ch.title);
+                if !key.is_empty() {
+                    keep_channels.insert(key);
+                }
+            }
+            for video in &self.feed.videos {
+                let key = recommendations::normalize_channel_key(&video.channel);
+                if !key.is_empty() {
+                    keep_channels.insert(key);
+                }
+            }
+            if let Some(selected) = &self.selected {
+                let key = recommendations::normalize_channel_key(&selected.channel);
+                if !key.is_empty() {
+                    keep_channels.insert(key);
+                }
+            }
+            if let Some(page) = &self.channels.page {
+                if let Some(title) = page.title.as_deref() {
+                    let key = recommendations::normalize_channel_key(title);
+                    if !key.is_empty() {
+                        keep_channels.insert(key);
+                    }
+                }
+                for item in &page.videos {
+                    let key = recommendations::normalize_channel_key(&item.video.channel);
+                    if !key.is_empty() {
+                        keep_channels.insert(key);
+                    }
+                }
+            }
+            self.feed
+                .home
+                .channel_avatars
+                .retain(|k, _| keep_channels.contains(k));
+            let min_cap = self.feed.home.channel_avatars.len().max(64);
+            if self.feed.home.channel_avatars.capacity() > min_cap.saturating_mul(4) {
+                self.feed.home.channel_avatars.shrink_to(min_cap);
+            }
+        }
+    }
+
     pub(crate) fn handle_watch_live_info_result(
         &mut self,
         session_id: u64,
@@ -3061,8 +3207,44 @@ impl FastTube {
                 let subscriber_count_text = info.subscriber_count_text.clone();
                 let description = info.description.clone();
                 let concurrent_view_count = info.concurrent_view_count;
+                let heights = info.heights.clone();
+                let subtitles = info.subtitles.clone();
+                let subtitles_parsed = info.subtitles_parsed;
+                let storyboard = info.storyboard.clone();
                 self.watch.live.info = Some(info);
+                if !heights.is_empty() {
+                    self.playback.qualities = heights.clone();
+                    self.playback.quality_error = None;
+                    self.playback.quality_fallback_url = None;
+                }
+                if storyboard.is_some() {
+                    self.playback.storyboard = storyboard.clone();
+                    self.playback.storyboard_video_url = video_url.clone();
+                }
+                if subtitles_parsed {
+                    self.watch
+                        .extras
+                        .apply_preloaded_subtitles(subtitles.clone());
+                    self.watch.overlay_cache.mpv_subs_last_poll = None;
+                    self.watch.overlay_cache.force_refresh = true;
+                }
                 if let Some(url) = video_url.as_deref() {
+                    search::prime_playback_metadata_cache(
+                        url,
+                        &heights,
+                        &subtitles,
+                        subtitles_parsed,
+                        search::PlaybackExtraInfo {
+                            is_live,
+                            title: title.clone(),
+                            channel: channel.clone(),
+                            channel_id: channel_id.clone(),
+                            channel_url: channel_url.clone(),
+                            description: description.clone(),
+                            concurrent_view_count,
+                            storyboard: storyboard.clone(),
+                        },
+                    );
                     self.apply_live_metadata_to_video(
                         url,
                         is_live,
@@ -3084,9 +3266,24 @@ impl FastTube {
                 if self.watch.live.chat_visible && self.watch.live.stream_rx.is_none() {
                     self.start_live_chat_stream_if_needed(ctx);
                 }
+                if heights.is_empty()
+                    && self.playback.qualities.is_empty()
+                    && self.playback.quality_rx.is_none()
+                    && let Some(url) = video_url
+                {
+                    self.playback.quality_fallback_url = Some(url);
+                    self.maybe_start_deferred_quality_fallback(ctx);
+                }
             }
             Err(err) => {
                 self.watch.live.watch_info_error = Some(err);
+                if self.playback.qualities.is_empty()
+                    && self.playback.quality_rx.is_none()
+                    && let Some(url) = self.watch.live.video_url.clone()
+                {
+                    self.playback.quality_fallback_url = Some(url);
+                    self.maybe_start_deferred_quality_fallback(ctx);
+                }
             }
         }
     }
@@ -6437,6 +6634,10 @@ impl FastTube {
         self.playback.qualities.clear();
         self.playback.quality_rx = None;
         self.playback.quality_error = None;
+        self.playback.quality_fallback_url = None;
+        self.playback.current_file_loaded = false;
+        self.playback.cached_raw_path = None;
+        self.playback.cached_raw_path_poll = None;
         self.playback.seek_drag = None;
         self.reset_decoding_diagnostics();
         self.selected_metadata = self.metadata_for(&next_video.url).cloned();
@@ -6554,6 +6755,10 @@ impl FastTube {
         self.playback.qualities.clear();
         self.playback.quality_rx = None;
         self.playback.quality_error = None;
+        self.playback.quality_fallback_url = None;
+        self.playback.current_file_loaded = false;
+        self.playback.cached_raw_path = None;
+        self.playback.cached_raw_path_poll = None;
         self.playback.seek_drag = None;
         self.reset_decoding_diagnostics();
         self.selected_metadata = self.metadata_for(&next_video.url).cloned();
@@ -6819,13 +7024,21 @@ impl FastTube {
     }
 
     pub(crate) fn handle_queue_player_event(&mut self, event: PlaybackEvent) {
-        if matches!(
-            event,
-            PlaybackEvent::StartFile { .. } | PlaybackEvent::FileLoaded
-        ) {
-            self.watch.overlay_cache.chapters_last_poll = None;
-            self.watch.overlay_cache.mpv_subs_last_poll = None;
-            self.watch.overlay_cache.force_refresh = true;
+        match event {
+            PlaybackEvent::StartFile { .. } => {
+                self.playback.cached_raw_path_poll = None;
+                self.watch.overlay_cache.chapters_last_poll = None;
+                self.watch.overlay_cache.mpv_subs_last_poll = None;
+                self.watch.overlay_cache.force_refresh = true;
+            }
+            PlaybackEvent::FileLoaded => {
+                self.playback.current_file_loaded = true;
+                self.playback.cached_raw_path_poll = None;
+                self.watch.overlay_cache.chapters_last_poll = None;
+                self.watch.overlay_cache.mpv_subs_last_poll = None;
+                self.watch.overlay_cache.force_refresh = true;
+            }
+            PlaybackEvent::EndFile { .. } => {}
         }
         match self.queue.correlation.handle(event) {
             QueueLoadResult::Confirmed { .. } => {
@@ -8054,9 +8267,12 @@ impl FastTube {
     pub(crate) fn clear_visual_caches(&mut self, ctx: &egui::Context) {
         let current_videos = std::mem::take(&mut self.feed.videos);
         self.thumbnails.reset(ctx, &current_videos);
+        self.thumbnails.clear_storyboards(ctx);
+        self.avatars.evict_all_gpu_textures(ctx);
         self.feed.videos = current_videos;
         self.playback.qualities.clear();
         search::clear_in_memory_caches();
+        self.prune_session_caches();
         self.feed.cache_dirty = true;
         self.settings.buffer.notice = Some(
             "Miniaturas e resoluções em cache foram liberadas. O feed continua disponível e os dados locais não foram alterados."
@@ -8549,8 +8765,9 @@ impl FastTube {
         self.poll_home(ctx);
         self.poll_liked_videos();
         self.poll_quality();
-        self.maybe_auto_activate_subtitle(ctx);
         self.poll_live_watch(ctx);
+        self.maybe_auto_activate_subtitle(ctx);
+        self.maybe_start_deferred_quality_fallback(ctx);
         self.poll_search(ctx);
         self.poll_search_suggestions(ctx);
         self.poll_channel(ctx);
@@ -9531,7 +9748,6 @@ impl FastTube {
                     self.settings.prefs.value.audio_normalization,
                     self.playback.audio_eq,
                 );
-                let _ = player.set_aspect_zoom(self.playback.aspect_zoom);
                 let _ = player.set_video_eq(
                     self.playback.brightness,
                     self.playback.contrast,
@@ -9561,6 +9777,10 @@ impl FastTube {
             self.playback.quality = None;
             self.playback.qualities.clear();
             self.playback.quality_error = None;
+            self.playback.quality_fallback_url = None;
+            self.playback.current_file_loaded = false;
+            self.playback.cached_raw_path = None;
+            self.playback.cached_raw_path_poll = None;
             self.playback.storyboard = None;
             self.playback.storyboard_video_url = None;
             self.playback.audio_tracks.clear();
@@ -9576,22 +9796,25 @@ impl FastTube {
             self.start_watch_live_for_selected(&video, ctx);
             self.start_sponsorblock_fetch(&video.url, ctx);
             self.start_community_extras_fetch(&video.url, ctx);
-            let (sender, receiver) = mpsc::channel();
             if let Some(cancel) = self.playback.quality_cancel.take() {
                 cancel.cancel();
             }
-            let cancel = process::Cancellation::default();
-            self.playback.quality_cancel = Some(cancel.clone());
-            self.playback.quality_rx = Some(receiver);
-            let url = video.url.clone();
-            let ctx_clone = ctx.clone();
-            std::thread::spawn(move || {
-                let _ = sender.send(search::playback_metadata_with_cancel(&url, &cancel));
-                ctx_clone.request_repaint();
-            });
+            self.playback.quality_rx = None;
+            if let Some(cached) = search::cached_playback_metadata(&video.url) {
+                self.playback.qualities = cached.heights;
+                self.playback.storyboard = cached.storyboard;
+                self.playback.storyboard_video_url = Some(video.url.clone());
+                self.watch
+                    .extras
+                    .apply_preloaded_subtitles(cached.subtitles);
+            } else if history::youtube_video_id(&video.url).is_none() {
+                self.playback.quality_fallback_url = Some(video.url.clone());
+            }
             self.selected_metadata = self.metadata_for(&video.url).cloned();
             self.feed.metadata_revision = self.feed.metadata_revision.wrapping_add(1);
+            self.watch.metadata_cache = app_state::WatchMetadataUiCache::default();
             self.watch.overlay_cache = app_state::OverlayCache::default();
+            self.prune_session_caches();
             self.playback.last_video_size_url = None;
             self.playback.last_video_size = None;
             let sub_target = self.channel_target_for_video(&video);
@@ -9672,6 +9895,8 @@ impl FastTube {
         self.invalidate_feed_cache();
         self.selected_metadata = None;
         self.feed.metadata_revision = self.feed.metadata_revision.wrapping_add(1);
+        self.watch.metadata_cache = app_state::WatchMetadataUiCache::default();
+        self.watch.sidebar_cache = app_state::WatchSidebarCache::default();
         self.watch.overlay_cache = app_state::OverlayCache::default();
         self.playback.last_video_size_url = None;
         self.playback.last_video_size = None;
@@ -9687,12 +9912,17 @@ impl FastTube {
         self.playback.qualities.clear();
         self.playback.quality_rx = None;
         self.playback.quality_error = None;
+        self.playback.quality_fallback_url = None;
+        self.playback.current_file_loaded = false;
+        self.playback.cached_raw_path = None;
+        self.playback.cached_raw_path_poll = None;
         self.playback.storyboard = None;
         self.playback.storyboard_video_url = None;
         self.playback.audio_tracks.clear();
         self.playback.audio_tracks_video_url = None;
         self.playback.audio_tracks_last_poll = None;
         self.thumbnails.clear_storyboards(ctx);
+        self.prune_session_caches();
         self.playback.active_buffer = None;
         self.playback.active_hwdec = None;
         self.playback.clear_ab_loop();
@@ -9716,18 +9946,69 @@ impl FastTube {
     }
 
     pub(crate) fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
-        if !self.playback.fullscreen && self.playback.mini_player {
-            self.toggle_mini_player(ctx);
-        }
         if !self.playback.fullscreen {
+            let current_maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+            let mut restore_maximized = current_maximized;
+            if self.playback.mini_player {
+                restore_maximized |=
+                    std::mem::take(&mut self.playback.mini_player_restore_maximized);
+                self.toggle_mini_player(ctx);
+            }
             self.playback.in_app_mini_player = false;
+            self.playback.fullscreen = true;
+            self.playback.fullscreen_restore_maximized = restore_maximized;
+            self.playback.fullscreen_sync_retries = 3;
+            self.playback.player_context_menu = None;
+            self.playback.overlay_last_activity = Instant::now();
+            self.playback.overlay_last_pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+            if current_maximized {
+                // Clear WS_MAXIMIZE before entering fullscreen; winit's WM_NCCALCSIZE clamps maximized windows to rcWork.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+            // Force egui-winit to clear MARKER_UNDECORATED_SHADOW while fullscreen to avoid a 1px WM_NCCALCSIZE offset.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+        } else {
+            let restore_maximized = std::mem::take(&mut self.playback.fullscreen_restore_maximized);
+            self.playback.fullscreen = false;
+            self.playback.fullscreen_sync_retries = 0;
+            self.playback.player_context_menu = None;
+            self.playback.overlay_last_activity = Instant::now();
+            self.playback.overlay_last_pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            // Restore undecorated drop shadow after leaving fullscreen.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+            if restore_maximized {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            }
         }
-        self.playback.fullscreen = !self.playback.fullscreen;
-        self.playback.player_context_menu = None;
-        self.playback.overlay_last_activity = Instant::now();
-        self.playback.overlay_last_pointer_pos = ctx.input(|i| i.pointer.hover_pos());
-        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.playback.fullscreen));
         self.sync_player_window_visibility();
+    }
+
+    pub(crate) fn sync_fullscreen_viewport(&mut self, ctx: &egui::Context) {
+        if !self.playback.fullscreen {
+            return;
+        }
+        let (is_maximized, is_fullscreen) = ctx.input(|input| {
+            let vp = input.viewport();
+            (vp.maximized == Some(true), vp.fullscreen == Some(true))
+        });
+        if is_maximized {
+            if self.playback.fullscreen_sync_retries > 0 {
+                self.playback.fullscreen_sync_retries -= 1;
+                self.playback.fullscreen_restore_maximized = true;
+                if is_fullscreen {
+                    // winit ignores set_fullscreen(Borderless(None)) when already fullscreen; reset first to reapply bounds.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+                ctx.request_repaint();
+            }
+        } else if is_fullscreen {
+            self.playback.fullscreen_sync_retries = 3;
+        }
     }
 
     pub(crate) fn toggle_theater_mode(&mut self) {
@@ -12522,6 +12803,7 @@ impl eframe::App for FastTube {
             self.message = err.to_owned();
         }
         self.poll_async_tasks(&ctx);
+        self.sync_fullscreen_viewport(&ctx);
         self.sync_mini_player_viewport(&ctx);
         let initial_viewport_width = ui.available_width();
         if !self.ui.initial_sidebar_synced {
