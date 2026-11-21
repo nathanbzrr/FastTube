@@ -37,6 +37,13 @@ if (-not $OutputDirectory) {
     $OutputDirectory = Join-Path $repoRoot 'target\installer'
 }
 
+foreach ($pathName in @('TargetDirectory', 'StagingDirectory', 'OutputDirectory', 'ExecutablePath')) {
+    $pathValue = Get-Variable -Name $pathName -ValueOnly
+    if ($pathValue -and -not [IO.Path]::IsPathRooted($pathValue)) {
+        Set-Variable -Name $pathName -Value ([IO.Path]::GetFullPath((Join-Path $repoRoot $pathValue)))
+    }
+}
+
 if (-not $InnoSetupCompiler) {
     $cmd = Get-Command iscc -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($cmd) {
