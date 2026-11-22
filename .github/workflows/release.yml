@@ -20,6 +20,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -146,8 +148,43 @@ jobs:
           name: fasttube-windows-x64-${{ steps.meta.outputs.version }}
           path: target/release-assets/*
 
-      - name: Publish GitHub Release
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
         if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.meta.outputs.version }}"
+          $changelogPath = 'CHANGELOG.md'
+          $hasNotes = $false
+          if (Test-Path -LiteralPath $changelogPath -PathType Leaf) {
+            $content = Get-Content -LiteralPath $changelogPath -Raw -Encoding UTF8
+            $escapedVer = [regex]::Escape($ver)
+            $pattern = "(?ms)^## \[$escapedVer\][^\r\n]*\r?\n(.*?)(?=^## \[|\z)"
+            if ($content -match $pattern) {
+              $sectionBody = $Matches[1].Trim()
+              if (-not [string]::IsNullOrWhiteSpace($sectionBody)) {
+                $notes = $sectionBody
+                $prevTag = (& git describe --tags --abbrev=0 "$($env:GITHUB_REF_NAME)^" 2>$null)
+                if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($prevTag)) {
+                  $prevTag = $prevTag.Trim()
+                  $notes += "`n`n**Full Changelog**: https://github.com/$($env:GITHUB_REPOSITORY)/compare/$prevTag...$($env:GITHUB_REF_NAME)"
+                }
+                Set-Content -LiteralPath target\release-notes.md -Value $notes -Encoding UTF8
+                $hasNotes = $true
+              }
+            }
+          }
+          "has_notes=$($hasNotes.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Publish GitHub Release (from CHANGELOG.md)
+        if: startsWith(github.ref, 'refs/tags/') && steps.notes.outputs.has_notes == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release-assets/*
+          body_path: target/release-notes.md
+
+      - name: Publish GitHub Release (auto-generated)
+        if: startsWith(github.ref, 'refs/tags/') && steps.notes.outputs.has_notes != 'true'
         uses: softprops/action-gh-release@v2
         with:
           files: target/release-assets/*
