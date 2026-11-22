@@ -4,7 +4,7 @@ use crate::session;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
 
 pub(crate) const YOUTUBE_ORIGIN: &str = "https://www.youtube.com";
@@ -26,6 +26,9 @@ pub struct YouTubeWebSession {
     pub client_version: String,
     pub visitor_data: Option<String>,
     pub client_config_refreshed: bool,
+    pub delegated_session_id: Option<String>,
+    pub api_key: Option<String>,
+    pub auth_user_index: u8,
 }
 
 impl Drop for YouTubeWebSession {
@@ -35,6 +38,12 @@ impl Drop for YouTubeWebSession {
         }
         if let Some(visitor) = &mut self.visitor_data {
             visitor.zeroize();
+        }
+        if let Some(delegated) = &mut self.delegated_session_id {
+            delegated.zeroize();
+        }
+        if let Some(api_key) = &mut self.api_key {
+            api_key.zeroize();
         }
     }
 }
@@ -46,6 +55,12 @@ impl fmt::Debug for YouTubeWebSession {
             .field("client_version", &self.client_version)
             .field("has_visitor_data", &self.visitor_data.is_some())
             .field("client_config_refreshed", &self.client_config_refreshed)
+            .field(
+                "has_delegated_session_id",
+                &self.delegated_session_id.is_some(),
+            )
+            .field("has_api_key", &self.api_key.is_some())
+            .field("auth_user_index", &self.auth_user_index)
             .finish()
     }
 }
@@ -63,6 +78,9 @@ impl YouTubeWebSession {
             client_version: FALLBACK_CLIENT_VERSION.into(),
             visitor_data: Some("test-visitor".into()),
             client_config_refreshed: true,
+            delegated_session_id: None,
+            api_key: None,
+            auth_user_index: 0,
         }
     }
 
@@ -104,6 +122,9 @@ impl YouTubeWebSession {
             client_version: FALLBACK_CLIENT_VERSION.into(),
             visitor_data: None,
             client_config_refreshed: false,
+            delegated_session_id: None,
+            api_key: None,
+            auth_user_index: 0,
         })
     }
 
@@ -195,11 +216,21 @@ impl YouTubeWebSession {
         let Ok(html) = response.text() else {
             return;
         };
-        if let Some(version) = extract_json_string_field(&html, "INNERTUBE_CLIENT_VERSION") {
+        let fields = crate::innertube::parse_ytcfg_session_fields(&html);
+        if let Some(version) = fields.client_version {
             self.client_version = version;
         }
-        if let Some(visitor) = extract_json_string_field(&html, "VISITOR_DATA") {
+        if let Some(visitor) = fields.visitor_data {
             self.visitor_data = Some(visitor);
+        }
+        if let Some(api_key) = fields.api_key {
+            self.api_key = Some(api_key);
+        }
+        if fields.delegated_session_id.is_some() {
+            self.delegated_session_id = fields.delegated_session_id;
+        }
+        if let Some(auth_idx) = fields.auth_user_index {
+            self.auth_user_index = auth_idx;
         }
     }
 }
@@ -409,11 +440,7 @@ impl InnerTubeError {
 }
 
 pub(crate) fn http_client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| "N\u{00e3}o foi poss\u{00ed}vel iniciar a conex\u{00e3}o segura.".into())
+    Ok(crate::http_client::no_redirect().clone())
 }
 
 fn unix_timestamp_secs() -> u64 {
@@ -428,7 +455,19 @@ pub fn post_innertube_at(
     client: &reqwest::blocking::Client,
     session: &mut YouTubeWebSession,
     endpoint: &str,
+    body: Value,
+    cancel: &Cancellation,
+) -> Result<Value, InnerTubeError> {
+    post_innertube_with_locale_at(base_url, client, session, endpoint, body, "pt", cancel)
+}
+
+pub fn post_innertube_with_locale_at(
+    base_url: &str,
+    client: &reqwest::blocking::Client,
+    session: &mut YouTubeWebSession,
+    endpoint: &str,
     mut body: Value,
+    hl: &str,
     cancel: &Cancellation,
 ) -> Result<Value, InnerTubeError> {
     if cancel.cancelled() {
@@ -443,7 +482,7 @@ pub fn post_innertube_at(
     let mut client_ctx = json!({
         "clientName": "WEB",
         "clientVersion": session.client_version,
-        "hl": "pt",
+        "hl": hl,
         "gl": "BR",
     });
     if let Some(visitor) = &session.visitor_data
@@ -452,7 +491,19 @@ pub fn post_innertube_at(
         obj.insert("visitorData".into(), Value::String(visitor.clone()));
     }
     if let Some(obj) = body.as_object_mut() {
-        obj.insert("context".into(), json!({ "client": client_ctx }));
+        let mut ctx_val = json!({ "client": client_ctx });
+        if let Some(page_id) = session
+            .delegated_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            ctx_val["user"] = json!({
+                "lockedSafetyMode": false,
+                "onBehalfOfUser": page_id,
+            });
+        }
+        obj.insert("context".into(), ctx_val);
     }
     let url = format!("{base_url}/{endpoint}?prettyPrint=false");
     let mut request = client
@@ -463,12 +514,21 @@ pub fn post_innertube_at(
         .header("Origin", YOUTUBE_ORIGIN)
         .header("X-Origin", YOUTUBE_ORIGIN)
         .header(reqwest::header::REFERER, format!("{YOUTUBE_ORIGIN}/"))
-        .header("X-Goog-AuthUser", "0")
+        .header("X-Goog-AuthUser", session.auth_user_index.to_string())
+        .header("X-Youtube-Bootstrap-Logged-In", "true")
         .header("X-Youtube-Client-Name", "1")
         .header("X-Youtube-Client-Version", &session.client_version)
         .json(&body);
     if let Some(visitor) = &session.visitor_data {
         request = request.header("X-Goog-Visitor-Id", visitor);
+    }
+    if let Some(page_id) = session
+        .delegated_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        request = request.header("X-Goog-PageId", page_id);
     }
 
     let response = request
@@ -566,6 +626,337 @@ pub fn perform_comment_action_at(
     )?;
     validate_perform_comment_action_response(&response)?;
     Ok(response)
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CommentReportReason {
+    Spam,
+    Harassment,
+    HateSpeech,
+    Misinformation,
+    UnwantedCommercial,
+    Other,
+}
+
+impl CommentReportReason {
+    #[allow(dead_code)]
+    pub const ALL: [Self; 6] = [
+        Self::Spam,
+        Self::Harassment,
+        Self::HateSpeech,
+        Self::Misinformation,
+        Self::UnwantedCommercial,
+        Self::Other,
+    ];
+
+    #[allow(dead_code)]
+    pub fn label(self, pt: bool) -> &'static str {
+        match self {
+            Self::Spam => {
+                if pt {
+                    "Spam ou conteúdo enganoso"
+                } else {
+                    "Spam or misleading"
+                }
+            }
+            Self::Harassment => {
+                if pt {
+                    "Assédio ou bullying"
+                } else {
+                    "Harassment or bullying"
+                }
+            }
+            Self::HateSpeech => {
+                if pt {
+                    "Discurso de ódio"
+                } else {
+                    "Hate speech"
+                }
+            }
+            Self::Misinformation => {
+                if pt {
+                    "Desinformação"
+                } else {
+                    "Misinformation"
+                }
+            }
+            Self::UnwantedCommercial => {
+                if pt {
+                    "Conteúdo comercial indesejado"
+                } else {
+                    "Unwanted commercial content"
+                }
+            }
+            Self::Other => {
+                if pt {
+                    "Outro motivo"
+                } else {
+                    "Other"
+                }
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn innertube_reason_code(self) -> &'static str {
+        match self {
+            Self::Spam => "SPAM_OR_MISLEADING",
+            Self::Harassment => "HARASSMENT_OR_BULLYING",
+            Self::HateSpeech => "HATE_SPEECH",
+            Self::Misinformation => "MISINFORMATION",
+            Self::UnwantedCommercial => "UNWANTED_COMMERCIAL_CONTENT",
+            Self::Other => "OTHER",
+        }
+    }
+}
+
+/// Builds a `comment/update_comment` payload for editing the user's own comment.
+#[allow(dead_code)]
+pub fn build_edit_comment_payload(
+    update_comment_params: &str,
+    new_text: &str,
+) -> Result<Value, InnerTubeError> {
+    let params = update_comment_params.trim();
+    let text = new_text.trim();
+    if params.is_empty() || params.len() > 4096 {
+        return Err(InnerTubeError::Other(
+            "Token de edição do comentário ausente ou inválido.".into(),
+        ));
+    }
+    if text.is_empty() || text.chars().count() > 10_000 {
+        return Err(InnerTubeError::Other(
+            "O texto do comentário não pode estar vazio.".into(),
+        ));
+    }
+    Ok(json!({
+        "updateCommentParams": params,
+        "commentText": text,
+    }))
+}
+
+#[allow(dead_code)]
+pub fn edit_comment_at(
+    base_url: &str,
+    client: &reqwest::blocking::Client,
+    session: &mut YouTubeWebSession,
+    update_comment_params: &str,
+    new_text: &str,
+    cancel: &Cancellation,
+) -> Result<Value, InnerTubeError> {
+    let payload = build_edit_comment_payload(update_comment_params, new_text)?;
+    let response = post_innertube_at(
+        base_url,
+        client,
+        session,
+        "comment/update_comment",
+        payload,
+        cancel,
+    )?;
+    validate_perform_comment_action_response(&response)?;
+    Ok(response)
+}
+
+#[allow(dead_code)]
+pub fn edit_comment(
+    session: &mut YouTubeWebSession,
+    update_comment_params: &str,
+    new_text: &str,
+    cancel: &Cancellation,
+) -> Result<Value, InnerTubeError> {
+    let client = http_client().map_err(InnerTubeError::Other)?;
+    session.refresh_client_config_if_needed(&client, cancel);
+    edit_comment_at(
+        INNERTUBE_BASE_URL,
+        &client,
+        session,
+        update_comment_params,
+        new_text,
+        cancel,
+    )
+}
+
+/// Builds a `comment/perform_comment_action` payload for deleting the user's own comment.
+#[allow(dead_code)]
+pub fn build_delete_comment_payload(delete_action_token: &str) -> Result<Value, InnerTubeError> {
+    let token = delete_action_token.trim();
+    if token.is_empty() || token.len() > 4096 {
+        return Err(InnerTubeError::Other(
+            "Token de exclusão do comentário ausente ou inválido.".into(),
+        ));
+    }
+    Ok(json!({ "actions": [token] }))
+}
+
+#[allow(dead_code)]
+pub fn delete_comment_at(
+    base_url: &str,
+    client: &reqwest::blocking::Client,
+    session: &mut YouTubeWebSession,
+    delete_action_token: &str,
+    cancel: &Cancellation,
+) -> Result<Value, InnerTubeError> {
+    let payload = build_delete_comment_payload(delete_action_token)?;
+    let response = post_innertube_at(
+        base_url,
+        client,
+        session,
+        "comment/perform_comment_action",
+        payload,
+        cancel,
+    )?;
+    validate_perform_comment_action_response(&response)?;
+    Ok(response)
+}
+
+#[allow(dead_code)]
+pub fn delete_comment(
+    session: &mut YouTubeWebSession,
+    delete_action_token: &str,
+    cancel: &Cancellation,
+) -> Result<Value, InnerTubeError> {
+    let client = http_client().map_err(InnerTubeError::Other)?;
+    session.refresh_client_config_if_needed(&client, cancel);
+    delete_comment_at(
+        INNERTUBE_BASE_URL,
+        &client,
+        session,
+        delete_action_token,
+        cancel,
+    )
+}
+
+fn is_valid_comment_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// Deletes the user's own comment via YouTube Data API v3 (`DELETE /comments?id=...`) using OAuth.
+#[allow(dead_code)]
+pub fn delete_comment_oauth_at(
+    api_base_url: &str,
+    client: &reqwest::blocking::Client,
+    access_token: &str,
+    comment_id: &str,
+    cancel: &Cancellation,
+) -> Result<(), InnerTubeError> {
+    if cancel.cancelled() {
+        return Err(InnerTubeError::Cancelled("Operação cancelada.".into()));
+    }
+    let cid = comment_id.trim();
+    if !is_valid_comment_id(cid) {
+        return Err(InnerTubeError::Other("ID de comentário inválido.".into()));
+    }
+    let token = access_token.trim();
+    if token.is_empty() {
+        return Err(InnerTubeError::AuthExpired(
+            "Token OAuth ausente. Entre novamente.".into(),
+        ));
+    }
+    let url = format!("{}/comments?id={cid}", api_base_url.trim_end_matches('/'));
+    let response = client
+        .delete(&url)
+        .bearer_auth(token)
+        .send()
+        .map_err(|_| InnerTubeError::Other("Falha de conexão ao excluir comentário.".into()))?;
+    if cancel.cancelled() {
+        return Err(InnerTubeError::Cancelled("Operação cancelada.".into()));
+    }
+    let status = response.status();
+    if matches!(status.as_u16(), 401 | 403) {
+        return Err(InnerTubeError::AuthExpired(
+            "Sua sessão do YouTube expirou ou não tem permissão para excluir comentários.".into(),
+        ));
+    }
+    if !status.is_success() {
+        return Err(InnerTubeError::Other(format!(
+            "Não foi possível excluir o comentário (HTTP {}).",
+            status.as_u16()
+        )));
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn delete_comment_oauth(
+    access_token: &str,
+    comment_id: &str,
+    cancel: &Cancellation,
+) -> Result<(), InnerTubeError> {
+    let client = http_client().map_err(InnerTubeError::Other)?;
+    delete_comment_oauth_at(
+        "https://www.googleapis.com/youtube/v3",
+        &client,
+        access_token,
+        comment_id,
+        cancel,
+    )
+}
+
+/// Builds a `flag/flag` payload for reporting a comment with a reason and optional details.
+#[allow(dead_code)]
+pub fn build_report_comment_payload(
+    flag_action: &str,
+    reason: CommentReportReason,
+    details: Option<&str>,
+) -> Result<Value, InnerTubeError> {
+    let action = flag_action.trim();
+    if action.is_empty() || action.len() > 4096 {
+        return Err(InnerTubeError::Other(
+            "Token de denúncia do comentário ausente ou inválido.".into(),
+        ));
+    }
+    let mut payload = json!({
+        "action": action,
+        "reason": reason.innertube_reason_code(),
+    });
+    if let Some(extra) = details.map(str::trim).filter(|s| !s.is_empty()) {
+        let bounded: String = extra.chars().take(1000).collect();
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("userComment".into(), Value::String(bounded));
+        }
+    }
+    Ok(payload)
+}
+
+#[allow(dead_code)]
+pub fn report_comment_at(
+    base_url: &str,
+    client: &reqwest::blocking::Client,
+    session: &mut YouTubeWebSession,
+    flag_action: &str,
+    reason: CommentReportReason,
+    details: Option<&str>,
+    cancel: &Cancellation,
+) -> Result<Value, InnerTubeError> {
+    let payload = build_report_comment_payload(flag_action, reason, details)?;
+    let response = post_innertube_at(base_url, client, session, "flag/flag", payload, cancel)?;
+    validate_perform_comment_action_response(&response)?;
+    Ok(response)
+}
+
+#[allow(dead_code)]
+pub fn report_comment(
+    session: &mut YouTubeWebSession,
+    flag_action: &str,
+    reason: CommentReportReason,
+    details: Option<&str>,
+    cancel: &Cancellation,
+) -> Result<Value, InnerTubeError> {
+    let client = http_client().map_err(InnerTubeError::Other)?;
+    session.refresh_client_config_if_needed(&client, cancel);
+    report_comment_at(
+        INNERTUBE_BASE_URL,
+        &client,
+        session,
+        flag_action,
+        reason,
+        details,
+        cancel,
+    )
 }
 
 fn walk_values<'a>(root: &'a Value, visitor: &mut impl FnMut(&'a Value)) {
@@ -1628,6 +2019,124 @@ mod tests {
             &cancel,
         );
         assert!(r3.is_err());
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn comment_edit_delete_and_report_payload_builders_validate_contracts() {
+        let edit = build_edit_comment_payload("UPD_PARAMS_1", "Updated comment text").unwrap();
+        assert_eq!(edit["updateCommentParams"], "UPD_PARAMS_1");
+        assert_eq!(edit["commentText"], "Updated comment text");
+        assert!(build_edit_comment_payload("   ", "text").is_err());
+        assert!(build_edit_comment_payload("UPD_PARAMS_1", "   ").is_err());
+
+        let del = build_delete_comment_payload("DEL_ACTION_1").unwrap();
+        assert_eq!(del["actions"][0], "DEL_ACTION_1");
+        assert!(build_delete_comment_payload("").is_err());
+
+        let report_basic =
+            build_report_comment_payload("FLAG_ACT_1", CommentReportReason::Spam, None).unwrap();
+        assert_eq!(report_basic["action"], "FLAG_ACT_1");
+        assert_eq!(report_basic["reason"], "SPAM_OR_MISLEADING");
+        assert!(report_basic.get("userComment").is_none());
+
+        let report_details = build_report_comment_payload(
+            "FLAG_ACT_2",
+            CommentReportReason::Harassment,
+            Some("Repeated personal attacks"),
+        )
+        .unwrap();
+        assert_eq!(report_details["reason"], "HARASSMENT_OR_BULLYING");
+        assert_eq!(report_details["userComment"], "Repeated personal attacks");
+        assert!(build_report_comment_payload(" ", CommentReportReason::Other, None).is_err());
+
+        assert_eq!(CommentReportReason::ALL.len(), 6);
+        assert_eq!(
+            CommentReportReason::HateSpeech.label(true),
+            "Discurso de ódio"
+        );
+        assert_eq!(CommentReportReason::HateSpeech.label(false), "Hate speech");
+    }
+
+    #[test]
+    fn edit_delete_oauth_delete_and_report_comment_roundtrip_over_http() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}/youtubei/v1");
+        let oauth_base = format!("http://127.0.0.1:{port}/youtube/v3");
+
+        let server = std::thread::spawn(move || {
+            // 1) comment/update_comment
+            let (mut s1, _) = listener.accept().unwrap();
+            let (h1, b1) = read_http_request(&mut s1);
+            assert!(h1.contains("/youtubei/v1/comment/update_comment"));
+            assert!(b1.contains("UPD_TOK"));
+            assert!(b1.contains("Edited body"));
+            write_http_response(
+                &mut s1,
+                "200 OK",
+                &json!({ "actionResults": [{ "status": "STATUS_SUCCEEDED" }] }).to_string(),
+            );
+
+            // 2) comment/perform_comment_action (delete via web session)
+            let (mut s2, _) = listener.accept().unwrap();
+            let (h2, b2) = read_http_request(&mut s2);
+            assert!(h2.contains("/youtubei/v1/comment/perform_comment_action"));
+            assert!(b2.contains("DEL_TOK"));
+            write_http_response(
+                &mut s2,
+                "200 OK",
+                &json!({ "actionResults": [{ "status": "STATUS_SUCCEEDED" }] }).to_string(),
+            );
+
+            // 3) DELETE /youtube/v3/comments?id=UgxOwn123 (delete via OAuth)
+            let (mut s3, _) = listener.accept().unwrap();
+            let (h3, _b3) = read_http_request(&mut s3);
+            assert!(h3.starts_with("DELETE /youtube/v3/comments?id=UgxOwn123 "));
+            assert!(h3.contains("Bearer oauth_tok_test"));
+            write_http_response(&mut s3, "204 No Content", "");
+
+            // 4) flag/flag (report comment)
+            let (mut s4, _) = listener.accept().unwrap();
+            let (h4, b4) = read_http_request(&mut s4);
+            assert!(h4.contains("/youtubei/v1/flag/flag"));
+            assert!(b4.contains("FLAG_TOK"));
+            assert!(b4.contains("SPAM_OR_MISLEADING"));
+            assert!(b4.contains("Bot link"));
+            write_http_response(
+                &mut s4,
+                "200 OK",
+                &json!({ "actionResults": [{ "status": "STATUS_SUCCEEDED" }] }).to_string(),
+            );
+        });
+
+        let client = http_client().unwrap();
+        let mut session = YouTubeWebSession::test_session();
+        let cancel = Cancellation::default();
+
+        edit_comment_at(
+            &base_url,
+            &client,
+            &mut session,
+            "UPD_TOK",
+            "Edited body",
+            &cancel,
+        )
+        .unwrap();
+        delete_comment_at(&base_url, &client, &mut session, "DEL_TOK", &cancel).unwrap();
+        delete_comment_oauth_at(&oauth_base, &client, "oauth_tok_test", "UgxOwn123", &cancel)
+            .unwrap();
+        report_comment_at(
+            &base_url,
+            &client,
+            &mut session,
+            "FLAG_TOK",
+            CommentReportReason::Spam,
+            Some("Bot link"),
+            &cancel,
+        )
+        .unwrap();
 
         server.join().unwrap();
     }

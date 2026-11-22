@@ -6,9 +6,22 @@ use eframe::egui::{
 pub const OVERLAY_HEIGHT: f32 = 64.0;
 pub const OVERLAY_HIDE_DELAY_SECS: f64 = 2.5;
 pub const SPEED_PRESETS: [f64; 10] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
+pub const MIN_CUSTOM_SPEED: f64 = 0.05;
+pub const MAX_CUSTOM_SPEED: f64 = 4.0;
+pub const CUSTOM_SPEED_STEP: f64 = 0.05;
+pub const MAX_VOLUME_PERCENT: f32 = 200.0;
 const BAR_SIDE_PADDING: f32 = 12.0;
 const PROGRESS_HIT_HEIGHT: f32 = 16.0;
 const BUTTON_ROW_HEIGHT: f32 = 38.0;
+
+pub fn clamp_playback_speed(speed: f64) -> f64 {
+    if !speed.is_finite() {
+        return 1.0;
+    }
+    let clamped = speed.clamp(MIN_CUSTOM_SPEED, MAX_CUSTOM_SPEED);
+    let steps = (clamped / CUSTOM_SPEED_STEP).round();
+    (steps * CUSTOM_SPEED_STEP).clamp(MIN_CUSTOM_SPEED, MAX_CUSTOM_SPEED)
+}
 
 pub fn step_speed_preset(current_speed: f64, increase: bool) -> f64 {
     if !current_speed.is_finite() || current_speed <= 0.0 {
@@ -39,6 +52,95 @@ pub enum OverlayMenu {
     Chapters,
     AudioTracks,
     VideoAudioEq,
+    SleepTimer,
+    UltrawideZoom,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SleepTimerOption {
+    Minutes(u32),
+    EndOfVideo,
+}
+
+impl SleepTimerOption {
+    pub const PRESETS: [Self; 6] = [
+        Self::Minutes(10),
+        Self::Minutes(15),
+        Self::Minutes(30),
+        Self::Minutes(45),
+        Self::Minutes(60),
+        Self::EndOfVideo,
+    ];
+
+    pub fn label(self, pt: bool) -> String {
+        match self {
+            Self::Minutes(mins) => format!("{mins} min"),
+            Self::EndOfVideo => if pt { "Fim do vídeo" } else { "End of video" }.to_owned(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn duration_secs(self) -> Option<u64> {
+        match self {
+            Self::Minutes(mins) => Some(u64::from(mins) * 60),
+            Self::EndOfVideo => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpNextOverlayInfo {
+    pub title: String,
+    pub channel: String,
+    pub thumbnail_url: Option<String>,
+    pub remaining_secs: f32,
+    pub total_secs: f32,
+}
+
+impl UpNextOverlayInfo {
+    pub fn progress_fraction(&self) -> f32 {
+        if !self.total_secs.is_finite()
+            || self.total_secs <= 0.0
+            || !self.remaining_secs.is_finite()
+        {
+            return 0.0;
+        }
+        (self.remaining_secs / self.total_secs).clamp(0.0, 1.0)
+    }
+}
+
+pub fn format_sleep_timer_summary(
+    option: Option<SleepTimerOption>,
+    remaining_secs: Option<u64>,
+    pt: bool,
+) -> String {
+    match (option, remaining_secs) {
+        (Some(SleepTimerOption::EndOfVideo), _) => {
+            if pt {
+                "Fim do vídeo".to_owned()
+            } else {
+                "End of video".to_owned()
+            }
+        }
+        (Some(_), Some(rem)) => format_time(rem as f64),
+        (Some(opt), None) => opt.label(pt),
+        (None, _) => {
+            if pt {
+                "Desativado".to_owned()
+            } else {
+                "Off".to_owned()
+            }
+        }
+    }
+}
+
+pub fn format_seek_ripple_label(is_forward: bool, seek_step_secs: u32) -> String {
+    let step = seek_step_secs.max(1);
+    if is_forward {
+        format!("+{step}s")
+    } else {
+        format!("-{step}s")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,6 +198,163 @@ pub struct OverlayChapter {
     pub time_secs: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeatmapPoint {
+    pub start_secs: f64,
+    pub duration_secs: f64,
+    pub intensity: f32,
+}
+
+pub const HEATMAP_MOST_REPLAYED_THRESHOLD: f32 = 0.85;
+const HEATMAP_MAX_HEIGHT: f32 = 22.0;
+
+fn catmull_rom_clamped(p0: f32, p1: f32, p2: f32, p3: f32, u: f32) -> f32 {
+    let u = u.clamp(0.0, 1.0);
+    let u2 = u * u;
+    let u3 = u2 * u;
+    let val = 0.5
+        * ((2.0 * p1)
+            + (-p0 + p2) * u
+            + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * u2
+            + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * u3);
+    val.clamp(0.0, 1.0)
+}
+
+fn valid_heatmap_point(point: &HeatmapPoint) -> bool {
+    point.start_secs.is_finite()
+        && point.start_secs >= 0.0
+        && point.duration_secs.is_finite()
+        && point.duration_secs > 0.0
+        && point.intensity.is_finite()
+}
+
+pub fn sample_heatmap_intensity(
+    heatmap: &[HeatmapPoint],
+    duration_secs: f64,
+    time_secs: f64,
+) -> f32 {
+    if heatmap.is_empty()
+        || !duration_secs.is_finite()
+        || duration_secs <= 0.0
+        || !time_secs.is_finite()
+    {
+        return 0.0;
+    }
+    let t = time_secs.clamp(0.0, duration_secs);
+
+    let is_sorted_and_valid = heatmap.iter().all(valid_heatmap_point)
+        && heatmap
+            .windows(2)
+            .all(|w| w[0].start_secs <= w[1].start_secs);
+
+    let owned_sorted: Vec<HeatmapPoint>;
+    let points: &[HeatmapPoint] = if is_sorted_and_valid {
+        heatmap
+    } else {
+        let mut buf: Vec<HeatmapPoint> = heatmap
+            .iter()
+            .copied()
+            .filter(valid_heatmap_point)
+            .collect();
+        buf.sort_by(|a, b| a.start_secs.total_cmp(&b.start_secs));
+        owned_sorted = buf;
+        &owned_sorted
+    };
+
+    if points.is_empty() {
+        return 0.0;
+    }
+
+    let first = &points[0];
+    if t < first.start_secs {
+        return 0.0;
+    }
+    let last = &points[points.len() - 1];
+    let last_end = last.start_secs + last.duration_secs;
+    if t > last_end {
+        return 0.0;
+    }
+
+    let center_of = |p: &HeatmapPoint| p.start_secs + p.duration_secs * 0.5;
+    let clamped_intensity = |idx: usize| points[idx].intensity.clamp(0.0, 1.0);
+
+    let first_center = center_of(first);
+    if t <= first_center {
+        return clamped_intensity(0);
+    }
+
+    let last_center = center_of(last);
+    if t >= last_center {
+        return clamped_intensity(points.len() - 1);
+    }
+
+    for i in 0..(points.len() - 1) {
+        let curr = &points[i];
+        let next = &points[i + 1];
+        let c0 = center_of(curr);
+        let c1 = center_of(next);
+        if t < c0 || t > c1 {
+            continue;
+        }
+        let curr_end = curr.start_secs + curr.duration_secs;
+        let is_contiguous = next.start_secs <= curr_end + 1e-3;
+        if !is_contiguous {
+            if t <= curr_end {
+                return clamped_intensity(i);
+            } else if t >= next.start_secs {
+                return clamped_intensity(i + 1);
+            } else {
+                return 0.0;
+            }
+        }
+        let span = c1 - c0;
+        if span <= 1e-6 {
+            return clamped_intensity(i);
+        }
+        let u = ((t - c0) / span).clamp(0.0, 1.0) as f32;
+        let p1 = clamped_intensity(i);
+        let p2 = clamped_intensity(i + 1);
+        let p0 = if i > 0
+            && curr.start_secs <= points[i - 1].start_secs + points[i - 1].duration_secs + 1e-3
+        {
+            clamped_intensity(i - 1)
+        } else {
+            p1
+        };
+        let p3 = if i + 2 < points.len()
+            && points[i + 2].start_secs <= next.start_secs + next.duration_secs + 1e-3
+        {
+            clamped_intensity(i + 2)
+        } else {
+            p2
+        };
+        return catmull_rom_clamped(p0, p1, p2, p3, u);
+    }
+
+    0.0
+}
+
+pub fn is_heatmap_most_replayed(
+    heatmap: &[HeatmapPoint],
+    duration_secs: f64,
+    time_secs: f64,
+) -> bool {
+    sample_heatmap_intensity(heatmap, duration_secs, time_secs) >= HEATMAP_MOST_REPLAYED_THRESHOLD
+}
+
+#[allow(dead_code)]
+pub fn heatmap_peak_point(heatmap: &[HeatmapPoint]) -> Option<HeatmapPoint> {
+    heatmap
+        .iter()
+        .copied()
+        .filter(valid_heatmap_point)
+        .max_by(|a, b| a.intensity.total_cmp(&b.intensity))
+        .map(|mut p| {
+            p.intensity = p.intensity.clamp(0.0, 1.0);
+            p
+        })
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct OverlaySponsorSegment {
     pub start_secs: f64,
@@ -128,6 +387,7 @@ pub struct OverlayTelemetry {
     pub selected_quality: Option<u32>,
     pub qualities: Vec<u32>,
     pub qualities_loading: bool,
+    pub has_previous: bool,
     pub has_queued: bool,
     pub has_active_subtitle: bool,
     pub active_subtitle_text: Option<String>,
@@ -156,6 +416,18 @@ pub struct OverlayTelemetry {
     pub at_live_edge: bool,
     pub live_behind_secs: f64,
     pub menu: Option<OverlayMenu>,
+    pub stable_volume: bool,
+    pub ambient_mode: bool,
+    pub show_remaining_time: bool,
+    pub caption_style: crate::settings::CaptionStylePrefs,
+    pub ultrawide_zoom_mode: crate::settings::UltrawideZoomMode,
+    pub ultrawide_custom_zoom: f32,
+    pub sleep_timer_option: Option<SleepTimerOption>,
+    pub sleep_timer_remaining_secs: Option<u64>,
+    pub temp_speed_2x_active: bool,
+    pub seek_ripple: Option<(bool, f32)>,
+    pub up_next: Option<UpNextOverlayInfo>,
+    pub shorts_mode: bool,
 }
 
 impl Default for OverlayTelemetry {
@@ -176,6 +448,7 @@ impl Default for OverlayTelemetry {
             selected_quality: None,
             qualities: Vec::new(),
             qualities_loading: false,
+            has_previous: false,
             has_queued: false,
             has_active_subtitle: false,
             active_subtitle_text: None,
@@ -204,6 +477,18 @@ impl Default for OverlayTelemetry {
             at_live_edge: false,
             live_behind_secs: 0.0,
             menu: None,
+            stable_volume: false,
+            ambient_mode: false,
+            show_remaining_time: false,
+            caption_style: crate::settings::CaptionStylePrefs::default(),
+            ultrawide_zoom_mode: crate::settings::UltrawideZoomMode::Fit,
+            ultrawide_custom_zoom: 0.0,
+            sleep_timer_option: None,
+            sleep_timer_remaining_secs: None,
+            temp_speed_2x_active: false,
+            seek_ripple: None,
+            up_next: None,
+            shorts_mode: false,
         }
     }
 }
@@ -226,6 +511,7 @@ pub enum OverlayAction {
     GoLive,
     ToggleMute,
     SetVolume(f32),
+    Previous,
     Next,
     ToggleAutoplay,
     ToggleLoop,
@@ -248,6 +534,15 @@ pub enum OverlayAction {
     ToggleMiniPlayer,
     ToggleTheater,
     ToggleFullscreen,
+    ToggleRemainingTime,
+    ToggleStableVolume,
+    ToggleAmbientMode,
+    SetSleepTimer(Option<SleepTimerOption>),
+    SetCaptionStyle(crate::settings::CaptionStylePrefs),
+    SetCaptionAutoTranslate(Option<String>),
+    SetUltrawideZoom(crate::settings::UltrawideZoomMode, f32),
+    PlayUpNextNow,
+    CancelUpNext,
     Close,
 }
 
@@ -316,12 +611,30 @@ pub fn format_live_behind(behind_secs: f64) -> String {
     format!("-{}", format_time(secs))
 }
 
+#[allow(dead_code)]
 fn format_elapsed_total(position_secs: f64, duration_secs: Option<f64>) -> String {
-    let elapsed = format_time(position_secs);
+    format_time_display(position_secs, duration_secs, false)
+}
+
+pub fn format_time_display(
+    position_secs: f64,
+    duration_secs: Option<f64>,
+    show_remaining: bool,
+) -> String {
     let total = match duration_secs {
         Some(d) if d.is_finite() && d > 0.0 => format_time(d),
         _ => "--:--".to_owned(),
     };
+    if show_remaining && let Some(d) = duration_secs.filter(|d| d.is_finite() && *d > 0.0) {
+        let pos = if position_secs.is_finite() && position_secs > 0.0 {
+            position_secs
+        } else {
+            0.0
+        };
+        let remaining = (d - pos).max(0.0);
+        return format!("-{} / {total}", format_time(remaining));
+    }
+    let elapsed = format_time(position_secs);
     format!("{elapsed} / {total}")
 }
 
@@ -438,10 +751,29 @@ pub(crate) fn compute_hover_pill_rect(
     Rect::from_center_size(Pos2::new(cx, cy), size)
 }
 
-pub fn hover_preview_time_secs(
+thread_local! {
+    static ACTIVE_PROGRESS_DRAG_RECT: std::cell::Cell<Option<Rect>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn set_active_progress_drag_rect(rect: Option<Rect>) {
+    ACTIVE_PROGRESS_DRAG_RECT.with(|cell| cell.set(rect));
+}
+
+fn is_active_progress_drag_for_rect(video_rect: Rect) -> bool {
+    ACTIVE_PROGRESS_DRAG_RECT.with(|cell| {
+        cell.get().is_some_and(|active| {
+            (active.min - video_rect.min).length_sq() < 1.0
+                && (active.max - video_rect.max).length_sq() < 1.0
+        })
+    })
+}
+
+pub fn hover_preview_time_secs_with_drag(
     video_rect: Rect,
     duration_secs: Option<f64>,
     pointer_pos: Option<Pos2>,
+    dragging_progress: bool,
 ) -> Option<f64> {
     let duration = duration_secs.filter(|d| d.is_finite() && *d > 0.0)?;
     let pos = pointer_pos?;
@@ -456,14 +788,27 @@ pub fn hover_preview_time_secs(
             (bar_rect.min.y + PROGRESS_HIT_HEIGHT).min(bar_rect.max.y),
         ),
     );
-    if !strip_rect.contains(pos) || strip_rect.width() <= 0.0 {
+    if strip_rect.width() <= 0.0 || (!dragging_progress && !strip_rect.contains(pos)) {
         return None;
     }
     let frac = f64::from((pos.x - strip_rect.min.x) / strip_rect.width()).clamp(0.0, 1.0);
     Some(frac * duration)
 }
 
-fn paint_vertical_gradient(
+pub fn hover_preview_time_secs(
+    video_rect: Rect,
+    duration_secs: Option<f64>,
+    pointer_pos: Option<Pos2>,
+) -> Option<f64> {
+    hover_preview_time_secs_with_drag(
+        video_rect,
+        duration_secs,
+        pointer_pos,
+        is_active_progress_drag_for_rect(video_rect),
+    )
+}
+
+pub(crate) fn paint_vertical_gradient(
     painter: &egui::Painter,
     rect: Rect,
     top_color: Color32,
@@ -501,6 +846,7 @@ enum VectorGlyph {
     Play,
     Pause,
     Replay,
+    Previous,
     Next,
     SkipBack(u32),
     SkipForward(u32),
@@ -598,6 +944,19 @@ fn icon_button(
                     Pos2::new(c.x + 1.0, c.y - 3.5),
                 ];
                 painter.add(Shape::convex_polygon(arrow, fg, Stroke::NONE));
+            }
+            VectorGlyph::Previous => {
+                let bar = Rect::from_min_max(
+                    Pos2::new(c.x - 6.5, c.y - 6.0),
+                    Pos2::new(c.x - 4.0, c.y + 6.0),
+                );
+                painter.rect_filled(bar, 1.0, fg);
+                let pts = vec![
+                    Pos2::new(c.x + 6.5, c.y - 6.0),
+                    Pos2::new(c.x + 6.5, c.y + 6.0),
+                    Pos2::new(c.x - 2.5, c.y),
+                ];
+                painter.add(Shape::convex_polygon(pts, fg, Stroke::NONE));
             }
             VectorGlyph::Next => {
                 let pts = vec![
@@ -856,17 +1215,17 @@ fn volume_slider(
     width: f32,
     volume_percent: f32,
     muted: bool,
+    pt: bool,
     style: &OverlayStyle,
-) -> (Option<f32>, bool) {
+) -> (Option<f32>, egui::Response) {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 28.0), Sense::click_and_drag());
     let response = response.on_hover_cursor(CursorIcon::PointingHand);
 
     let effective = if muted {
         0.0
     } else {
-        volume_percent.clamp(0.0, 100.0)
+        volume_percent.clamp(0.0, MAX_VOLUME_PERCENT)
     };
-    let ratio = (effective / 100.0).clamp(0.0, 1.0);
 
     let mut new_volume = None;
     let interacting = response.dragged() || response.clicked();
@@ -877,13 +1236,14 @@ fn volume_slider(
         let track_left = rect.left() + 4.0;
         let track_right = rect.right() - 4.0;
         let frac = ((pos.x - track_left) / (track_right - track_left)).clamp(0.0, 1.0);
-        new_volume = Some((frac * 100.0).round());
+        new_volume = Some((frac * MAX_VOLUME_PERCENT).round());
     }
 
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         let track_left = rect.left() + 4.0;
         let track_right = rect.right() - 4.0;
+        let track_w = (track_right - track_left).max(1.0);
         let cy = rect.center().y;
         let track_rect = Rect::from_min_max(
             Pos2::new(track_left, cy - 1.5),
@@ -895,23 +1255,52 @@ fn volume_slider(
             Color32::from_rgba_unmultiplied(255, 255, 255, 75),
         );
 
-        let shown_ratio = new_volume.map(|v| v / 100.0).unwrap_or(ratio);
-        let fill_x = track_left + (track_right - track_left) * shown_ratio;
+        let mid_x = track_left + track_w * (100.0 / MAX_VOLUME_PERCENT);
+        let shown_vol = new_volume.unwrap_or(effective);
+        let shown_ratio = (shown_vol / MAX_VOLUME_PERCENT).clamp(0.0, 1.0);
+        let fill_x = track_left + track_w * shown_ratio;
+        let is_boosted = shown_vol > 100.5;
+        let boost_accent = Color32::from_rgb(255, 168, 56);
+
         if fill_x > track_left {
-            let fill_rect =
-                Rect::from_min_max(Pos2::new(track_left, cy - 1.5), Pos2::new(fill_x, cy + 1.5));
+            let base_end = fill_x.min(mid_x);
+            let fill_rect = Rect::from_min_max(
+                Pos2::new(track_left, cy - 1.5),
+                Pos2::new(base_end, cy + 1.5),
+            );
             painter.rect_filled(fill_rect, 1.5, style.icon);
+            if is_boosted && fill_x > mid_x {
+                let boost_rect =
+                    Rect::from_min_max(Pos2::new(mid_x, cy - 1.5), Pos2::new(fill_x, cy + 1.5));
+                painter.rect_filled(boost_rect, 1.5, boost_accent);
+            }
         }
+        // Subtle 100% nominal tick marker so the boost region (>100%) is immediately clear.
+        painter.line_segment(
+            [Pos2::new(mid_x, cy - 3.5), Pos2::new(mid_x, cy + 3.5)],
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 145)),
+        );
+
         let thumb_radius = if response.hovered() || response.dragged() {
             5.5
         } else {
             4.5
         };
-        painter.circle_filled(Pos2::new(fill_x, cy), thumb_radius, Color32::WHITE);
+        let thumb_color = if is_boosted {
+            boost_accent
+        } else {
+            Color32::WHITE
+        };
+        painter.circle_filled(Pos2::new(fill_x, cy), thumb_radius, thumb_color);
     }
 
-    let resp = response.on_hover_text(format!("Volume: {:.0}%", effective));
-    (new_volume, resp.hovered() || resp.dragged())
+    let boost_suffix = if effective > 100.5 {
+        if pt { " (Reforço)" } else { " (Boost)" }
+    } else {
+        ""
+    };
+    let resp = response.on_hover_text(format!("Volume: {:.0}%{boost_suffix}", effective));
+    (new_volume, resp)
 }
 
 fn current_chapter_title(chapters: &[OverlayChapter], position_secs: f64) -> Option<&str> {
@@ -961,16 +1350,17 @@ fn subtitle_summary(telemetry: &OverlayTelemetry) -> String {
         .unwrap_or_else(|| "Ativadas".to_owned())
 }
 
-fn menu_row(
+fn menu_row_sized(
     ui: &mut egui::Ui,
     label: &str,
     value: Option<&str>,
     selected: bool,
     has_chevron: bool,
+    row_height: f32,
     style: &OverlayStyle,
 ) -> egui::Response {
     let width = ui.available_width().max(120.0);
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 32.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, row_height), Sense::click());
     let response = response.on_hover_cursor(CursorIcon::PointingHand);
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
@@ -1021,6 +1411,17 @@ fn menu_row(
     response
 }
 
+fn menu_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: Option<&str>,
+    selected: bool,
+    has_chevron: bool,
+    style: &OverlayStyle,
+) -> egui::Response {
+    menu_row_sized(ui, label, value, selected, has_chevron, 32.0, style)
+}
+
 fn compact_pill_button(
     ui: &mut egui::Ui,
     label: &str,
@@ -1066,22 +1467,22 @@ fn show_settings_popup(
     telemetry: &OverlayTelemetry,
     style: &OverlayStyle,
 ) -> (Option<OverlayAction>, bool) {
-    let popup_w = (video_rect.width() - 16.0).clamp(180.0, 276.0);
-    let max_h = (bar_rect.min.y - video_rect.min.y - 12.0).clamp(110.0, 360.0);
+    let popup_w = (video_rect.width() - 16.0).clamp(180.0, 290.0);
+    let max_h = (bar_rect.min.y - video_rect.min.y - 10.0).clamp(110.0, 420.0);
     let est_h = match menu {
         OverlayMenu::Root => {
-            let base_rows = if telemetry.is_live { 6 } else { 8 };
+            let base_rows = if telemetry.is_live { 10 } else { 12 };
             let rows = base_rows + usize::from(!telemetry.chapters.is_empty());
-            (rows as f32 * 34.0 + 24.0).min(max_h)
+            (rows as f32 * 27.5 + 24.0).min(max_h)
         }
-        OverlayMenu::Speed => ((SPEED_PRESETS.len() as f32 + 1.0) * 32.0 + 44.0).min(max_h),
+        OverlayMenu::Speed => ((SPEED_PRESETS.len() as f32 + 2.5) * 32.0 + 44.0).min(max_h),
         OverlayMenu::Quality => {
             let rows = telemetry.qualities.len().max(1) + 2;
             (rows as f32 * 32.0 + 44.0).min(max_h)
         }
         OverlayMenu::Subtitles => {
             let rows = telemetry.subtitles.len().max(1) + 2;
-            (rows as f32 * 32.0 + 44.0).min(max_h)
+            (rows as f32 * 32.0 + 220.0).min(max_h)
         }
         OverlayMenu::Chapters => {
             let rows = telemetry.chapters.len().max(1) + 1;
@@ -1092,6 +1493,11 @@ fn show_settings_popup(
             (rows as f32 * 32.0 + 44.0).min(max_h)
         }
         OverlayMenu::VideoAudioEq => 316.0_f32.min(max_h),
+        OverlayMenu::SleepTimer => {
+            let rows = SleepTimerOption::PRESETS.len() + 2;
+            (rows as f32 * 32.0 + 56.0).min(max_h)
+        }
+        OverlayMenu::UltrawideZoom => 220.0_f32.min(max_h),
     };
 
     let right = (video_rect.max.x - 10.0).max(video_rect.min.x + popup_w);
@@ -1133,12 +1539,14 @@ fn show_settings_popup(
             ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
             match menu {
                 OverlayMenu::Root => {
+                    ui.spacing_mut().item_spacing = Vec2::new(0.0, 1.0);
+                    let root_row_h = 25.5_f32;
                     egui::ScrollArea::vertical()
                         .id_salt("overlay_root_scroll")
                         .max_height(inner.height().max(40.0))
                         .show(ui, |ui| {
                             if !telemetry.is_live {
-                                if menu_row(
+                                if menu_row_sized(
                                     ui,
                                     pick("Reprodu\u{00e7}\u{00e3}o autom\u{00e1}tica", "Autoplay"),
                                     Some(if telemetry.autoplay {
@@ -1148,13 +1556,14 @@ fn show_settings_popup(
                                     }),
                                     telemetry.autoplay,
                                     false,
+                                    root_row_h,
                                     style,
                                 )
                                 .clicked()
                                 {
                                     action = Some(OverlayAction::ToggleAutoplay);
                                 }
-                                if menu_row(
+                                if menu_row_sized(
                                     ui,
                                     pick("Repetir v\u{00ed}deo", "Loop video"),
                                     Some(if telemetry.loop_video {
@@ -1164,6 +1573,7 @@ fn show_settings_popup(
                                     }),
                                     telemetry.loop_video,
                                     false,
+                                    root_row_h,
                                     style,
                                 )
                                 .clicked()
@@ -1171,36 +1581,92 @@ fn show_settings_popup(
                                     action = Some(OverlayAction::ToggleLoop);
                                 }
                             }
-                            if menu_row(
+                            if menu_row_sized(
+                                ui,
+                                pick("Volume est\u{00e1}vel", "Stable volume"),
+                                Some(if telemetry.stable_volume {
+                                    pick("Ativado", "On")
+                                } else {
+                                    pick("Desativado", "Off")
+                                }),
+                                telemetry.stable_volume,
+                                false,
+                                root_row_h,
+                                style,
+                            )
+                            .clicked()
+                            {
+                                action = Some(OverlayAction::ToggleStableVolume);
+                            }
+                            if menu_row_sized(
+                                ui,
+                                pick("Modo ambiente", "Ambient mode"),
+                                Some(if telemetry.ambient_mode {
+                                    pick("Ativado", "On")
+                                } else {
+                                    pick("Desativado", "Off")
+                                }),
+                                telemetry.ambient_mode,
+                                false,
+                                root_row_h,
+                                style,
+                            )
+                            .clicked()
+                            {
+                                action = Some(OverlayAction::ToggleAmbientMode);
+                            }
+                            let sleep_summary = format_sleep_timer_summary(
+                                telemetry.sleep_timer_option,
+                                telemetry.sleep_timer_remaining_secs,
+                                pt,
+                            );
+                            if menu_row_sized(
+                                ui,
+                                pick("Timer de sono", "Sleep timer"),
+                                Some(&sleep_summary),
+                                telemetry.sleep_timer_option.is_some(),
+                                true,
+                                root_row_h,
+                                style,
+                            )
+                            .clicked()
+                            {
+                                action =
+                                    Some(OverlayAction::SetMenu(Some(OverlayMenu::SleepTimer)));
+                            }
+                            if menu_row_sized(
                                 ui,
                                 pick("Velocidade", "Playback speed"),
                                 Some(&speed_label(telemetry.speed)),
                                 false,
                                 true,
+                                root_row_h,
                                 style,
                             )
                             .clicked()
                             {
                                 action = Some(OverlayAction::SetMenu(Some(OverlayMenu::Speed)));
                             }
-                            if menu_row(
+                            if menu_row_sized(
                                 ui,
                                 pick("Qualidade", "Quality"),
                                 Some(&quality_summary(telemetry)),
                                 false,
                                 true,
+                                root_row_h,
                                 style,
                             )
                             .clicked()
                             {
                                 action = Some(OverlayAction::SetMenu(Some(OverlayMenu::Quality)));
                             }
-                            if menu_row(
+                            if menu_row_sized(
                                 ui,
                                 pick("Legendas", "Subtitles"),
                                 Some(&subtitle_summary(telemetry)),
                                 false,
                                 true,
+                                root_row_h,
                                 style,
                             )
                             .clicked()
@@ -1213,12 +1679,13 @@ fn show_settings_popup(
                                 .find(|t| t.selected)
                                 .map(|t| t.label.as_str())
                                 .unwrap_or_else(|| pick("Padr\u{00e3}o", "Default"));
-                            if menu_row(
+                            if menu_row_sized(
                                 ui,
                                 pick("Faixa de \u{00e1}udio", "Audio track"),
                                 Some(audio_summary),
                                 false,
                                 true,
+                                root_row_h,
                                 style,
                             )
                             .clicked()
@@ -1230,12 +1697,13 @@ fn show_settings_popup(
                                 || telemetry.brightness != 0
                                 || telemetry.contrast != 0
                                 || telemetry.saturation != 0;
-                            if menu_row(
+                            if menu_row_sized(
                                 ui,
                                 pick("Imagem e equalizador", "Video & audio EQ"),
                                 Some(telemetry.audio_eq.label(pt)),
                                 eq_active,
                                 true,
+                                root_row_h,
                                 style,
                             )
                             .clicked()
@@ -1243,14 +1711,38 @@ fn show_settings_popup(
                                 action =
                                     Some(OverlayAction::SetMenu(Some(OverlayMenu::VideoAudioEq)));
                             }
+                            let zoom_active = telemetry.ultrawide_zoom_mode
+                                != crate::settings::UltrawideZoomMode::Fit;
+                            let zoom_summary = if telemetry.ultrawide_zoom_mode
+                                == crate::settings::UltrawideZoomMode::Custom
+                            {
+                                format!("{:.0}%", telemetry.ultrawide_custom_zoom.clamp(0.0, 0.5) * 100.0)
+                            } else {
+                                telemetry.ultrawide_zoom_mode.label(pt).to_owned()
+                            };
+                            if menu_row_sized(
+                                ui,
+                                pick("Zoom ultrawide", "Ultrawide zoom"),
+                                Some(&zoom_summary),
+                                zoom_active,
+                                true,
+                                root_row_h,
+                                style,
+                            )
+                            .clicked()
+                            {
+                                action =
+                                    Some(OverlayAction::SetMenu(Some(OverlayMenu::UltrawideZoom)));
+                            }
                             if !telemetry.chapters.is_empty() {
                                 let ch_count = format!("{}", telemetry.chapters.len());
-                                if menu_row(
+                                if menu_row_sized(
                                     ui,
                                     pick("Cap\u{00ed}tulos", "Chapters"),
                                     Some(&ch_count),
                                     false,
                                     true,
+                                    root_row_h,
                                     style,
                                 )
                                 .clicked()
@@ -1271,13 +1763,14 @@ fn show_settings_popup(
                                     Color32::from_rgba_unmultiplied(255, 255, 255, 24),
                                 ),
                             );
-                            ui.add_space(4.0);
-                            if menu_row(
+                            ui.add_space(3.0);
+                            if menu_row_sized(
                                 ui,
                                 pick("Configura\u{00e7}\u{00f5}es do app...", "App settings..."),
                                 None,
                                 false,
                                 false,
+                                root_row_h,
                                 style,
                             )
                             .clicked()
@@ -1303,6 +1796,42 @@ fn show_settings_popup(
                         .id_salt("overlay_speed_scroll")
                         .max_height((inner.height() - 36.0).max(40.0))
                         .show(ui, |ui| {
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(pick("Personalizada", "Custom"))
+                                        .size(11.5)
+                                        .strong()
+                                        .color(style.text.gamma_multiply(0.85)),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new(format!("{:.2}\u{00d7}", telemetry.speed))
+                                                .size(11.5)
+                                                .strong()
+                                                .color(style.accent),
+                                        );
+                                    },
+                                );
+                            });
+                            let mut custom_speed = clamp_playback_speed(telemetry.speed);
+                            if ui
+                                .add(
+                                    egui::Slider::new(
+                                        &mut custom_speed,
+                                        MIN_CUSTOM_SPEED..=MAX_CUSTOM_SPEED,
+                                    )
+                                    .step_by(CUSTOM_SPEED_STEP)
+                                    .show_value(false),
+                                )
+                                .changed()
+                            {
+                                action =
+                                    Some(OverlayAction::SetSpeed(clamp_playback_speed(custom_speed)));
+                            }
+                            ui.add_space(4.0);
                             for choice in SPEED_PRESETS {
                                 let is_cur = (telemetry.speed - choice).abs() < 0.02;
                                 let label = if (choice - 1.0).abs() < 0.01 {
@@ -1405,6 +1934,108 @@ fn show_settings_popup(
                                     action =
                                         Some(OverlayAction::SelectSubtitle(Some(track.id.clone())));
                                 }
+                            }
+                            ui.add_space(6.0);
+                            let sep_y = ui.cursor().top();
+                            ui.painter().line_segment(
+                                [
+                                    Pos2::new(inner.left(), sep_y),
+                                    Pos2::new(inner.right(), sep_y),
+                                ],
+                                Stroke::new(
+                                    1.0,
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, 24),
+                                ),
+                            );
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(pick(
+                                    "Tradu\u{00e7}\u{00e3}o autom\u{00e1}tica (tlang)",
+                                    "Auto-translate (tlang)",
+                                ))
+                                .size(11.5)
+                                .strong()
+                                .color(style.text.gamma_multiply(0.85)),
+                            );
+                            ui.add_space(4.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+                                let cur_tlang = telemetry.caption_style.translate_lang.as_deref();
+                                if compact_pill_button(
+                                    ui,
+                                    pick("Desligado", "Off"),
+                                    cur_tlang.is_none(),
+                                    true,
+                                    style,
+                                    pick("Usar idioma original da legenda", "Use original subtitle language"),
+                                )
+                                .clicked()
+                                {
+                                    action = Some(OverlayAction::SetCaptionAutoTranslate(None));
+                                }
+                                for &(code, label) in crate::settings::CAPTION_TRANSLATE_LANGUAGES {
+                                    let active = cur_tlang
+                                        .is_some_and(|c| c.eq_ignore_ascii_case(code));
+                                    if compact_pill_button(ui, label, active, true, style, label)
+                                        .clicked()
+                                    {
+                                        action = Some(OverlayAction::SetCaptionAutoTranslate(
+                                            Some(code.to_owned()),
+                                        ));
+                                    }
+                                }
+                            });
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new(pick("Estilo das legendas", "Caption style"))
+                                    .size(11.5)
+                                    .strong()
+                                    .color(style.text.gamma_multiply(0.85)),
+                            );
+                            ui.add_space(4.0);
+                            let mut next_style = telemetry.caption_style.clone().normalized();
+                            let mut font_pct = (next_style.font_scale * 100.0).round() as i32;
+                            let font_changed = ui
+                                .add(
+                                    egui::Slider::new(&mut font_pct, 50..=200)
+                                        .suffix("%")
+                                        .text(pick("Fonte", "Size")),
+                                )
+                                .changed();
+                            if font_changed {
+                                next_style.font_scale = (font_pct as f32 / 100.0).clamp(0.5, 2.0);
+                            }
+                            let mut bg_pct = (next_style.bg_opacity * 100.0).round() as i32;
+                            let bg_changed = ui
+                                .add(
+                                    egui::Slider::new(&mut bg_pct, 0..=100)
+                                        .suffix("%")
+                                        .text(pick("Fundo", "Bg")),
+                                )
+                                .changed();
+                            if bg_changed {
+                                next_style.bg_opacity = (bg_pct as f32 / 100.0).clamp(0.0, 1.0);
+                            }
+                            let mut color_changed = false;
+                            ui.add_space(4.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+                                for &(hex, label_pt, label_en) in
+                                    crate::settings::CAPTION_COLOR_PRESETS
+                                {
+                                    let selected =
+                                        next_style.text_color_hex.eq_ignore_ascii_case(hex);
+                                    let lbl = if pt { label_pt } else { label_en };
+                                    if compact_pill_button(ui, lbl, selected, true, style, hex)
+                                        .clicked()
+                                    {
+                                        next_style.text_color_hex = hex.to_owned();
+                                        color_changed = true;
+                                    }
+                                }
+                            });
+                            if font_changed || bg_changed || color_changed {
+                                action = Some(OverlayAction::SetCaptionStyle(next_style));
                             }
                         });
                 }
@@ -1575,6 +2206,136 @@ fn show_settings_popup(
                             }
                         });
                 }
+                OverlayMenu::SleepTimer => {
+                    if menu_row(
+                        ui,
+                        pick("‹  Timer de sono", "‹  Sleep timer"),
+                        None,
+                        false,
+                        false,
+                        style,
+                    )
+                    .clicked()
+                    {
+                        action = Some(OverlayAction::SetMenu(Some(OverlayMenu::Root)));
+                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("overlay_sleep_timer_scroll")
+                        .max_height((inner.height() - 36.0).max(40.0))
+                        .show(ui, |ui| {
+                            if let Some(rem) = telemetry.sleep_timer_remaining_secs {
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new(if pt {
+                                        format!("Pausando em {}", format_time(rem as f64))
+                                    } else {
+                                        format!("Pausing in {}", format_time(rem as f64))
+                                    })
+                                    .size(11.5)
+                                    .strong()
+                                    .color(style.accent),
+                                );
+                                ui.add_space(4.0);
+                            }
+                            if menu_row(
+                                ui,
+                                pick("Desativado", "Off"),
+                                None,
+                                telemetry.sleep_timer_option.is_none(),
+                                false,
+                                style,
+                            )
+                            .clicked()
+                            {
+                                action = Some(OverlayAction::SetSleepTimer(None));
+                            }
+                            for preset in SleepTimerOption::PRESETS {
+                                let label = preset.label(pt);
+                                let selected = telemetry.sleep_timer_option == Some(preset);
+                                if menu_row(ui, &label, None, selected, false, style).clicked() {
+                                    action = Some(OverlayAction::SetSleepTimer(Some(preset)));
+                                }
+                            }
+                        });
+                }
+                OverlayMenu::UltrawideZoom => {
+                    if menu_row(
+                        ui,
+                        pick("‹  Zoom ultrawide", "‹  Ultrawide zoom"),
+                        None,
+                        false,
+                        false,
+                        style,
+                    )
+                    .clicked()
+                    {
+                        action = Some(OverlayAction::SetMenu(Some(OverlayMenu::Root)));
+                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("overlay_ultrawide_zoom_scroll")
+                        .max_height((inner.height() - 36.0).max(40.0))
+                        .show(ui, |ui| {
+                            use crate::settings::UltrawideZoomMode;
+                            if menu_row(
+                                ui,
+                                UltrawideZoomMode::Fit.label(pt),
+                                None,
+                                telemetry.ultrawide_zoom_mode == UltrawideZoomMode::Fit,
+                                false,
+                                style,
+                            )
+                            .clicked()
+                            {
+                                action =
+                                    Some(OverlayAction::SetUltrawideZoom(UltrawideZoomMode::Fit, 0.0));
+                            }
+                            if menu_row(
+                                ui,
+                                UltrawideZoomMode::Crop21x9.label(pt),
+                                None,
+                                telemetry.ultrawide_zoom_mode == UltrawideZoomMode::Crop21x9,
+                                false,
+                                style,
+                            )
+                            .clicked()
+                            {
+                                action = Some(OverlayAction::SetUltrawideZoom(
+                                    UltrawideZoomMode::Crop21x9,
+                                    0.0,
+                                ));
+                            }
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new(pick(
+                                    "Zoom personalizado (video-zoom)",
+                                    "Custom zoom (video-zoom)",
+                                ))
+                                .size(11.5)
+                                .strong()
+                                .color(style.text.gamma_multiply(0.85)),
+                            );
+                            ui.add_space(4.0);
+                            let mut zoom_pct =
+                                (telemetry.ultrawide_custom_zoom.clamp(0.0, 0.5) * 100.0).round()
+                                    as i32;
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut zoom_pct, 0..=50)
+                                        .suffix("%")
+                                        .text(pick("Zoom", "Zoom")),
+                                )
+                                .changed()
+                            {
+                                let next_zoom = (zoom_pct as f32 / 100.0).clamp(0.0, 0.5);
+                                let next_mode = if next_zoom <= 0.001 {
+                                    UltrawideZoomMode::Fit
+                                } else {
+                                    UltrawideZoomMode::Custom
+                                };
+                                action = Some(OverlayAction::SetUltrawideZoom(next_mode, next_zoom));
+                            }
+                        });
+                }
             }
         });
     });
@@ -1582,6 +2343,13 @@ fn show_settings_popup(
     (action, pointer_inside)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OverlayHitState {
+    pub over_controls: bool,
+    pub over_volume: bool,
+}
+
+#[allow(dead_code)]
 pub fn show(
     ui: &mut egui::Ui,
     video_rect: Rect,
@@ -1589,10 +2357,36 @@ pub fn show(
     style: &OverlayStyle,
     visible: bool,
 ) -> (Option<OverlayAction>, bool) {
+    show_with_heatmap(ui, video_rect, telemetry, &[], style, visible)
+}
+
+#[allow(dead_code)]
+pub fn show_with_heatmap(
+    ui: &mut egui::Ui,
+    video_rect: Rect,
+    telemetry: &OverlayTelemetry,
+    heatmap: &[HeatmapPoint],
+    style: &OverlayStyle,
+    visible: bool,
+) -> (Option<OverlayAction>, bool) {
+    let (action, hit) =
+        show_with_heatmap_hit_state(ui, video_rect, telemetry, heatmap, style, visible);
+    (action, hit.over_controls)
+}
+
+pub fn show_with_heatmap_hit_state(
+    ui: &mut egui::Ui,
+    video_rect: Rect,
+    telemetry: &OverlayTelemetry,
+    heatmap: &[HeatmapPoint],
+    style: &OverlayStyle,
+    visible: bool,
+) -> (Option<OverlayAction>, OverlayHitState) {
     let prev_clip = ui.clip_rect();
     let clipped_video = video_rect.intersect(prev_clip);
     if clipped_video.width() <= 0.0 || clipped_video.height() <= 0.0 {
-        return (None, false);
+        set_active_progress_drag_rect(None);
+        return (None, OverlayHitState::default());
     }
 
     let bar_rect = compute_bar_rect(video_rect);
@@ -1603,13 +2397,18 @@ pub fn show(
         .map(str::trim)
         .filter(|t| !t.is_empty())
     {
-        let font_px = (video_rect.height() * 0.042).clamp(14.0, 26.0);
+        let cap_style = telemetry.caption_style.clone().normalized();
+        let (cr, cg, cb) = cap_style.parse_rgb();
+        let cap_text_color = Color32::from_rgb(cr, cg, cb);
+        let cap_bg_alpha = (cap_style.bg_opacity * 255.0).round().clamp(0.0, 255.0) as u8;
+        let font_px = ((video_rect.height() * 0.042).clamp(14.0, 26.0) * cap_style.font_scale)
+            .clamp(10.0, 48.0);
         let max_sub_width = (video_rect.width() * 0.84).max(120.0);
         let painter = ui.painter().with_clip_rect(clipped_video);
         let galley = painter.layout(
             sub_text.to_owned(),
             FontId::proportional(font_px),
-            Color32::WHITE,
+            cap_text_color,
             max_sub_width,
         );
         let text_size = galley.size();
@@ -1628,16 +2427,260 @@ pub fn show(
             Pos2::new(video_rect.center().x - box_w * 0.5, bottom_y - box_h),
             Vec2::new(box_w, box_h),
         );
-        painter.rect_filled(
-            box_rect,
-            CornerRadius::same(6),
-            Color32::from_rgba_unmultiplied(8, 8, 10, 210),
-        );
+        if cap_bg_alpha > 0 {
+            painter.rect_filled(
+                box_rect,
+                CornerRadius::same(6),
+                Color32::from_rgba_unmultiplied(8, 8, 10, cap_bg_alpha),
+            );
+        }
         let text_pos = Pos2::new(
             box_rect.center().x - text_size.x * 0.5,
             box_rect.min.y + pad_y,
         );
-        painter.galley(text_pos, galley, Color32::WHITE);
+        painter.galley(text_pos, galley, cap_text_color);
+    }
+
+    // Hold-Space / Hold-Mouse temporary 2x speed pill (top-center).
+    if telemetry.temp_speed_2x_active && video_rect.height() >= 90.0 {
+        let label = if telemetry.pt {
+            "Velocidade 2\u{00d7} >>"
+        } else {
+            "2\u{00d7} >>"
+        };
+        let painter = ui.painter().with_clip_rect(clipped_video);
+        let galley =
+            painter.layout_no_wrap(label.to_owned(), FontId::proportional(12.5), Color32::WHITE);
+        let pad = Vec2::new(14.0, 6.0);
+        let pill_size = galley.size() + pad * 2.0;
+        let pill_rect = Rect::from_center_size(
+            Pos2::new(
+                video_rect.center().x,
+                video_rect.top() + 14.0 + pill_size.y * 0.5,
+            ),
+            pill_size,
+        );
+        painter.rect_filled(
+            pill_rect,
+            CornerRadius::same(14),
+            Color32::from_rgba_unmultiplied(16, 16, 20, 224),
+        );
+        painter.rect_stroke(
+            pill_rect,
+            CornerRadius::same(14),
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 44)),
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(
+            Pos2::new(pill_rect.left() + pad.x, pill_rect.top() + pad.y),
+            galley,
+            Color32::WHITE,
+        );
+    }
+
+    // Double-click left/right +/-10s circular ripple feedback.
+    if let Some((is_forward, raw_progress)) = telemetry.seek_ripple
+        && raw_progress.is_finite()
+        && (0.0..1.0).contains(&raw_progress)
+        && video_rect.width() >= 140.0
+        && video_rect.height() >= 90.0
+    {
+        let t = raw_progress.clamp(0.0, 1.0);
+        let fade = (1.0 - t).powf(1.2);
+        let min_dim = video_rect.width().min(video_rect.height());
+        let ripple_r = min_dim * (0.14 + 0.22 * t);
+        let center_x = if is_forward {
+            video_rect.right() - video_rect.width() * 0.18
+        } else {
+            video_rect.left() + video_rect.width() * 0.18
+        };
+        let center = Pos2::new(center_x, video_rect.center().y);
+        let painter = ui.painter().with_clip_rect(clipped_video);
+        let circle_alpha = (fade * 72.0).round().clamp(0.0, 255.0) as u8;
+        let text_alpha = (fade * 255.0).round().clamp(0.0, 255.0) as u8;
+        painter.circle_filled(
+            center,
+            ripple_r,
+            Color32::from_rgba_unmultiplied(255, 255, 255, circle_alpha),
+        );
+        let chevron_str = if is_forward {
+            "\u{203a}\u{203a}\u{203a}"
+        } else {
+            "\u{2039}\u{2039}\u{2039}"
+        };
+        painter.text(
+            Pos2::new(center.x, center.y - 10.0),
+            egui::Align2::CENTER_CENTER,
+            chevron_str,
+            FontId::proportional(20.0),
+            Color32::from_rgba_unmultiplied(255, 255, 255, text_alpha),
+        );
+        let ripple_label = format_seek_ripple_label(is_forward, telemetry.seek_step_secs);
+        painter.text(
+            Pos2::new(center.x, center.y + 12.0),
+            egui::Align2::CENTER_CENTER,
+            ripple_label,
+            FontId::proportional(13.5),
+            Color32::from_rgba_unmultiplied(255, 255, 255, text_alpha),
+        );
+    }
+
+    // Autoplay "Up Next" countdown card.
+    let mut action_up_next: Option<OverlayAction> = None;
+    let mut over_up_next = false;
+    if let Some(up_next) = &telemetry.up_next
+        && telemetry.menu.is_none()
+        && video_rect.width() >= 240.0
+        && video_rect.height() >= 150.0
+    {
+        let card_w = (video_rect.width() - 32.0).clamp(220.0, 320.0);
+        let card_h = (video_rect.height() - 32.0).clamp(138.0, 196.0);
+        let card_rect = Rect::from_center_size(video_rect.center(), Vec2::new(card_w, card_h));
+        if ui
+            .input(|i| i.pointer.hover_pos())
+            .is_some_and(|p| card_rect.contains(p))
+        {
+            over_up_next = true;
+        }
+        let pt = telemetry.pt;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(card_rect), |ui| {
+            ui.set_clip_rect(card_rect.intersect(clipped_video));
+            let _ = ui.interact(
+                card_rect,
+                ui.make_persistent_id("fasttube_up_next_backdrop"),
+                Sense::click(),
+            );
+            let painter = ui.painter();
+            painter.rect_filled(
+                card_rect,
+                CornerRadius::same(12),
+                Color32::from_rgba_unmultiplied(18, 18, 22, 238),
+            );
+            painter.rect_stroke(
+                card_rect,
+                CornerRadius::same(12),
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 36)),
+                egui::StrokeKind::Inside,
+            );
+            let inner = card_rect.shrink2(Vec2::new(14.0, 12.0));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+                ui.vertical_centered(|ui| {
+                    let secs_left = up_next.remaining_secs.ceil().max(0.0) as u32;
+                    let header = if pt {
+                        format!("A seguir em {secs_left}s")
+                    } else {
+                        format!("Up next in {secs_left}s")
+                    };
+                    ui.label(
+                        RichText::new(header)
+                            .size(11.5)
+                            .color(style.text.gamma_multiply(0.75)),
+                    );
+                    ui.add_space(2.0);
+                    let display_title = if up_next.title.chars().count() > 46 {
+                        let prefix: String = up_next.title.chars().take(45).collect();
+                        format!("{}\u{2026}", prefix.trim_end())
+                    } else {
+                        up_next.title.clone()
+                    };
+                    ui.label(
+                        RichText::new(display_title)
+                            .size(13.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                    );
+                    if !up_next.channel.trim().is_empty() {
+                        ui.label(
+                            RichText::new(up_next.channel.trim())
+                                .size(11.0)
+                                .color(style.text.gamma_multiply(0.7)),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    // Circular countdown ring with centered play triangle.
+                    let (ring_rect, ring_resp) =
+                        ui.allocate_exact_size(Vec2::new(50.0, 50.0), Sense::click());
+                    let ring_resp = ring_resp
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .on_hover_text(if pt { "Reproduzir agora" } else { "Play now" });
+                    let rc = ring_rect.center();
+                    let radius = 21.0_f32;
+                    let p = ui.painter();
+                    p.circle_filled(
+                        rc,
+                        radius,
+                        if ring_resp.hovered() {
+                            Color32::from_rgba_unmultiplied(255, 255, 255, 42)
+                        } else {
+                            Color32::from_rgba_unmultiplied(255, 255, 255, 22)
+                        },
+                    );
+                    p.circle_stroke(
+                        rc,
+                        radius,
+                        Stroke::new(2.5, Color32::from_rgba_unmultiplied(255, 255, 255, 48)),
+                    );
+                    let frac = up_next.progress_fraction();
+                    if frac > 0.005 {
+                        let segs = ((frac * 32.0).ceil() as usize).max(2);
+                        let start = -std::f32::consts::FRAC_PI_2;
+                        let sweep = frac * std::f32::consts::TAU;
+                        let arc_pts: Vec<Pos2> = (0..=segs)
+                            .map(|i| {
+                                let a = start + sweep * (i as f32 / segs as f32);
+                                Pos2::new(rc.x + a.cos() * radius, rc.y + a.sin() * radius)
+                            })
+                            .collect();
+                        p.add(Shape::line(arc_pts, Stroke::new(2.8, Color32::WHITE)));
+                    }
+                    let tri = vec![
+                        Pos2::new(rc.x - 4.5, rc.y - 7.0),
+                        Pos2::new(rc.x - 4.5, rc.y + 7.0),
+                        Pos2::new(rc.x + 7.5, rc.y),
+                    ];
+                    p.add(Shape::convex_polygon(tri, Color32::WHITE, Stroke::NONE));
+                    if ring_resp.clicked() {
+                        action_up_next = Some(OverlayAction::PlayUpNextNow);
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let btn_w = ((inner.width() - 8.0) * 0.5).max(80.0);
+                        let cancel_btn = egui::Button::new(
+                            RichText::new(if pt { "Cancelar" } else { "Cancel" })
+                                .size(12.0)
+                                .color(Color32::WHITE),
+                        )
+                        .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 26))
+                        .corner_radius(6)
+                        .min_size(Vec2::new(btn_w, 28.0));
+                        if ui
+                            .add(cancel_btn)
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            action_up_next = Some(OverlayAction::CancelUpNext);
+                        }
+                        let play_btn = egui::Button::new(
+                            RichText::new(if pt { "Reproduzir agora" } else { "Play now" })
+                                .size(12.0)
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .fill(style.accent)
+                        .corner_radius(6)
+                        .min_size(Vec2::new(btn_w, 28.0));
+                        if ui
+                            .add(play_btn)
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                            && action_up_next.is_none()
+                        {
+                            action_up_next = Some(OverlayAction::PlayUpNextNow);
+                        }
+                    });
+                });
+            });
+        });
     }
 
     let mut sponsor_skip_action: Option<OverlayAction> = None;
@@ -1750,27 +2793,61 @@ pub fn show(
         }
     }
 
+    if telemetry.shorts_mode
+        && !telemetry.fullscreen
+        && !telemetry.theater
+        && !telemetry.mini_player
+    {
+        let (shorts_action, shorts_hit) =
+            show_shorts_overlay(ui, video_rect, clipped_video, telemetry, style);
+        return (
+            action_up_next.or(sponsor_skip_action).or(shorts_action),
+            OverlayHitState {
+                over_controls: over_up_next || over_sponsor_pill || shorts_hit.over_controls,
+                over_volume: shorts_hit.over_volume && !over_up_next && !over_sponsor_pill,
+            },
+        );
+    }
+
     if !visible {
-        return (sponsor_skip_action, over_sponsor_pill);
+        set_active_progress_drag_rect(None);
+        return (
+            action_up_next.or(sponsor_skip_action),
+            OverlayHitState {
+                over_controls: over_up_next || over_sponsor_pill,
+                over_volume: false,
+            },
+        );
     }
 
     let Some(bar_rect) = bar_rect else {
-        return (sponsor_skip_action, over_sponsor_pill);
+        set_active_progress_drag_rect(None);
+        return (
+            action_up_next.or(sponsor_skip_action),
+            OverlayHitState {
+                over_controls: over_up_next || over_sponsor_pill,
+                over_volume: false,
+            },
+        );
     };
 
     let pointer_pos = ui.input(|i| i.pointer.hover_pos());
     let mut over_controls = pointer_pos.is_some_and(|pos| bar_rect.contains(pos));
+    let mut over_volume = false;
+    let mut over_popup = false;
 
     let mut action_top: Option<OverlayAction> = None;
     let mut action_center: Option<OverlayAction> = None;
     let mut action_popup: Option<OverlayAction> = None;
     let mut action_play: Option<OverlayAction> = None;
+    let mut action_prev: Option<OverlayAction> = None;
     let mut action_next: Option<OverlayAction> = None;
     let mut action_seek_btn: Option<OverlayAction> = None;
     let mut action_progress: Option<OverlayAction> = None;
     let mut action_mute: Option<OverlayAction> = None;
     let mut action_volume: Option<OverlayAction> = None;
     let mut action_live_pill: Option<OverlayAction> = None;
+    let mut action_time_toggle: Option<OverlayAction> = None;
     let mut action_chapter_pill: Option<OverlayAction> = None;
     let mut action_autoplay: Option<OverlayAction> = None;
     let mut action_audio_only: Option<OverlayAction> = None;
@@ -1839,6 +2916,7 @@ pub fn show(
     if telemetry.ended
         && !telemetry.is_live
         && telemetry.menu.is_none()
+        && telemetry.up_next.is_none()
         && video_rect.height() >= 140.0
     {
         let center_rect = Rect::from_center_size(video_rect.center(), Vec2::new(56.0, 56.0));
@@ -1877,10 +2955,11 @@ pub fn show(
     }
 
     if let Some(menu) = telemetry.menu {
-        let (popup_act, over_popup) =
+        let (popup_act, popup_hovered) =
             show_settings_popup(ui, video_rect, bar_rect, menu, telemetry, style);
         action_popup = popup_act;
-        if over_popup {
+        over_popup = popup_hovered;
+        if popup_hovered {
             over_controls = true;
         }
     }
@@ -1992,7 +3071,14 @@ pub fn show(
                 };
             }
 
-            let is_progress_hot = can_scrub && (progress_resp.hovered() || progress_resp.dragged());
+            let is_dragging_progress = can_scrub && progress_resp.dragged();
+            let retain_scrub_preview =
+                is_dragging_progress || (can_scrub && progress_resp.is_pointer_button_down_on());
+            set_active_progress_drag_rect(retain_scrub_preview.then_some(video_rect));
+            let is_progress_hot = can_scrub
+                && (progress_resp.hovered()
+                    || progress_resp.dragged()
+                    || progress_resp.is_pointer_button_down_on());
             if progress_resp.hovered() || progress_resp.dragged() {
                 over_controls = true;
             }
@@ -2027,8 +3113,25 @@ pub fn show(
                 }
             }
 
+            let scrub_pointer_pos = if is_dragging_progress {
+                progress_resp
+                    .interact_pointer_pos()
+                    .or_else(|| ui.input(|i| i.pointer.interact_pos()))
+                    .or(pointer_pos)
+            } else {
+                pointer_pos
+            };
             let hover_fraction = if is_progress_hot && strip_rect.width() > 0.0 {
-                pointer_pos.map(|p| ((p.x - strip_rect.min.x) / strip_rect.width()).clamp(0.0, 1.0))
+                if is_dragging_progress {
+                    drag_fraction.map(|f| f as f32).or_else(|| {
+                        scrub_pointer_pos.map(|p| {
+                            ((p.x - strip_rect.min.x) / strip_rect.width()).clamp(0.0, 1.0)
+                        })
+                    })
+                } else {
+                    scrub_pointer_pos
+                        .map(|p| ((p.x - strip_rect.min.x) / strip_rect.width()).clamp(0.0, 1.0))
+                }
             } else {
                 None
             };
@@ -2169,13 +3272,120 @@ pub fn show(
                         .circle_filled(Pos2::new(knob_x, track_cy), 6.5, style.accent);
                 }
 
-                if let Some(hf) = hover_fraction
-                    && let Some(p) = pointer_pos
+                let mut heatmap_top_y = strip_rect.min.y;
+                if is_progress_hot
+                    && !telemetry.is_live
+                    && !heatmap.is_empty()
+                    && line_rect.width() >= 24.0
                 {
+                    let baseline_y = line_rect.min.y - 1.5;
+                    let max_h =
+                        HEATMAP_MAX_HEIGHT.min((baseline_y - video_rect.min.y - 8.0).max(0.0));
+                    if max_h >= 6.0 {
+                        let steps = ((line_rect.width() / 3.5).round() as usize).clamp(32, 220);
+                        let mut mesh = egui::Mesh::default();
+                        let mut contour_pts = Vec::with_capacity(steps + 1);
+                        let mut highlight_pts = Vec::new();
+                        let hover_f = hover_fraction.unwrap_or(-1.0);
+                        let mut any_positive = false;
+
+                        for idx in 0..=steps {
+                            let frac = idx as f32 / steps as f32;
+                            let x = line_rect.min.x + line_rect.width() * frac;
+                            let sample_t = f64::from(frac) * duration;
+                            let intensity = sample_heatmap_intensity(heatmap, duration, sample_t);
+                            if intensity > 0.005 {
+                                any_positive = true;
+                            }
+                            let h = if intensity <= 0.005 {
+                                0.0
+                            } else {
+                                (intensity * max_h).max(1.5)
+                            };
+                            let top_y = baseline_y - h;
+                            let top_pos = Pos2::new(x, top_y);
+                            let bot_pos = Pos2::new(x, baseline_y);
+                            contour_pts.push(top_pos);
+
+                            let dist_to_hover = (frac - hover_f).abs();
+                            let near_hover = hover_f >= 0.0 && dist_to_hover <= 0.055;
+                            let is_peak = intensity >= HEATMAP_MOST_REPLAYED_THRESHOLD;
+                            if is_peak && near_hover {
+                                highlight_pts.push(top_pos);
+                            }
+
+                            let (top_color, bot_color) = if is_peak && near_hover {
+                                (
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, 210),
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, 92),
+                                )
+                            } else if near_hover || is_peak {
+                                (
+                                    Color32::from_rgba_unmultiplied(245, 247, 252, 148),
+                                    Color32::from_rgba_unmultiplied(230, 234, 242, 56),
+                                )
+                            } else {
+                                (
+                                    Color32::from_rgba_unmultiplied(228, 232, 240, 102),
+                                    Color32::from_rgba_unmultiplied(200, 205, 215, 34),
+                                )
+                            };
+
+                            let base_v = mesh.vertices.len() as u32;
+                            mesh.vertices.push(Vertex {
+                                pos: top_pos,
+                                uv: egui::epaint::WHITE_UV,
+                                color: top_color,
+                            });
+                            mesh.vertices.push(Vertex {
+                                pos: bot_pos,
+                                uv: egui::epaint::WHITE_UV,
+                                color: bot_color,
+                            });
+                            if idx > 0 {
+                                let prev_top = base_v - 2;
+                                let prev_bot = base_v - 1;
+                                mesh.add_triangle(prev_top, prev_bot, base_v);
+                                mesh.add_triangle(prev_bot, base_v + 1, base_v);
+                            }
+                        }
+
+                        if any_positive {
+                            heatmap_top_y = (baseline_y - max_h).min(strip_rect.min.y);
+                            let painter = ui.painter().with_clip_rect(clipped_video);
+                            painter.add(Shape::mesh(mesh));
+                            painter.add(Shape::line(
+                                contour_pts,
+                                Stroke::new(
+                                    1.25,
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, 176),
+                                ),
+                            ));
+                            if highlight_pts.len() >= 2 {
+                                painter.add(Shape::line(
+                                    highlight_pts,
+                                    Stroke::new(2.0, Color32::WHITE),
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                if let Some(hf) = hover_fraction {
+                    let preview_anchor_x = scrub_pointer_pos
+                        .map(|p| p.x)
+                        .unwrap_or_else(|| strip_rect.min.x + strip_rect.width() * hf);
                     let preview_secs = f64::from(hf) * duration;
                     let chapter_title = current_chapter_title(&telemetry.chapters, preview_secs)
                         .map(str::trim)
                         .filter(|t| !t.is_empty());
+                    let most_replayed_badge = (!telemetry.is_live
+                        && is_heatmap_most_replayed(heatmap, duration, preview_secs))
+                    .then_some(if telemetry.pt {
+                        "Mais assistido"
+                    } else {
+                        "Most replayed"
+                    });
                     let mut time_line = if telemetry.is_live {
                         if f64::from(hf) >= LIVE_EDGE_SNAP_FRACTION {
                             if telemetry.pt { "Ao vivo" } else { "Live" }.to_owned()
@@ -2201,6 +3411,13 @@ pub fn show(
                             FontId::proportional(11.0),
                             Color32::from_gray(230),
                             max_text_w,
+                        )
+                    });
+                    let most_replayed_galley = most_replayed_badge.map(|badge| {
+                        ui.painter().layout_no_wrap(
+                            badge.to_owned(),
+                            FontId::proportional(10.5),
+                            Color32::WHITE,
                         )
                     });
                     let time_galley = ui.painter().layout(
@@ -2232,20 +3449,31 @@ pub fn show(
 
                     let pad = Vec2::new(9.0, 5.0);
                     let line_gap = if chapter_galley.is_some() { 2.0 } else { 0.0 };
+                    let badge_pad = Vec2::new(6.0, 2.0);
+                    let badge_box_size = most_replayed_galley
+                        .as_ref()
+                        .map(|g| g.size() + badge_pad * 2.0);
+                    let badge_gap = if badge_box_size.is_some() { 3.0 } else { 0.0 };
                     let thumb_gap = if storyboard_size.is_some() { 6.0 } else { 0.0 };
                     let content_w = chapter_galley
                         .as_ref()
                         .map_or(0.0, |g| g.size().x)
+                        .max(badge_box_size.map_or(0.0, |s| s.x))
                         .max(time_galley.size().x)
                         .max(storyboard_size.map_or(0.0, |s| s.x));
                     let content_h = storyboard_size.map_or(0.0, |s| s.y + thumb_gap)
                         + chapter_galley
                             .as_ref()
                             .map_or(0.0, |g| g.size().y + line_gap)
+                        + badge_box_size.map_or(0.0, |s| s.y + badge_gap)
                         + time_galley.size().y;
                     let pill_size = Vec2::new(content_w + pad.x * 2.0, content_h + pad.y * 2.0);
-                    let pill_rect =
-                        compute_hover_pill_rect(p.x, strip_rect.min.y, pill_size, video_rect);
+                    let pill_rect = compute_hover_pill_rect(
+                        preview_anchor_x,
+                        heatmap_top_y,
+                        pill_size,
+                        video_rect,
+                    );
                     let pill_painter = ui.painter().with_clip_rect(clipped_video);
                     pill_painter.rect_filled(
                         pill_rect,
@@ -2285,6 +3513,34 @@ pub fn show(
                             Color32::from_gray(230),
                         );
                         text_y += ch_h + line_gap;
+                    }
+                    if let (Some(badge_galley), Some(box_sz)) =
+                        (most_replayed_galley, badge_box_size)
+                    {
+                        let box_x =
+                            (pill_rect.center().x - box_sz.x * 0.5).max(pill_rect.left() + pad.x);
+                        let badge_rect = Rect::from_min_size(Pos2::new(box_x, text_y), box_sz);
+                        let badge_painter = pill_painter.with_clip_rect(pill_rect);
+                        badge_painter.rect_filled(
+                            badge_rect,
+                            CornerRadius::same(4),
+                            Color32::from_rgba_unmultiplied(255, 255, 255, 32),
+                        );
+                        badge_painter.rect_stroke(
+                            badge_rect,
+                            CornerRadius::same(4),
+                            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 58)),
+                            egui::StrokeKind::Inside,
+                        );
+                        badge_painter.galley(
+                            Pos2::new(
+                                badge_rect.left() + badge_pad.x,
+                                badge_rect.top() + badge_pad.y,
+                            ),
+                            badge_galley,
+                            Color32::WHITE,
+                        );
+                        text_y += box_sz.y + badge_gap;
                     }
                     let time_x = (pill_rect.center().x - time_galley.size().x * 0.5)
                         .max(pill_rect.left() + pad.x);
@@ -2378,6 +3634,21 @@ pub fn show(
                         action_play = Some(OverlayAction::TogglePlay);
                     }
 
+                    if telemetry.has_previous
+                        && icon_button(
+                            ui,
+                            Vec2::new(30.0, 30.0),
+                            VectorGlyph::Previous,
+                            style,
+                            true,
+                            false,
+                            "V\u{00ed}deo anterior (Shift+P)",
+                        )
+                        .clicked()
+                    {
+                        action_prev = Some(OverlayAction::Previous);
+                    }
+
                     if icon_button(
                         ui,
                         Vec2::new(30.0, 30.0),
@@ -2429,7 +3700,7 @@ pub fn show(
                         }
                     }
 
-                    if icon_button(
+                    let mute_resp = icon_button(
                         ui,
                         Vec2::new(30.0, 30.0),
                         VectorGlyph::Volume(telemetry.muted, telemetry.volume_percent),
@@ -2441,26 +3712,41 @@ pub fn show(
                         } else {
                             "Silenciar (M)"
                         },
-                    )
-                    .clicked()
-                    {
+                    );
+                    if mute_resp.clicked() {
                         action_mute = Some(OverlayAction::ToggleMute);
                     }
 
+                    let mut volume_rect = mute_resp.rect;
+                    let mut volume_widget_hot = mute_resp.hovered();
+
                     if slider_w > 0.0 {
-                        let (vol_changed, vol_hot) = volume_slider(
+                        let (vol_changed, vol_resp) = volume_slider(
                             ui,
                             slider_w,
                             telemetry.volume_percent,
                             telemetry.muted,
+                            telemetry.pt,
                             style,
                         );
+                        let vol_hot = vol_resp.hovered() || vol_resp.dragged();
                         if vol_hot {
                             over_controls = true;
+                            volume_widget_hot = true;
                         }
                         if let Some(v) = vol_changed {
                             action_volume = Some(OverlayAction::SetVolume(v));
                         }
+                        volume_rect = volume_rect.union(vol_resp.rect);
+                    }
+
+                    let visible_volume_rect =
+                        volume_rect.intersect(left_rect.intersect(clipped_video));
+                    if visible_volume_rect.is_positive()
+                        && (volume_widget_hot
+                            || pointer_pos.is_some_and(|pos| visible_volume_rect.contains(pos)))
+                    {
+                        over_volume = true;
                     }
 
                     if telemetry.is_live {
@@ -2536,9 +3822,31 @@ pub fn show(
                         let shown_pos = drag_fraction
                             .and_then(|f| telemetry.duration_secs.map(|d| f * d))
                             .unwrap_or(telemetry.position_secs);
-                        let time_label = format_elapsed_total(shown_pos, telemetry.duration_secs);
+                        let time_label = format_time_display(
+                            shown_pos,
+                            telemetry.duration_secs,
+                            telemetry.show_remaining_time,
+                        );
                         ui.add_space(4.0);
-                        ui.label(RichText::new(time_label).color(style.text).size(12.0));
+                        let time_resp = ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(time_label).color(style.text).size(12.0),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .on_hover_text(if telemetry.pt {
+                                "Alternar tempo decorrido / restante"
+                            } else {
+                                "Toggle elapsed / remaining time"
+                            });
+                        if time_resp.hovered() {
+                            over_controls = true;
+                        }
+                        if time_resp.clicked() {
+                            action_time_toggle = Some(OverlayAction::ToggleRemainingTime);
+                        }
                     }
 
                     if vw >= 620.0
@@ -2730,19 +4038,24 @@ pub fn show(
                 });
             });
         });
+    } else {
+        set_active_progress_drag_rect(None);
     }
 
-    let action = sponsor_skip_action
+    let action = action_up_next
+        .or(sponsor_skip_action)
         .or(action_popup)
         .or(action_top)
         .or(action_center)
         .or(action_play)
+        .or(action_prev)
         .or(action_next)
         .or(action_seek_btn)
         .or(action_progress)
         .or(action_mute)
         .or(action_volume)
         .or(action_live_pill)
+        .or(action_time_toggle)
         .or(action_chapter_pill)
         .or(action_autoplay)
         .or(action_audio_only)
@@ -2752,9 +4065,409 @@ pub fn show(
         .or(action_theater)
         .or(action_fullscreen);
 
-    over_controls |= over_sponsor_pill;
+    over_controls |= over_up_next || over_sponsor_pill;
+    if over_up_next || over_sponsor_pill || over_popup {
+        over_volume = false;
+    }
 
-    (action, over_controls)
+    (
+        action,
+        OverlayHitState {
+            over_controls,
+            over_volume,
+        },
+    )
+}
+
+fn show_shorts_overlay(
+    ui: &mut egui::Ui,
+    video_rect: Rect,
+    clipped_video: Rect,
+    telemetry: &OverlayTelemetry,
+    style: &OverlayStyle,
+) -> (Option<OverlayAction>, OverlayHitState) {
+    let painter = ui.painter().with_clip_rect(clipped_video);
+    let scrim_h = 68.0_f32.min(video_rect.height() * 0.25);
+    if scrim_h > 4.0 {
+        let bands = 6_usize;
+        let band_h = scrim_h / bands as f32;
+        for i in 0..bands {
+            let t = i as f32 / bands as f32;
+            let alpha = ((1.0 - t).powf(1.4) * 110.0).round() as u8;
+            let band_rect = Rect::from_min_max(
+                Pos2::new(video_rect.left(), video_rect.top() + i as f32 * band_h),
+                Pos2::new(
+                    video_rect.right(),
+                    video_rect.top() + (i + 1) as f32 * band_h,
+                ),
+            );
+            painter.rect_filled(
+                band_rect,
+                0.0,
+                Color32::from_rgba_unmultiplied(0, 0, 0, alpha),
+            );
+        }
+    }
+
+    let pointer_pos = ui.input(|i| i.pointer.hover_pos());
+    let mut over_controls = false;
+    let mut over_volume = false;
+    let mut action_play: Option<OverlayAction> = None;
+    let mut action_mute: Option<OverlayAction> = None;
+    let mut action_volume: Option<OverlayAction> = None;
+    let mut action_progress: Option<OverlayAction> = None;
+
+    // Top-left circular Play/Pause button.
+    let play_rect = Rect::from_min_size(
+        Pos2::new(video_rect.left() + 12.0, video_rect.top() + 12.0),
+        Vec2::splat(40.0),
+    );
+    let play_resp = ui
+        .interact(
+            play_rect,
+            ui.make_persistent_id("fasttube_shorts_play_btn"),
+            Sense::click(),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text(if telemetry.paused || telemetry.ended {
+            if telemetry.pt { "Reproduzir" } else { "Play" }
+        } else if telemetry.pt {
+            "Pausar"
+        } else {
+            "Pause"
+        });
+    if play_resp.hovered() || pointer_pos.is_some_and(|p| play_rect.contains(p)) {
+        over_controls = true;
+    }
+    let play_bg = if play_resp.hovered() {
+        Color32::from_rgba_unmultiplied(15, 15, 15, 210)
+    } else {
+        Color32::from_rgba_unmultiplied(15, 15, 15, 150)
+    };
+    painter.circle_filled(play_rect.center(), 20.0, play_bg);
+    let c = play_rect.center();
+    if telemetry.paused || telemetry.ended {
+        painter.add(Shape::convex_polygon(
+            vec![
+                Pos2::new(c.x - 4.5, c.y - 6.5),
+                Pos2::new(c.x - 4.5, c.y + 6.5),
+                Pos2::new(c.x + 6.5, c.y),
+            ],
+            Color32::WHITE,
+            Stroke::NONE,
+        ));
+    } else {
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(c.x - 5.0, c.y - 6.5),
+                Pos2::new(c.x - 1.5, c.y + 6.5),
+            ),
+            1.0,
+            Color32::WHITE,
+        );
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(c.x + 1.5, c.y - 6.5),
+                Pos2::new(c.x + 5.0, c.y + 6.5),
+            ),
+            1.0,
+            Color32::WHITE,
+        );
+    }
+    if play_resp.clicked() {
+        action_play = Some(OverlayAction::TogglePlay);
+    }
+
+    // Top-left circular Volume/Mute button with hover-expandable volume slider pill.
+    let vol_state_id = ui.make_persistent_id("fasttube_shorts_vol_hover");
+    let prev_expanded: bool = ui.data(|d| d.get_temp(vol_state_id)).unwrap_or(false);
+    let mute_rect = Rect::from_min_size(
+        Pos2::new(video_rect.left() + 60.0, video_rect.top() + 12.0),
+        Vec2::splat(40.0),
+    );
+    let max_pill_w = (video_rect.width() - 124.0).clamp(40.0, 134.0);
+    let pill_hover_rect = Rect::from_min_size(
+        mute_rect.min,
+        Vec2::new(if prev_expanded { max_pill_w } else { 40.0 }, 40.0),
+    );
+    let mut show_slider = max_pill_w >= 112.0
+        && (prev_expanded && ui.input(|i| i.pointer.any_down())
+            || pointer_pos.is_some_and(|p| pill_hover_rect.contains(p)));
+    if show_slider {
+        let full_pill = Rect::from_min_size(mute_rect.min, Vec2::new(max_pill_w, 40.0));
+        painter.rect_filled(
+            full_pill,
+            CornerRadius::same(20),
+            Color32::from_rgba_unmultiplied(15, 15, 15, 175),
+        );
+        if pointer_pos.is_some_and(|p| full_pill.contains(p)) {
+            over_controls = true;
+        }
+    }
+
+    let mute_resp = ui
+        .interact(
+            mute_rect,
+            ui.make_persistent_id("fasttube_shorts_mute_btn"),
+            Sense::click(),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text(if telemetry.muted {
+            if telemetry.pt { "Ativar som" } else { "Unmute" }
+        } else if telemetry.pt {
+            "Silenciar"
+        } else {
+            "Mute"
+        });
+    if mute_resp.hovered() || pointer_pos.is_some_and(|p| mute_rect.contains(p)) {
+        over_controls = true;
+        over_volume = true;
+        show_slider |= max_pill_w >= 112.0;
+    }
+    if !show_slider {
+        let mute_bg = if mute_resp.hovered() {
+            Color32::from_rgba_unmultiplied(15, 15, 15, 210)
+        } else {
+            Color32::from_rgba_unmultiplied(15, 15, 15, 150)
+        };
+        painter.circle_filled(mute_rect.center(), 20.0, mute_bg);
+    }
+    let vc = mute_rect.center();
+    let speaker = vec![
+        Pos2::new(vc.x - 7.5, vc.y - 2.5),
+        Pos2::new(vc.x - 4.0, vc.y - 2.5),
+        Pos2::new(vc.x + 0.5, vc.y - 6.5),
+        Pos2::new(vc.x + 0.5, vc.y + 6.5),
+        Pos2::new(vc.x - 4.0, vc.y + 2.5),
+        Pos2::new(vc.x - 7.5, vc.y + 2.5),
+    ];
+    painter.add(Shape::convex_polygon(speaker, Color32::WHITE, Stroke::NONE));
+    if telemetry.muted || telemetry.volume_percent <= 0.5 {
+        painter.line_segment(
+            [
+                Pos2::new(vc.x + 3.0, vc.y - 3.5),
+                Pos2::new(vc.x + 8.0, vc.y + 3.5),
+            ],
+            Stroke::new(1.8, Color32::WHITE),
+        );
+        painter.line_segment(
+            [
+                Pos2::new(vc.x + 8.0, vc.y - 3.5),
+                Pos2::new(vc.x + 3.0, vc.y + 3.5),
+            ],
+            Stroke::new(1.8, Color32::WHITE),
+        );
+    } else {
+        let arc1 = [
+            Pos2::new(vc.x + 3.0, vc.y - 3.0),
+            Pos2::new(vc.x + 4.5, vc.y),
+            Pos2::new(vc.x + 3.0, vc.y + 3.0),
+        ];
+        painter.add(Shape::line(arc1.to_vec(), Stroke::new(1.6, Color32::WHITE)));
+        if telemetry.volume_percent > 45.0 {
+            let arc2 = [
+                Pos2::new(vc.x + 5.5, vc.y - 5.5),
+                Pos2::new(vc.x + 8.0, vc.y),
+                Pos2::new(vc.x + 5.5, vc.y + 5.5),
+            ];
+            painter.add(Shape::line(arc2.to_vec(), Stroke::new(1.6, Color32::WHITE)));
+        }
+    }
+    if mute_resp.clicked() {
+        action_mute = Some(OverlayAction::ToggleMute);
+    }
+
+    if show_slider {
+        let slider_rect = Rect::from_min_max(
+            Pos2::new(mute_rect.right() + 2.0, mute_rect.top() + 6.0),
+            Pos2::new(
+                mute_rect.left() + max_pill_w - 8.0,
+                mute_rect.bottom() - 6.0,
+            ),
+        );
+        let slider_w = slider_rect.width().max(24.0);
+        let (vol_changed, vol_resp) = ui
+            .scope_builder(egui::UiBuilder::new().max_rect(slider_rect), |ui| {
+                ui.set_clip_rect(slider_rect.intersect(clipped_video));
+                volume_slider(
+                    ui,
+                    slider_w,
+                    telemetry.volume_percent,
+                    telemetry.muted,
+                    telemetry.pt,
+                    style,
+                )
+            })
+            .inner;
+        let vol_dragging = vol_resp.hovered() || vol_resp.dragged();
+        if let Some(v) = vol_changed {
+            action_volume = Some(OverlayAction::SetVolume(v));
+        }
+        over_controls |= vol_dragging;
+        let in_pill = pointer_pos.is_some_and(|p| {
+            Rect::from_min_size(mute_rect.min, Vec2::new(max_pill_w, 40.0)).contains(p)
+        });
+        over_volume |= vol_dragging || in_pill;
+        show_slider = vol_dragging || in_pill;
+    }
+    ui.data_mut(|d| d.insert_temp(vol_state_id, show_slider));
+
+    // Thin YouTube-red bottom progress bar along the bottom edge of the 9:16 card.
+    let strip_rect = Rect::from_min_max(
+        Pos2::new(
+            video_rect.left() + 4.0,
+            (video_rect.bottom() - 14.0).max(video_rect.top() + 60.0),
+        ),
+        Pos2::new(video_rect.right() - 4.0, video_rect.bottom()),
+    );
+    let can_scrub = telemetry
+        .duration_secs
+        .is_some_and(|d| d.is_finite() && d > 0.0);
+    let progress_id = ui.make_persistent_id("fasttube_shorts_progress_strip");
+    let progress_resp = ui.interact(
+        strip_rect,
+        progress_id,
+        if can_scrub {
+            Sense::click_and_drag()
+        } else {
+            Sense::hover()
+        },
+    );
+    let progress_resp = if can_scrub {
+        progress_resp.on_hover_cursor(CursorIcon::PointingHand)
+    } else {
+        progress_resp
+    };
+    if progress_resp.hovered() || pointer_pos.is_some_and(|p| strip_rect.contains(p)) {
+        over_controls = true;
+    }
+
+    let mut drag_fraction: Option<f64> = if can_scrub {
+        ui.data(|d| d.get_temp(progress_id))
+    } else {
+        ui.data_mut(|d| d.remove::<f64>(progress_id));
+        None
+    };
+    if can_scrub
+        && progress_resp.dragged()
+        && strip_rect.width() > 0.0
+        && let Some(pos) = progress_resp
+            .interact_pointer_pos()
+            .or_else(|| ui.input(|i| i.pointer.interact_pos()))
+    {
+        let frac = f64::from((pos.x - strip_rect.min.x) / strip_rect.width()).clamp(0.0, 1.0);
+        drag_fraction = Some(frac);
+        ui.data_mut(|d| d.insert_temp(progress_id, frac));
+    }
+    if can_scrub && progress_resp.drag_stopped() {
+        if let Some(frac) = drag_fraction.take() {
+            action_progress = action_for_progress_click(frac, telemetry.duration_secs);
+        }
+        ui.data_mut(|d| d.remove::<f64>(progress_id));
+    } else if can_scrub
+        && progress_resp.clicked()
+        && strip_rect.width() > 0.0
+        && let Some(pos) = progress_resp
+            .interact_pointer_pos()
+            .or_else(|| ui.input(|i| i.pointer.interact_pos()))
+    {
+        let frac = f64::from((pos.x - strip_rect.min.x) / strip_rect.width()).clamp(0.0, 1.0);
+        action_progress = action_for_progress_click(frac, telemetry.duration_secs);
+    }
+
+    let is_dragging = can_scrub && progress_resp.dragged();
+    let retain_preview = is_dragging || (can_scrub && progress_resp.is_pointer_button_down_on());
+    set_active_progress_drag_rect(retain_preview.then_some(video_rect));
+    over_controls |= retain_preview;
+
+    let bar_h = if progress_resp.hovered() || retain_preview {
+        5.0
+    } else {
+        3.0
+    };
+    let bar_bottom = video_rect.bottom() - 1.5;
+    let bar_rect_visual = Rect::from_min_max(
+        Pos2::new(strip_rect.left(), bar_bottom - bar_h),
+        Pos2::new(strip_rect.right(), bar_bottom),
+    );
+    painter.rect_filled(
+        bar_rect_visual,
+        1.5,
+        Color32::from_rgba_unmultiplied(255, 255, 255, 72),
+    );
+
+    let played_ratio = drag_fraction
+        .unwrap_or_else(|| {
+            telemetry
+                .duration_secs
+                .filter(|d| d.is_finite() && *d > 0.0)
+                .map_or(0.0, |d| (telemetry.position_secs / d).clamp(0.0, 1.0))
+        })
+        .clamp(0.0, 1.0) as f32;
+    let buffered_ratio = telemetry
+        .buffered_secs
+        .zip(telemetry.duration_secs)
+        .filter(|(b, d)| b.is_finite() && d.is_finite() && *d > 0.0)
+        .map_or(0.0, |(b, d)| (b / d).clamp(0.0, 1.0)) as f32;
+
+    if buffered_ratio > played_ratio {
+        let buf_end =
+            bar_rect_visual.left() + bar_rect_visual.width() * buffered_ratio.clamp(0.0, 1.0);
+        painter.rect_filled(
+            Rect::from_min_max(
+                bar_rect_visual.min,
+                Pos2::new(buf_end, bar_rect_visual.max.y),
+            ),
+            1.5,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 125),
+        );
+    }
+    let yt_red = Color32::from_rgb(255, 0, 51);
+    if played_ratio > 0.0 {
+        let fill_end = bar_rect_visual.left() + bar_rect_visual.width() * played_ratio;
+        painter.rect_filled(
+            Rect::from_min_max(
+                bar_rect_visual.min,
+                Pos2::new(fill_end, bar_rect_visual.max.y),
+            ),
+            1.5,
+            yt_red,
+        );
+        if progress_resp.hovered() || retain_preview {
+            painter.circle_filled(Pos2::new(fill_end, bar_rect_visual.center().y), 5.5, yt_red);
+        }
+    }
+
+    let mut action_popup: Option<OverlayAction> = None;
+    if let Some(menu) = telemetry.menu {
+        let popup_anchor = Rect::from_min_max(
+            Pos2::new(
+                video_rect.left(),
+                (video_rect.bottom() - 16.0).max(video_rect.top()),
+            ),
+            video_rect.max,
+        );
+        let (act, over_popup) =
+            show_settings_popup(ui, video_rect, popup_anchor, menu, telemetry, style);
+        action_popup = act;
+        over_controls |= over_popup;
+        if over_popup {
+            over_volume = false;
+        }
+    }
+
+    let action = action_popup
+        .or(action_play)
+        .or(action_mute)
+        .or(action_volume)
+        .or(action_progress);
+    (
+        action,
+        OverlayHitState {
+            over_controls,
+            over_volume,
+        },
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4211,5 +5924,764 @@ mod tests {
         assert!(stats_texts.iter().any(|t| t == "Estatísticas para nerds"));
         assert!(stats_texts.iter().any(|t| t == "dQw4w9WgXcQ"));
         assert!(stats_texts.iter().any(|t| t == "av1 / opus"));
+    }
+
+    #[test]
+    fn overlay_renders_previous_button_when_has_previous_is_true() {
+        let rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(720.0, 405.0));
+        let style = sample_style();
+        let telemetry = OverlayTelemetry {
+            paused: true,
+            has_previous: true,
+            has_queued: true,
+            duration_secs: Some(120.0),
+            ..OverlayTelemetry::default()
+        };
+        let ctx = egui::Context::default();
+        let bar_rect = compute_bar_rect(rect).expect("bar_rect");
+        // Left row order: Play(32) + spacing(4) + Previous(30) + spacing(4) + Next(30)
+        let prev_pos = Pos2::new(
+            bar_rect.min.x + 12.0 + 32.0 + 4.0 + 15.0,
+            bar_rect.min.y + 36.0,
+        );
+        assert_eq!(
+            click_at(&ctx, rect, &telemetry, &style, prev_pos),
+            (Some(OverlayAction::Previous), true)
+        );
+        let next_pos = Pos2::new(prev_pos.x + 34.0, prev_pos.y);
+        assert_eq!(
+            click_at(&ctx, rect, &telemetry, &style, next_pos),
+            (Some(OverlayAction::Next), true)
+        );
+    }
+
+    #[test]
+    fn hover_preview_time_secs_retains_scrub_time_when_dragging_outside_strip() {
+        let rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(720.0, 405.0));
+        let bar_rect = compute_bar_rect(rect).expect("bar_rect");
+        let track_left = bar_rect.min.x + BAR_SIDE_PADDING;
+        let track_right = bar_rect.max.x - BAR_SIDE_PADDING;
+        let track_w = track_right - track_left;
+
+        let above_strip = Pos2::new(track_left + track_w * 0.75, bar_rect.min.y - 80.0);
+        let below_strip = Pos2::new(track_left + track_w * 0.25, bar_rect.max.y + 40.0);
+        let past_right = Pos2::new(track_right + 50.0, bar_rect.min.y - 60.0);
+        let past_left = Pos2::new(track_left - 50.0, bar_rect.min.y - 60.0);
+
+        // Hovering outside the 16px strip without dragging yields None.
+        assert_eq!(
+            hover_preview_time_secs_with_drag(rect, Some(200.0), Some(above_strip), false),
+            None
+        );
+        assert_eq!(
+            hover_preview_time_secs_with_drag(rect, Some(200.0), Some(below_strip), false),
+            None
+        );
+
+        // While dragging, vertical drift and horizontal overshoot stay active and clamped.
+        let t_above = hover_preview_time_secs_with_drag(rect, Some(200.0), Some(above_strip), true)
+            .expect("dragged scrub time above strip");
+        assert!((t_above - 150.0).abs() < 1.0, "got {t_above}");
+
+        let t_below = hover_preview_time_secs_with_drag(rect, Some(200.0), Some(below_strip), true)
+            .expect("dragged scrub time below strip");
+        assert!((t_below - 50.0).abs() < 1.0, "got {t_below}");
+
+        let t_right = hover_preview_time_secs_with_drag(rect, Some(200.0), Some(past_right), true)
+            .expect("dragged scrub time past right");
+        assert!((t_right - 200.0).abs() < 1e-6, "got {t_right}");
+
+        let t_left = hover_preview_time_secs_with_drag(rect, Some(200.0), Some(past_left), true)
+            .expect("dragged scrub time past left");
+        assert!(t_left.abs() < 1e-6, "got {t_left}");
+    }
+
+    #[test]
+    fn progress_bar_drag_retains_storyboard_preview_when_pointer_drifts_vertically() {
+        let rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(800.0, 450.0));
+        let style = sample_style();
+        let bar_rect = compute_bar_rect(rect).expect("bar_rect");
+        let side_pad = BAR_SIDE_PADDING.min((bar_rect.width() * 0.04).max(4.0));
+        let track_left = bar_rect.min.x + side_pad;
+        let track_right = bar_rect.max.x - side_pad;
+        let track_w = track_right - track_left;
+
+        let start_pos = Pos2::new(track_left + track_w * 0.25, bar_rect.min.y + 6.0);
+        let drifted_pos = Pos2::new(track_left + track_w * 0.75, bar_rect.min.y - 120.0);
+
+        let telemetry = OverlayTelemetry {
+            duration_secs: Some(200.0),
+            storyboard_preview: Some(OverlayStoryboardFrame {
+                texture_id: egui::TextureId::Managed(1),
+                uv: Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(0.2, 0.2)),
+                aspect_ratio: 16.0 / 9.0,
+            }),
+            ..OverlayTelemetry::default()
+        };
+
+        let ctx = egui::Context::default();
+        set_active_progress_drag_rect(None);
+
+        // Frame 0: warm up layout and hover over the progress strip.
+        let mut out0 = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                events: vec![egui::Event::PointerMoved(start_pos)],
+                ..Default::default()
+            },
+            |ui| {
+                let _ = show(ui, rect, &telemetry, &style, true);
+            },
+        );
+        out0.textures_delta.clear();
+
+        // Frame 1: begin pressing on the progress strip.
+        let mut out1 = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                events: vec![
+                    egui::Event::PointerMoved(start_pos),
+                    egui::Event::PointerButton {
+                        pos: start_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                let _ = show(ui, rect, &telemetry, &style, true);
+            },
+        );
+        out1.textures_delta.clear();
+
+        // Frame 2: pointer drifts 120px vertically above the 16px strip while dragging.
+        let preview_secs = hover_preview_time_secs(rect, Some(200.0), Some(drifted_pos)).expect(
+            "hover_preview_time_secs must remain active while dragging vertically off strip",
+        );
+        assert!((preview_secs - 150.0).abs() < 1.5, "got {preview_secs}");
+
+        let mut texts = Vec::new();
+        let mut has_mesh = false;
+        let mut out2 = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                events: vec![egui::Event::PointerMoved(drifted_pos)],
+                ..Default::default()
+            },
+            |ui| {
+                let _ = show(ui, rect, &telemetry, &style, true);
+            },
+        );
+        for clipped in &out2.shapes {
+            match &clipped.shape {
+                Shape::Mesh(_) => has_mesh = true,
+                Shape::Text(t) => texts.push(t.galley.text().to_owned()),
+                Shape::Vec(vec) => {
+                    for s in vec {
+                        match s {
+                            Shape::Mesh(_) => has_mesh = true,
+                            Shape::Text(t) => texts.push(t.galley.text().to_owned()),
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out2.textures_delta.clear();
+        assert!(
+            has_mesh,
+            "storyboard preview mesh must stay rendered while dragging vertically off strip"
+        );
+        assert!(
+            texts.iter().any(|t| t == "2:30"),
+            "expected dragged preview timestamp 2:30 in {texts:?}"
+        );
+
+        // Frame 3: release pointer and confirm SeekTo is emitted and drag state clears.
+        let mut release_action = None;
+        let mut out3 = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                events: vec![
+                    egui::Event::PointerMoved(drifted_pos),
+                    egui::Event::PointerButton {
+                        pos: drifted_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                release_action = show(ui, rect, &telemetry, &style, true).0;
+            },
+        );
+        out3.textures_delta.clear();
+        match release_action {
+            Some(OverlayAction::SeekTo(secs)) => {
+                assert!((secs - 150.0).abs() < 1.5, "unexpected seek target {secs}");
+            }
+            other => panic!("expected SeekTo(~150.0) on drag release, got {other:?}"),
+        }
+        assert_eq!(
+            hover_preview_time_secs(rect, Some(200.0), Some(drifted_pos)),
+            None
+        );
+    }
+
+    #[test]
+    fn sample_heatmap_intensity_interpolates_across_boundaries_and_guards_empty_or_zero_duration() {
+        let points = [
+            HeatmapPoint {
+                start_secs: 0.0,
+                duration_secs: 10.0,
+                intensity: 0.2,
+            },
+            HeatmapPoint {
+                start_secs: 10.0,
+                duration_secs: 10.0,
+                intensity: 0.8,
+            },
+            HeatmapPoint {
+                start_secs: 20.0,
+                duration_secs: 10.0,
+                intensity: 0.4,
+            },
+        ];
+
+        assert_eq!(sample_heatmap_intensity(&[], 30.0, 10.0), 0.0);
+        assert_eq!(sample_heatmap_intensity(&points, 0.0, 10.0), 0.0);
+        assert_eq!(sample_heatmap_intensity(&points, -5.0, 10.0), 0.0);
+        assert_eq!(sample_heatmap_intensity(&points, f64::NAN, 10.0), 0.0);
+        assert_eq!(sample_heatmap_intensity(&points, 30.0, f64::NAN), 0.0);
+
+        // Segment centers match exact normalized intensities.
+        assert!((sample_heatmap_intensity(&points, 30.0, 0.0) - 0.2).abs() < 1e-5);
+        assert!((sample_heatmap_intensity(&points, 30.0, 5.0) - 0.2).abs() < 1e-5);
+        assert!((sample_heatmap_intensity(&points, 30.0, 15.0) - 0.8).abs() < 1e-5);
+        assert!((sample_heatmap_intensity(&points, 30.0, 25.0) - 0.4).abs() < 1e-5);
+        assert!((sample_heatmap_intensity(&points, 30.0, 30.0) - 0.4).abs() < 1e-5);
+
+        // Boundary at t=10.0s sits smoothly between 0.2 and 0.8.
+        let boundary_01 = sample_heatmap_intensity(&points, 30.0, 10.0);
+        assert!(
+            boundary_01 > 0.45 && boundary_01 < 0.65,
+            "expected smooth boundary transition around ~0.5, got {boundary_01}"
+        );
+
+        // Disjoint markers return 0.0 in uncovered gaps and outside marker bounds.
+        let disjoint = [
+            HeatmapPoint {
+                start_secs: 20.0,
+                duration_secs: 10.0,
+                intensity: 0.9,
+            },
+            HeatmapPoint {
+                start_secs: 50.0,
+                duration_secs: 10.0,
+                intensity: 0.6,
+            },
+        ];
+        assert_eq!(sample_heatmap_intensity(&disjoint, 100.0, 5.0), 0.0);
+        assert!((sample_heatmap_intensity(&disjoint, 100.0, 25.0) - 0.9).abs() < 1e-5);
+        assert_eq!(sample_heatmap_intensity(&disjoint, 100.0, 35.0), 0.0);
+        assert!((sample_heatmap_intensity(&disjoint, 100.0, 55.0) - 0.6).abs() < 1e-5);
+        assert_eq!(sample_heatmap_intensity(&disjoint, 100.0, 80.0), 0.0);
+    }
+
+    #[test]
+    fn heatmap_peak_detection_and_most_replayed_hover_badge_renders_bilingually() {
+        let heatmap = [
+            HeatmapPoint {
+                start_secs: 0.0,
+                duration_secs: 50.0,
+                intensity: 0.25,
+            },
+            HeatmapPoint {
+                start_secs: 50.0,
+                duration_secs: 50.0,
+                intensity: 0.96,
+            },
+            HeatmapPoint {
+                start_secs: 100.0,
+                duration_secs: 50.0,
+                intensity: 0.30,
+            },
+            HeatmapPoint {
+                start_secs: 150.0,
+                duration_secs: 50.0,
+                intensity: 0.15,
+            },
+        ];
+
+        assert!(!is_heatmap_most_replayed(&heatmap, 200.0, 25.0));
+        assert!(is_heatmap_most_replayed(&heatmap, 200.0, 75.0));
+        assert!(!is_heatmap_most_replayed(&heatmap, 200.0, 175.0));
+        assert_eq!(
+            heatmap_peak_point(&heatmap),
+            Some(HeatmapPoint {
+                start_secs: 50.0,
+                duration_secs: 50.0,
+                intensity: 0.96,
+            })
+        );
+
+        let rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(800.0, 450.0));
+        let style = sample_style();
+        let bar_rect = compute_bar_rect(rect).expect("bar_rect");
+        let side_pad = BAR_SIDE_PADDING.min((bar_rect.width() * 0.04).max(4.0));
+        let track_left = bar_rect.min.x + side_pad;
+        let track_right = bar_rect.max.x - side_pad;
+        let track_w = track_right - track_left;
+
+        // Hover at 75.0s / 200.0s (fraction 0.375, center of the 0.96 peak marker).
+        let peak_hover_pos = Pos2::new(track_left + track_w * 0.375, bar_rect.min.y + 6.0);
+        // Hover at 175.0s / 200.0s (fraction 0.875, low-intensity 0.15 marker).
+        let low_hover_pos = Pos2::new(track_left + track_w * 0.875, bar_rect.min.y + 6.0);
+
+        for (pt, expected_badge) in [(true, "Mais assistido"), (false, "Most replayed")] {
+            let ctx = egui::Context::default();
+            let telemetry = OverlayTelemetry {
+                pt,
+                duration_secs: Some(200.0),
+                position_secs: 10.0,
+                ..OverlayTelemetry::default()
+            };
+
+            // Warm up one pass so egui registers the progress strip rect for hover hit-testing.
+            let mut warmup = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events: vec![egui::Event::PointerMoved(peak_hover_pos)],
+                    ..Default::default()
+                },
+                |ui| {
+                    let _ = show_with_heatmap(ui, rect, &telemetry, &heatmap, &style, true);
+                },
+            );
+            warmup.textures_delta.clear();
+
+            let mut texts = Vec::new();
+            let mut has_mesh = false;
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events: vec![egui::Event::PointerMoved(peak_hover_pos)],
+                    ..Default::default()
+                },
+                |ui| {
+                    let _ = show_with_heatmap(ui, rect, &telemetry, &heatmap, &style, true);
+                },
+            );
+            for clipped in &out.shapes {
+                match &clipped.shape {
+                    Shape::Mesh(_) => has_mesh = true,
+                    Shape::Text(t) => texts.push(t.galley.text().to_owned()),
+                    Shape::Vec(vec) => {
+                        for s in vec {
+                            match s {
+                                Shape::Mesh(_) => has_mesh = true,
+                                Shape::Text(t) => texts.push(t.galley.text().to_owned()),
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out.textures_delta.clear();
+            assert!(has_mesh, "expected heatmap area mesh to be painted");
+            assert!(
+                texts.iter().any(|t| t == expected_badge),
+                "pt={pt}: expected {expected_badge:?} badge in {texts:?}"
+            );
+
+            // Hovering over a low-intensity segment must not display the Most replayed badge.
+            let mut low_texts = Vec::new();
+            let mut out_low = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events: vec![egui::Event::PointerMoved(low_hover_pos)],
+                    ..Default::default()
+                },
+                |ui| {
+                    let _ = show_with_heatmap(ui, rect, &telemetry, &heatmap, &style, true);
+                },
+            );
+            for clipped in &out_low.shapes {
+                match &clipped.shape {
+                    Shape::Text(t) => low_texts.push(t.galley.text().to_owned()),
+                    Shape::Vec(vec) => {
+                        for s in vec {
+                            if let Shape::Text(t) = s {
+                                low_texts.push(t.galley.text().to_owned());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out_low.textures_delta.clear();
+            assert!(
+                !low_texts.iter().any(|t| t == expected_badge),
+                "pt={pt}: unexpected {expected_badge:?} badge at low intensity in {low_texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clickable_remaining_time_format_and_toggle_action() {
+        assert_eq!(
+            format_time_display(83.0, Some(600.0), false),
+            "1:23 / 10:00"
+        );
+        assert_eq!(
+            format_time_display(83.0, Some(600.0), true),
+            "-8:37 / 10:00"
+        );
+        assert_eq!(
+            format_time_display(620.0, Some(600.0), true),
+            "-0:00 / 10:00"
+        );
+        assert_eq!(format_time_display(45.0, None, true), "0:45 / --:--");
+
+        let rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(800.0, 450.0));
+        let style = sample_style();
+        let telemetry = OverlayTelemetry {
+            position_secs: 83.0,
+            duration_secs: Some(600.0),
+            show_remaining_time: true,
+            ..OverlayTelemetry::default()
+        };
+        let ctx = egui::Context::default();
+        let mut texts = Vec::new();
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let _ = show(ui, rect, &telemetry, &style, true);
+        });
+        for clipped in &out.shapes {
+            match &clipped.shape {
+                Shape::Text(t) => texts.push(t.galley.text().to_owned()),
+                Shape::Vec(vec) => {
+                    for s in vec {
+                        if let Shape::Text(t) = s {
+                            texts.push(t.galley.text().to_owned());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.textures_delta.clear();
+        assert!(
+            texts.iter().any(|t| t == "-8:37 / 10:00"),
+            "expected remaining time readout in {texts:?}"
+        );
+    }
+
+    #[test]
+    fn continuous_speed_clamp_bounds_and_step_snapping() {
+        assert_eq!(clamp_playback_speed(f64::NAN), 1.0);
+        assert_eq!(clamp_playback_speed(0.0), 0.05);
+        assert_eq!(clamp_playback_speed(0.05), 0.05);
+        assert!((clamp_playback_speed(1.37) - 1.35).abs() < 1e-6);
+        assert!((clamp_playback_speed(1.38) - 1.40).abs() < 1e-6);
+        assert_eq!(clamp_playback_speed(4.0), 4.0);
+        assert_eq!(clamp_playback_speed(9.5), 4.0);
+    }
+
+    #[test]
+    fn up_next_overlay_and_sleep_timer_helpers_and_rendering() {
+        let up_next = UpNextOverlayInfo {
+            title: "Next Great Video".to_owned(),
+            channel: "FastTube Channel".to_owned(),
+            thumbnail_url: None,
+            remaining_secs: 4.0,
+            total_secs: 8.0,
+        };
+        assert!((up_next.progress_fraction() - 0.5).abs() < 1e-5);
+        let zero_total = UpNextOverlayInfo {
+            total_secs: 0.0,
+            ..up_next.clone()
+        };
+        assert_eq!(zero_total.progress_fraction(), 0.0);
+
+        assert_eq!(format_sleep_timer_summary(None, None, true), "Desativado");
+        assert_eq!(format_sleep_timer_summary(None, None, false), "Off");
+        assert_eq!(
+            format_sleep_timer_summary(Some(SleepTimerOption::Minutes(15)), Some(890), false),
+            "14:50"
+        );
+        assert_eq!(
+            format_sleep_timer_summary(Some(SleepTimerOption::EndOfVideo), None, true),
+            "Fim do vídeo"
+        );
+        assert_eq!(SleepTimerOption::Minutes(30).duration_secs(), Some(1800));
+        assert_eq!(SleepTimerOption::EndOfVideo.duration_secs(), None);
+
+        let rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(800.0, 450.0));
+        let style = sample_style();
+        let telemetry = OverlayTelemetry {
+            pt: false,
+            ended: true,
+            up_next: Some(up_next),
+            ..OverlayTelemetry::default()
+        };
+        let ctx = egui::Context::default();
+        let mut texts = Vec::new();
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let _ = show(ui, rect, &telemetry, &style, false);
+        });
+        for clipped in &out.shapes {
+            match &clipped.shape {
+                Shape::Text(t) => texts.push(t.galley.text().to_owned()),
+                Shape::Vec(vec) => {
+                    for s in vec {
+                        if let Shape::Text(t) = s {
+                            texts.push(t.galley.text().to_owned());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.textures_delta.clear();
+        assert!(
+            texts.iter().any(|t| t == "Play now"),
+            "missing Play now in {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "Cancel"),
+            "missing Cancel in {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "Next Great Video"),
+            "missing Up Next title in {texts:?}"
+        );
+    }
+
+    #[test]
+    fn temp_2x_pill_seek_ripple_and_new_submenus_render_cleanly() {
+        assert_eq!(format_seek_ripple_label(true, 10), "+10s");
+        assert_eq!(format_seek_ripple_label(false, 10), "-10s");
+        assert_eq!(format_seek_ripple_label(true, 15), "+15s");
+
+        let rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(800.0, 450.0));
+        let style = sample_style();
+        let ctx = egui::Context::default();
+        for menu in [
+            None,
+            Some(OverlayMenu::SleepTimer),
+            Some(OverlayMenu::UltrawideZoom),
+            Some(OverlayMenu::Subtitles),
+            Some(OverlayMenu::Speed),
+        ] {
+            let telemetry = OverlayTelemetry {
+                pt: false,
+                volume_percent: 165.0,
+                temp_speed_2x_active: true,
+                seek_ripple: Some((true, 0.35)),
+                sleep_timer_option: Some(SleepTimerOption::Minutes(15)),
+                sleep_timer_remaining_secs: Some(420),
+                menu,
+                ..OverlayTelemetry::default()
+            };
+            let mut texts = Vec::new();
+            let mut out = ctx.run_ui(Default::default(), |ui| {
+                let _ = show(ui, rect, &telemetry, &style, true);
+            });
+            for clipped in &out.shapes {
+                match &clipped.shape {
+                    Shape::Text(t) => texts.push(t.galley.text().to_owned()),
+                    Shape::Vec(vec) => {
+                        for s in vec {
+                            if let Shape::Text(t) = s {
+                                texts.push(t.galley.text().to_owned());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out.textures_delta.clear();
+            if menu.is_none() {
+                assert!(
+                    texts.iter().any(|t| t == "2\u{00d7} >>"),
+                    "missing 2x pill in {texts:?}"
+                );
+                assert!(
+                    texts.iter().any(|t| t == "+10s"),
+                    "missing +10s ripple in {texts:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn volume_wheel_hit_state_targets_only_volume_area() {
+        let rect = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(800.0, 450.0));
+        let bar_rect = compute_bar_rect(rect).expect("bar_rect");
+        let style = sample_style();
+        let telemetry = OverlayTelemetry {
+            duration_secs: Some(180.0),
+            position_secs: 42.0,
+            volume_percent: 75.0,
+            ..OverlayTelemetry::default()
+        };
+        let row_cy = bar_rect.min.y + PROGRESS_HIT_HEIGHT + 2.0 + BUTTON_ROW_HEIGHT * 0.5;
+        let ctx = egui::Context::default();
+
+        let probe_hit = |telemetry: &OverlayTelemetry, visible: bool, pos: Pos2| {
+            // Two frames so egui widget hover state and hit-rects settle on `pos`.
+            let mut hit = OverlayHitState::default();
+            for _ in 0..2 {
+                let mut out = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(rect),
+                        events: vec![egui::Event::PointerMoved(pos)],
+                        ..Default::default()
+                    },
+                    |ui| {
+                        hit =
+                            show_with_heatmap_hit_state(ui, rect, telemetry, &[], &style, visible)
+                                .1;
+                    },
+                );
+                out.textures_delta.clear();
+            }
+            hit
+        };
+
+        // Warm up once to locate the rendered timestamp rect so coordinates derive from layout.
+        let mut warm_out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ui| {
+                let _ = show_with_heatmap_hit_state(ui, rect, &telemetry, &[], &style, true);
+            },
+        );
+        let mut time_rect = None;
+        for clipped in &warm_out.shapes {
+            match &clipped.shape {
+                Shape::Text(t) if t.galley.text() == "0:42 / 3:00" => {
+                    time_rect = Some(clipped.shape.visual_bounding_rect());
+                }
+                Shape::Vec(vec) => {
+                    for s in vec {
+                        if let Shape::Text(t) = s
+                            && t.galley.text() == "0:42 / 3:00"
+                        {
+                            time_rect = Some(s.visual_bounding_rect());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        warm_out.textures_delta.clear();
+        let time_rect = time_rect.expect("rendered time readout rect");
+
+        let slider_pos = Pos2::new(time_rect.left() - 36.0, row_cy);
+        let gap_pos = Pos2::new(time_rect.left() - 74.0, row_cy);
+        let mute_pos = Pos2::new(time_rect.left() - 88.0, row_cy);
+
+        for pos in [mute_pos, gap_pos, slider_pos] {
+            let hit = probe_hit(&telemetry, true, pos);
+            assert_eq!(
+                hit,
+                OverlayHitState {
+                    over_controls: true,
+                    over_volume: true,
+                },
+                "expected volume hit at {pos:?}"
+            );
+        }
+
+        let non_volume_controls = [
+            ("play", Pos2::new(bar_rect.left() + 26.0, row_cy)),
+            (
+                "progress",
+                Pos2::new(bar_rect.center().x, bar_rect.min.y + 8.0),
+            ),
+            ("timestamp", time_rect.center()),
+            ("empty_bar", Pos2::new(bar_rect.center().x, row_cy)),
+            ("fullscreen", Pos2::new(bar_rect.right() - 28.0, row_cy)),
+        ];
+        for (label, pos) in non_volume_controls {
+            let hit = probe_hit(&telemetry, true, pos);
+            assert_eq!(
+                hit,
+                OverlayHitState {
+                    over_controls: true,
+                    over_volume: false,
+                },
+                "expected over_controls=true, over_volume=false for {label} at {pos:?}"
+            );
+        }
+
+        // Video stage outside bar.
+        assert_eq!(
+            probe_hit(&telemetry, true, Pos2::new(400.0, 200.0)),
+            OverlayHitState {
+                over_controls: false,
+                over_volume: false,
+            }
+        );
+
+        // Hidden overlay never reports over_volume even at the slider coordinates.
+        assert_eq!(
+            probe_hit(&telemetry, false, slider_pos),
+            OverlayHitState {
+                over_controls: false,
+                over_volume: false,
+            }
+        );
+
+        // Open settings popup reports over_controls=true and over_volume=false when hovered.
+        let menu_telemetry = OverlayTelemetry {
+            menu: Some(OverlayMenu::Root),
+            ..telemetry.clone()
+        };
+        let mut menu_out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                ..Default::default()
+            },
+            |ui| {
+                let _ = show_with_heatmap_hit_state(ui, rect, &menu_telemetry, &[], &style, true);
+            },
+        );
+        let mut speed_rect = None;
+        for clipped in &menu_out.shapes {
+            match &clipped.shape {
+                Shape::Text(t) if t.galley.text() == "Velocidade" => {
+                    speed_rect = Some(clipped.shape.visual_bounding_rect());
+                }
+                Shape::Vec(vec) => {
+                    for s in vec {
+                        if let Shape::Text(t) = s
+                            && t.galley.text() == "Velocidade"
+                        {
+                            speed_rect = Some(s.visual_bounding_rect());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        menu_out.textures_delta.clear();
+        let popup_pos = speed_rect.expect("Velocidade menu item rect").center();
+        assert_eq!(
+            probe_hit(&menu_telemetry, true, popup_pos),
+            OverlayHitState {
+                over_controls: true,
+                over_volume: false,
+            }
+        );
     }
 }

@@ -173,8 +173,38 @@ impl ToastManager {
         self.toasts.len()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_empty(&self) -> bool {
         self.toasts.is_empty()
+    }
+
+    /// Computes the exact minimum delay until the next toast state transition
+    /// (fade-in tick, start of fade-out, or expiry). Returns `None` when empty so
+    /// idle frames schedule zero timer repaints.
+    pub(crate) fn next_repaint_delay(&self, now: Instant) -> Option<Duration> {
+        if self.toasts.is_empty() {
+            return None;
+        }
+        let mut next_repaint: Option<Duration> = None;
+        for toast in self.toasts.iter().take(self.max_visible) {
+            if toast.is_expired(now) {
+                return Some(Duration::ZERO);
+            }
+            let elapsed_ms = toast.elapsed(now).as_secs_f32() * 1000.0;
+            let remaining = toast.remaining(now);
+            let remaining_ms = remaining.as_secs_f32() * 1000.0;
+            let delay = if elapsed_ms < FADE_IN_MS || remaining_ms <= FADE_OUT_MS {
+                Duration::from_millis(33)
+            } else {
+                let until_fade_out_ms = (remaining_ms - FADE_OUT_MS).max(16.0);
+                Duration::from_secs_f32(until_fade_out_ms / 1000.0)
+            };
+            next_repaint = Some(match next_repaint {
+                Some(current) => current.min(delay),
+                None => delay,
+            });
+        }
+        next_repaint.map(|d| d.max(Duration::from_millis(16)))
     }
 
     pub(crate) fn show(&mut self, ctx: &egui::Context, palette: &ThemePalette) {
@@ -187,20 +217,10 @@ impl ToastManager {
             return;
         }
 
-        let mut next_repaint = Duration::from_millis(250);
-        for toast in self.toasts.iter().take(self.max_visible) {
-            let elapsed_ms = toast.elapsed(now).as_secs_f32() * 1000.0;
-            let remaining = toast.remaining(now);
-            let remaining_ms = remaining.as_secs_f32() * 1000.0;
-            if elapsed_ms < FADE_IN_MS || remaining_ms <= FADE_OUT_MS {
-                next_repaint = next_repaint.min(Duration::from_millis(33));
-            } else {
-                let until_fade_out =
-                    Duration::from_secs_f32(((remaining_ms - FADE_OUT_MS).max(20.0)) / 1000.0);
-                next_repaint = next_repaint.min(until_fade_out);
-            }
+        let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        if !minimized && let Some(delay) = self.next_repaint_delay(now) {
+            ctx.request_repaint_after(delay);
         }
-        ctx.request_repaint_after(next_repaint.max(Duration::from_millis(16)));
 
         let visible: Vec<Toast> = self.toasts.iter().take(self.max_visible).cloned().collect();
         let mut dismissed_id: Option<u64> = None;

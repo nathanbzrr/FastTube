@@ -292,7 +292,7 @@ pub(crate) fn should_show_persistent_navigation_panel(
 
 pub(crate) fn compute_header_search_layout(available_width: f32, reserve_right: f32) -> (f32, f32) {
     let usable = (available_width - reserve_right).max(120.0);
-    let search_button_and_gap = 50.0;
+    let search_button_and_gap = 12.0;
     let max_input = (usable - search_button_and_gap).max(80.0);
     let input_width = max_input.clamp(80.0, 640.0);
     let leftover = (usable - input_width - search_button_and_gap).max(0.0);

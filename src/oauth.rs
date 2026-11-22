@@ -28,7 +28,7 @@ const PROGRESS_LATER_CHANNEL_BATCH: usize = 15;
 const SUBSCRIPTION_WORKER_COUNT: usize = 24;
 const RSS_MAX_BYTES: usize = 512 * 1024;
 const RSS_TIMEOUT: Duration = Duration::from_secs(6);
-const RSS_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const SUBSCRIPTIONS_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const SUBSCRIPTIONS_CACHE_VERSION: u32 = 1;
 static SUBSCRIPTIONS_CACHE_TEMP_ID: std::sync::atomic::AtomicU64 =
@@ -516,12 +516,8 @@ fn wait_for_callback(
     }
 }
 
-fn http_client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| "Não foi possível iniciar a conexão segura.".into())
+fn http_client() -> Result<&'static reqwest::blocking::Client, String> {
+    Ok(crate::http_client::no_redirect())
 }
 
 fn api_at(
@@ -809,7 +805,7 @@ pub fn comments_page_ordered(
         }
         params.push(("pageToken", page));
     }
-    let json = api(&http_client()?, token, "commentThreads", &params).map_err(|error| {
+    let json = api(http_client()?, token, "commentThreads", &params).map_err(|error| {
         format!("N\u{00e3}o foi poss\u{00ed}vel carregar coment\u{00e1}rios. {error}")
     })?;
     if cancel.cancelled() {
@@ -862,7 +858,7 @@ fn post_comment_at(
         }
     });
     let json = api_post_json_at(
-        &http_client()?,
+        http_client()?,
         base_url,
         token,
         "commentThreads",
@@ -916,7 +912,7 @@ fn post_comment_reply_at(
         }
     });
     let json = api_post_json_at(
-        &http_client()?,
+        http_client()?,
         base_url,
         token,
         "comments",
@@ -974,7 +970,7 @@ pub fn comment_replies_page(
         }
         params.push(("pageToken", page));
     }
-    let json = api(&http_client()?, token, "comments", &params).map_err(|error| {
+    let json = api(http_client()?, token, "comments", &params).map_err(|error| {
         format!("N\u{00e3}o foi poss\u{00ed}vel carregar as respostas. {error}")
     })?;
     if cancel.cancelled() {
@@ -1025,7 +1021,7 @@ fn resolve_channel_id_at(
                 return Err("Identificador de canal inválido.".into());
             }
             let json = api_at(
-                &http_client()?,
+                http_client()?,
                 base_url,
                 token,
                 "channels",
@@ -1069,7 +1065,7 @@ fn check_subscription_at(
         return Err("ID de canal inválido.".into());
     }
     let json = api_at(
-        &http_client()?,
+        http_client()?,
         base_url,
         token,
         "subscriptions",
@@ -1135,7 +1131,7 @@ fn subscribe_channel_at(
         }
     });
     let json = api_post_json_at(
-        &http_client()?,
+        http_client()?,
         base_url,
         token,
         "subscriptions",
@@ -1193,7 +1189,7 @@ fn unsubscribe_channel_at(
         return Err("Identificador de inscrição inválido.".into());
     }
     api_delete_at(
-        &http_client()?,
+        http_client()?,
         base_url,
         token,
         "subscriptions",
@@ -1261,7 +1257,7 @@ pub fn my_channel_profile(token: &str, cancel: &Cancellation) -> Result<MyChanne
         return Err("Consulta cancelada.".into());
     }
     let json = api(
-        &http_client()?,
+        http_client()?,
         token,
         "channels",
         &[
@@ -1315,7 +1311,7 @@ fn create_playlist_at(
         "status": { "privacyStatus": privacy }
     });
     let json = api_post_json_at(
-        &http_client()?,
+        http_client()?,
         base_url,
         token,
         "playlists",
@@ -1377,7 +1373,7 @@ fn add_video_to_playlist_at(
         }
     });
     let json = api_post_json_at(
-        &http_client()?,
+        http_client()?,
         base_url,
         token,
         "playlistItems",
@@ -1594,13 +1590,8 @@ fn parse_liked_video_item_with_vertical(item: &Value) -> Option<(SearchResult, b
     ))
 }
 
-fn short_probe_http_client() -> Option<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(4))
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-        .build()
-        .ok()
+fn short_probe_http_client() -> Option<&'static reqwest::blocking::Client> {
+    Some(crate::http_client::no_redirect_fast())
 }
 
 fn probe_short_video_http(
@@ -1613,7 +1604,12 @@ fn probe_short_video_http(
         return ShortProbeOutcome::TransientError;
     }
     let oar_url = format!("https://i.ytimg.com/vi/{video_id}/oardefault.jpg");
-    match client.head(&oar_url).send() {
+    match client
+        .head(&oar_url)
+        .timeout(Duration::from_secs(4))
+        .header(reqwest::header::USER_AGENT, BROWSER_USER_AGENT)
+        .send()
+    {
         Ok(resp) => {
             let status = resp.status().as_u16();
             if status == 200
@@ -1638,7 +1634,12 @@ fn probe_short_video_http(
         return ShortProbeOutcome::NotShort;
     }
     let shorts_url = format!("https://www.youtube.com/shorts/{video_id}");
-    match client.head(&shorts_url).send() {
+    match client
+        .head(&shorts_url)
+        .timeout(Duration::from_secs(4))
+        .header(reqwest::header::USER_AGENT, BROWSER_USER_AGENT)
+        .send()
+    {
         Ok(resp) => match resp.status().as_u16() {
             200 => ShortProbeOutcome::ShortOnly,
             301..=303 => ShortProbeOutcome::NotShort,
@@ -1850,7 +1851,7 @@ pub fn liked_videos_feed_progressive(
     liked_videos_feed_progressive_with(
         cancel,
         on_progress,
-        |resource, params| api(&client, token, resource, params),
+        |resource, params| api(client, token, resource, params),
         |video_id, dur_secs| match probe_client.as_ref() {
             Some(c) => probe_short_video_http(c, video_id, dur_secs, cancel),
             None => ShortProbeOutcome::TransientError,
@@ -2245,7 +2246,7 @@ fn report_video_abuse_at(
     }
     let client = http_client()?;
     let (reason_id, secondary_reason_id) =
-        resolve_abuse_reason_ids(&client, base_url, token, reason);
+        resolve_abuse_reason_ids(client, base_url, token, reason);
     if cancel.cancelled() {
         return Err("Denúncia cancelada.".into());
     }
@@ -2390,7 +2391,145 @@ fn parse_playlist(item: &Value) -> Option<(String, SearchResult)> {
 
 pub fn playlists_feed(token: &str, cancel: &Cancellation) -> Result<HomeFeed, String> {
     let client = http_client()?;
-    playlists_feed_with(cancel, |params| api(&client, token, "playlists", params))
+    playlists_feed_with(cancel, |params| api(client, token, "playlists", params))
+}
+
+fn parse_detailed_playlist_card(item: &Value) -> Option<crate::playlist_sync::SyncedPlaylistCard> {
+    let id = item.get("id")?.as_str()?;
+    if !valid_id(id) {
+        return None;
+    }
+    let snippet = item.get("snippet")?;
+    let title = snippet["title"].as_str()?.trim();
+    if title.is_empty() {
+        return None;
+    }
+    let thumbnail_url = [
+        "/thumbnails/high/url",
+        "/thumbnails/medium/url",
+        "/thumbnails/default/url",
+    ]
+    .into_iter()
+    .find_map(|ptr| {
+        snippet
+            .pointer(ptr)
+            .and_then(Value::as_str)
+            .and_then(|url| {
+                sanitize_rss_thumbnail_url(url).or_else(|| {
+                    sanitize_avatar_url(Some(url)).filter(|u| {
+                        url::Url::parse(u)
+                            .ok()
+                            .and_then(|p| p.host_str().map(str::to_owned))
+                            .is_some_and(|h| h == "yt3.ggpht.com" || h.ends_with(".ggpht.com"))
+                    })
+                })
+            })
+    })
+    .unwrap_or_default();
+    let count = item
+        .pointer("/contentDetails/itemCount")
+        .and_then(Value::as_u64);
+    let owner_label = snippet["channelTitle"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(256)
+        .collect::<String>();
+    let privacy = match item
+        .pointer("/status/privacyStatus")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+    {
+        "public" => crate::playlist_sync::PlaylistPrivacy::Public,
+        "unlisted" => crate::playlist_sync::PlaylistPrivacy::Unlisted,
+        "private" => crate::playlist_sync::PlaylistPrivacy::Private,
+        _ => crate::playlist_sync::PlaylistPrivacy::Unknown,
+    };
+    let lower = title.to_lowercase();
+    let is_music = lower.contains("music") || lower.contains("música") || lower.contains("musica");
+    let badge_text = count
+        .map(|c| format!("{c} vídeos"))
+        .unwrap_or_else(|| "Playlist".to_owned());
+    let subtitle_line = if !owner_label.is_empty() {
+        format!("{owner_label} · Playlist")
+    } else {
+        "Playlist".to_owned()
+    };
+
+    Some(crate::playlist_sync::SyncedPlaylistCard {
+        id: id.to_owned(),
+        title: title.chars().take(512).collect(),
+        thumbnail_url,
+        video_count: count,
+        badge_text,
+        owner_label,
+        subtitle_line,
+        updated_text: None,
+        privacy,
+        kind: if id == "WL" {
+            crate::playlist_sync::PlaylistKind::WatchLater
+        } else if id == "LL" {
+            crate::playlist_sync::PlaylistKind::LikedVideos
+        } else if is_music {
+            crate::playlist_sync::PlaylistKind::Music
+        } else {
+            crate::playlist_sync::PlaylistKind::Playlist
+        },
+        is_mix: false,
+        is_music,
+        is_owned: true,
+        is_saved: false,
+        seed_video_id: None,
+        browse_id: Some(format!("VL{id}")),
+        has_full_playlist_link: true,
+        stack_color_dark: None,
+        stack_color_light: None,
+    })
+}
+
+pub fn list_my_playlists_detailed(
+    token: &str,
+    cancel: &Cancellation,
+) -> Result<Vec<crate::playlist_sync::SyncedPlaylistCard>, String> {
+    let client = http_client()?;
+    let mut cards = Vec::new();
+    let mut page = None;
+    loop {
+        if cancel.cancelled() {
+            return Err("Consulta cancelada.".into());
+        }
+        let mut params = vec![
+            ("part", "snippet,contentDetails,status"),
+            ("mine", "true"),
+            ("maxResults", "50"),
+        ];
+        if let Some(token) = page.as_deref() {
+            params.push(("pageToken", token));
+        }
+        let response = api(client, token, "playlists", &params)?;
+        if cancel.cancelled() {
+            return Err("Consulta cancelada.".into());
+        }
+        let rows = response["items"]
+            .as_array()
+            .ok_or("Lista de playlists inválida.")?;
+        cards.extend(
+            rows.iter()
+                .filter_map(parse_detailed_playlist_card)
+                .take(MAX_PLAYLISTS - cards.len()),
+        );
+        let next = response["nextPageToken"]
+            .as_str()
+            .filter(|v| !v.is_empty() && v.len() <= 1024)
+            .map(str::to_owned);
+        if cards.len() >= MAX_PLAYLISTS || next.is_none() {
+            break;
+        }
+        page = next;
+    }
+    Ok(cards)
 }
 
 fn playlists_feed_with<F>(cancel: &Cancellation, mut fetch: F) -> Result<HomeFeed, String>
@@ -2404,7 +2543,7 @@ where
             return Err("Consulta cancelada.".into());
         }
         let mut params = vec![
-            ("part", "snippet,contentDetails"),
+            ("part", "snippet,contentDetails,status"),
             ("mine", "true"),
             ("maxResults", "50"),
         ];
@@ -2456,7 +2595,7 @@ pub fn playlist_videos_feed_progressive(
         playlist_id,
         cancel,
         on_progress,
-        |resource, params| api(&client, token, resource, params),
+        |resource, params| api(client, token, resource, params),
         |video_id, dur_secs| match probe_client.as_ref() {
             Some(c) => probe_short_video_http(c, video_id, dur_secs, cancel),
             None => ShortProbeOutcome::TransientError,
@@ -2641,7 +2780,7 @@ where
 pub fn list_subscriptions(token: &str, cancel: &Cancellation) -> Result<Vec<HomeChannel>, String> {
     let client = http_client()?;
     let (_, channels, _) = fetch_subscription_channels_with(cancel, |resource, params| {
-        api(&client, token, resource, params)
+        api(client, token, resource, params)
     })?;
     Ok(channels)
 }
@@ -2658,6 +2797,10 @@ pub struct CachedFeedItem {
     pub view_count: Option<u64>,
     #[serde(default)]
     pub is_short: bool,
+    #[serde(default)]
+    pub published_time_text: Option<String>,
+    #[serde(default)]
+    pub view_count_text: Option<String>,
 }
 
 impl From<&SearchResult> for CachedFeedItem {
@@ -2672,6 +2815,8 @@ impl From<&SearchResult> for CachedFeedItem {
             channel_id: item.metadata.channel_id.clone(),
             view_count: item.metadata.view_count,
             is_short: item.metadata.kind == SearchResultKind::Short,
+            published_time_text: item.metadata.published_time_text.clone(),
+            view_count_text: item.metadata.view_count_text.clone(),
         }
     }
 }
@@ -2691,6 +2836,8 @@ impl From<CachedFeedItem> for SearchResult {
                 upload_date: item.upload_date,
                 channel_id: item.channel_id,
                 view_count: item.view_count,
+                published_time_text: item.published_time_text,
+                view_count_text: item.view_count_text,
                 kind: if is_short {
                     SearchResultKind::Short
                 } else {
@@ -2950,15 +3097,8 @@ pub struct SubscriptionProgress {
     pub reached_limit: bool,
 }
 
-fn rss_http_client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .connect_timeout(RSS_CONNECT_TIMEOUT)
-        .timeout(RSS_TIMEOUT)
-        .pool_max_idle_per_host(SUBSCRIPTION_WORKER_COUNT + 4)
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-        .build()
-        .map_err(|_| "Não foi possível iniciar o cliente RSS.".into())
+fn rss_http_client() -> Result<&'static reqwest::blocking::Client, String> {
+    Ok(crate::http_client::no_redirect_fast())
 }
 
 fn sanitize_http_cache_header(value: Option<&reqwest::header::HeaderValue>) -> Option<String> {
@@ -3205,7 +3345,10 @@ fn fetch_channel_rss_at(
         "{rss_base_url}/feeds/videos.xml?channel_id={}",
         channel.channel_id
     );
-    let mut request = client.get(&url);
+    let mut request = client
+        .get(&url)
+        .timeout(RSS_TIMEOUT)
+        .header(reqwest::header::USER_AGENT, BROWSER_USER_AGENT);
     if let Some(entry) = cached {
         if let Some(etag) = entry.etag.as_deref() {
             request = request.header(reqwest::header::IF_NONE_MATCH, etag);
@@ -3418,7 +3561,7 @@ fn subscriptions_feed_fast_at(
         _ => {
             let (_, channels, reached_limit) =
                 fetch_subscription_channels_with(cancel, |resource, params| {
-                    api_at(&api_client, api_base_url, token, resource, params)
+                    api_at(api_client, api_base_url, token, resource, params)
                 })?;
             (channels, reached_limit, false)
         }
@@ -5281,5 +5424,46 @@ mod tests {
         assert_eq!(std::fs::read(&cache_path).unwrap(), b"{not valid json");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subscriptions_cache_preserves_published_time_and_loads_legacy_items() {
+        let feed = HomeFeed {
+            items: vec![SearchResult {
+                video: Video {
+                    title: "InnerTube Sub Video".into(),
+                    channel: "Canal 1".into(),
+                    url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+                    thumbnail: String::new(),
+                    duration: "10:00".into(),
+                },
+                metadata: VideoMetadata {
+                    published_time_text: Some("há 4 horas".into()),
+                    view_count_text: Some("12 mil".into()),
+                    view_count: Some(12_000),
+                    channel_id: Some("UC000000001".into()),
+                    ..Default::default()
+                },
+            }],
+            playlists: Vec::new(),
+            channels: Vec::new(),
+        };
+        let snapshot = SubscriptionsDiskCache::from_feed(&feed, &HashMap::new(), 1_794_000_000);
+        let serialized = serde_json::to_vec(&snapshot).unwrap();
+        let restored: SubscriptionsDiskCache = serde_json::from_slice(&serialized).unwrap();
+        let (_, _, items, _) = restored.into_parts();
+        assert_eq!(
+            items[0].metadata.published_time_text.as_deref(),
+            Some("há 4 horas")
+        );
+        assert_eq!(items[0].metadata.view_count_text.as_deref(), Some("12 mil"));
+
+        // Legacy item without published_time_text / view_count_text defaults to None.
+        let legacy_json = r#"{"title":"Old","channel":"C","url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ","thumbnail":"","duration":"1:00","upload_date":"20261101","channel_id":null,"view_count":50}"#;
+        let legacy: CachedFeedItem = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy.published_time_text, None);
+        assert_eq!(legacy.view_count_text, None);
+        let sr = SearchResult::from(legacy);
+        assert_eq!(sr.metadata.upload_date.as_deref(), Some("20261101"));
     }
 }

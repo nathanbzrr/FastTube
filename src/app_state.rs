@@ -1,9 +1,12 @@
+use crate::async_task::{AsyncStreamTask, AsyncTask};
 use crate::community_apis;
 use crate::downloads;
 use crate::feed_prefs;
 use crate::followed_channels;
-use crate::history::{self, History};
+use crate::history::{self, FileFingerprint, History};
 use crate::overlay;
+use crate::persistence::{PersistenceSlot, PersistenceWorker};
+use crate::playlist_sync;
 use crate::process;
 use crate::queue;
 use crate::search::{self, ChannelTarget};
@@ -22,10 +25,116 @@ use crate::{
     parse_duration_ms,
 };
 use eframe::egui::{self, Color32};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
+
+pub(crate) const MAX_SEARCH_SUGGEST_PREFIX_CACHE: usize = 64;
+
+pub(crate) struct InnerTubeHomeFetchMessage {
+    pub(crate) request_id: u64,
+    pub(crate) append: bool,
+    pub(crate) is_default_home: bool,
+    pub(crate) result: Result<crate::innertube::InnerTubeHomePage, String>,
+}
+
+pub(crate) struct InnerTubeSubscriptionsFetchMessage {
+    pub(crate) request_id: u64,
+    pub(crate) append: bool,
+    pub(crate) result: Result<crate::innertube::InnerTubeSubscriptionsPage, String>,
+}
+
+pub(crate) struct SearchPageFetchMessage {
+    pub(crate) request_id: u64,
+    pub(crate) append: bool,
+    pub(crate) result: Result<search::SearchPageOutput, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ChannelContinuationTarget {
+    VideosAppend,
+    VideosReplace,
+    ShortsAppend,
+    ShortsReplace,
+    StreamsAppend,
+    StreamsReplace,
+    DynamicTab(crate::innertube::ChannelTabKind),
+}
+
+pub(crate) struct ChannelContinuationFetchMessage {
+    pub(crate) request_id: u64,
+    pub(crate) target: ChannelTarget,
+    pub(crate) mode: ChannelContinuationTarget,
+    pub(crate) result: Result<search::ChannelTabPage, String>,
+}
+
+pub(crate) struct StreamManifestFetchMessage {
+    pub(crate) request_id: u64,
+    pub(crate) video_id: String,
+    pub(crate) video_url: String,
+    pub(crate) resume_target_ms: Option<u64>,
+    pub(crate) result: Result<std::sync::Arc<crate::stream_manifest::StreamManifest>, String>,
+}
+
+pub(crate) struct WatchNextFetchMessage {
+    pub(crate) request_id: u64,
+    pub(crate) video_url: String,
+    pub(crate) chip_index: Option<usize>,
+    pub(crate) is_chip_reload: bool,
+    pub(crate) result: Result<crate::innertube::InnerTubeWatchNext, String>,
+}
+
+pub(crate) struct InnerTubeCommentsFetchMessage {
+    pub(crate) request_id: u64,
+    pub(crate) video_url: String,
+    pub(crate) append: bool,
+    pub(crate) result: Result<crate::innertube::InnerTubeCommentsPage, String>,
+}
+
+pub(crate) struct ZeroQuotaFeedbackMessage {
+    pub(crate) request_id: u64,
+    pub(crate) not_interested: bool,
+    pub(crate) result: Result<(), String>,
+}
+
+pub(crate) struct NotificationsInboxFetchMessage {
+    pub(crate) request_id: u64,
+    pub(crate) append: bool,
+    pub(crate) web_session: Option<crate::comment_actions::YouTubeWebSession>,
+    pub(crate) auth_expired: bool,
+    pub(crate) needs_connect: bool,
+    pub(crate) result: Result<crate::innertube::InnerTubeNotificationsMenu, String>,
+}
+
+pub(crate) struct ExploreHubFetchMessage {
+    pub(crate) request_id: u64,
+    pub(crate) append: bool,
+    pub(crate) result: Result<crate::innertube::ExploreHubPage, String>,
+}
+
+pub(crate) struct ShortsSequenceFetchMessage {
+    pub(crate) request_id: u64,
+    pub(crate) result: Result<crate::innertube::ShortsSequencePage, String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CommentMutationKind {
+    Edit,
+    Delete,
+}
+
+pub(crate) struct CommentMutationFetchMessage {
+    pub(crate) request_id: u64,
+    pub(crate) kind: CommentMutationKind,
+    pub(crate) result: Result<(), String>,
+}
+
+pub(crate) struct LiveChatReplayFetchMessage {
+    pub(crate) request_id: u64,
+    pub(crate) session_id: u64,
+    pub(crate) result: Result<crate::live_chat::LiveChatBatch, String>,
+}
 
 pub(crate) struct BrowseFeedState {
     pub(crate) query: String,
@@ -41,6 +150,20 @@ pub(crate) struct BrowseFeedState {
     pub(crate) search_filters: search::SearchFilters,
     pub(crate) search_chip: search::SearchChip,
     pub(crate) search_filters_open: bool,
+    pub search_continuation: Option<String>,
+    pub search_loading_more: bool,
+    pub search_spelling: Option<crate::innertube::SearchSpellingCorrection>,
+    pub search_filters_modal_open: bool,
+    pub home_continuation: Option<String>,
+    pub home_loading_more: bool,
+    pub home_chips: Vec<crate::innertube::HomeFeedChip>,
+    pub subscriptions_continuation: Option<String>,
+    pub subscriptions_loading_more: bool,
+    pub(crate) home_swr_hydrated: bool,
+    pub(crate) home_innertube_task: AsyncTask<InnerTubeHomeFetchMessage>,
+    pub(crate) subs_innertube_task: AsyncTask<InnerTubeSubscriptionsFetchMessage>,
+    pub(crate) search_page_task: AsyncTask<SearchPageFetchMessage>,
+    pub(crate) search_page_last_query: String,
     pub(crate) search_save_modal_video: Option<Video>,
     pub(crate) search_report_modal_video: Option<Video>,
     pub(crate) search_report_reason: Option<usize>,
@@ -56,6 +179,24 @@ pub(crate) struct BrowseFeedState {
     pub(crate) search_suggest: SearchSuggestState,
     pub(crate) report_history: Vec<ReportedContentEntry>,
     pub(crate) report_history_filter: u8,
+    pub(crate) report_history_path: Option<PathBuf>,
+    pub(crate) notifications: Vec<crate::innertube::InnerTubeNotification>,
+    pub(crate) notifications_loading: bool,
+    pub(crate) notifications_loading_more: bool,
+    pub(crate) notifications_loaded: bool,
+    pub(crate) notifications_initial_sync_attempted: bool,
+    pub(crate) notifications_continuation: Option<String>,
+    pub(crate) notifications_error: Option<String>,
+    pub(crate) notifications_needs_connect: bool,
+    pub(crate) notifications_task: AsyncTask<NotificationsInboxFetchMessage>,
+    pub(crate) explore_category: crate::innertube::ExploreCategory,
+    pub(crate) explore_loading: bool,
+    pub(crate) explore_loading_more: bool,
+    pub(crate) explore_continuation: Option<String>,
+    pub(crate) explore_loaded_category: Option<crate::innertube::ExploreCategory>,
+    pub(crate) explore_task: AsyncTask<ExploreHubFetchMessage>,
+    pub(crate) shorts_continuation: Option<String>,
+    pub(crate) shorts_task: AsyncTask<ShortsSequenceFetchMessage>,
 }
 
 #[derive(Clone, Debug)]
@@ -85,6 +226,20 @@ impl Default for BrowseFeedState {
             search_filters: search::SearchFilters::default(),
             search_chip: search::SearchChip::default(),
             search_filters_open: false,
+            search_continuation: None,
+            search_loading_more: false,
+            search_spelling: None,
+            search_filters_modal_open: false,
+            home_continuation: None,
+            home_loading_more: false,
+            home_chips: Vec::new(),
+            subscriptions_continuation: None,
+            subscriptions_loading_more: false,
+            home_swr_hydrated: false,
+            home_innertube_task: AsyncTask::new(),
+            subs_innertube_task: AsyncTask::new(),
+            search_page_task: AsyncTask::new(),
+            search_page_last_query: String::new(),
             search_save_modal_video: None,
             search_report_modal_video: None,
             search_report_reason: None,
@@ -100,6 +255,24 @@ impl Default for BrowseFeedState {
             search_suggest: SearchSuggestState::default(),
             report_history: Vec::new(),
             report_history_filter: 0,
+            report_history_path: None,
+            notifications: Vec::new(),
+            notifications_loading: false,
+            notifications_loading_more: false,
+            notifications_loaded: false,
+            notifications_initial_sync_attempted: false,
+            notifications_continuation: None,
+            notifications_error: None,
+            notifications_needs_connect: false,
+            notifications_task: AsyncTask::new(),
+            explore_category: crate::innertube::ExploreCategory::default(),
+            explore_loading: false,
+            explore_loading_more: false,
+            explore_continuation: None,
+            explore_loaded_category: None,
+            explore_task: AsyncTask::new(),
+            shorts_continuation: None,
+            shorts_task: AsyncTask::new(),
         }
     }
 }
@@ -118,36 +291,110 @@ pub(crate) struct SearchSuggestState {
     pub(crate) pending_fetch_query: Option<String>,
     pub(crate) last_fetched_query: String,
     pub(crate) remote_suggestions: Vec<String>,
+    pub(crate) prefix_cache: HashMap<String, Vec<String>>,
+    pub(crate) prefix_lru: VecDeque<String>,
+    pub(crate) recent_revision: u64,
+    pub(crate) remote_revision: u64,
+    pub(crate) merged_cache_key: Option<(String, u64, u64, usize)>,
+    pub(crate) merged_cache: Vec<search::SearchSuggestionItem>,
     pub(crate) highlighted_index: Option<usize>,
-    pub(crate) rx: Option<Receiver<SearchSuggestFetchMessage>>,
-    pub(crate) cancel: Option<process::Cancellation>,
-    pub(crate) next_request_id: u64,
-    pub(crate) active_request_id: Option<u64>,
+    pub(crate) task: AsyncTask<SearchSuggestFetchMessage>,
+}
+
+impl SearchSuggestState {
+    fn normalize_prefix_key(prefix: &str) -> String {
+        prefix.trim().to_ascii_lowercase()
+    }
+
+    pub(crate) fn set_remote_suggestions(&mut self, items: Vec<String>) {
+        if self.remote_suggestions != items {
+            self.remote_suggestions = items;
+            self.remote_revision = self.remote_revision.wrapping_add(1);
+        }
+    }
+
+    pub(crate) fn clear_remote_suggestions(&mut self) {
+        if !self.remote_suggestions.is_empty() {
+            self.remote_suggestions.clear();
+            self.remote_revision = self.remote_revision.wrapping_add(1);
+        }
+    }
+
+    pub(crate) fn bump_recent_revision(&mut self) {
+        self.recent_revision = self.recent_revision.wrapping_add(1);
+    }
+
+    pub(crate) fn get_cached_prefix(&mut self, prefix: &str) -> Option<Vec<String>> {
+        let key = Self::normalize_prefix_key(prefix);
+        let hit = self.prefix_cache.get(&key)?.clone();
+        self.prefix_lru.retain(|existing| existing != &key);
+        self.prefix_lru.push_back(key);
+        Some(hit)
+    }
+
+    pub(crate) fn insert_cached_prefix(&mut self, prefix: &str, items: Vec<String>) {
+        let key = Self::normalize_prefix_key(prefix);
+        if key.is_empty() {
+            return;
+        }
+        self.prefix_lru.retain(|existing| existing != &key);
+        self.prefix_lru.push_back(key.clone());
+        self.prefix_cache.insert(key, items);
+        while self.prefix_cache.len() > MAX_SEARCH_SUGGEST_PREFIX_CACHE {
+            let Some(victim) = self.prefix_lru.pop_front() else {
+                break;
+            };
+            self.prefix_cache.remove(&victim);
+        }
+    }
+
+    pub(crate) fn merged_suggestions(
+        &mut self,
+        query: &str,
+        recent_searches: &[String],
+        limit: usize,
+    ) -> &[search::SearchSuggestionItem] {
+        let cache_hit = self.merged_cache_key.as_ref().is_some_and(
+            |(cached_query, cached_recent, cached_remote, cached_limit)| {
+                cached_query == query
+                    && *cached_recent == self.recent_revision
+                    && *cached_remote == self.remote_revision
+                    && *cached_limit == limit
+            },
+        );
+        if !cache_hit {
+            self.merged_cache = search::merge_search_suggestions(
+                query,
+                recent_searches,
+                &self.remote_suggestions,
+                limit,
+            );
+            self.merged_cache_key = Some((
+                query.to_owned(),
+                self.recent_revision,
+                self.remote_revision,
+                limit,
+            ));
+        }
+        &self.merged_cache
+    }
 }
 
 #[derive(Default)]
 pub(crate) struct SearchJob {
-    pub(crate) rx: Option<Receiver<SearchFetchMessage>>,
-    pub(crate) cancel: Option<process::Cancellation>,
-    pub(crate) next_request_id: u64,
-    pub(crate) active_request_id: Option<u64>,
+    pub(crate) task: AsyncTask<SearchFetchMessage>,
 }
 
-pub(crate) type SubscriptionChannelsReceiver = Receiver<(
+pub(crate) type SubscriptionChannelsPayload = (
     Option<crate::oauth::TokenSession>,
     Result<Vec<search::HomeChannel>, String>,
-)>;
+);
 
 #[derive(Default)]
 pub(crate) struct HomeFeedState {
-    pub(crate) rx: Option<Receiver<HomeFetchMessage>>,
-    pub(crate) cancel: Option<process::Cancellation>,
-    pub(crate) batch_rx: Option<Receiver<HomeBatchFetchMessage>>,
-    pub(crate) batch_cancel: Option<process::Cancellation>,
-    pub(crate) batch_next_request_id: u64,
-    pub(crate) batch_active_request_id: Option<u64>,
-    pub(crate) channels_rx: Option<SubscriptionChannelsReceiver>,
-    pub(crate) channels_cancel: Option<process::Cancellation>,
+    pub(crate) stream_task: AsyncStreamTask<HomeFetchMessage>,
+    pub(crate) batch_task: AsyncTask<HomeBatchFetchMessage>,
+    pub(crate) channels_task: AsyncTask<SubscriptionChannelsPayload>,
     pub(crate) initial_public_started: bool,
     pub(crate) playlist_urls: Vec<String>,
     pub(crate) playlist_total_results: Option<u64>,
@@ -162,8 +409,6 @@ pub(crate) struct HomeFeedState {
     pub(crate) subscriptions_disk_cache_loaded: bool,
     pub(crate) subscriptions_disk_cache_path: Option<PathBuf>,
     pub(crate) subscriptions_rss_cache: HashMap<String, crate::oauth::ChannelRssCacheEntry>,
-    pub(crate) subscriptions_next_request_id: u64,
-    pub(crate) subscriptions_active_request_id: Option<u64>,
     pub(crate) subscriptions_progressive_streaming: bool,
     pub(crate) subscriptions_refreshing_in_background: bool,
     pub(crate) pending_items: Vec<SearchResult>,
@@ -187,7 +432,6 @@ pub(crate) struct ChannelState {
     pub(crate) view_open: bool,
     pub(crate) tab: ChannelTab,
     pub(crate) about_modal_open: bool,
-    pub(crate) next_request_id: u64,
     pub(crate) loading_target: Option<crate::ChannelTarget>,
     pub(crate) last_target: Option<crate::ChannelTarget>,
     pub(crate) error: Option<String>,
@@ -200,6 +444,9 @@ pub(crate) struct ChannelState {
     pub(crate) playlist_detail: ChannelPlaylistDetailState,
     pub(crate) about: ChannelAboutState,
     pub(crate) search: ChannelSearchState,
+    pub(crate) community_posts: Vec<crate::innertube::ChannelCommunityPost>,
+    pub(crate) upcoming_notify_urls: HashSet<String>,
+    pub(crate) upcoming_start_unix_by_url: HashMap<String, i64>,
 }
 
 impl ChannelState {
@@ -209,7 +456,6 @@ impl ChannelState {
             view_open: false,
             tab: ChannelTab::Home,
             about_modal_open: false,
-            next_request_id: 0,
             loading_target: None,
             last_target: None,
             error: None,
@@ -222,6 +468,9 @@ impl ChannelState {
             playlist_detail: ChannelPlaylistDetailState::default(),
             about: ChannelAboutState::default(),
             search: ChannelSearchState::default(),
+            community_posts: Vec::new(),
+            upcoming_notify_urls: HashSet::new(),
+            upcoming_start_unix_by_url: HashMap::new(),
         }
     }
 }
@@ -234,20 +483,15 @@ impl Default for ChannelState {
 
 #[derive(Default)]
 pub(crate) struct ChannelVideosState {
-    pub(crate) rx: Option<Receiver<ChannelFetchMessage>>,
-    pub(crate) cancel: Option<process::Cancellation>,
-    pub(crate) active_request_id: Option<u64>,
-    pub(crate) more_rx: Option<Receiver<ChannelMoreVideosFetchMessage>>,
-    pub(crate) more_cancel: Option<process::Cancellation>,
-    pub(crate) active_more_request_id: Option<u64>,
+    pub(crate) task: AsyncTask<ChannelFetchMessage>,
+    pub(crate) more_task: AsyncTask<ChannelMoreVideosFetchMessage>,
+    pub(crate) continuation_task: AsyncTask<ChannelContinuationFetchMessage>,
     pub(crate) more_error: Option<String>,
     pub(crate) has_more: bool,
     pub(crate) reached_max: bool,
     pub(crate) sort: search::ChannelVideosSort,
     pub(crate) sorted_items: Vec<SearchResult>,
-    pub(crate) sorted_rx: Option<Receiver<ChannelSortedVideosFetchMessage>>,
-    pub(crate) sorted_cancel: Option<process::Cancellation>,
-    pub(crate) active_sorted_request_id: Option<u64>,
+    pub(crate) sorted_task: AsyncTask<ChannelSortedVideosFetchMessage>,
     pub(crate) sorted_error: Option<String>,
 }
 
@@ -257,9 +501,7 @@ pub(crate) struct ChannelSearchState {
     pub(crate) query: String,
     pub(crate) items: Vec<SearchResult>,
     pub(crate) loaded: bool,
-    pub(crate) rx: Option<Receiver<ChannelSearchFetchMessage>>,
-    pub(crate) cancel: Option<process::Cancellation>,
-    pub(crate) active_request_id: Option<u64>,
+    pub(crate) task: AsyncTask<ChannelSearchFetchMessage>,
     pub(crate) error: Option<String>,
 }
 
@@ -267,9 +509,7 @@ pub(crate) struct ChannelSearchState {
 pub(crate) struct ChannelTabFeedState {
     pub(crate) items: Vec<SearchResult>,
     pub(crate) loaded: bool,
-    pub(crate) rx: Option<Receiver<ChannelTabVideosFetchMessage>>,
-    pub(crate) cancel: Option<process::Cancellation>,
-    pub(crate) active_request_id: Option<u64>,
+    pub(crate) task: AsyncTask<ChannelTabVideosFetchMessage>,
     pub(crate) error: Option<String>,
 }
 
@@ -277,9 +517,7 @@ pub(crate) struct ChannelTabFeedState {
 pub(crate) struct ChannelPlaylistsState {
     pub(crate) items: Vec<search::ChannelPlaylist>,
     pub(crate) loaded: bool,
-    pub(crate) rx: Option<Receiver<ChannelPlaylistsFetchMessage>>,
-    pub(crate) cancel: Option<process::Cancellation>,
-    pub(crate) active_request_id: Option<u64>,
+    pub(crate) task: AsyncTask<ChannelPlaylistsFetchMessage>,
     pub(crate) error: Option<String>,
 }
 
@@ -288,9 +526,7 @@ pub(crate) struct ChannelPlaylistDetailState {
     pub(crate) selected: Option<search::ChannelPlaylist>,
     pub(crate) items: Vec<SearchResult>,
     pub(crate) loaded: bool,
-    pub(crate) rx: Option<Receiver<ChannelPlaylistVideosFetchMessage>>,
-    pub(crate) cancel: Option<process::Cancellation>,
-    pub(crate) active_request_id: Option<u64>,
+    pub(crate) task: AsyncTask<ChannelPlaylistVideosFetchMessage>,
     pub(crate) error: Option<String>,
 }
 
@@ -298,71 +534,61 @@ pub(crate) struct ChannelPlaylistDetailState {
 pub(crate) struct ChannelAboutState {
     pub(crate) info: Option<search::ChannelAboutInfo>,
     pub(crate) loaded: bool,
-    pub(crate) rx: Option<Receiver<ChannelAboutFetchMessage>>,
-    pub(crate) cancel: Option<process::Cancellation>,
-    pub(crate) active_request_id: Option<u64>,
+    pub(crate) task: AsyncTask<ChannelAboutFetchMessage>,
     pub(crate) error: Option<String>,
 }
 
-pub(crate) type RatingResultReceiver = Receiver<(
+pub(crate) type RatingResultPayload = (
     Option<crate::oauth::TokenSession>,
     Result<(String, Option<crate::oauth::VideoRating>), String>,
-)>;
+);
 
-pub(crate) type SubscriptionResultReceiver = Receiver<(
+pub(crate) type SubscriptionResultPayload = (
     Option<crate::oauth::TokenSession>,
     Result<(String, crate::oauth::SubscriptionStatus), String>,
-)>;
+);
 
-pub(crate) type MyChannelResultReceiver = Receiver<(
+pub(crate) type MyChannelResultPayload = (
     Option<crate::oauth::TokenSession>,
     Result<crate::oauth::MyChannelProfile, String>,
-)>;
+);
 
-pub(crate) type RemotePlaylistsResultReceiver = Receiver<(
+pub(crate) type RemotePlaylistsResultPayload = (
     Option<crate::oauth::TokenSession>,
-    Result<Vec<(String, String)>, String>,
-)>;
+    Result<Vec<playlist_sync::SyncedPlaylistCard>, String>,
+);
 
-pub(crate) type PlaylistActionResultReceiver = Receiver<(
+pub(crate) type PlaylistActionResultPayload = (
     Option<crate::oauth::TokenSession>,
     Result<(Option<(String, String)>, String), String>,
-)>;
+);
 
-pub(crate) type ReportResultReceiver =
-    Receiver<(Option<crate::oauth::TokenSession>, Result<String, String>)>;
+pub(crate) type ReportResultPayload = (Option<crate::oauth::TokenSession>, Result<String, String>);
 
 #[derive(Default)]
 pub(crate) struct AuthState {
-    pub(crate) reauth_rx: Option<Receiver<Result<crate::oauth::TokenSession, String>>>,
-    pub(crate) reauth_cancel: Option<process::Cancellation>,
+    pub(crate) reauth_task: AsyncTask<Result<crate::oauth::TokenSession, String>>,
     pub(crate) authenticated: bool,
     pub(crate) session: Option<crate::oauth::TokenSession>,
     pub(crate) ratings: HashMap<String, crate::oauth::VideoRating>,
-    pub(crate) rating_rx: Option<RatingResultReceiver>,
-    pub(crate) rating_cancel: Option<process::Cancellation>,
+    pub(crate) rating_task: AsyncTask<RatingResultPayload>,
     pub(crate) subscriptions: HashMap<String, crate::oauth::SubscriptionStatus>,
-    pub(crate) sub_check_rx: Option<SubscriptionResultReceiver>,
-    pub(crate) sub_check_cancel: Option<process::Cancellation>,
-    pub(crate) sub_toggle_rx: Option<SubscriptionResultReceiver>,
-    pub(crate) sub_toggle_cancel: Option<process::Cancellation>,
+    pub(crate) sub_check_task: AsyncTask<SubscriptionResultPayload>,
+    pub(crate) sub_toggle_task: AsyncTask<SubscriptionResultPayload>,
     pub(crate) my_channel: Option<ChannelTarget>,
     pub(crate) my_channel_title: Option<String>,
     pub(crate) my_channel_avatar_url: Option<String>,
     pub(crate) my_channel_subscribers: Option<u64>,
     pub(crate) my_channel_open_when_ready: bool,
     pub(crate) my_channel_fetch_attempted: bool,
-    pub(crate) my_channel_rx: Option<MyChannelResultReceiver>,
-    pub(crate) my_channel_cancel: Option<process::Cancellation>,
+    pub(crate) my_channel_task: AsyncTask<MyChannelResultPayload>,
     pub(crate) remote_playlists: Vec<(String, String)>,
-    pub(crate) remote_playlists_rx: Option<RemotePlaylistsResultReceiver>,
-    pub(crate) remote_playlists_cancel: Option<process::Cancellation>,
-    pub(crate) playlist_action_rx: Option<PlaylistActionResultReceiver>,
-    pub(crate) playlist_action_cancel: Option<process::Cancellation>,
-    pub(crate) report_rx: Option<ReportResultReceiver>,
-    pub(crate) report_cancel: Option<process::Cancellation>,
+    pub(crate) remote_playlists_task: AsyncTask<RemotePlaylistsResultPayload>,
+    pub(crate) playlist_action_task: AsyncTask<PlaylistActionResultPayload>,
+    pub(crate) report_task: AsyncTask<ReportResultPayload>,
     pub(crate) youtube_web_session: Option<crate::comment_actions::YouTubeWebSession>,
     pub(crate) youtube_web_session_checked: bool,
+    pub(crate) cached_has_saved_profile: bool,
     pub(crate) restore_attempted: bool,
 }
 
@@ -623,14 +849,14 @@ pub(crate) struct PlaybackState {
     pub(crate) video_forward_stack: Vec<Video>,
     pub(crate) pending_open_keep_mini_player: bool,
     pub(crate) pending_open_suppress_back_stack: bool,
+    pub(crate) pending_open_keep_playlist: bool,
     pub(crate) mini_player_paused: bool,
     pub(crate) mini_player_muted: bool,
     pub(crate) mini_player_volume: f32,
     pub(crate) active: Option<ActivePlayback>,
     pub(crate) quality: Option<u32>,
     pub(crate) qualities: Vec<u32>,
-    pub(crate) quality_rx: Option<Receiver<Result<search::VideoPlaybackMetadata, String>>>,
-    pub(crate) quality_cancel: Option<process::Cancellation>,
+    pub(crate) quality_task: AsyncTask<Result<search::VideoPlaybackMetadata, String>>,
     pub(crate) quality_error: Option<String>,
     pub(crate) quality_fallback_url: Option<String>,
     pub(crate) current_file_loaded: bool,
@@ -671,10 +897,26 @@ pub(crate) struct PlaybackState {
     pub(crate) audio_tracks_last_poll: Option<Instant>,
     pub(crate) storyboard: Option<search::StoryboardSpec>,
     pub(crate) storyboard_video_url: Option<String>,
+    pub stream_manifest_cache: std::sync::Arc<crate::stream_manifest::StreamManifestCache>,
+    pub stream_prefetcher: crate::stream_manifest::StreamPrefetcher,
+    pub current_manifest: Option<std::sync::Arc<crate::stream_manifest::StreamManifest>>,
+    pub preferred_audio_lang: Option<String>,
+    pub(crate) manifest_task: AsyncTask<StreamManifestFetchMessage>,
+    pub(crate) active_direct_stream_url: Option<String>,
+    pub(crate) direct_stream_fallback_attempted: bool,
+    pub(crate) pending_open_queue_entry_id: Option<u64>,
+    #[cfg(windows)]
+    pub(crate) frame_snapshot: Option<crate::player::PlayerSnapshot>,
+    pub(crate) frame_events_polled_pass: Option<u64>,
 }
 
 impl Default for PlaybackState {
     fn default() -> Self {
+        let stream_manifest_cache =
+            std::sync::Arc::new(crate::stream_manifest::StreamManifestCache::default());
+        let stream_prefetcher = crate::stream_manifest::StreamPrefetcher::new(
+            std::sync::Arc::clone(&stream_manifest_cache),
+        );
         Self {
             fullscreen: false,
             fullscreen_restore_maximized: false,
@@ -696,14 +938,14 @@ impl Default for PlaybackState {
             video_forward_stack: Vec::new(),
             pending_open_keep_mini_player: false,
             pending_open_suppress_back_stack: false,
+            pending_open_keep_playlist: false,
             mini_player_paused: false,
             mini_player_muted: false,
             mini_player_volume: 100.0,
             active: None,
             quality: None,
             qualities: Vec::new(),
-            quality_rx: None,
-            quality_cancel: None,
+            quality_task: AsyncTask::new(),
             quality_error: None,
             quality_fallback_url: None,
             current_file_loaded: false,
@@ -744,6 +986,17 @@ impl Default for PlaybackState {
             audio_tracks_last_poll: None,
             storyboard: None,
             storyboard_video_url: None,
+            stream_manifest_cache,
+            stream_prefetcher,
+            current_manifest: None,
+            preferred_audio_lang: None,
+            manifest_task: AsyncTask::new(),
+            active_direct_stream_url: None,
+            direct_stream_fallback_attempted: false,
+            pending_open_queue_entry_id: None,
+            #[cfg(windows)]
+            frame_snapshot: None,
+            frame_events_polled_pass: None,
         }
     }
 }
@@ -913,12 +1166,12 @@ pub(crate) struct SettingsState {
     pub(crate) confirm_reset_tab: Option<SettingsTab>,
     pub(crate) cache_dir_input: String,
     pub(crate) cache_dir_input_synced: bool,
-    pub(crate) cache_picker_rx: Option<Receiver<Result<Option<PathBuf>, String>>>,
+    pub(crate) cache_picker_task: AsyncTask<Result<Option<PathBuf>, String>>,
     pub(crate) download_dir_input: String,
     pub(crate) download_dir_input_synced: bool,
-    pub(crate) download_picker_rx: Option<Receiver<Result<Option<PathBuf>, String>>>,
-    pub(crate) backup_picker_rx: Option<Receiver<BackupPickerResult>>,
-    pub(crate) oauth_picker_rx: Option<Receiver<Result<Option<PathBuf>, String>>>,
+    pub(crate) download_picker_task: AsyncTask<Result<Option<PathBuf>, String>>,
+    pub(crate) backup_picker_task: AsyncTask<BackupPickerResult>,
+    pub(crate) oauth_picker_task: AsyncTask<Result<Option<PathBuf>, String>>,
     pub(crate) oauth_import_status: Option<(bool, String)>,
     pub(crate) cache_status: Option<String>,
     pub(crate) storage_action_status: Option<(bool, String)>,
@@ -930,13 +1183,11 @@ pub(crate) struct SettingsState {
     pub(crate) pending_reload_video: bool,
     pub(crate) ytdlp_check: Option<updater::YtDlpUpdateCheck>,
     pub(crate) ytdlp_status: Option<(bool, String)>,
-    pub(crate) ytdlp_rx: Option<Receiver<YtDlpUpdaterMessage>>,
-    pub(crate) ytdlp_cancel: Option<process::Cancellation>,
+    pub(crate) ytdlp_task: AsyncTask<YtDlpUpdaterMessage>,
     pub(crate) app_update_check: Option<updater::AppUpdateCheck>,
     pub(crate) app_update_prepared: Option<updater::AppUpdatePrepared>,
     pub(crate) app_update_status: Option<(bool, String)>,
-    pub(crate) app_update_rx: Option<Receiver<AppUpdaterMessage>>,
-    pub(crate) app_update_cancel: Option<process::Cancellation>,
+    pub(crate) app_update_task: AsyncTask<AppUpdaterMessage>,
     pub(crate) app_update_auto_checked: bool,
     pub(crate) app_update_banner_dismissed: bool,
     pub(crate) capturing_keybinding: Option<&'static str>,
@@ -957,12 +1208,12 @@ impl Default for SettingsState {
             confirm_reset_tab: None,
             cache_dir_input: String::new(),
             cache_dir_input_synced: false,
-            cache_picker_rx: None,
+            cache_picker_task: AsyncTask::new(),
             download_dir_input: String::new(),
             download_dir_input_synced: false,
-            download_picker_rx: None,
-            backup_picker_rx: None,
-            oauth_picker_rx: None,
+            download_picker_task: AsyncTask::new(),
+            backup_picker_task: AsyncTask::new(),
+            oauth_picker_task: AsyncTask::new(),
             oauth_import_status: None,
             cache_status: None,
             storage_action_status: None,
@@ -974,13 +1225,11 @@ impl Default for SettingsState {
             pending_reload_video: false,
             ytdlp_check: None,
             ytdlp_status: None,
-            ytdlp_rx: None,
-            ytdlp_cancel: None,
+            ytdlp_task: AsyncTask::new(),
             app_update_check: None,
             app_update_prepared: None,
             app_update_status: None,
-            app_update_rx: None,
-            app_update_cancel: None,
+            app_update_task: AsyncTask::new(),
             app_update_auto_checked: false,
             app_update_banner_dismissed: false,
             capturing_keybinding: None,
@@ -1015,10 +1264,92 @@ impl<T: Default> Default for TrackedSettings<T> {
 }
 
 #[derive(Default)]
+pub(crate) struct RemoteHistoryFeed {
+    pub(crate) sections: Vec<crate::history_sync::RemoteHistorySection>,
+    pub(crate) seen_ids: HashSet<String>,
+    pub(crate) next_continuation: Option<String>,
+    pub(crate) loaded: bool,
+    pub(crate) complete: bool,
+    pub(crate) loading_more: bool,
+    pub(crate) page_count: usize,
+}
+
+#[derive(Default)]
+pub(crate) struct RemoteHistoryState {
+    pub(crate) feeds: HashMap<history::HistoryFilter, RemoteHistoryFeed>,
+    pub(crate) feed_lru: crate::history_sync::RemoteHistoryFeedLru,
+    pub(crate) chips: HashMap<history::HistoryFilter, crate::history_sync::HistoryChipAction>,
+    pub(crate) feedback_tokens: HashMap<String, String>,
+    pub(crate) actions: crate::history_sync::RemoteHistoryActions,
+    pub(crate) sync_rx: Option<Receiver<crate::history_sync::HistorySyncMessage>>,
+    pub(crate) sync_cancel: Option<process::Cancellation>,
+    pub(crate) sync_next_request_id: u64,
+    pub(crate) sync_active_request_id: Option<u64>,
+    pub(crate) chip_rx: Option<Receiver<crate::history_sync::HistorySyncMessage>>,
+    pub(crate) chip_cancel: Option<process::Cancellation>,
+    pub(crate) chip_next_request_id: u64,
+    pub(crate) chip_active_request_id: Option<u64>,
+    pub(crate) chip_active_filter: Option<history::HistoryFilter>,
+    pub(crate) feedback_rx: Option<Receiver<crate::history_sync::RemoteHistoryFeedbackEvent>>,
+    pub(crate) feedback_cancel: Option<process::Cancellation>,
+    pub(crate) initial_sync_attempted: bool,
+    pub(crate) loaded: bool,
+    pub(crate) stale: bool,
+    pub(crate) needs_connect: bool,
+    pub(crate) synced_at: Option<Instant>,
+    pub(crate) error: Option<String>,
+    pub(crate) confirm_remote_clear: bool,
+    pub(crate) shorts_shelf_offsets: HashMap<String, usize>,
+    pub(crate) watch_session_id: u64,
+    pub(crate) watch_init_rx: Option<Receiver<crate::history_sync::RemoteWatchInitEvent>>,
+    pub(crate) watch_init_cancel: Option<process::Cancellation>,
+    pub(crate) watch_tracker: Option<crate::history_sync::RemoteWatchTracker>,
+}
+
+impl RemoteHistoryState {
+    pub(crate) fn reset(&mut self) {
+        if let Some(cancel) = self.sync_cancel.take() {
+            cancel.cancel();
+        }
+        if let Some(cancel) = self.chip_cancel.take() {
+            cancel.cancel();
+        }
+        if let Some(cancel) = self.feedback_cancel.take() {
+            cancel.cancel();
+        }
+        if let Some(cancel) = self.watch_init_cancel.take() {
+            cancel.cancel();
+        }
+        self.sync_rx = None;
+        self.sync_active_request_id = None;
+        self.chip_rx = None;
+        self.chip_active_request_id = None;
+        self.chip_active_filter = None;
+        self.feedback_rx = None;
+        self.watch_init_rx = None;
+        self.watch_tracker = None;
+        self.feeds.clear();
+        self.feed_lru.clear();
+        self.chips.clear();
+        self.feedback_tokens.clear();
+        self.actions = crate::history_sync::RemoteHistoryActions::default();
+        self.initial_sync_attempted = false;
+        self.loaded = false;
+        self.stale = false;
+        self.needs_connect = false;
+        self.synced_at = None;
+        self.error = None;
+        self.confirm_remote_clear = false;
+        self.shorts_shelf_offsets.clear();
+    }
+}
+
+#[derive(Default)]
 pub(crate) struct HistoryState {
     pub(crate) data: History,
     pub(crate) path: Option<PathBuf>,
     pub(crate) loaded_path: Option<PathBuf>,
+    pub(crate) loaded_fingerprint: Option<FileFingerprint>,
     pub(crate) read_failed: bool,
     pub(crate) error: Option<String>,
     pub(crate) notice: Option<String>,
@@ -1026,6 +1357,7 @@ pub(crate) struct HistoryState {
     pub(crate) save: HistorySaveState,
     pub(crate) search_query: String,
     pub(crate) filter: history::HistoryFilter,
+    pub(crate) remote: RemoteHistoryState,
 }
 
 #[derive(Default)]
@@ -1044,6 +1376,7 @@ pub(crate) struct RemotePlaylistFetchMessage {
 pub(crate) struct QueueState {
     pub(crate) data: Queue,
     pub(crate) path: Option<PathBuf>,
+    pub(crate) loaded_fingerprint: Option<FileFingerprint>,
     pub(crate) read_failed: bool,
     pub(crate) persistence_error: Option<String>,
     pub(crate) eof_handled: bool,
@@ -1058,10 +1391,7 @@ pub(crate) struct QueueState {
     pub(crate) save_collection_name: String,
     pub(crate) repeat_mode: queue::RepeatMode,
     pub(crate) remote_playlist_id: Option<String>,
-    pub(crate) remote_playlist_rx: Option<Receiver<RemotePlaylistFetchMessage>>,
-    pub(crate) remote_playlist_cancel: Option<process::Cancellation>,
-    pub(crate) remote_playlist_next_id: u64,
-    pub(crate) remote_playlist_active_id: Option<u64>,
+    pub(crate) remote_playlist_task: AsyncTask<RemotePlaylistFetchMessage>,
     pub(crate) remote_playlist_save_name: String,
 }
 
@@ -1070,6 +1400,7 @@ impl Default for QueueState {
         Self {
             data: Queue::new(crate::DEFAULT_QUEUE_LIMIT),
             path: None,
+            loaded_fingerprint: None,
             read_failed: false,
             persistence_error: None,
             eof_handled: false,
@@ -1084,10 +1415,7 @@ impl Default for QueueState {
             save_collection_name: String::new(),
             repeat_mode: queue::RepeatMode::Off,
             remote_playlist_id: None,
-            remote_playlist_rx: None,
-            remote_playlist_cancel: None,
-            remote_playlist_next_id: 0,
-            remote_playlist_active_id: None,
+            remote_playlist_task: AsyncTask::new(),
             remote_playlist_save_name: String::new(),
         }
     }
@@ -1132,10 +1460,123 @@ impl LikedVideosState {
 }
 
 #[derive(Default)]
+pub(crate) struct RemotePlaylistsSyncState {
+    pub(crate) items: Vec<playlist_sync::SyncedPlaylistCard>,
+    pub(crate) all_items: Vec<playlist_sync::SyncedPlaylistCard>,
+    pub(crate) oauth_items: Vec<playlist_sync::SyncedPlaylistCard>,
+    pub(crate) chips:
+        HashMap<playlist_sync::PlaylistCategoryFilter, playlist_sync::PlaylistChipAction>,
+    pub(crate) sort_options: Vec<playlist_sync::PlaylistSortOption>,
+    pub(crate) active_filter: playlist_sync::PlaylistCategoryFilter,
+    pub(crate) active_sort: playlist_sync::PlaylistSort,
+    pub(crate) server_sorted_for: Option<playlist_sync::PlaylistSort>,
+    pub(crate) next_continuation: Option<String>,
+    pub(crate) loaded: bool,
+    pub(crate) initial_sync_attempted: bool,
+    pub(crate) needs_connect: bool,
+    pub(crate) error: Option<String>,
+    pub(crate) rx: Option<Receiver<playlist_sync::PlaylistsSyncMessage>>,
+    pub(crate) cancel: Option<process::Cancellation>,
+    pub(crate) next_request_id: u64,
+    pub(crate) active_request_id: Option<u64>,
+    pub(crate) revision: u64,
+    pub(crate) action_rx: Option<Receiver<playlist_sync::RemotePlaylistActionEvent>>,
+    pub(crate) action_cancel: Option<process::Cancellation>,
+}
+
+impl RemotePlaylistsSyncState {
+    pub(crate) fn cancel_active(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel.cancel();
+        }
+        self.rx = None;
+        self.active_request_id = None;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    pub(crate) fn reset(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel.cancel();
+        }
+        if let Some(cancel) = self.action_cancel.take() {
+            cancel.cancel();
+        }
+        self.rx = None;
+        self.action_rx = None;
+        self.active_request_id = None;
+        self.items.clear();
+        self.all_items.clear();
+        self.oauth_items.clear();
+        self.chips.clear();
+        self.sort_options.clear();
+        self.active_filter = playlist_sync::PlaylistCategoryFilter::All;
+        self.active_sort = playlist_sync::PlaylistSort::RecentlyAdded;
+        self.server_sorted_for = None;
+        self.next_continuation = None;
+        self.loaded = false;
+        self.initial_sync_attempted = false;
+        self.needs_connect = false;
+        self.error = None;
+        self.revision = self.revision.wrapping_add(1);
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct SyncedPlaylistDetailState {
+    pub(crate) playlist_id: Option<String>,
+    pub(crate) meta: Option<playlist_sync::RemotePlaylistDetailMetadata>,
+    pub(crate) items: Vec<playlist_sync::RemotePlaylistDetailItem>,
+    pub(crate) seen_keys: HashSet<String>,
+    pub(crate) total_results: Option<u64>,
+    pub(crate) loaded: bool,
+    pub(crate) needs_connect: bool,
+    pub(crate) error: Option<String>,
+    pub(crate) rx: Option<Receiver<playlist_sync::PlaylistDetailSyncMessage>>,
+    pub(crate) cancel: Option<process::Cancellation>,
+    pub(crate) next_request_id: u64,
+    pub(crate) active_request_id: Option<u64>,
+    pub(crate) revision: u64,
+    pub(crate) merged_cache_key: Option<(u64, usize, u64, usize)>,
+    pub(crate) merged_videos: Vec<Video>,
+    pub(crate) merged_is_short: Vec<bool>,
+    pub(crate) extra_local_count: usize,
+}
+
+impl SyncedPlaylistDetailState {
+    pub(crate) fn cancel_active(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel.cancel();
+        }
+        self.rx = None;
+        self.active_request_id = None;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.cancel_active();
+        self.playlist_id = None;
+        self.meta = None;
+        self.items.clear();
+        self.seen_keys.clear();
+        self.total_results = None;
+        self.loaded = false;
+        self.needs_connect = false;
+        self.error = None;
+        self.merged_videos.clear();
+        self.merged_is_short.clear();
+        self.extra_local_count = 0;
+        self.merged_cache_key = None;
+        self.revision = self.revision.wrapping_add(1);
+    }
+}
+
+#[derive(Default)]
 pub(crate) struct LibraryState {
     pub(crate) data: crate::library::Library,
     pub(crate) revision: u64,
     pub(crate) path: Option<PathBuf>,
+    pub(crate) loaded_fingerprint: Option<FileFingerprint>,
+    pub(crate) read_failed: bool,
     pub(crate) error: Option<String>,
     pub(crate) notice: Option<String>,
     pub(crate) bookmark_note: String,
@@ -1150,9 +1591,12 @@ pub(crate) struct LibraryState {
     pub(crate) pending_bookmark_seek: Option<(String, u64)>,
     pub(crate) selected_collection_idx: Option<usize>,
     pub(crate) active_remote_playlist_title: Option<String>,
-    pub(crate) playlist_chip_filter: u8,
     pub(crate) detail_chip_filter: u8,
     pub(crate) liked_videos: LikedVideosState,
+    pub(crate) remote_playlists: RemotePlaylistsSyncState,
+    pub(crate) watch_later_remote: SyncedPlaylistDetailState,
+    pub(crate) active_playlist_detail: SyncedPlaylistDetailState,
+    pub(crate) new_playlist_composer_open: bool,
 }
 
 #[derive(Default)]
@@ -1162,9 +1606,22 @@ pub(crate) struct FollowedChannelsState {
     pub(crate) error: Option<String>,
     pub(crate) feed_items: Vec<search::SearchResult>,
     pub(crate) new_video_urls: HashSet<String>,
-    pub(crate) feed_rx: Option<Receiver<Result<followed_channels::LocalFeedOutput, String>>>,
-    pub(crate) feed_cancel: Option<process::Cancellation>,
+    pub(crate) feed_task: AsyncTask<Result<followed_channels::LocalFeedOutput, String>>,
     pub(crate) loaded_at: Option<Instant>,
+}
+
+#[derive(Default)]
+pub(crate) struct Win11RuntimeState {
+    pub(crate) hwnd: Option<isize>,
+    pub(crate) theme_observer: Option<crate::win11::SystemThemeObserver>,
+    pub(crate) taskbar: crate::win11::TaskbarController,
+    pub(crate) thumb_rx: Option<Receiver<crate::win11::TaskbarThumbCommand>>,
+    pub(crate) last_dwm_state: Option<(bool, bool)>,
+    pub(crate) last_jump_list_lang: Option<crate::i18n::UiLanguage>,
+    pub(crate) subclass_installed: bool,
+    pub(crate) maximize_button_rect: Option<egui::Rect>,
+    #[cfg(test)]
+    pub(crate) test_system_dark_override: Option<bool>,
 }
 
 #[derive(Default)]
@@ -1174,6 +1631,7 @@ pub(crate) struct DownloadState {
     pub(crate) direct_url_input: String,
     pub(crate) selected_format: downloads::DownloadFormat,
     pub(crate) filter_tab: u8,
+    pub(crate) history_path: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -1197,6 +1655,25 @@ pub(crate) enum NavigationRoute {
     Settings(SettingsTab),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CommandPaletteCacheKey {
+    pub(crate) pt: bool,
+    pub(crate) theme: Theme,
+    pub(crate) repeat_mode: queue::RepeatMode,
+    pub(crate) queue_len: usize,
+    pub(crate) queue_first_entry_id: Option<u64>,
+    pub(crate) feed_generation: u64,
+    pub(crate) history_len: usize,
+    pub(crate) history_first_id: Option<String>,
+    pub(crate) history_first_pos_ms: Option<u64>,
+    pub(crate) library_revision: u64,
+    pub(crate) authenticated: bool,
+    pub(crate) sub_channels_len: usize,
+    pub(crate) followed_channels_len: usize,
+    pub(crate) clipboard_raw: Option<String>,
+    pub(crate) query: String,
+}
+
 #[derive(Default)]
 pub(crate) struct NavigationUiState {
     pub(crate) navigation_open: bool,
@@ -1213,10 +1690,26 @@ pub(crate) struct NavigationUiState {
     pub(crate) nav_last_route: Option<NavigationRoute>,
     pub(crate) nav_suppress_record: bool,
     pub(crate) command_palette: crate::command_palette::CommandPaletteState,
+    pub(crate) command_palette_cache_key: Option<CommandPaletteCacheKey>,
+    pub(crate) command_palette_cached_items: Vec<crate::command_palette::PaletteItem>,
+    pub(crate) command_palette_cached_ranked: Vec<crate::command_palette::RankedPaletteEntry>,
+    pub(crate) command_palette_cached_has_direct: bool,
+    pub(crate) command_palette_rebuilds: u64,
     pub(crate) clipboard_last_checked_at: Option<Instant>,
+    pub(crate) last_clipboard_seq: u32,
     pub(crate) clipboard_last_raw: Option<String>,
     pub(crate) clipboard_youtube_target: Option<crate::command_palette::DirectYouTubeTarget>,
     pub(crate) clipboard_dismissed_raw: Option<String>,
+    pub(crate) incognito_mode: bool,
+    pub(crate) subscriptions_list_view: bool,
+    pub(crate) subscriptions_filters_open: bool,
+    pub(crate) subscriptions_top_expanded: bool,
+    pub(crate) subscriptions_shorts_expanded: bool,
+    pub(crate) manage_subscriptions_open: bool,
+    pub(crate) manage_subscriptions_query: String,
+    pub(crate) pending_unsubscribe_channel: Option<(String, String)>,
+    pub(crate) notifications_open: bool,
+    pub(crate) focus_search_requested: bool,
 }
 
 impl NavigationUiState {
@@ -1293,6 +1786,7 @@ pub(crate) struct WatchMetadataUiCache {
     pub(crate) video_url: Option<String>,
     pub(crate) metadata_revision: u64,
     pub(crate) live_info_revision: u64,
+    pub(crate) community_revision: u64,
     pub(crate) library_revision: u64,
     pub(crate) is_live: bool,
     pub(crate) channel_target: Option<ChannelTarget>,
@@ -1312,21 +1806,281 @@ pub(crate) struct CommunityExtrasFetchMessage {
     pub(crate) outcome: community_apis::CommunityExtrasOutcome,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ActivePlaylistPlayback {
+    pub(crate) playlist_id: String,
+    pub(crate) title: String,
+    pub(crate) owner: String,
+    pub(crate) privacy: playlist_sync::PlaylistPrivacy,
+    pub(crate) is_mix: bool,
+    pub(crate) videos: Vec<Video>,
+    pub(crate) total_count: Option<usize>,
+    pub(crate) play_order: Vec<usize>,
+    pub(crate) current_pos: usize,
+    pub(crate) loop_playlist: bool,
+    pub(crate) shuffle: bool,
+    pub(crate) collapsed: bool,
+    pub(crate) scroll_to_current: bool,
+    pub(crate) loading_more: bool,
+    pub(crate) local_collection_idx: Option<usize>,
+}
+
+fn shuffle_usize_slice(slice: &mut [usize], mut seed: u64) {
+    if slice.len() <= 1 {
+        return;
+    }
+    if seed == 0 {
+        seed = 0x9E37_79B9_7F4A_7C15;
+    }
+    for i in (1..slice.len()).rev() {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let j = (seed as usize) % (i + 1);
+        slice.swap(i, j);
+    }
+}
+
+impl ActivePlaylistPlayback {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        playlist_id: String,
+        title: String,
+        owner: String,
+        privacy: playlist_sync::PlaylistPrivacy,
+        is_mix: bool,
+        videos: Vec<Video>,
+        total_count: Option<usize>,
+        start_index: usize,
+        shuffle: bool,
+        seed: u64,
+        loading_more: bool,
+        local_collection_idx: Option<usize>,
+    ) -> Self {
+        let len = videos.len();
+        let safe_start = if len == 0 {
+            0
+        } else {
+            start_index.min(len - 1)
+        };
+        let mut play_order: Vec<usize> = (0..len).collect();
+        let current_pos = if shuffle && len > 1 {
+            play_order.swap(0, safe_start);
+            shuffle_usize_slice(&mut play_order[1..], seed);
+            0
+        } else {
+            safe_start
+        };
+        Self {
+            playlist_id,
+            title,
+            owner,
+            privacy,
+            is_mix,
+            videos,
+            total_count,
+            play_order,
+            current_pos,
+            loop_playlist: false,
+            shuffle,
+            collapsed: false,
+            scroll_to_current: true,
+            loading_more,
+            local_collection_idx,
+        }
+    }
+
+    pub(crate) fn current_video(&self) -> Option<&Video> {
+        self.video_at_order_pos(self.current_pos)
+    }
+
+    pub(crate) fn video_at_order_pos(&self, pos: usize) -> Option<&Video> {
+        let idx = *self.play_order.get(pos)?;
+        self.videos.get(idx)
+    }
+
+    pub(crate) fn total_display_count(&self) -> usize {
+        self.total_count
+            .unwrap_or(self.videos.len())
+            .max(self.videos.len())
+    }
+
+    pub(crate) fn peek_next(&self) -> Option<(usize, Video)> {
+        if self.play_order.is_empty() {
+            return None;
+        }
+        if self.current_pos + 1 < self.play_order.len() {
+            let next_pos = self.current_pos + 1;
+            let vid = self.videos.get(self.play_order[next_pos])?.clone();
+            Some((next_pos, vid))
+        } else if self.loop_playlist {
+            let vid = self.videos.get(self.play_order[0])?.clone();
+            Some((0, vid))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn peek_previous(&self) -> Option<(usize, Video)> {
+        if self.play_order.is_empty() {
+            return None;
+        }
+        if self.current_pos > 0 {
+            let prev_pos = self.current_pos - 1;
+            let vid = self.videos.get(self.play_order[prev_pos])?.clone();
+            Some((prev_pos, vid))
+        } else if self.loop_playlist {
+            let last_pos = self.play_order.len() - 1;
+            let vid = self.videos.get(self.play_order[last_pos])?.clone();
+            Some((last_pos, vid))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn has_next(&self) -> bool {
+        self.peek_next().is_some()
+    }
+
+    pub(crate) fn has_previous(&self) -> bool {
+        self.peek_previous().is_some()
+    }
+
+    pub(crate) fn select_pos(&mut self, pos: usize) -> Option<Video> {
+        let vid = self.video_at_order_pos(pos)?.clone();
+        self.current_pos = pos;
+        self.scroll_to_current = true;
+        Some(vid)
+    }
+
+    pub(crate) fn toggle_loop(&mut self) {
+        self.loop_playlist = !self.loop_playlist;
+    }
+
+    pub(crate) fn toggle_shuffle(&mut self, seed: u64) {
+        let current_vid_idx = self.play_order.get(self.current_pos).copied();
+        self.shuffle = !self.shuffle;
+        if self.videos.is_empty() {
+            self.play_order.clear();
+            self.current_pos = 0;
+            return;
+        }
+        if self.shuffle {
+            if let Some(cur_idx) = current_vid_idx {
+                let mut rest: Vec<usize> =
+                    (0..self.videos.len()).filter(|&i| i != cur_idx).collect();
+                shuffle_usize_slice(&mut rest, seed);
+                self.play_order.clear();
+                self.play_order.push(cur_idx);
+                self.play_order.extend(rest);
+                self.current_pos = 0;
+            } else {
+                self.play_order = (0..self.videos.len()).collect();
+                shuffle_usize_slice(&mut self.play_order, seed);
+                self.current_pos = 0;
+            }
+        } else {
+            self.play_order = (0..self.videos.len()).collect();
+            self.current_pos = current_vid_idx
+                .unwrap_or(0)
+                .min(self.videos.len().saturating_sub(1));
+        }
+        self.scroll_to_current = true;
+    }
+
+    pub(crate) fn append_videos(
+        &mut self,
+        incoming: &[Video],
+        total_count: Option<usize>,
+        loading_more: bool,
+    ) {
+        let mut key_to_idx: HashMap<String, usize> = HashMap::with_capacity(self.videos.len());
+        for (idx, vid) in self.videos.iter().enumerate() {
+            let key = history::youtube_video_id(&vid.url).unwrap_or_else(|| vid.url.clone());
+            key_to_idx.entry(key).or_insert(idx);
+        }
+        for vid in incoming {
+            let key = history::youtube_video_id(&vid.url).unwrap_or_else(|| vid.url.clone());
+            if let Some(&existing_idx) = key_to_idx.get(&key) {
+                if let Some(existing) = self.videos.get_mut(existing_idx)
+                    && !vid.title.trim().is_empty()
+                    && (existing.title.trim().is_empty()
+                        || existing.title.starts_with("YouTube (")
+                        || existing.channel.trim().is_empty())
+                {
+                    *existing = vid.clone();
+                }
+            } else {
+                let new_idx = self.videos.len();
+                key_to_idx.insert(key, new_idx);
+                self.videos.push(vid.clone());
+                self.play_order.push(new_idx);
+            }
+        }
+        if let Some(total) = total_count {
+            self.total_count = Some(total);
+        }
+        self.loading_more = loading_more;
+    }
+
+    pub(crate) fn update_metadata(
+        &mut self,
+        title: Option<String>,
+        owner: Option<String>,
+        privacy: Option<playlist_sync::PlaylistPrivacy>,
+        total_count: Option<usize>,
+        loading_more: bool,
+    ) {
+        if let Some(t) = title.filter(|s| !s.trim().is_empty()) {
+            self.title = t;
+        }
+        if let Some(o) = owner.filter(|s| !s.trim().is_empty()) {
+            self.owner = o;
+        }
+        if let Some(p) = privacy.filter(|&p| p != playlist_sync::PlaylistPrivacy::Unknown) {
+            self.privacy = p;
+        }
+        if let Some(total) = total_count {
+            self.total_count = Some(total);
+        }
+        self.loading_more = loading_more;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ShortsSidePanel {
+    #[default]
+    None,
+    Description,
+    Comments,
+}
+
 #[derive(Default)]
 pub(crate) struct WatchState {
     pub(crate) extras: crate::watch_extras::WatchExtras,
     pub(crate) live: crate::live_chat::LiveWatchState,
     pub(crate) sponsorblock: sponsorblock::SponsorBlockRuntime,
+    pub(crate) auto_skipped_chapter_indices: HashSet<usize>,
     pub(crate) share_copied_at: Option<Instant>,
+    pub(crate) shorts_side_panel: ShortsSidePanel,
     pub(crate) sidebar_cache: WatchSidebarCache,
     pub(crate) metadata_cache: WatchMetadataUiCache,
     pub(crate) overlay_cache: OverlayCache,
     pub(crate) community_cache: community_apis::CommunityExtrasCache,
-    pub(crate) community_rx: Option<Receiver<CommunityExtrasFetchMessage>>,
-    pub(crate) community_cancel: Option<process::Cancellation>,
-    pub(crate) community_next_id: u64,
-    pub(crate) community_active_id: Option<u64>,
+    pub(crate) community_revision: u64,
+    pub(crate) community_task: AsyncTask<CommunityExtrasFetchMessage>,
     pub(crate) show_original_title: bool,
+    pub(crate) active_playlist: Option<ActivePlaylistPlayback>,
+    pub(crate) mix_rx: Option<Receiver<playlist_sync::PlaylistDetailSyncMessage>>,
+    pub(crate) mix_cancel: Option<process::Cancellation>,
+    pub(crate) mix_next_request_id: u64,
+    pub(crate) mix_active_request_id: Option<u64>,
+    pub(crate) next_task: AsyncTask<WatchNextFetchMessage>,
+    pub(crate) innertube_comments_task: AsyncTask<InnerTubeCommentsFetchMessage>,
+    pub(crate) feedback_task: AsyncTask<ZeroQuotaFeedbackMessage>,
+    pub(crate) comment_mutation_task: AsyncTask<CommentMutationFetchMessage>,
+    pub(crate) replay_chat_task: AsyncTask<LiveChatReplayFetchMessage>,
+    pub(crate) replay_chat_last_poll_at: Option<Instant>,
 }
 
 pub(crate) fn load_playback_settings_from_path(path: &Path) -> Result<PlaybackPreferences, String> {
@@ -1360,6 +2114,17 @@ pub(crate) fn load_app_preferences_from_path(
 
 pub(crate) fn load_history_from_path(path: &Path) -> Result<History, String> {
     history::load(path).map_err(|error| {
+        format!(
+            "Erro ao ler o histórico local em '{}' ({error}). O arquivo existente foi preservado sem sobrescrita.",
+            path.display()
+        )
+    })
+}
+
+pub(crate) fn load_history_with_fingerprint_from_path(
+    path: &Path,
+) -> Result<(History, Option<FileFingerprint>), String> {
+    history::load_with_fingerprint(path).map_err(|error| {
         format!(
             "Erro ao ler o histórico local em '{}' ({error}). O arquivo existente foi preservado sem sobrescrita.",
             path.display()
@@ -1454,14 +2219,15 @@ impl SettingsState {
         }
     }
 
-    pub(crate) fn sync_theme_visuals(&mut self, ctx: &egui::Context) {
+    pub(crate) fn sync_theme_visuals(&mut self, ctx: &egui::Context, system_is_dark: bool) {
         self.ensure_theme_synchronized();
-        let want_dark = self.theme.value == Theme::Dark;
-        if self.applied_theme != Some(self.theme.value)
+        let effective = self.theme.value.resolve(system_is_dark).to_concrete_theme();
+        let want_dark = effective == Theme::Dark;
+        if self.applied_theme != Some(effective)
             || ctx.global_style().visuals.dark_mode != want_dark
         {
-            apply_theme_visuals(ctx, self.theme.value);
-            self.applied_theme = Some(self.theme.value);
+            apply_theme_visuals(ctx, effective);
+            self.applied_theme = Some(effective);
         }
     }
 
@@ -1500,8 +2266,8 @@ impl SettingsState {
         self.theme.error = save_result.err();
     }
 
-    pub(crate) fn palette(&self) -> ThemePalette {
-        ThemePalette::for_theme(self.theme.value)
+    pub(crate) fn palette_for(&self, system_is_dark: bool) -> ThemePalette {
+        ThemePalette::for_theme(self.theme.value.resolve(system_is_dark).to_concrete_theme())
     }
 
     pub(crate) fn overlay_style(&self) -> overlay::OverlayStyle {
@@ -1646,23 +2412,26 @@ impl SettingsState {
 }
 
 impl HistoryState {
-    pub(crate) fn ensure_synchronized(&mut self) -> bool {
+    pub(crate) fn ensure_synchronized(&mut self, persistence: &PersistenceWorker) -> bool {
         if self.loaded_path == self.path {
             return false;
         }
         let had_previous_path = self.loaded_path.is_some();
         self.loaded_path = self.path.clone();
         let Some(path) = self.path.clone() else {
+            self.loaded_fingerprint = None;
             self.read_failed = false;
             return false;
         };
         let mut invalidated = false;
-        match load_history_from_path(&path) {
-            Ok(loaded) => {
+        match load_history_with_fingerprint_from_path(&path) {
+            Ok((loaded, fingerprint)) => {
                 if had_previous_path || self.data.entries().is_empty() {
                     self.data = loaded;
                     invalidated = true;
                 }
+                self.loaded_fingerprint = fingerprint;
+                persistence.record_loaded_fingerprint(PersistenceSlot::History, path, fingerprint);
                 self.read_failed = false;
                 self.error = None;
             }
@@ -1671,6 +2440,7 @@ impl HistoryState {
                     self.data = History::default();
                     invalidated = true;
                 }
+                self.loaded_fingerprint = None;
                 self.read_failed = true;
                 self.error = Some(error);
             }
@@ -1680,10 +2450,11 @@ impl HistoryState {
 
     pub(crate) fn save_to_disk(
         &mut self,
+        persistence: &PersistenceWorker,
         now: Instant,
         active: Option<&ActivePlayback>,
     ) -> (bool, bool) {
-        let invalidated = self.ensure_synchronized();
+        let invalidated = self.ensure_synchronized(persistence);
         if self.read_failed {
             return (false, invalidated);
         }
@@ -1694,11 +2465,13 @@ impl HistoryState {
         }) {
             Ok(path) => path,
             Err(Ok(path)) => {
-                let mut loaded = match load_history_from_path(&path) {
+                let (mut loaded, fingerprint) = match load_history_with_fingerprint_from_path(&path)
+                {
                     Ok(loaded) => loaded,
                     Err(error) => {
                         self.path = Some(path.clone());
                         self.loaded_path = Some(path);
+                        self.loaded_fingerprint = None;
                         self.read_failed = true;
                         self.error = Some(error);
                         return (false, invalidated);
@@ -1710,6 +2483,12 @@ impl HistoryState {
                 self.data = loaded;
                 self.path = Some(path.clone());
                 self.loaded_path = Some(path.clone());
+                self.loaded_fingerprint = fingerprint;
+                persistence.record_loaded_fingerprint(
+                    PersistenceSlot::History,
+                    path.clone(),
+                    fingerprint,
+                );
                 path
             }
             Err(Err(message)) => {
@@ -1717,35 +2496,42 @@ impl HistoryState {
                 return (false, invalidated);
             }
         };
-        if let Err(error) = load_history_from_path(&path) {
-            self.read_failed = true;
-            self.error = Some(error);
-            return (false, invalidated);
+        let expected_fp = persistence
+            .last_fingerprint(PersistenceSlot::History)
+            .or(self.loaded_fingerprint);
+        // Fast `(mtime, len)` guard: skip reading/parsing disk JSON unless the file
+        // changed externally since our last known good load or write.
+        let current_fp = history::file_fingerprint(&path);
+        if current_fp != expected_fp && current_fp.is_some() {
+            if let Err(error) = load_history_from_path(&path) {
+                self.read_failed = true;
+                self.error = Some(error);
+                return (false, invalidated);
+            }
+            self.loaded_fingerprint = current_fp;
+            persistence.record_loaded_fingerprint(
+                PersistenceSlot::History,
+                path.clone(),
+                current_fp,
+            );
         }
-        let saved = match history::save(&path, &self.data) {
-            Ok(()) => {
-                self.error = None;
-                self.dirty = false;
-                self.save.last_at = Some(now);
-                if let Some(active) = active {
-                    self.save.last_position_ms = Some(active.position_ms);
-                    self.save.last_duration_ms = Some(active.duration_ms);
-                }
-                true
-            }
-            Err(error) => {
-                self.error = Some(format!(
-                    "Não foi possível salvar o histórico em '{}': {error}",
-                    path.display()
-                ));
-                false
-            }
-        };
-        (saved, invalidated)
+        persistence.schedule_history(path, self.data.clone(), expected_fp);
+        self.error = None;
+        self.dirty = false;
+        self.save.last_at = Some(now);
+        if let Some(active) = active {
+            self.save.last_position_ms = Some(active.position_ms);
+            self.save.last_duration_ms = Some(active.duration_ms);
+        }
+        (true, invalidated)
     }
 
-    pub(crate) fn planned_resume_ms(&mut self, video: &Video) -> (Option<u64>, bool) {
-        let invalidated = self.ensure_synchronized();
+    pub(crate) fn planned_resume_ms(
+        &mut self,
+        video: &Video,
+        persistence: &PersistenceWorker,
+    ) -> (Option<u64>, bool) {
+        let invalidated = self.ensure_synchronized(persistence);
         let Some(video_id) = history::youtube_video_id(&video.url) else {
             return (None, invalidated);
         };
@@ -1798,8 +2584,9 @@ impl HistoryState {
         video: &Video,
         position_ms: u64,
         duration_ms: Option<u64>,
+        persistence: &PersistenceWorker,
     ) -> (std::io::Result<()>, bool) {
-        let invalidated = self.ensure_synchronized();
+        let invalidated = self.ensure_synchronized(persistence);
         let Some(video_id) = history::youtube_video_id(&video.url) else {
             return (
                 Err(std::io::Error::new(
@@ -1822,6 +2609,7 @@ impl HistoryState {
             position_ms,
             duration_ms,
             watched_at_ms: Some(crate::history::current_unix_epoch_ms()),
+            ..Default::default()
         };
         match self.data.record(entry) {
             Ok(()) => {
@@ -1835,39 +2623,39 @@ impl HistoryState {
 
 impl ChannelState {
     pub(crate) fn is_loading(&self) -> bool {
-        self.videos.active_request_id.is_some()
+        self.videos.task.is_active()
     }
 
     pub(crate) fn is_more_videos_loading(&self) -> bool {
-        self.videos.active_more_request_id.is_some()
+        self.videos.more_task.is_active() || self.videos.continuation_task.is_active()
     }
 
     pub(crate) fn is_shorts_loading(&self) -> bool {
-        self.shorts.active_request_id.is_some()
+        self.shorts.task.is_active()
     }
 
     pub(crate) fn is_streams_loading(&self) -> bool {
-        self.streams.active_request_id.is_some()
+        self.streams.task.is_active()
     }
 
     pub(crate) fn is_playlists_loading(&self) -> bool {
-        self.playlists.active_request_id.is_some()
+        self.playlists.task.is_active()
     }
 
     pub(crate) fn is_playlist_videos_loading(&self) -> bool {
-        self.playlist_detail.active_request_id.is_some()
+        self.playlist_detail.task.is_active()
     }
 
     pub(crate) fn is_about_loading(&self) -> bool {
-        self.about.active_request_id.is_some()
+        self.about.task.is_active()
     }
 
     pub(crate) fn is_sorted_videos_loading(&self) -> bool {
-        self.videos.active_sorted_request_id.is_some()
+        self.videos.sorted_task.is_active()
     }
 
     pub(crate) fn is_channel_search_loading(&self) -> bool {
-        self.search.active_request_id.is_some()
+        self.search.task.is_active()
     }
 
     pub(crate) fn current_target(&self) -> Option<ChannelTarget> {
@@ -1878,116 +2666,62 @@ impl ChannelState {
     }
 
     pub(crate) fn cancel_subrequests(&mut self) {
-        if let Some(cancel) = self.videos.more_cancel.take() {
-            cancel.cancel();
-        }
-        self.videos.more_rx = None;
-        self.videos.active_more_request_id = None;
+        self.videos.more_task.cancel();
+        self.videos.continuation_task.cancel();
         self.cancel_sorted_videos();
         self.cancel_shorts();
         self.cancel_streams();
         self.cancel_channel_search();
-        if let Some(cancel) = self.playlists.cancel.take() {
-            cancel.cancel();
-        }
-        self.playlists.rx = None;
-        self.playlists.active_request_id = None;
-        if let Some(cancel) = self.playlist_detail.cancel.take() {
-            cancel.cancel();
-        }
-        self.playlist_detail.rx = None;
-        self.playlist_detail.active_request_id = None;
-        if let Some(cancel) = self.about.cancel.take() {
-            cancel.cancel();
-        }
-        self.about.rx = None;
-        self.about.active_request_id = None;
+        self.playlists.task.cancel();
+        self.playlist_detail.task.cancel();
+        self.about.task.cancel();
     }
 
     pub(crate) fn cancel_loading(&mut self) {
-        if let Some(cancel) = self.videos.cancel.take() {
-            cancel.cancel();
-        }
-        self.videos.active_request_id = None;
+        self.videos.task.cancel();
         self.loading_target = None;
-        self.videos.rx = None;
         self.cancel_subrequests();
     }
 
     pub(crate) fn close_view(&mut self) {
-        if let Some(cancel) = self.videos.cancel.take() {
-            cancel.cancel();
-        }
+        self.videos.task.cancel();
         self.cancel_subrequests();
         self.view_open = false;
         self.about_modal_open = false;
-        self.videos.active_request_id = None;
         self.loading_target = None;
-        self.videos.rx = None;
     }
 
     pub(crate) fn cancel_more_videos(&mut self) {
-        if let Some(cancel) = self.videos.more_cancel.take() {
-            cancel.cancel();
-        }
-        self.videos.more_rx = None;
-        self.videos.active_more_request_id = None;
+        self.videos.more_task.cancel();
+        self.videos.continuation_task.cancel();
     }
 
     pub(crate) fn cancel_sorted_videos(&mut self) {
-        if let Some(cancel) = self.videos.sorted_cancel.take() {
-            cancel.cancel();
-        }
-        self.videos.sorted_rx = None;
-        self.videos.active_sorted_request_id = None;
+        self.videos.sorted_task.cancel();
     }
 
     pub(crate) fn cancel_channel_search(&mut self) {
-        if let Some(cancel) = self.search.cancel.take() {
-            cancel.cancel();
-        }
-        self.search.rx = None;
-        self.search.active_request_id = None;
+        self.search.task.cancel();
     }
 
     pub(crate) fn cancel_shorts(&mut self) {
-        if let Some(cancel) = self.shorts.cancel.take() {
-            cancel.cancel();
-        }
-        self.shorts.rx = None;
-        self.shorts.active_request_id = None;
+        self.shorts.task.cancel();
     }
 
     pub(crate) fn cancel_streams(&mut self) {
-        if let Some(cancel) = self.streams.cancel.take() {
-            cancel.cancel();
-        }
-        self.streams.rx = None;
-        self.streams.active_request_id = None;
+        self.streams.task.cancel();
     }
 
     pub(crate) fn cancel_playlists(&mut self) {
-        if let Some(cancel) = self.playlists.cancel.take() {
-            cancel.cancel();
-        }
-        self.playlists.rx = None;
-        self.playlists.active_request_id = None;
+        self.playlists.task.cancel();
     }
 
     pub(crate) fn cancel_playlist_videos(&mut self) {
-        if let Some(cancel) = self.playlist_detail.cancel.take() {
-            cancel.cancel();
-        }
-        self.playlist_detail.rx = None;
-        self.playlist_detail.active_request_id = None;
+        self.playlist_detail.task.cancel();
     }
 
     pub(crate) fn cancel_about(&mut self) {
-        if let Some(cancel) = self.about.cancel.take() {
-            cancel.cancel();
-        }
-        self.about.rx = None;
-        self.about.active_request_id = None;
+        self.about.task.cancel();
     }
 
     pub(crate) fn begin_sorted_videos_request(&mut self) -> Option<(u64, ChannelTarget)> {
@@ -1997,9 +2731,7 @@ impl ChannelState {
             .as_ref()
             .map(|page| page.target.clone())
             .or_else(|| self.current_target())?;
-        self.next_request_id = self.next_request_id.wrapping_add(1);
-        let request_id = self.next_request_id;
-        self.videos.active_sorted_request_id = Some(request_id);
+        let request_id = self.videos.sorted_task.begin_reserved();
         self.videos.sorted_error = None;
         Some((request_id, target))
     }
@@ -2011,9 +2743,7 @@ impl ChannelState {
             .as_ref()
             .map(|page| page.target.clone())
             .or_else(|| self.current_target())?;
-        self.next_request_id = self.next_request_id.wrapping_add(1);
-        let request_id = self.next_request_id;
-        self.search.active_request_id = Some(request_id);
+        let request_id = self.search.task.begin_reserved();
         self.search.error = None;
         Some((request_id, target))
     }
@@ -2040,9 +2770,7 @@ impl ChannelState {
             return None;
         }
         let target = page.target.clone();
-        self.next_request_id = self.next_request_id.wrapping_add(1);
-        let request_id = self.next_request_id;
-        self.videos.active_more_request_id = Some(request_id);
+        let request_id = self.videos.more_task.begin_reserved();
         self.videos.more_error = None;
         Some((request_id, target, start, count))
     }
@@ -2056,9 +2784,7 @@ impl ChannelState {
             .as_ref()
             .map(|page| page.target.clone())
             .or_else(|| self.current_target())?;
-        self.next_request_id = self.next_request_id.wrapping_add(1);
-        let request_id = self.next_request_id;
-        self.shorts.active_request_id = Some(request_id);
+        let request_id = self.shorts.task.begin_reserved();
         self.shorts.error = None;
         Some((request_id, target))
     }
@@ -2072,9 +2798,7 @@ impl ChannelState {
             .as_ref()
             .map(|page| page.target.clone())
             .or_else(|| self.current_target())?;
-        self.next_request_id = self.next_request_id.wrapping_add(1);
-        let request_id = self.next_request_id;
-        self.streams.active_request_id = Some(request_id);
+        let request_id = self.streams.task.begin_reserved();
         self.streams.error = None;
         Some((request_id, target))
     }
@@ -2088,9 +2812,7 @@ impl ChannelState {
             .as_ref()
             .map(|page| page.target.clone())
             .or_else(|| self.current_target())?;
-        self.next_request_id = self.next_request_id.wrapping_add(1);
-        let request_id = self.next_request_id;
-        self.playlists.active_request_id = Some(request_id);
+        let request_id = self.playlists.task.begin_reserved();
         self.playlists.error = None;
         Some((request_id, target))
     }
@@ -2104,25 +2826,39 @@ impl ChannelState {
             .as_ref()
             .map(|page| page.target.clone())
             .or_else(|| self.current_target())?;
-        self.next_request_id = self.next_request_id.wrapping_add(1);
-        let request_id = self.next_request_id;
-        self.about.active_request_id = Some(request_id);
+        let request_id = self.about.task.begin_reserved();
         self.about.error = None;
         Some((request_id, target))
     }
 }
 
 impl QueueState {
-    pub(crate) fn persist(&mut self) {
+    pub(crate) fn persist(&mut self, persistence: &PersistenceWorker) {
         if self.read_failed {
             return;
         }
-        if let Some(path) = &self.path {
-            if let Err(error) = self.data.save(path) {
-                self.persistence_error = Some(format!("Não foi possível salvar a fila: {error}"));
-            } else {
-                self.persistence_error = None;
+        if let Some(path) = self.path.clone() {
+            let expected_fp = persistence
+                .last_fingerprint(PersistenceSlot::Queue)
+                .or(self.loaded_fingerprint);
+            let current_fp = history::file_fingerprint(&path);
+            if current_fp != expected_fp && current_fp.is_some() {
+                if let Err(error) = Queue::load(&path, self.data.limit()) {
+                    self.read_failed = true;
+                    self.persistence_error = Some(format!(
+                        "Não foi possível salvar a fila (arquivo externo inválido preservado): {error}"
+                    ));
+                    return;
+                }
+                self.loaded_fingerprint = current_fp;
+                persistence.record_loaded_fingerprint(
+                    PersistenceSlot::Queue,
+                    path.clone(),
+                    current_fp,
+                );
             }
+            persistence.schedule_queue(path, self.data.clone(), expected_fp);
+            self.persistence_error = None;
         }
     }
 }

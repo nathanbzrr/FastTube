@@ -3,20 +3,39 @@
 #[path = "mp4_mux.rs"]
 mod mp4_mux;
 
-use crate::process::Cancellation;
+use crate::process::{Cancellation, ProcessJobObject};
 use crate::search::{self, Video};
 use libloading::Library;
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 const MAX_DOWNLOAD_HISTORY: usize = 50;
-static STAGING_SEQ: AtomicU64 = AtomicU64::new(1);
+const MAX_DOWNLOAD_RECORDS_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_DOWNLOAD_RECORD_TEXT_BYTES: usize = 4096;
+const MAX_STDERR_LINES: usize = 64;
+const PROGRESS_REPAINT_MIN_INTERVAL: Duration = Duration::from_millis(100);
+const PROGRESS_REPAINT_MIN_PERCENT_DELTA: f32 = 1.0;
+const CANCEL_WATCHER_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub const DEFAULT_MAX_CONCURRENT_DOWNLOADS: usize = 2;
+
+pub fn can_start_another_download(active_count: usize, max_concurrent: usize) -> bool {
+    active_count < max_concurrent.max(1)
+}
+
+static STAGING_SEQ: AtomicU64 = AtomicU64::new(1);
+static FFMPEG_PATH_CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
+static FFMPEG_PROBE_STARTED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DownloadFormat {
     #[default]
     VideoMp4Best,
@@ -41,6 +60,22 @@ impl DownloadFormat {
 
     pub fn is_audio(self) -> bool {
         matches!(self, Self::AudioM4a | Self::AudioOpus | Self::AudioMp3)
+    }
+
+    pub fn filename_tag(self) -> &'static str {
+        match self {
+            Self::VideoMp4Best => "best",
+            Self::Video1080p => "1080p",
+            Self::Video720p => "720p",
+            Self::Video480p => "480p",
+            Self::AudioM4a => "audio-m4a",
+            Self::AudioOpus => "audio-opus",
+            Self::AudioMp3 => "audio-mp3",
+        }
+    }
+
+    pub fn output_template(self) -> String {
+        format!("%(title).120B [%(id)s] [{}].%(ext)s", self.filename_tag())
     }
 
     pub fn label_pt(self) -> &'static str {
@@ -100,7 +135,7 @@ impl DownloadFormat {
                 ],
                 Self::AudioOpus => vec![
                     "-f",
-                    "bestaudio[ext=webm][protocol^=http]/bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio/best",
+                    "bestaudio[acodec*=opus][ext=webm][protocol^=http]/bestaudio[acodec*=opus]/bestaudio[ext=webm][protocol^=http]/bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio/best",
                 ],
                 Self::AudioMp3 => vec![
                     "-f",
@@ -142,10 +177,7 @@ impl DownloadFormat {
             ],
             Self::AudioOpus => vec![
                 "-f",
-                "ba[ext=webm][protocol^=http]/ba[ext=webm]/ba/b",
-                "-x",
-                "--audio-format",
-                "opus",
+                "bestaudio[acodec*=opus][ext=webm][protocol^=http]/bestaudio[acodec*=opus]/ba[acodec*=opus]/ba[ext=webm][protocol^=http]/ba[ext=webm]/bestaudio/ba/b",
             ],
             Self::AudioMp3 => vec![
                 "-f",
@@ -164,7 +196,7 @@ impl DownloadFormat {
                     vec!["-f", "bv*+ba/b", "--merge-output-format", "mp4"]
                 }
                 Self::AudioM4a => vec!["-f", "ba/b", "-x", "--audio-format", "m4a"],
-                Self::AudioOpus => vec!["-f", "ba/b", "-x", "--audio-format", "opus"],
+                Self::AudioOpus => vec!["-f", "bestaudio[acodec*=opus]/bestaudio/ba/b"],
                 Self::AudioMp3 => vec!["-f", "ba/b", "-x", "--audio-format", "mp3"],
             };
         }
@@ -193,57 +225,334 @@ impl DownloadFormat {
     }
 }
 
+fn probe_ffmpeg_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let exe_name = "ffmpeg.exe";
+    #[cfg(not(windows))]
+    let exe_name = "ffmpeg";
+
+    let probe = |bin: &Path| {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.arg("-version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        cmd.status().map(|s| s.success()).unwrap_or(false)
+    };
+
+    if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+        let bin = PathBuf::from(local)
+            .join("FastTube")
+            .join("bin")
+            .join(exe_name);
+        if bin.is_file() && probe(&bin) {
+            return Some(bin);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let bin = dir.join(exe_name);
+        if bin.is_file() && probe(&bin) {
+            return Some(bin);
+        }
+    }
+    let path_bin = Path::new("ffmpeg");
+    if probe(path_bin) {
+        return Some(PathBuf::from("ffmpeg"));
+    }
+    None
+}
+
 pub fn find_ffmpeg() -> Option<PathBuf> {
-    static CACHED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    CACHED
-        .get_or_init(|| {
-            #[cfg(windows)]
-            let exe_name = "ffmpeg.exe";
-            #[cfg(not(windows))]
-            let exe_name = "ffmpeg";
-
-            let probe = |bin: &Path| {
-                let mut cmd = std::process::Command::new(bin);
-                cmd.arg("-version")
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null());
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    cmd.creation_flags(0x0800_0000);
-                }
-                cmd.status().map(|s| s.success()).unwrap_or(false)
-            };
-
-            if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
-                let bin = PathBuf::from(local)
-                    .join("FastTube")
-                    .join("bin")
-                    .join(exe_name);
-                if bin.is_file() && probe(&bin) {
-                    return Some(bin);
-                }
-            }
-            if let Ok(exe) = std::env::current_exe()
-                && let Some(dir) = exe.parent()
-            {
-                let bin = dir.join(exe_name);
-                if bin.is_file() && probe(&bin) {
-                    return Some(bin);
-                }
-            }
-            let path_bin = Path::new("ffmpeg");
-            if probe(path_bin) {
-                return Some(PathBuf::from("ffmpeg"));
-            }
-            None
-        })
-        .clone()
+    FFMPEG_PATH_CACHE.get_or_init(probe_ffmpeg_path).clone()
 }
 
 pub fn has_ffmpeg() -> bool {
     find_ffmpeg().is_some()
+}
+
+/// Returns the cached `ffmpeg` probe result without ever blocking or spawning a process.
+pub fn has_ffmpeg_cached() -> Option<bool> {
+    FFMPEG_PATH_CACHE.get().map(Option::is_some)
+}
+
+/// Spawns at most one background thread to probe `ffmpeg` availability and
+/// wakes the UI via `ctx.request_repaint()` once the cache is populated.
+pub fn trigger_ffmpeg_probe(ctx: eframe::egui::Context) {
+    if FFMPEG_PATH_CACHE.get().is_some() {
+        return;
+    }
+    if FFMPEG_PROBE_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    std::thread::spawn(move || {
+        let _ = has_ffmpeg();
+        ctx.request_repaint();
+    });
+}
+
+#[derive(Debug, Default)]
+struct ProgressRepaintThrottle {
+    last_repaint: Option<Instant>,
+    last_percent: Option<f32>,
+}
+
+impl ProgressRepaintThrottle {
+    fn should_emit(&mut self, percent: f32, now: Instant) -> bool {
+        let should = match (self.last_repaint, self.last_percent) {
+            (None, _) | (_, None) => true,
+            (Some(prev_time), Some(prev_pct)) => {
+                now.duration_since(prev_time) >= PROGRESS_REPAINT_MIN_INTERVAL
+                    || (percent - prev_pct).abs() >= PROGRESS_REPAINT_MIN_PERCENT_DELTA
+                    || (percent >= 100.0 && prev_pct < 100.0)
+            }
+        };
+        if should {
+            self.last_repaint = Some(now);
+            self.last_percent = Some(percent);
+        }
+        should
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DownloadOptions {
+    pub embed_subs: bool,
+    pub embed_chapters: bool,
+    pub embed_thumbnail: bool,
+    pub continue_partial: bool,
+}
+
+pub fn build_embed_args(opts: &DownloadOptions) -> Vec<String> {
+    let mut args = Vec::new();
+    if opts.continue_partial {
+        args.push("--continue".to_owned());
+    }
+    if opts.embed_subs {
+        args.push("--embed-subs".to_owned());
+    }
+    if opts.embed_chapters {
+        args.push("--embed-chapters".to_owned());
+    }
+    if opts.embed_thumbnail {
+        args.push("--embed-thumbnail".to_owned());
+    }
+    args
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchDownloadRequest {
+    pub video: Video,
+    pub format: DownloadFormat,
+    pub output_dir: PathBuf,
+    pub options: DownloadOptions,
+}
+
+pub fn build_batch_playlist_requests(
+    videos: &[Video],
+    format: DownloadFormat,
+    output_dir: &Path,
+    opts: DownloadOptions,
+) -> Vec<BatchDownloadRequest> {
+    let mut seen_keys = std::collections::HashSet::with_capacity(videos.len());
+    let mut requests = Vec::with_capacity(videos.len());
+    for video in videos {
+        let trimmed_url = video.url.trim();
+        if trimmed_url.is_empty() {
+            continue;
+        }
+        let key =
+            crate::history::youtube_video_id(trimmed_url).unwrap_or_else(|| trimmed_url.to_owned());
+        if seen_keys.insert(key) {
+            requests.push(BatchDownloadRequest {
+                video: video.clone(),
+                format,
+                output_dir: output_dir.to_path_buf(),
+                options: opts,
+            });
+        }
+    }
+    requests
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistedDownloadStatus {
+    Completed,
+    Paused,
+    Failed,
+    #[default]
+    Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedDownloadRecord {
+    pub id: u64,
+    pub video_id: Option<String>,
+    pub title: String,
+    pub channel: String,
+    pub url: String,
+    #[serde(default)]
+    pub thumbnail_url: String,
+    #[serde(default)]
+    pub format: DownloadFormat,
+    pub status: PersistedDownloadStatus,
+    #[serde(default)]
+    pub output_path: Option<PathBuf>,
+    #[serde(default)]
+    pub progress_percent: f32,
+    #[serde(default)]
+    pub file_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub updated_at_unix: i64,
+}
+
+impl PersistedDownloadRecord {
+    fn is_valid(&self) -> bool {
+        !self.url.trim().is_empty()
+            && self.url.len() <= MAX_DOWNLOAD_RECORD_TEXT_BYTES
+            && self.title.len() <= MAX_DOWNLOAD_RECORD_TEXT_BYTES
+            && self.channel.len() <= MAX_DOWNLOAD_RECORD_TEXT_BYTES
+            && self.thumbnail_url.len() <= MAX_DOWNLOAD_RECORD_TEXT_BYTES
+            && self.progress_percent.is_finite()
+            && (0.0..=100.0).contains(&self.progress_percent)
+    }
+
+    pub fn into_download_item(self, default_output_dir: &Path) -> DownloadItem {
+        let output_dir = self
+            .output_path
+            .as_deref()
+            .and_then(|p| p.parent())
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| default_output_dir.to_path_buf());
+        let status = match self.status {
+            PersistedDownloadStatus::Completed => DownloadStatus::Completed {
+                output_path: self.output_path,
+            },
+            PersistedDownloadStatus::Paused => DownloadStatus::Paused,
+            PersistedDownloadStatus::Failed => {
+                DownloadStatus::Failed("Download interrompido na sessão anterior.".to_owned())
+            }
+            PersistedDownloadStatus::Cancelled => DownloadStatus::Cancelled,
+        };
+        DownloadItem {
+            id: self.id.max(1),
+            video: Video {
+                title: if self.title.trim().is_empty() {
+                    self.video_id
+                        .clone()
+                        .unwrap_or_else(|| "Download".to_owned())
+                } else {
+                    self.title
+                },
+                channel: self.channel,
+                url: self.url,
+                thumbnail: self.thumbnail_url,
+                duration: String::new(),
+            },
+            format: self.format,
+            output_dir,
+            status,
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn downloads_history_path() -> PathBuf {
+    if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+        let root = PathBuf::from(local);
+        if root.is_absolute() {
+            return root.join("FastTube").join("downloads.json");
+        }
+    }
+    PathBuf::from("downloads.json")
+}
+
+pub fn load_download_records_from(path: &Path) -> std::io::Result<Vec<PersistedDownloadRecord>> {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_DOWNLOAD_RECORDS_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid downloads.json");
+    if bytes.len() as u64 > MAX_DOWNLOAD_RECORDS_FILE_BYTES {
+        return Err(invalid());
+    }
+    let root: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    let records_val = if let Some(arr) = root.as_array() {
+        arr.clone()
+    } else {
+        if root.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+            return Err(invalid());
+        }
+        root.get("records")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(invalid)?
+            .clone()
+    };
+    if records_val.len() > MAX_DOWNLOAD_HISTORY * 4 {
+        return Err(invalid());
+    }
+    let mut records = Vec::with_capacity(records_val.len());
+    for val in records_val {
+        let rec: PersistedDownloadRecord = serde_json::from_value(val).map_err(|_| invalid())?;
+        if !rec.is_valid() {
+            return Err(invalid());
+        }
+        records.push(rec);
+    }
+    Ok(records)
+}
+
+pub fn save_download_records_to(
+    path: &Path,
+    records: &[PersistedDownloadRecord],
+) -> std::io::Result<()> {
+    if path.exists() {
+        // Preserve corrupt files on disk untouched and surface InvalidData.
+        let _ = load_download_records_from(path)?;
+    }
+    if records.iter().any(|r| !r.is_valid()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "download record exceeds validation limits",
+        ));
+    }
+    #[derive(serde::Serialize)]
+    struct DownloadsFile<'a> {
+        version: u8,
+        records: &'a [PersistedDownloadRecord],
+    }
+    let slice = if records.len() > MAX_DOWNLOAD_HISTORY {
+        &records[records.len() - MAX_DOWNLOAD_HISTORY..]
+    } else {
+        records
+    };
+    let bytes = serde_json::to_vec(&DownloadsFile {
+        version: 1,
+        records: slice,
+    })?;
+    if bytes.len() as u64 > MAX_DOWNLOAD_RECORDS_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "downloads.json exceeds file size limit",
+        ));
+    }
+    crate::history::write_atomic(path, &bytes)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -254,6 +563,7 @@ pub enum DownloadStatus {
         speed: Option<String>,
         eta: Option<String>,
     },
+    Paused,
     Completed {
         output_path: Option<PathBuf>,
     },
@@ -268,6 +578,10 @@ impl DownloadStatus {
             Self::Completed { .. } | Self::Failed(_) | Self::Cancelled
         )
     }
+
+    pub fn is_paused(&self) -> bool {
+        matches!(self, Self::Paused)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -277,6 +591,63 @@ pub struct DownloadItem {
     pub format: DownloadFormat,
     pub output_dir: PathBuf,
     pub status: DownloadStatus,
+}
+
+impl DownloadItem {
+    pub fn to_persisted_record(
+        &self,
+        paused_progress: Option<f32>,
+        now_unix: i64,
+    ) -> PersistedDownloadRecord {
+        let (status, output_path, progress_percent) = match &self.status {
+            DownloadStatus::Completed { output_path } => (
+                PersistedDownloadStatus::Completed,
+                output_path.clone(),
+                100.0,
+            ),
+            DownloadStatus::Paused => (
+                PersistedDownloadStatus::Paused,
+                None,
+                paused_progress.unwrap_or(0.0).clamp(0.0, 100.0),
+            ),
+            DownloadStatus::Queued => (
+                PersistedDownloadStatus::Paused,
+                None,
+                paused_progress.unwrap_or(0.0).clamp(0.0, 100.0),
+            ),
+            DownloadStatus::Running {
+                progress_percent, ..
+            } => (
+                PersistedDownloadStatus::Paused,
+                None,
+                progress_percent.clamp(0.0, 100.0),
+            ),
+            DownloadStatus::Failed(_) => (
+                PersistedDownloadStatus::Failed,
+                None,
+                paused_progress.unwrap_or(0.0).clamp(0.0, 100.0),
+            ),
+            DownloadStatus::Cancelled => (PersistedDownloadStatus::Cancelled, None, 0.0),
+        };
+        let file_size_bytes = output_path
+            .as_deref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len());
+        PersistedDownloadRecord {
+            id: self.id,
+            video_id: crate::history::youtube_video_id(&self.video.url),
+            title: self.video.title.clone(),
+            channel: self.video.channel.clone(),
+            url: self.video.url.clone(),
+            thumbnail_url: self.video.thumbnail.clone(),
+            format: self.format,
+            status,
+            output_path,
+            progress_percent,
+            file_size_bytes,
+            updated_at_unix: now_unix,
+        }
+    }
 }
 
 enum WorkerEvent {
@@ -296,14 +667,26 @@ enum WorkerEvent {
     },
 }
 
+struct ActiveWorkerSlot {
+    cancel: Cancellation,
+    pause_flag: Arc<AtomicBool>,
+}
+
 #[derive(Default)]
 pub struct DownloadManager {
     pub items: Vec<DownloadItem>,
+    pub default_options: DownloadOptions,
     next_id: u64,
+    max_concurrent: usize,
     active_id: Option<u64>,
     active_cancel: Option<Cancellation>,
+    active_workers: std::collections::HashMap<u64, ActiveWorkerSlot>,
+    tx: Option<mpsc::Sender<WorkerEvent>>,
     rx: Option<Receiver<WorkerEvent>>,
     pending_output_paths: std::collections::HashMap<u64, PathBuf>,
+    item_options: std::collections::HashMap<u64, DownloadOptions>,
+    paused_progress: std::collections::HashMap<u64, f32>,
+    paused_staging_dirs: std::collections::HashMap<u64, PathBuf>,
 }
 
 impl DownloadManager {
@@ -326,19 +709,78 @@ impl DownloadManager {
             .unwrap_or_else(Self::default_download_dir)
     }
 
+    pub fn effective_max_concurrent(&self) -> usize {
+        if self.max_concurrent == 0 {
+            DEFAULT_MAX_CONCURRENT_DOWNLOADS
+        } else {
+            self.max_concurrent
+        }
+    }
+
+    pub fn set_max_concurrent(&mut self, max_concurrent: usize) {
+        self.max_concurrent = max_concurrent.max(1);
+    }
+
+    pub fn running_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| matches!(item.status, DownloadStatus::Running { .. }))
+            .count()
+            .max(self.active_workers.len())
+    }
+
+    pub fn paused_progress(&self, id: u64) -> f32 {
+        self.paused_progress.get(&id).copied().unwrap_or(0.0)
+    }
+
     pub fn has_active(&self) -> bool {
         self.active_id.is_some()
-            || self
-                .items
-                .iter()
-                .any(|item| matches!(item.status, DownloadStatus::Queued))
+            || !self.active_workers.is_empty()
+            || self.items.iter().any(|item| {
+                matches!(
+                    item.status,
+                    DownloadStatus::Queued | DownloadStatus::Running { .. }
+                )
+            })
     }
 
     pub fn active_count(&self) -> usize {
         self.items
             .iter()
-            .filter(|item| !item.status.is_terminal())
+            .filter(|item| !item.status.is_terminal() && !item.status.is_paused())
             .count()
+    }
+
+    pub fn to_persisted_records(&self, now_unix: i64) -> Vec<PersistedDownloadRecord> {
+        self.items
+            .iter()
+            .map(|item| {
+                item.to_persisted_record(self.paused_progress.get(&item.id).copied(), now_unix)
+            })
+            .collect()
+    }
+
+    pub fn restore_from_records(
+        &mut self,
+        records: Vec<PersistedDownloadRecord>,
+        default_output_dir: &Path,
+    ) {
+        for rec in records {
+            let id = rec.id.max(1);
+            let progress = rec.progress_percent.clamp(0.0, 100.0);
+            let is_paused = rec.status == PersistedDownloadStatus::Paused;
+            let item = rec.into_download_item(default_output_dir);
+            if is_paused {
+                self.paused_progress.insert(id, progress);
+                let mut opts = self.default_options;
+                opts.continue_partial = true;
+                self.item_options.insert(id, opts);
+            }
+            self.next_id = self.next_id.max(id);
+            if !self.items.iter().any(|existing| existing.id == id) {
+                self.items.push(item);
+            }
+        }
     }
 
     pub fn enqueue(
@@ -348,13 +790,27 @@ impl DownloadManager {
         output_dir: PathBuf,
         ctx: &eframe::egui::Context,
     ) -> u64 {
+        let opts = self.default_options;
+        self.enqueue_with_options(video, format, output_dir, opts, ctx)
+    }
+
+    pub fn enqueue_with_options(
+        &mut self,
+        video: Video,
+        format: DownloadFormat,
+        output_dir: PathBuf,
+        options: DownloadOptions,
+        ctx: &eframe::egui::Context,
+    ) -> u64 {
         if self.items.len() >= MAX_DOWNLOAD_HISTORY
             && let Some(pos) = self.items.iter().position(|item| item.status.is_terminal())
         {
-            self.items.remove(pos);
+            let removed = self.items.remove(pos);
+            self.cleanup_item_aux(removed.id, true);
         }
         self.next_id = self.next_id.wrapping_add(1).max(1);
         let id = self.next_id;
+        self.item_options.insert(id, options);
         self.items.push(DownloadItem {
             id,
             video,
@@ -366,32 +822,132 @@ impl DownloadManager {
         id
     }
 
+    pub fn enqueue_batch(
+        &mut self,
+        requests: Vec<BatchDownloadRequest>,
+        ctx: &eframe::egui::Context,
+    ) -> Vec<u64> {
+        let mut ids = Vec::with_capacity(requests.len());
+        for req in requests {
+            ids.push(self.enqueue_with_options(
+                req.video,
+                req.format,
+                req.output_dir,
+                req.options,
+                ctx,
+            ));
+        }
+        ids
+    }
+
+    fn cleanup_item_aux(&mut self, id: u64, remove_staging: bool) {
+        self.pending_output_paths.remove(&id);
+        self.item_options.remove(&id);
+        self.paused_progress.remove(&id);
+        if let Some(staging_dir) = self.paused_staging_dirs.remove(&id)
+            && remove_staging
+        {
+            let _ = std::fs::remove_dir_all(staging_dir);
+        }
+    }
+
+    fn sync_legacy_active_fields(&mut self) {
+        if let Some((&id, slot)) = self.active_workers.iter().next() {
+            self.active_id = Some(id);
+            self.active_cancel = Some(slot.cancel.clone());
+        } else {
+            self.active_id = None;
+            self.active_cancel = None;
+        }
+    }
+
+    pub fn pause(&mut self, id: u64, ctx: &eframe::egui::Context) -> bool {
+        let mut current_pct = self.paused_progress.get(&id).copied().unwrap_or(0.0);
+        let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
+            return false;
+        };
+        match item.status {
+            DownloadStatus::Running {
+                progress_percent, ..
+            } => {
+                current_pct = progress_percent;
+            }
+            DownloadStatus::Queued => {}
+            _ => return false,
+        }
+        item.status = DownloadStatus::Paused;
+        self.paused_progress.insert(id, current_pct);
+        self.item_options.entry(id).or_default().continue_partial = true;
+
+        if let Some(slot) = self.active_workers.remove(&id) {
+            slot.pause_flag.store(true, Ordering::Release);
+            slot.cancel.cancel();
+        } else if self.active_id == Some(id)
+            && let Some(cancel) = self.active_cancel.take()
+        {
+            cancel.cancel();
+        }
+        self.sync_legacy_active_fields();
+        self.pump_next(ctx);
+        true
+    }
+
+    pub fn resume(&mut self, id: u64, ctx: &eframe::egui::Context) -> bool {
+        let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
+            return false;
+        };
+        if !matches!(item.status, DownloadStatus::Paused) {
+            return false;
+        }
+        item.status = DownloadStatus::Queued;
+        self.item_options.entry(id).or_default().continue_partial = true;
+        self.pump_next(ctx);
+        true
+    }
+
     pub fn cancel(&mut self, id: u64, ctx: &eframe::egui::Context) {
-        if self.active_id == Some(id) {
+        let was_active = if let Some(slot) = self.active_workers.remove(&id) {
+            slot.cancel.cancel();
+            true
+        } else if self.active_id == Some(id) {
             if let Some(cancel) = self.active_cancel.take() {
                 cancel.cancel();
             }
-            if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
-                item.status = DownloadStatus::Cancelled;
-            }
-            self.active_id = None;
-            self.rx = None;
-            self.pump_next(ctx);
-            return;
-        }
+            true
+        } else {
+            false
+        };
         if let Some(item) = self.items.iter_mut().find(|item| item.id == id)
-            && matches!(item.status, DownloadStatus::Queued)
+            && (was_active
+                || matches!(item.status, DownloadStatus::Queued | DownloadStatus::Paused))
         {
             item.status = DownloadStatus::Cancelled;
+        }
+        self.cleanup_item_aux(id, true);
+        self.sync_legacy_active_fields();
+        if self.active_workers.is_empty() {
+            self.tx = None;
+            self.rx = None;
+        }
+        if was_active {
+            self.pump_next(ctx);
         }
     }
 
     pub fn cancel_all(&mut self) {
+        for (_, slot) in self.active_workers.drain() {
+            slot.cancel.cancel();
+        }
         if let Some(cancel) = self.active_cancel.take() {
             cancel.cancel();
         }
         self.active_id = None;
+        self.tx = None;
         self.rx = None;
+        for (_, staging_dir) in self.paused_staging_dirs.drain() {
+            let _ = std::fs::remove_dir_all(staging_dir);
+        }
+        self.paused_progress.clear();
         for item in &mut self.items {
             if !item.status.is_terminal() {
                 item.status = DownloadStatus::Cancelled;
@@ -409,36 +965,40 @@ impl DownloadManager {
         };
         if !matches!(
             item.status,
-            DownloadStatus::Failed(_) | DownloadStatus::Cancelled
+            DownloadStatus::Failed(_) | DownloadStatus::Cancelled | DownloadStatus::Paused
         ) {
             return false;
         }
+        let was_paused = matches!(item.status, DownloadStatus::Paused);
         item.status = DownloadStatus::Queued;
         self.pending_output_paths.remove(&id);
+        if was_paused {
+            self.item_options.entry(id).or_default().continue_partial = true;
+        }
         self.pump_next(ctx);
         true
     }
 
     pub fn remove(&mut self, id: u64) -> bool {
-        if self.active_id == Some(id) {
+        if self.active_id == Some(id) || self.active_workers.contains_key(&id) {
             return false;
         }
-        let Some(pos) = self
-            .items
-            .iter()
-            .position(|item| item.id == id && item.status.is_terminal())
-        else {
+        let Some(pos) = self.items.iter().position(|item| {
+            item.id == id && (item.status.is_terminal() || item.status.is_paused())
+        }) else {
             return false;
         };
         self.items.remove(pos);
-        self.pending_output_paths.remove(&id);
+        self.cleanup_item_aux(id, true);
         true
     }
 
     pub fn poll(&mut self, ctx: &eframe::egui::Context) -> Option<(u64, Result<(), String>)> {
         let mut completed: Option<(u64, Result<(), String>)> = None;
         let mut disconnected = false;
-        if let Some(rx) = &self.rx {
+        let mut slot_freed = false;
+        if let Some(rx) = self.rx.take() {
+            let mut keep_rx = true;
             loop {
                 match rx.try_recv() {
                     Ok(WorkerEvent::Progress {
@@ -447,9 +1007,14 @@ impl DownloadManager {
                         speed,
                         eta,
                     }) => {
-                        if self.active_id == Some(id)
+                        if (self.active_workers.contains_key(&id) || self.active_id == Some(id))
                             && let Some(item) = self.items.iter_mut().find(|i| i.id == id)
+                            && !matches!(
+                                item.status,
+                                DownloadStatus::Paused | DownloadStatus::Cancelled
+                            )
                         {
+                            self.paused_progress.insert(id, percent);
                             item.status = DownloadStatus::Running {
                                 progress_percent: percent,
                                 speed,
@@ -467,88 +1032,148 @@ impl DownloadManager {
                         }
                     }
                     Ok(WorkerEvent::Finished { id, result }) => {
-                        if self.active_id == Some(id) {
+                        let was_tracked =
+                            self.active_workers.remove(&id).is_some() || self.active_id == Some(id);
+                        self.sync_legacy_active_fields();
+                        if !was_tracked {
+                            continue;
+                        }
+                        if let Some(item) = self.items.iter_mut().find(|i| i.id == id) {
+                            if matches!(
+                                item.status,
+                                DownloadStatus::Paused | DownloadStatus::Cancelled
+                            ) {
+                                slot_freed = true;
+                                continue;
+                            }
                             let resolved_path = self.pending_output_paths.remove(&id);
-                            if let Some(item) = self.items.iter_mut().find(|i| i.id == id) {
-                                match &result {
-                                    Ok(()) => {
-                                        let fallback_dir = item.output_dir.clone();
-                                        item.status = DownloadStatus::Completed {
-                                            output_path: Some(
-                                                resolved_path.unwrap_or(fallback_dir),
-                                            ),
-                                        };
-                                    }
-                                    Err(err) => {
-                                        item.status = DownloadStatus::Failed(err.clone());
-                                    }
+                            match &result {
+                                Ok(()) => {
+                                    let fallback_dir = item.output_dir.clone();
+                                    item.status = DownloadStatus::Completed {
+                                        output_path: Some(resolved_path.unwrap_or(fallback_dir)),
+                                    };
+                                }
+                                Err(err) => {
+                                    item.status = DownloadStatus::Failed(err.clone());
                                 }
                             }
-                            self.active_id = None;
-                            self.active_cancel = None;
-                            completed = Some((id, result));
-                            disconnected = true;
-                            break;
                         }
+                        self.cleanup_item_aux(id, true);
+                        completed = Some((id, result));
+                        slot_freed = true;
+                        break;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         disconnected = true;
+                        keep_rx = false;
                         break;
                     }
                 }
             }
+            if keep_rx {
+                self.rx = Some(rx);
+            }
         }
         if disconnected {
+            self.tx = None;
             self.rx = None;
-            if let Some(id) = self.active_id.take()
-                && let Some(item) = self.items.iter_mut().find(|i| i.id == id)
-                && !item.status.is_terminal()
-            {
-                item.status = DownloadStatus::Failed("Processo de download encerrado.".to_owned());
-            }
+            let abandoned: Vec<u64> = self
+                .active_workers
+                .drain()
+                .map(|(id, _)| id)
+                .chain(self.active_id.take())
+                .collect();
             self.active_cancel = None;
+            for id in abandoned {
+                if let Some(item) = self.items.iter_mut().find(|i| i.id == id)
+                    && !item.status.is_terminal()
+                    && !item.status.is_paused()
+                {
+                    item.status =
+                        DownloadStatus::Failed("Processo de download encerrado.".to_owned());
+                }
+            }
+            self.pump_next(ctx);
+        } else if slot_freed {
+            if self.active_workers.is_empty() {
+                self.tx = None;
+                self.rx = None;
+            }
             self.pump_next(ctx);
         }
         completed
     }
 
     fn pump_next(&mut self, ctx: &eframe::egui::Context) {
-        if self.active_id.is_some() {
-            return;
+        let max_conc = self.effective_max_concurrent();
+        while can_start_another_download(self.active_workers.len(), max_conc) {
+            let Some(next_idx) = self
+                .items
+                .iter()
+                .position(|item| matches!(item.status, DownloadStatus::Queued))
+            else {
+                break;
+            };
+            let id = self.items[next_idx].id;
+            let url = self.items[next_idx].video.url.clone();
+            let format = self.items[next_idx].format;
+            let output_dir = self.items[next_idx].output_dir.clone();
+            let initial_pct = self.paused_progress.get(&id).copied().unwrap_or(0.0);
+            self.items[next_idx].status = DownloadStatus::Running {
+                progress_percent: initial_pct,
+                speed: None,
+                eta: None,
+            };
+
+            let options = self
+                .item_options
+                .get(&id)
+                .copied()
+                .unwrap_or(self.default_options);
+            let staging_dir = self
+                .paused_staging_dirs
+                .entry(id)
+                .or_insert_with(|| {
+                    let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+                    output_dir.join(format!(".fasttube-dl-{}-{id}-{seq}", std::process::id()))
+                })
+                .clone();
+
+            let cancel = Cancellation::default();
+            let worker_cancel = cancel.clone();
+            let pause_flag = Arc::new(AtomicBool::new(false));
+            let worker_pause_flag = Arc::clone(&pause_flag);
+
+            if self.tx.is_none() || self.rx.is_none() {
+                let (tx, rx) = mpsc::channel();
+                self.tx = Some(tx);
+                self.rx = Some(rx);
+            }
+            let tx = self.tx.as_ref().unwrap().clone();
+            let wake = ctx.clone();
+
+            self.active_workers
+                .insert(id, ActiveWorkerSlot { cancel, pause_flag });
+            self.sync_legacy_active_fields();
+
+            std::thread::spawn(move || {
+                let result = run_yt_dlp_download_with_options(
+                    id,
+                    &url,
+                    format,
+                    &output_dir,
+                    options,
+                    Some((staging_dir, worker_pause_flag)),
+                    &worker_cancel,
+                    &tx,
+                    &wake,
+                );
+                let _ = tx.send(WorkerEvent::Finished { id, result });
+                wake.request_repaint();
+            });
         }
-        let Some(next) = self
-            .items
-            .iter_mut()
-            .find(|item| matches!(item.status, DownloadStatus::Queued))
-        else {
-            return;
-        };
-        let id = next.id;
-        let url = next.video.url.clone();
-        let format = next.format;
-        let output_dir = next.output_dir.clone();
-        next.status = DownloadStatus::Running {
-            progress_percent: 0.0,
-            speed: None,
-            eta: None,
-        };
-
-        let cancel = Cancellation::default();
-        let worker_cancel = cancel.clone();
-        let (tx, rx) = mpsc::channel();
-        let wake = ctx.clone();
-
-        self.active_id = Some(id);
-        self.active_cancel = Some(cancel);
-        self.rx = Some(rx);
-
-        std::thread::spawn(move || {
-            let result =
-                run_yt_dlp_download(id, &url, format, &output_dir, &worker_cancel, &tx, &wake);
-            let _ = tx.send(WorkerEvent::Finished { id, result });
-            wake.request_repaint();
-        });
     }
 }
 
@@ -657,6 +1282,29 @@ fn extract_sanitized_base_name(path: &Path) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
+fn build_final_output_path(
+    output_dir: &Path,
+    base: &str,
+    format: DownloadFormat,
+    ext: &str,
+) -> PathBuf {
+    let tag = format!("[{}]", format.filename_tag());
+    let trimmed_base = base.trim();
+    let stem = if trimmed_base.ends_with(&tag) {
+        trimmed_base.to_owned()
+    } else if trimmed_base.is_empty() {
+        format!("download {tag}")
+    } else {
+        format!("{trimmed_base} {tag}")
+    };
+    let clean_ext = ext.trim().trim_start_matches('.');
+    if clean_ext.is_empty() {
+        output_dir.join(stem)
+    } else {
+        output_dir.join(format!("{stem}.{clean_ext}"))
+    }
+}
+
 fn is_format_unavailable_error(stderr_lines: &[String]) -> bool {
     stderr_lines.iter().any(|line| {
         let lower = line.to_ascii_lowercase();
@@ -667,15 +1315,26 @@ fn is_format_unavailable_error(stderr_lines: &[String]) -> bool {
 
 struct StagingDirGuard {
     path: PathBuf,
+    preserve_on_drop: Option<Arc<AtomicBool>>,
 }
 
 impl StagingDirGuard {
     fn create(output_dir: &Path, id: u64) -> Result<Self, String> {
         let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
         let path = output_dir.join(format!(".fasttube-dl-{}-{id}-{seq}", std::process::id()));
+        Self::open_or_create_at(path, None)
+    }
+
+    fn open_or_create_at(
+        path: PathBuf,
+        preserve_on_drop: Option<Arc<AtomicBool>>,
+    ) -> Result<Self, String> {
         std::fs::create_dir_all(&path)
             .map_err(|e| format!("Não foi possível criar pasta temporária de download: {e}"))?;
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            preserve_on_drop,
+        })
     }
 
     fn reset(&self) -> Result<(), String> {
@@ -691,7 +1350,21 @@ impl StagingDirGuard {
 
 impl Drop for StagingDirGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        if self
+            .preserve_on_drop
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return;
+        }
+        for attempt in 0..4 {
+            if std::fs::remove_dir_all(&self.path).is_ok() || !self.path.exists() {
+                break;
+            }
+            if attempt < 3 {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
 }
 
@@ -1004,9 +1677,16 @@ struct DownloadJob<'a> {
     url: &'a str,
     format: DownloadFormat,
     output_dir: &'a Path,
+    options: DownloadOptions,
     cancel: &'a Cancellation,
     tx: &'a mpsc::Sender<WorkerEvent>,
     wake: &'a eframe::egui::Context,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProgressMode {
+    Direct,
+    StagedPostprocess,
 }
 
 struct YtDlpRunOptions<'a> {
@@ -1014,14 +1694,127 @@ struct YtDlpRunOptions<'a> {
     extractor_args: Option<&'a str>,
     target_dir: &'a Path,
     output_template: &'a str,
-    staged: bool,
+    print_after_move: bool,
+    progress_mode: ProgressMode,
     ffmpeg_path: Option<&'a Path>,
+}
+
+struct YtDlpRunOutput {
+    streams: Vec<DownloadedStream>,
+    last_output_path: Option<PathBuf>,
+}
+
+struct CancelWatcherGuard {
+    signal: Arc<(Mutex<bool>, Condvar)>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for CancelWatcherGuard {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.signal;
+        if let Ok(mut done) = lock.lock() {
+            *done = true;
+            cvar.notify_all();
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn spawn_cancel_watcher(
+    cancel: Cancellation,
+    process_job: Option<Arc<ProcessJobObject>>,
+    child: Arc<Mutex<std::process::Child>>,
+) -> CancelWatcherGuard {
+    let signal = Arc::new((Mutex::new(false), Condvar::new()));
+    let thread_signal = Arc::clone(&signal);
+    let handle = std::thread::spawn(move || {
+        let (lock, cvar) = &*thread_signal;
+        let mut done = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while !*done {
+            if cancel.cancelled() {
+                if let Some(ref pj) = process_job {
+                    pj.terminate();
+                }
+                if let Ok(mut guard) = child.lock() {
+                    let _ = guard.kill();
+                }
+                break;
+            }
+            let (guard, _) = cvar
+                .wait_timeout(done, CANCEL_WATCHER_POLL_INTERVAL)
+                .unwrap_or_else(|e| e.into_inner());
+            done = guard;
+        }
+    });
+    CancelWatcherGuard {
+        signal,
+        handle: Some(handle),
+    }
+}
+
+fn resolve_staged_output_file(
+    staging_dir: &Path,
+    streams: &[DownloadedStream],
+    last_parsed_path: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(stream) = streams.iter().rev().find(|s| s.path.is_file()) {
+        return Some(stream.path.clone());
+    }
+    if let Some(path) = last_parsed_path.filter(|p| p.is_file()) {
+        return Some(path.to_path_buf());
+    }
+    let entries = std::fs::read_dir(staging_dir).ok()?;
+    let mut best: Option<(u64, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let is_temp = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("part")
+                    || ext.eq_ignore_ascii_case("ytdl")
+                    || ext.eq_ignore_ascii_case("tmp")
+                    || ext.eq_ignore_ascii_case("temp")
+            });
+        if is_temp {
+            continue;
+        }
+        let len = meta.len();
+        if best.as_ref().is_none_or(|(best_len, _)| len >= *best_len) {
+            best = Some((len, path));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+fn move_staged_output_to_final(
+    staged_file: &Path,
+    output_dir: &Path,
+    format: DownloadFormat,
+) -> Result<PathBuf, String> {
+    let base = extract_sanitized_base_name(staged_file).unwrap_or_else(|| "download".to_owned());
+    let ext = staged_file
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| !e.is_empty())
+        .unwrap_or(if format.is_audio() { "m4a" } else { "mp4" });
+    let final_path = build_final_output_path(output_dir, &base, format, ext);
+    replace_file_atomically(staged_file, &final_path)?;
+    Ok(final_path)
 }
 
 fn run_yt_dlp_once(
     job: &DownloadJob<'_>,
     opts: &YtDlpRunOptions<'_>,
-) -> Result<Vec<DownloadedStream>, (String, Vec<String>)> {
+) -> Result<YtDlpRunOutput, (String, Vec<String>)> {
     if job.cancel.cancelled() {
         return Err(("Download cancelado.".to_owned(), Vec::new()));
     }
@@ -1031,13 +1824,14 @@ fn run_yt_dlp_once(
         .arg("--newline")
         .arg("--no-playlist")
         .arg("--no-warnings");
-    if opts.staged {
+    if opts.print_after_move {
         cmd.arg("--no-simulate")
             .arg("--no-quiet")
             .arg("--progress")
             .arg("--print")
             .arg("after_move:FASTTUBE_DL:%(vcodec)s|%(acodec)s|%(ext)s|%(filepath)s");
-    } else if let Some(ffmpeg) = opts.ffmpeg_path
+    }
+    if let Some(ffmpeg) = opts.ffmpeg_path
         && ffmpeg != Path::new("ffmpeg")
     {
         cmd.arg("--ffmpeg-location").arg(ffmpeg);
@@ -1052,34 +1846,67 @@ fn run_yt_dlp_once(
     for arg in opts.format_args {
         cmd.arg(arg);
     }
+    let embed_opts = if opts.ffmpeg_path.is_some() {
+        job.options
+    } else {
+        DownloadOptions {
+            continue_partial: job.options.continue_partial,
+            ..Default::default()
+        }
+    };
+    for arg in build_embed_args(&embed_opts) {
+        cmd.arg(arg);
+    }
     cmd.arg("--").arg(job.url);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
+    let process_job = ProcessJobObject::new().map(Arc::new);
     let mut child = cmd
         .spawn()
         .map_err(|e| (format!("Não foi possível iniciar yt-dlp: {e}"), Vec::new()))?;
+    if let Some(ref pj) = process_job {
+        pj.assign_child(&child);
+    }
+    let stdout = child.stdout.take();
     let err_handle = child.stderr.take().map(|stderr| {
         std::thread::spawn(move || {
-            BufReader::new(stderr)
-                .lines()
-                .map_while(Result::ok)
-                .filter(|line| !line.trim().is_empty())
-                .collect::<Vec<_>>()
+            let mut ring = VecDeque::with_capacity(MAX_STDERR_LINES);
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if ring.len() >= MAX_STDERR_LINES {
+                    ring.pop_front();
+                }
+                ring.push_back(line);
+            }
+            ring.into_iter().collect::<Vec<_>>()
         })
     });
 
-    let mut streams = Vec::new();
-    let mut seen_destinations: usize = 0;
+    let child = Arc::new(Mutex::new(child));
+    let _watcher =
+        spawn_cancel_watcher(job.cancel.clone(), process_job.clone(), Arc::clone(&child));
 
-    if let Some(stdout) = child.stdout.take() {
+    let mut streams = Vec::new();
+    let mut last_output_path = None;
+    let mut seen_destinations: usize = 0;
+    let mut progress_throttle = ProgressRepaintThrottle::default();
+
+    if let Some(stdout) = stdout {
         let reader = BufReader::new(stdout);
         for line in reader.lines().map_while(Result::ok) {
             if job.cancel.cancelled() {
-                let _ = child.kill();
-                let _ = child.wait();
+                if let Some(ref pj) = process_job {
+                    pj.terminate();
+                }
+                if let Ok(mut guard) = child.lock() {
+                    let _ = guard.kill();
+                    let _ = guard.wait();
+                }
                 return Err(("Download cancelado.".to_owned(), Vec::new()));
             }
-            if opts.staged
+            if opts.print_after_move
                 && let Some(stream) = parse_yt_dlp_printed_file_line(&line)
             {
                 streams.push(stream);
@@ -1089,36 +1916,59 @@ fn run_yt_dlp_once(
                 seen_destinations += 1;
             }
             if let Some((raw_percent, speed, eta)) = parse_yt_dlp_progress_line(&line) {
-                let mapped_percent = if opts.staged {
-                    if job.format.is_audio() {
-                        (raw_percent * 0.90).clamp(0.0, 90.0)
-                    } else {
-                        let stream_idx = seen_destinations.saturating_sub(1).max(streams.len());
-                        if stream_idx == 0 {
-                            (raw_percent * 0.80).clamp(0.0, 80.0)
+                let mapped_percent = match opts.progress_mode {
+                    ProgressMode::StagedPostprocess => {
+                        if job.format.is_audio() {
+                            (raw_percent * 0.90).clamp(0.0, 90.0)
                         } else {
-                            (80.0 + raw_percent * 0.15).clamp(80.0, 95.0)
+                            let stream_idx = seen_destinations.saturating_sub(1).max(streams.len());
+                            if stream_idx == 0 {
+                                (raw_percent * 0.80).clamp(0.0, 80.0)
+                            } else {
+                                (80.0 + raw_percent * 0.15).clamp(80.0, 95.0)
+                            }
                         }
                     }
-                } else {
-                    raw_percent
+                    ProgressMode::Direct => raw_percent,
                 };
-                let _ = job.tx.send(WorkerEvent::Progress {
-                    id: job.id,
-                    percent: mapped_percent,
-                    speed,
-                    eta,
-                });
-                job.wake.request_repaint();
-            } else if !opts.staged
-                && let Some(path) = parse_yt_dlp_output_path_line(&line)
-            {
-                let _ = job.tx.send(WorkerEvent::OutputPath { id: job.id, path });
+                if progress_throttle.should_emit(mapped_percent, Instant::now()) {
+                    let _ = job.tx.send(WorkerEvent::Progress {
+                        id: job.id,
+                        percent: mapped_percent,
+                        speed,
+                        eta,
+                    });
+                    job.wake.request_repaint();
+                }
+            } else if let Some(path) = parse_yt_dlp_output_path_line(&line) {
+                last_output_path = Some(path);
             }
         }
     }
 
-    let wait_res = child.wait();
+    // Reap without holding the mutex across a blocking wait so the cancel
+    // watcher can still issue `kill()` if stdout closed early.
+    let wait_res = loop {
+        let step = {
+            let mut guard = child.lock().unwrap_or_else(|e| e.into_inner());
+            guard.try_wait()
+        };
+        match step {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {
+                if job.cancel.cancelled() {
+                    if let Some(ref pj) = process_job {
+                        pj.terminate();
+                    }
+                    if let Ok(mut guard) = child.lock() {
+                        let _ = guard.kill();
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(err) => break Err(err),
+        }
+    };
     let stderr_lines = err_handle
         .and_then(|handle| handle.join().ok())
         .unwrap_or_default();
@@ -1128,7 +1978,10 @@ fn run_yt_dlp_once(
         return Err(("Download cancelado.".to_owned(), stderr_lines));
     }
     if status.success() {
-        Ok(streams)
+        Ok(YtDlpRunOutput {
+            streams,
+            last_output_path,
+        })
     } else {
         let message = stderr_lines
             .iter()
@@ -1156,7 +2009,7 @@ fn finish_single_staged_stream(
     } else {
         stream.ext.as_str()
     };
-    let final_path = job.output_dir.join(format!("{base}.{ext}"));
+    let final_path = build_final_output_path(job.output_dir, &base, job.format, ext);
     replace_file_atomically(&stream.path, &final_path)?;
     let _ = job.tx.send(WorkerEvent::Progress {
         id: job.id,
@@ -1178,29 +2031,62 @@ fn run_premuxed_staged_fallback(
 ) -> Result<(), String> {
     staging.reset()?;
     let fallback_args = job.format.fallback_args(false);
-    let streams = run_yt_dlp_once(
+    let run_out = run_yt_dlp_once(
         job,
         &YtDlpRunOptions {
             format_args: &fallback_args,
             extractor_args: Some("youtube:player_client=default,android_vr"),
             target_dir: &staging.path,
             output_template: "%(title).120B [%(id)s]__ft_f%(format_id)s.%(ext)s",
-            staged: true,
+            print_after_move: true,
+            progress_mode: ProgressMode::StagedPostprocess,
             ffmpeg_path: None,
         },
     )
     .map_err(|(err, _)| err)?;
-    let Some(first) = streams.first() else {
+    let Some(first) = run_out.streams.first() else {
         return Err("yt-dlp não produziu arquivos de saída na tentativa alternativa.".to_owned());
     };
     finish_single_staged_stream(job, first)
 }
 
+pub fn is_native_opus_stream(ext: &str, acodec: &str) -> bool {
+    let ext_lower = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+    let acodec_lower = acodec.trim().to_ascii_lowercase();
+    ext_lower == "webm" || ext_lower == "opus" || acodec_lower.contains("opus")
+}
+
+#[allow(dead_code)]
 fn run_yt_dlp_download(
     id: u64,
     url: &str,
     format: DownloadFormat,
     output_dir: &Path,
+    cancel: &Cancellation,
+    tx: &mpsc::Sender<WorkerEvent>,
+    wake: &eframe::egui::Context,
+) -> Result<(), String> {
+    run_yt_dlp_download_with_options(
+        id,
+        url,
+        format,
+        output_dir,
+        DownloadOptions::default(),
+        None,
+        cancel,
+        tx,
+        wake,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_yt_dlp_download_with_options(
+    id: u64,
+    url: &str,
+    format: DownloadFormat,
+    output_dir: &Path,
+    options: DownloadOptions,
+    resumable_staging: Option<(PathBuf, Arc<AtomicBool>)>,
     cancel: &Cancellation,
     tx: &mpsc::Sender<WorkerEvent>,
     wake: &eframe::egui::Context,
@@ -1216,30 +2102,41 @@ fn run_yt_dlp_download(
         url,
         format,
         output_dir,
+        options,
         cancel,
         tx,
         wake,
     };
     let ffmpeg_path = find_ffmpeg();
     let ffmpeg_available = ffmpeg_path.is_some();
+    let staging = match resumable_staging {
+        Some((path, pause_flag)) => StagingDirGuard::open_or_create_at(path, Some(pause_flag))?,
+        None => StagingDirGuard::create(output_dir, id)?,
+    };
 
-    if ffmpeg_available || format == DownloadFormat::AudioM4a {
+    if ffmpeg_available || format == DownloadFormat::AudioM4a || format == DownloadFormat::AudioOpus
+    {
         let primary_args = format.yt_dlp_args_with_ffmpeg(ffmpeg_available);
-        match run_yt_dlp_once(
+        let output_template = format.output_template();
+        let run_out = match run_yt_dlp_once(
             &job,
             &YtDlpRunOptions {
                 format_args: &primary_args,
                 extractor_args: None,
-                target_dir: output_dir,
-                output_template: "%(title).120B [%(id)s].%(ext)s",
-                staged: false,
+                target_dir: &staging.path,
+                output_template: &output_template,
+                print_after_move: true,
+                progress_mode: ProgressMode::Direct,
                 ffmpeg_path: ffmpeg_path.as_deref(),
             },
         ) {
-            Ok(_) => return Ok(()),
+            Ok(out) => out,
             Err((err, stderr_lines)) => {
                 if cancel.cancelled() || !is_format_unavailable_error(&stderr_lines) {
                     return Err(err);
+                }
+                if !options.continue_partial {
+                    staging.reset()?;
                 }
                 let fallback_args = format.fallback_args(ffmpeg_available);
                 run_yt_dlp_once(
@@ -1247,20 +2144,37 @@ fn run_yt_dlp_download(
                     &YtDlpRunOptions {
                         format_args: &fallback_args,
                         extractor_args: Some("youtube:player_client=default,android_vr"),
-                        target_dir: output_dir,
-                        output_template: "%(title).120B [%(id)s].%(ext)s",
-                        staged: false,
+                        target_dir: &staging.path,
+                        output_template: &output_template,
+                        print_after_move: true,
+                        progress_mode: ProgressMode::Direct,
                         ffmpeg_path: ffmpeg_path.as_deref(),
                     },
                 )
-                .map(|_| ())
-                .map_err(|(fallback_err, _)| fallback_err)
+                .map_err(|(fallback_err, _)| fallback_err)?
             }
-        }?;
+        };
+        let staged_file = resolve_staged_output_file(
+            &staging.path,
+            &run_out.streams,
+            run_out.last_output_path.as_deref(),
+        )
+        .ok_or_else(|| "yt-dlp não produziu arquivos de saída.".to_owned())?;
+        let final_path = move_staged_output_to_final(&staged_file, output_dir, format)?;
+        let _ = tx.send(WorkerEvent::Progress {
+            id,
+            percent: 100.0,
+            speed: None,
+            eta: None,
+        });
+        let _ = tx.send(WorkerEvent::OutputPath {
+            id,
+            path: final_path,
+        });
+        wake.request_repaint();
         return Ok(());
     }
 
-    let staging = StagingDirGuard::create(output_dir, id)?;
     let primary_args = format.yt_dlp_args_with_ffmpeg(false);
     let streams = match run_yt_dlp_once(
         &job,
@@ -1269,16 +2183,19 @@ fn run_yt_dlp_download(
             extractor_args: None,
             target_dir: &staging.path,
             output_template: "%(title).120B [%(id)s]__ft_f%(format_id)s.%(ext)s",
-            staged: true,
+            print_after_move: true,
+            progress_mode: ProgressMode::StagedPostprocess,
             ffmpeg_path: None,
         },
     ) {
-        Ok(streams) => streams,
+        Ok(out) => out.streams,
         Err((err, stderr_lines)) => {
             if cancel.cancelled() || !is_format_unavailable_error(&stderr_lines) {
                 return Err(err);
             }
-            staging.reset()?;
+            if !options.continue_partial {
+                staging.reset()?;
+            }
             let fallback_args = format.fallback_args(false);
             run_yt_dlp_once(
                 &job,
@@ -1287,10 +2204,12 @@ fn run_yt_dlp_download(
                     extractor_args: Some("youtube:player_client=default,android_vr"),
                     target_dir: &staging.path,
                     output_template: "%(title).120B [%(id)s]__ft_f%(format_id)s.%(ext)s",
-                    staged: true,
+                    print_after_move: true,
+                    progress_mode: ProgressMode::StagedPostprocess,
                     ffmpeg_path: None,
                 },
             )
+            .map(|out| out.streams)
             .map_err(|(fallback_err, _)| fallback_err)?
         }
     };
@@ -1321,12 +2240,11 @@ fn run_yt_dlp_download(
                     .or_else(|| extract_sanitized_base_name(&audio.path))
                     .unwrap_or_else(|| "download".to_owned());
                 let merged_temp = staging.path.join(format!("{base}.__merged.mp4"));
-                let mut last_mux_pct = 95.0f32;
+                let mut mux_throttle = ProgressRepaintThrottle::default();
                 let mux_result =
                     mp4_mux::mux_mp4(&video.path, &audio.path, &merged_temp, cancel, |p| {
                         let mapped = (95.0 + (p * 0.05)).clamp(95.0, 100.0);
-                        if mapped - last_mux_pct >= 0.5 || mapped >= 100.0 {
-                            last_mux_pct = mapped;
+                        if mux_throttle.should_emit(mapped, Instant::now()) {
                             let _ = tx.send(WorkerEvent::Progress {
                                 id,
                                 percent: mapped,
@@ -1338,7 +2256,7 @@ fn run_yt_dlp_download(
                     });
                 match mux_result {
                     Ok(()) => {
-                        let final_path = output_dir.join(format!("{base}.mp4"));
+                        let final_path = build_final_output_path(output_dir, &base, format, "mp4");
                         replace_file_atomically(&merged_temp, &final_path)?;
                         let _ = tx.send(WorkerEvent::Progress {
                             id,
@@ -1379,7 +2297,12 @@ fn run_yt_dlp_download(
         extract_sanitized_base_name(&audio_stream.path).unwrap_or_else(|| "download".to_owned());
     let (target_of, target_oac, target_ext) = match format {
         DownloadFormat::AudioMp3 => ("mp3", "libmp3lame", "mp3"),
-        DownloadFormat::AudioOpus => ("opus", "libopus", "opus"),
+        DownloadFormat::AudioOpus => {
+            if is_native_opus_stream(&audio_stream.ext, &audio_stream.acodec) {
+                return finish_single_staged_stream(&job, audio_stream);
+            }
+            ("opus", "libopus", "opus")
+        }
         _ => return finish_single_staged_stream(&job, audio_stream),
     };
 
@@ -1401,7 +2324,7 @@ fn run_yt_dlp_download(
     match transcode_audio_with_libmpv(&audio_stream.path, &temp_out, target_of, target_oac, cancel)
     {
         Ok(()) => {
-            let final_path = output_dir.join(format!("{base}.{target_ext}"));
+            let final_path = build_final_output_path(output_dir, &base, format, target_ext);
             replace_file_atomically(&temp_out, &final_path)?;
             let _ = tx.send(WorkerEvent::Progress {
                 id,
@@ -1601,6 +2524,189 @@ mod tests {
         assert!(!is_format_unavailable_error(&[
             "ERROR: HTTP Error 403: Forbidden".to_owned(),
         ]));
+    }
+
+    #[test]
+    fn download_output_templates_and_resolved_paths_are_distinct_across_qualities() {
+        let mut tags = std::collections::HashSet::new();
+        let mut templates = std::collections::HashSet::new();
+        for fmt in DownloadFormat::ALL {
+            let tag = fmt.filename_tag();
+            assert!(!tag.is_empty());
+            assert!(tags.insert(tag), "duplicate filename tag: {tag}");
+            let template = fmt.output_template();
+            assert!(template.contains("%(title).120B [%(id)s]"));
+            assert!(template.contains(&format!("[{tag}]")));
+            assert!(
+                templates.insert(template.clone()),
+                "duplicate output template: {template}"
+            );
+        }
+
+        let dir = Path::new(r"C:\Downloads");
+        let base = "Sample Video [dQw4w9WgXcQ]";
+        let video_formats = [
+            DownloadFormat::VideoMp4Best,
+            DownloadFormat::Video1080p,
+            DownloadFormat::Video720p,
+            DownloadFormat::Video480p,
+        ];
+        let mut video_paths = std::collections::HashSet::new();
+        for fmt in video_formats {
+            let path = build_final_output_path(dir, base, fmt, "mp4");
+            assert!(
+                video_paths.insert(path.clone()),
+                "video quality collision for {fmt:?}: {}",
+                path.display()
+            );
+        }
+
+        assert_eq!(
+            build_final_output_path(dir, base, DownloadFormat::Video1080p, "mp4"),
+            PathBuf::from(r"C:\Downloads\Sample Video [dQw4w9WgXcQ] [1080p].mp4")
+        );
+        assert_eq!(
+            build_final_output_path(dir, base, DownloadFormat::Video480p, "mp4"),
+            PathBuf::from(r"C:\Downloads\Sample Video [dQw4w9WgXcQ] [480p].mp4")
+        );
+        assert_eq!(
+            build_final_output_path(dir, base, DownloadFormat::VideoMp4Best, "mp4"),
+            PathBuf::from(r"C:\Downloads\Sample Video [dQw4w9WgXcQ] [best].mp4")
+        );
+        assert_eq!(
+            build_final_output_path(dir, base, DownloadFormat::AudioMp3, "mp3"),
+            PathBuf::from(r"C:\Downloads\Sample Video [dQw4w9WgXcQ] [audio-mp3].mp3")
+        );
+        assert_eq!(
+            build_final_output_path(dir, base, DownloadFormat::AudioOpus, "opus"),
+            PathBuf::from(r"C:\Downloads\Sample Video [dQw4w9WgXcQ] [audio-opus].opus")
+        );
+        assert_eq!(
+            build_final_output_path(dir, base, DownloadFormat::AudioM4a, "m4a"),
+            PathBuf::from(r"C:\Downloads\Sample Video [dQw4w9WgXcQ] [audio-m4a].m4a")
+        );
+
+        // Even when an audio profile falls back to a native .m4a stream, paths stay distinct.
+        assert_ne!(
+            build_final_output_path(dir, base, DownloadFormat::AudioMp3, "m4a"),
+            build_final_output_path(dir, base, DownloadFormat::AudioM4a, "m4a")
+        );
+
+        // Idempotency: an already-tagged base is not tagged twice.
+        assert_eq!(
+            build_final_output_path(
+                dir,
+                "Sample Video [dQw4w9WgXcQ] [1080p]",
+                DownloadFormat::Video1080p,
+                "mp4"
+            ),
+            PathBuf::from(r"C:\Downloads\Sample Video [dQw4w9WgXcQ] [1080p].mp4")
+        );
+    }
+
+    #[test]
+    fn progress_repaint_throttle_limits_frequency_and_passes_large_deltas() {
+        let mut throttle = ProgressRepaintThrottle::default();
+        let t0 = Instant::now();
+        assert!(throttle.should_emit(0.0, t0));
+        assert!(!throttle.should_emit(0.3, t0 + Duration::from_millis(20)));
+        assert!(!throttle.should_emit(0.9, t0 + Duration::from_millis(80)));
+        assert!(throttle.should_emit(1.0, t0 + Duration::from_millis(85)));
+        assert!(!throttle.should_emit(1.2, t0 + Duration::from_millis(120)));
+        assert!(throttle.should_emit(1.2, t0 + Duration::from_millis(186)));
+        // Reaching 100% always passes immediately even for a tiny delta.
+        assert!(throttle.should_emit(99.7, t0 + Duration::from_millis(290)));
+        assert!(throttle.should_emit(100.0, t0 + Duration::from_millis(295)));
+    }
+
+    #[test]
+    fn staging_dir_guard_moves_output_atomically_and_cleans_up_on_drop() {
+        let root_guard = TempDirGuard(std::env::temp_dir().join(format!(
+            "fasttube-dl-staging-test-{}-{}",
+            std::process::id(),
+            STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
+        )));
+        let out_dir = &root_guard.0;
+        std::fs::create_dir_all(out_dir).unwrap();
+
+        let staging_path;
+        let final_path;
+        {
+            let staging = StagingDirGuard::create(out_dir, 42).unwrap();
+            staging_path = staging.path.clone();
+            assert!(staging_path.is_dir());
+            assert_eq!(staging_path.parent(), Some(out_dir.as_path()));
+
+            // Partial files must be ignored in favor of the completed merged output.
+            std::fs::write(staging_path.join("video.f299.mp4.part"), b"partial").unwrap();
+            let merged = staging_path.join("Clip [abc12345678] [1080p].mp4");
+            std::fs::write(&merged, b"completed-mp4-bytes").unwrap();
+
+            let resolved = resolve_staged_output_file(&staging_path, &[], None).unwrap();
+            assert_eq!(resolved, merged);
+
+            final_path =
+                move_staged_output_to_final(&resolved, out_dir, DownloadFormat::Video1080p)
+                    .unwrap();
+            assert_eq!(final_path, out_dir.join("Clip [abc12345678] [1080p].mp4"));
+            assert_eq!(std::fs::read(&final_path).unwrap(), b"completed-mp4-bytes");
+        }
+
+        // Guard drop removes the staging dir and all leftover temp files.
+        assert!(!staging_path.exists());
+        assert!(final_path.is_file());
+    }
+
+    #[test]
+    fn ffmpeg_cached_probe_state_is_non_blocking_and_consistent() {
+        let before = has_ffmpeg_cached();
+        let actual = has_ffmpeg();
+        let after = has_ffmpeg_cached();
+        assert_eq!(after, Some(actual));
+        if let Some(cached_before) = before {
+            assert_eq!(cached_before, actual);
+        }
+        // Once cached, trigger_ffmpeg_probe is an immediate no-op.
+        trigger_ffmpeg_probe(eframe::egui::Context::default());
+        assert_eq!(has_ffmpeg_cached(), Some(actual));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancel_watcher_terminates_stalled_child_immediately() {
+        use std::os::windows::process::CommandExt;
+
+        let job = ProcessJobObject::new().map(Arc::new);
+        let mut cmd = std::process::Command::new("ping");
+        cmd.args(["-n", "10", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x0800_0000);
+        let child = cmd.spawn().expect("spawn ping");
+        if let Some(ref pj) = job {
+            assert!(pj.assign_child(&child));
+        }
+
+        let cancel = Cancellation::default();
+        let child = Arc::new(Mutex::new(child));
+        let _watcher = spawn_cancel_watcher(cancel.clone(), job, Arc::clone(&child));
+
+        let started = Instant::now();
+        std::thread::sleep(Duration::from_millis(80));
+        cancel.cancel();
+
+        let status = loop {
+            let step = child.lock().unwrap().try_wait().unwrap();
+            if let Some(status) = step {
+                break status;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "cancel watcher did not terminate stalled child promptly"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(!status.success());
     }
 
     struct TempDirGuard(PathBuf);
@@ -1859,5 +2965,192 @@ mod tests {
             "unexpected Opus duration: {}",
             opus_probe.duration_secs
         );
+    }
+
+    #[test]
+    fn persisted_download_records_round_trip_and_preserve_corrupt_file() {
+        let dir_guard = TempDirGuard(std::env::temp_dir().join(format!(
+            "fasttube-dl-persist-test-{}-{}",
+            std::process::id(),
+            STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
+        )));
+        let dir = &dir_guard.0;
+        std::fs::create_dir_all(dir).unwrap();
+        let json_path = dir.join("downloads.json");
+
+        assert!(load_download_records_from(&json_path).unwrap().is_empty());
+
+        let records = vec![
+            PersistedDownloadRecord {
+                id: 1,
+                video_id: Some("dQw4w9WgXcQ".into()),
+                title: "Completed Track".into(),
+                channel: "Artist".into(),
+                url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+                thumbnail_url: "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg".into(),
+                format: DownloadFormat::AudioOpus,
+                status: PersistedDownloadStatus::Completed,
+                output_path: Some(dir.join("Completed Track [dQw4w9WgXcQ] [audio-opus].webm")),
+                progress_percent: 100.0,
+                file_size_bytes: Some(4_200_000),
+                updated_at_unix: 1_700_000_000,
+            },
+            PersistedDownloadRecord {
+                id: 2,
+                video_id: Some("9bZkp7q19f0".into()),
+                title: "Paused Video".into(),
+                channel: "Creator".into(),
+                url: "https://www.youtube.com/watch?v=9bZkp7q19f0".into(),
+                thumbnail_url: String::new(),
+                format: DownloadFormat::Video1080p,
+                status: PersistedDownloadStatus::Paused,
+                output_path: None,
+                progress_percent: 47.5,
+                file_size_bytes: None,
+                updated_at_unix: 1_700_000_120,
+            },
+        ];
+
+        save_download_records_to(&json_path, &records).unwrap();
+        let loaded = load_download_records_from(&json_path).unwrap();
+        assert_eq!(loaded, records);
+
+        let mut manager = DownloadManager::default();
+        manager.restore_from_records(loaded, dir);
+        assert_eq!(manager.items.len(), 2);
+        assert!(matches!(
+            manager.items[0].status,
+            DownloadStatus::Completed { .. }
+        ));
+        assert_eq!(manager.items[1].status, DownloadStatus::Paused);
+        assert!((manager.paused_progress(2) - 47.5).abs() < 0.01);
+
+        // Corrupt file must remain untouched on disk and surface an error on load/save.
+        std::fs::write(&json_path, b"{corrupt-downloads-json").unwrap();
+        assert!(load_download_records_from(&json_path).is_err());
+        assert!(save_download_records_to(&json_path, &records).is_err());
+        assert_eq!(
+            std::fs::read(&json_path).unwrap(),
+            b"{corrupt-downloads-json"
+        );
+    }
+
+    #[test]
+    fn audio_opus_avoids_ffmpeg_reencode_and_build_embed_args_maps_flags() {
+        let opus_with_ff = DownloadFormat::AudioOpus.yt_dlp_args_with_ffmpeg(true);
+        let opus_no_ff = DownloadFormat::AudioOpus.yt_dlp_args_with_ffmpeg(false);
+        assert!(!opus_with_ff.contains(&"-x"));
+        assert!(!opus_with_ff.contains(&"--audio-format"));
+        assert!(opus_with_ff[1].contains("bestaudio[acodec*=opus]"));
+        assert!(opus_no_ff[1].contains("bestaudio[acodec*=opus]"));
+        assert!(is_native_opus_stream("webm", "opus"));
+        assert!(is_native_opus_stream("opus", "none"));
+        assert!(!is_native_opus_stream("m4a", "mp4a.40.2"));
+
+        let opts = DownloadOptions {
+            embed_subs: true,
+            embed_chapters: true,
+            embed_thumbnail: true,
+            continue_partial: true,
+        };
+        let args = build_embed_args(&opts);
+        assert_eq!(
+            args,
+            vec![
+                "--continue".to_owned(),
+                "--embed-subs".to_owned(),
+                "--embed-chapters".to_owned(),
+                "--embed-thumbnail".to_owned(),
+            ]
+        );
+        assert!(build_embed_args(&DownloadOptions::default()).is_empty());
+    }
+
+    #[test]
+    fn pause_preserves_staging_part_file_and_batch_playlist_helpers_deduplicate() {
+        let dir_guard = TempDirGuard(std::env::temp_dir().join(format!(
+            "fasttube-dl-pause-test-{}-{}",
+            std::process::id(),
+            STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
+        )));
+        let out_dir = &dir_guard.0;
+        std::fs::create_dir_all(out_dir).unwrap();
+
+        let staging_path = out_dir.join(".fasttube-dl-paused-1");
+        let part_file = staging_path.join("video.f137.mp4.part");
+        let pause_flag = Arc::new(AtomicBool::new(true));
+        {
+            let guard = StagingDirGuard::open_or_create_at(
+                staging_path.clone(),
+                Some(Arc::clone(&pause_flag)),
+            )
+            .unwrap();
+            std::fs::write(&part_file, b"partial-bytes-preserved").unwrap();
+            assert_eq!(guard.path, staging_path);
+        }
+        // When pause_flag is true, Drop must preserve the staging directory and .part file.
+        assert!(part_file.is_file());
+        assert_eq!(
+            std::fs::read(&part_file).unwrap(),
+            b"partial-bytes-preserved"
+        );
+
+        // When pause_flag is cleared and guard drops, staging directory is cleaned up.
+        pause_flag.store(false, Ordering::Release);
+        {
+            let _guard =
+                StagingDirGuard::open_or_create_at(staging_path.clone(), Some(pause_flag)).unwrap();
+        }
+        assert!(!staging_path.exists());
+
+        assert!(can_start_another_download(
+            0,
+            DEFAULT_MAX_CONCURRENT_DOWNLOADS
+        ));
+        assert!(can_start_another_download(
+            1,
+            DEFAULT_MAX_CONCURRENT_DOWNLOADS
+        ));
+        assert!(!can_start_another_download(
+            2,
+            DEFAULT_MAX_CONCURRENT_DOWNLOADS
+        ));
+
+        let v1 = Video {
+            title: "One".into(),
+            channel: "Ch".into(),
+            url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into(),
+            thumbnail: String::new(),
+            duration: "3:00".into(),
+        };
+        let v1_dup = Video {
+            title: "One Short URL".into(),
+            channel: "Ch".into(),
+            url: "https://youtu.be/dQw4w9WgXcQ".into(),
+            thumbnail: String::new(),
+            duration: "3:00".into(),
+        };
+        let v2 = Video {
+            title: "Two".into(),
+            channel: "Ch".into(),
+            url: "https://www.youtube.com/watch?v=9bZkp7q19f0".into(),
+            thumbnail: String::new(),
+            duration: "4:00".into(),
+        };
+        let opts = DownloadOptions {
+            embed_subs: true,
+            ..Default::default()
+        };
+        let batch = build_batch_playlist_requests(
+            &[v1, v1_dup, v2],
+            DownloadFormat::Video720p,
+            out_dir,
+            opts,
+        );
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].video.title, "One");
+        assert_eq!(batch[1].video.title, "Two");
+        assert_eq!(batch[0].format, DownloadFormat::Video720p);
+        assert!(batch[0].options.embed_subs);
     }
 }

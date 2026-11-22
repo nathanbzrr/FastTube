@@ -4,11 +4,11 @@ use crate::{
     format_diagnostics_display, history, i18n, open_external_url, settings, sponsorblock, updater,
 };
 use eframe::egui::{self, Color32, CornerRadius, CursorIcon, Pos2, RichText, Sense, Stroke, Vec2};
-use settings::{BufferProfile, BufferSettings, HwdecMode, Theme};
+use settings::{BufferProfile, BufferSettings, HwdecMode, Theme, VideoCodecPreference};
 use sponsorblock::{SponsorCategory, SponsorSkipMode};
 use std::path::PathBuf;
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::sync::{Mutex, OnceLock, mpsc};
+use std::time::Instant;
 
 const BUFFER_PROFILE_HELP_SUMMARY: &str = "Escolha o perfil de cache do demuxer do libmpv. O perfil Padrão (64 MiB de avanço, 16 MiB de retorno e 30s de cache) equilibra consumo moderado de RAM com boa estabilidade.\n• Buffer menor reduz o uso de RAM, mas oferece menor folga contra oscilações de rede.\n• Buffer maior aumenta a tolerância a conexões instáveis e buscas rápidas, usando mais RAM.";
 
@@ -22,9 +22,9 @@ struct SettingsSearchEntry {
 const SETTINGS_SEARCH_INDEX: &[SettingsSearchEntry] = &[
     SettingsSearchEntry {
         tab: SettingsTab::General,
-        section: "Tema e idioma da interface",
-        description: "Alterne entre Escuro e Claro e escolha o idioma (Português / English).",
-        keywords: "tema escuro claro aparencia dark light idioma language english portugues pt en",
+        section: "Tema (Sistema/Escuro/Claro), efeito Mica, idioma e país (gl)",
+        description: "Siga o tema do Windows (Sistema), alterne entre Escuro e Claro, ative o efeito Mica (Windows 11) e escolha idioma e país.",
+        keywords: "tema sistema system escuro claro aparencia dark light mica windows 11 backdrop transparencia idioma language english portugues pt en pais regiao country region gl br us",
     },
     SettingsSearchEntry {
         tab: SettingsTab::General,
@@ -34,9 +34,9 @@ const SETTINGS_SEARCH_INDEX: &[SettingsSearchEntry] = &[
     },
     SettingsSearchEntry {
         tab: SettingsTab::General,
-        section: "Sistema, bandeja e inicialização com o Windows",
-        description: "Configure tela ativa, minimizar ou fechar para a bandeja e iniciar junto com o Windows.",
-        keywords: "energia tela ativa suspensao monitor iniciar windows autostart bandeja tray minimizar fechar hidden minimizado sistema",
+        section: "Sistema, bandeja, notificações Toast, protocolo fasttube:// e inicialização",
+        description: "Configure tela ativa, bandeja, notificações Toast do Windows (RSS), registro portátil do protocolo fasttube:// (HKCU) e inicialização automática.",
+        keywords: "energia tela ativa suspensao monitor iniciar windows autostart bandeja tray minimizar fechar hidden minimizado sistema toast notificacoes notifications rss fasttube:// protocolo protocol hkcu portatil registrar",
     },
     SettingsSearchEntry {
         tab: SettingsTab::General,
@@ -46,21 +46,27 @@ const SETTINGS_SEARCH_INDEX: &[SettingsSearchEntry] = &[
     },
     SettingsSearchEntry {
         tab: SettingsTab::General,
-        section: "Atalhos de teclado personalizáveis",
-        description: "Capture novas teclas de atalho para player e comandos ou restaure os padrões.",
-        keywords: "atalhos teclado teclas keybindings personalizar capturar f1 espaco fullscreen teatro miniplayer",
+        section: "Atalhos de teclado personalizáveis e conflitos",
+        description: "Remapeie todos os atalhos de player/app com detecção de conflitos em tempo real e restauração.",
+        keywords: "atalhos teclado teclas keybindings shortcuts personalizar capturar conflito conflict f1 f11 espaco fullscreen teatro miniplayer volume capitulo chapter",
     },
     SettingsSearchEntry {
         tab: SettingsTab::Playback,
-        section: "Velocidade, qualidade e passo",
-        description: "Defina velocidade padrão, altura máxima, duração do salto e autoplay/loop.",
-        keywords: "velocidade 1.0x 2.0x qualidade 1080p 4k 720p passo salto 5s 10s 15s 30s autoplay loop retomar",
+        section: "Velocidade, velocidade por canal, qualidade, codec e Modo ambiente",
+        description: "Defina velocidade padrão, memória de velocidade por canal, altura máxima, codec (Auto, VP9, H.264, AV1), passo, autoplay/loop e Modo ambiente.",
+        keywords: "velocidade 1.0x 2.0x velocidade por canal speed per channel lembrar limpar qualidade 1080p 4k 720p codec vp9 av1 h264 h.264 passo salto 5s 10s 15s 30s autoplay loop retomar ambiente ambient mode glow",
     },
     SettingsSearchEntry {
         tab: SettingsTab::Playback,
-        section: "Áudio e legendas",
-        description: "Lembrar volume, volume inicial, normalização (loudnorm) e legendas automáticas.",
-        keywords: "audio volume lembrar padrao normalizacao loudnorm som legendas automaticas idioma pt en es",
+        section: "Pular capítulos automaticamente por palavra-chave",
+        description: "Pule automaticamente capítulos como sponsor, intro, outro, merch ou patrocinador por palavras-chave.",
+        keywords: "capitulos chapters pular skip auto-skip palavra-chave keyword sponsor intro outro merch ad patrocinador anuncio",
+    },
+    SettingsSearchEntry {
+        tab: SettingsTab::Playback,
+        section: "Áudio, legendas, estilo e tradução automática",
+        description: "Volume, normalização (loudnorm), legendas automáticas, tamanho da fonte, opacidade do fundo, cor e tradução (tlang).",
+        keywords: "audio volume lembrar padrao normalizacao loudnorm som legendas automaticas estilo caption style fonte tamanho opacidade cor traduzir auto-translate tlang pt en es",
     },
     SettingsSearchEntry {
         tab: SettingsTab::Playback,
@@ -100,15 +106,15 @@ const SETTINGS_SEARCH_INDEX: &[SettingsSearchEntry] = &[
     },
     SettingsSearchEntry {
         tab: SettingsTab::Privacy,
-        section: "Histórico, aprendizado e tópicos",
-        description: "Pause o histórico ou aprendizado, silencie tópicos específicos e limpe dados locais.",
-        keywords: "historico privacidade pausar recomendacoes topicos aprendidos silenciar limpar",
+        section: "Histórico, Modo restrito, aprendizado e tópicos",
+        description: "Ative o Modo restrito, pause o histórico ou aprendizado, silencie tópicos específicos e limpe dados locais.",
+        keywords: "historico privacidade modo restrito restricted mode safe filtro conteudo pausar recomendacoes topicos aprendidos silenciar limpar",
     },
     SettingsSearchEntry {
         tab: SettingsTab::Storage,
-        section: "Pasta de downloads e atualizador do yt-dlp",
-        description: "Configure onde salvar downloads offline e verifique ou atualize o yt-dlp pelo GitHub.",
-        keywords: "downloads pasta offline yt-dlp atualizar versao github bin",
+        section: "Downloads offline, concorrência, embutir metadados e yt-dlp",
+        description: "Configure pasta, downloads simultâneos (1–4), embutir legendas/capítulos/miniatura e atualize o yt-dlp.",
+        keywords: "downloads pasta offline concorrencia simultaneos concurrent embutir embed legendas subs capitulos chapters miniatura thumbnail yt-dlp atualizar versao github bin",
     },
     SettingsSearchEntry {
         tab: SettingsTab::Storage,
@@ -144,7 +150,7 @@ fn card_surface_stroke(palette: ThemePalette) -> Color32 {
 
 fn rail_surface_bg(theme: Theme) -> Color32 {
     match theme {
-        Theme::Dark => Color32::from_rgb(20, 20, 23),
+        Theme::Dark | Theme::System => Color32::from_rgb(20, 20, 23),
         Theme::Light => Color32::from_rgb(245, 246, 249),
     }
 }
@@ -155,14 +161,14 @@ fn switch_active_color(palette: ThemePalette) -> Color32 {
 
 fn switch_inactive_color(theme: Theme) -> Color32 {
     match theme {
-        Theme::Dark => Color32::from_rgb(72, 72, 78),
+        Theme::Dark | Theme::System => Color32::from_rgb(72, 72, 78),
         Theme::Light => Color32::from_rgb(194, 198, 206),
     }
 }
 
 fn nav_active_bg(theme: Theme) -> Color32 {
     match theme {
-        Theme::Dark => Color32::from_rgb(40, 40, 44),
+        Theme::Dark | Theme::System => Color32::from_rgb(40, 40, 44),
         Theme::Light => Color32::from_rgb(232, 235, 240),
     }
 }
@@ -665,20 +671,18 @@ fn theme_swatch_card(
     label: &str,
     selected: bool,
 ) -> bool {
-    let (canvas_bg, card_bg, line_col, accent_col) = match target_theme {
-        Theme::Dark => (
-            Color32::from_rgb(15, 15, 17),
-            Color32::from_rgb(30, 30, 34),
-            Color32::from_rgb(86, 88, 96),
-            Color32::from_rgb(62, 166, 255),
-        ),
-        Theme::Light => (
-            Color32::from_rgb(246, 247, 250),
-            Color32::from_rgb(255, 255, 255),
-            Color32::from_rgb(185, 190, 200),
-            Color32::from_rgb(6, 95, 212),
-        ),
-    };
+    let dark_colors = (
+        Color32::from_rgb(15, 15, 17),
+        Color32::from_rgb(30, 30, 34),
+        Color32::from_rgb(86, 88, 96),
+        Color32::from_rgb(62, 166, 255),
+    );
+    let light_colors = (
+        Color32::from_rgb(246, 247, 250),
+        Color32::from_rgb(255, 255, 255),
+        Color32::from_rgb(185, 190, 200),
+        Color32::from_rgb(6, 95, 212),
+    );
     let (fill, stroke) = if selected {
         (palette.profile_selected_bg, palette.profile_selected_stroke)
     } else {
@@ -693,43 +697,133 @@ fn theme_swatch_card(
         .corner_radius(CornerRadius::same(10))
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
-            ui.set_width(126.0);
-            let (preview_rect, _) = ui.allocate_exact_size(Vec2::new(106.0, 44.0), Sense::hover());
+            ui.set_min_width(142.0);
+            let (preview_rect, _) = ui.allocate_exact_size(Vec2::new(122.0, 44.0), Sense::hover());
             if ui.is_rect_visible(preview_rect) {
                 let p = ui.painter();
-                p.rect_filled(preview_rect, CornerRadius::same(6), canvas_bg);
-                p.rect_stroke(
-                    preview_rect,
-                    CornerRadius::same(6),
-                    Stroke::new(1.0, palette.card_alt_stroke),
-                    egui::StrokeKind::Inside,
-                );
-                let mini_card = egui::Rect::from_min_size(
-                    Pos2::new(preview_rect.left() + 8.0, preview_rect.top() + 8.0),
-                    Vec2::new(56.0, 28.0),
-                );
-                p.rect_filled(mini_card, CornerRadius::same(4), card_bg);
-                p.circle_filled(
-                    Pos2::new(preview_rect.right() - 16.0, preview_rect.top() + 14.0),
-                    4.0,
-                    accent_col,
-                );
-                p.rect_filled(
-                    egui::Rect::from_min_size(
-                        Pos2::new(mini_card.left() + 6.0, mini_card.top() + 7.0),
-                        Vec2::new(34.0, 4.0),
-                    ),
-                    CornerRadius::same(2),
-                    line_col,
-                );
-                p.rect_filled(
-                    egui::Rect::from_min_size(
-                        Pos2::new(mini_card.left() + 6.0, mini_card.top() + 15.0),
-                        Vec2::new(22.0, 4.0),
-                    ),
-                    CornerRadius::same(2),
-                    line_col.gamma_multiply(0.6),
-                );
+                match target_theme {
+                    Theme::System => {
+                        let mid_x = preview_rect.center().x;
+                        let left_rect = egui::Rect::from_min_max(
+                            preview_rect.min,
+                            Pos2::new(mid_x, preview_rect.max.y),
+                        );
+                        let right_rect = egui::Rect::from_min_max(
+                            Pos2::new(mid_x, preview_rect.min.y),
+                            preview_rect.max,
+                        );
+                        p.rect_filled(
+                            left_rect,
+                            CornerRadius {
+                                nw: 6,
+                                sw: 6,
+                                ne: 0,
+                                se: 0,
+                            },
+                            dark_colors.0,
+                        );
+                        p.rect_filled(
+                            right_rect,
+                            CornerRadius {
+                                nw: 0,
+                                sw: 0,
+                                ne: 6,
+                                se: 6,
+                            },
+                            light_colors.0,
+                        );
+                        p.rect_filled(
+                            egui::Rect::from_min_size(
+                                Pos2::new(preview_rect.left() + 8.0, preview_rect.top() + 8.0),
+                                Vec2::new(42.0, 28.0),
+                            ),
+                            CornerRadius::same(4),
+                            dark_colors.1,
+                        );
+                        p.rect_filled(
+                            egui::Rect::from_min_size(
+                                Pos2::new(preview_rect.left() + 13.0, preview_rect.top() + 15.0),
+                                Vec2::new(26.0, 4.0),
+                            ),
+                            CornerRadius::same(2),
+                            dark_colors.2,
+                        );
+                        p.rect_filled(
+                            egui::Rect::from_min_size(
+                                Pos2::new(mid_x + 8.0, preview_rect.top() + 8.0),
+                                Vec2::new(44.0, 28.0),
+                            ),
+                            CornerRadius::same(4),
+                            light_colors.1,
+                        );
+                        p.circle_filled(
+                            Pos2::new(preview_rect.right() - 16.0, preview_rect.top() + 16.0),
+                            4.0,
+                            light_colors.3,
+                        );
+                        p.rect_filled(
+                            egui::Rect::from_min_size(
+                                Pos2::new(mid_x + 13.0, preview_rect.top() + 24.0),
+                                Vec2::new(24.0, 4.0),
+                            ),
+                            CornerRadius::same(2),
+                            light_colors.2,
+                        );
+                        p.line_segment(
+                            [
+                                Pos2::new(mid_x, preview_rect.top() + 1.0),
+                                Pos2::new(mid_x, preview_rect.bottom() - 1.0),
+                            ],
+                            Stroke::new(1.0, palette.card_alt_stroke),
+                        );
+                        p.rect_stroke(
+                            preview_rect,
+                            CornerRadius::same(6),
+                            Stroke::new(1.0, palette.card_alt_stroke),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    Theme::Dark | Theme::Light => {
+                        let (canvas_bg, card_bg, line_col, accent_col) = match target_theme {
+                            Theme::Dark => dark_colors,
+                            Theme::Light => light_colors,
+                            Theme::System => unreachable!(),
+                        };
+                        p.rect_filled(preview_rect, CornerRadius::same(6), canvas_bg);
+                        p.rect_stroke(
+                            preview_rect,
+                            CornerRadius::same(6),
+                            Stroke::new(1.0, palette.card_alt_stroke),
+                            egui::StrokeKind::Inside,
+                        );
+                        let mini_card = egui::Rect::from_min_size(
+                            Pos2::new(preview_rect.left() + 8.0, preview_rect.top() + 8.0),
+                            Vec2::new(66.0, 28.0),
+                        );
+                        p.rect_filled(mini_card, CornerRadius::same(4), card_bg);
+                        p.circle_filled(
+                            Pos2::new(preview_rect.right() - 16.0, preview_rect.top() + 14.0),
+                            4.0,
+                            accent_col,
+                        );
+                        p.rect_filled(
+                            egui::Rect::from_min_size(
+                                Pos2::new(mini_card.left() + 6.0, mini_card.top() + 7.0),
+                                Vec2::new(38.0, 4.0),
+                            ),
+                            CornerRadius::same(2),
+                            line_col,
+                        );
+                        p.rect_filled(
+                            egui::Rect::from_min_size(
+                                Pos2::new(mini_card.left() + 6.0, mini_card.top() + 15.0),
+                                Vec2::new(24.0, 4.0),
+                            ),
+                            CornerRadius::same(2),
+                            line_col.gamma_multiply(0.6),
+                        );
+                    }
+                }
             }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -751,7 +845,7 @@ fn theme_swatch_card(
 
 fn settings_search_bar(ui: &mut egui::Ui, query: &mut String, palette: ThemePalette, theme: Theme) {
     let bg = match theme {
-        Theme::Dark => Color32::from_rgb(15, 15, 17),
+        Theme::Dark | Theme::System => Color32::from_rgb(15, 15, 17),
         Theme::Light => Color32::WHITE,
     };
     egui::Frame::new()
@@ -838,14 +932,156 @@ fn stepper_u32_controls(
     changed
 }
 
+type ClearCacheResultReceiver = mpsc::Receiver<(u64, PathBuf, Result<usize, String>)>;
+
+#[derive(Default)]
+struct StorageAsyncState {
+    measure_request_id: u64,
+    measuring_dir: Option<PathBuf>,
+    measure_rx: Option<mpsc::Receiver<(u64, PathBuf, settings::DirUsage)>>,
+    was_storage_tab_open: bool,
+    clear_request_id: u64,
+    clear_rx: Option<ClearCacheResultReceiver>,
+}
+
+fn storage_async_state() -> &'static Mutex<StorageAsyncState> {
+    static STATE: OnceLock<Mutex<StorageAsyncState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(StorageAsyncState::default()))
+}
+
+fn reset_storage_tab_open_flag() {
+    if let Ok(mut state) = storage_async_state().lock() {
+        state.was_storage_tab_open = false;
+    }
+}
+
 impl FastTube {
-    pub(crate) fn poll_cache_picker(&mut self, ctx: &egui::Context) {
-        let Some(rx) = self.settings.cache_picker_rx.as_ref() else {
+    pub(crate) fn poll_storage_background_jobs(&mut self, ctx: &egui::Context) {
+        if !self.ui.settings_open {
+            reset_storage_tab_open_flag();
+        }
+        let mut completed_measure: Option<(PathBuf, settings::DirUsage)> = None;
+        let mut completed_clear: Option<(PathBuf, Result<usize, String>)> = None;
+
+        if let Ok(mut state) = storage_async_state().lock() {
+            if let Some(rx) = state.measure_rx.as_ref() {
+                match rx.try_recv() {
+                    Ok((req_id, dir, usage)) => {
+                        if req_id == state.measure_request_id {
+                            completed_measure = Some((dir, usage));
+                            state.measure_rx = None;
+                            state.measuring_dir = None;
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        state.measure_rx = None;
+                        state.measuring_dir = None;
+                    }
+                }
+            }
+
+            if let Some(rx) = state.clear_rx.as_ref() {
+                match rx.try_recv() {
+                    Ok((req_id, base_dir, result)) => {
+                        if req_id == state.clear_request_id {
+                            completed_clear = Some((base_dir, result));
+                            state.clear_rx = None;
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        state.clear_rx = None;
+                    }
+                }
+            }
+        }
+
+        if let Some((dir, usage)) = completed_measure {
+            self.settings.cache_disk_usage = Some((dir, usage, Instant::now()));
+        }
+
+        if let Some((base_dir, result)) = completed_clear {
+            let pt = self.ui_pt();
+            match result {
+                Ok(removed) => {
+                    self.settings.cache_disk_usage = None;
+                    self.settings.cache_status = Some(if pt {
+                        format!("Cache do yt-dlp limpo ({removed} arquivo(s) removido(s)).")
+                    } else {
+                        format!("yt-dlp cache cleared ({removed} file(s) removed).")
+                    });
+                    self.start_async_cache_measure(settings::yt_dlp_cache_subdir(&base_dir), ctx);
+                }
+                Err(err) => {
+                    self.settings.cache_status = Some(if pt {
+                        format!("Falha ao limpar cache do yt-dlp: {err}")
+                    } else {
+                        format!("Failed to clear yt-dlp cache: {err}")
+                    });
+                }
+            }
+        }
+    }
+
+    fn start_async_cache_measure(&mut self, target_dir: PathBuf, ctx: &egui::Context) {
+        let Ok(mut state) = storage_async_state().lock() else {
             return;
         };
-        match rx.try_recv() {
-            Ok(Ok(Some(path))) => {
-                self.settings.cache_picker_rx = None;
+        if state.measure_rx.is_some()
+            && state.measuring_dir.as_deref() == Some(target_dir.as_path())
+        {
+            return;
+        }
+        state.measure_request_id = state.measure_request_id.wrapping_add(1).max(1);
+        let req_id = state.measure_request_id;
+        let (tx, rx) = mpsc::channel();
+        state.measuring_dir = Some(target_dir.clone());
+        state.measure_rx = Some(rx);
+        drop(state);
+
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let usage = settings::measure_dir_usage(&target_dir);
+            let _ = tx.send((req_id, target_dir, usage));
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn start_async_yt_dlp_cache_clear(&mut self, base_dir: PathBuf, ctx: &egui::Context) {
+        let Ok(mut state) = storage_async_state().lock() else {
+            return;
+        };
+        if state.clear_rx.is_some() {
+            return;
+        }
+        state.clear_request_id = state.clear_request_id.wrapping_add(1).max(1);
+        let req_id = state.clear_request_id;
+        let (tx, rx) = mpsc::channel();
+        state.clear_rx = Some(rx);
+        drop(state);
+
+        let pt = self.ui_pt();
+        self.settings.cache_status = Some(if pt {
+            "Limpando cache do yt-dlp...".into()
+        } else {
+            "Clearing yt-dlp cache...".into()
+        });
+
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let result = settings::clear_yt_dlp_cache_dir(&base_dir).map_err(|e| e.to_string());
+            let _ = tx.send((req_id, base_dir, result));
+            ctx_clone.request_repaint();
+        });
+    }
+
+    pub(crate) fn poll_cache_picker(&mut self, ctx: &egui::Context) {
+        let Some(result) = self.settings.cache_picker_task.poll() else {
+            return;
+        };
+        match result {
+            Ok(Some(path)) => {
                 let path_str = path.to_string_lossy().into_owned();
                 self.settings.cache_dir_input = path_str.clone();
                 self.settings.cache_dir_input_synced = true;
@@ -861,29 +1097,19 @@ impl FastTube {
                 }
                 ctx.request_repaint();
             }
-            Ok(Ok(None)) => {
-                self.settings.cache_picker_rx = None;
-            }
-            Ok(Err(error)) => {
-                self.settings.cache_picker_rx = None;
+            Ok(None) => {}
+            Err(error) => {
                 self.settings.cache_status = Some(error);
-            }
-            Err(mpsc::TryRecvError::Empty) => {
-                ctx.request_repaint_after(Duration::from_millis(120));
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.settings.cache_picker_rx = None;
             }
         }
     }
 
     pub(crate) fn poll_download_dir_picker(&mut self, ctx: &egui::Context) {
-        let Some(rx) = self.settings.download_picker_rx.as_ref() else {
+        let Some(result) = self.settings.download_picker_task.poll() else {
             return;
         };
-        match rx.try_recv() {
-            Ok(Ok(Some(path))) => {
-                self.settings.download_picker_rx = None;
+        match result {
+            Ok(Some(path)) => {
                 let path_str = path.to_string_lossy().into_owned();
                 self.settings.download_dir_input = path_str.clone();
                 self.settings.download_dir_input_synced = true;
@@ -899,29 +1125,19 @@ impl FastTube {
                 }
                 ctx.request_repaint();
             }
-            Ok(Ok(None)) => {
-                self.settings.download_picker_rx = None;
-            }
-            Ok(Err(error)) => {
-                self.settings.download_picker_rx = None;
+            Ok(None) => {}
+            Err(error) => {
                 self.downloads.notice = Some(error);
-            }
-            Err(mpsc::TryRecvError::Empty) => {
-                ctx.request_repaint_after(Duration::from_millis(120));
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.settings.download_picker_rx = None;
             }
         }
     }
 
     pub(crate) fn poll_backup_picker(&mut self, ctx: &egui::Context) {
-        let Some(rx) = self.settings.backup_picker_rx.as_ref() else {
+        let Some((is_save, result)) = self.settings.backup_picker_task.poll() else {
             return;
         };
-        match rx.try_recv() {
-            Ok((is_save, Ok(Some(path)))) => {
-                self.settings.backup_picker_rx = None;
+        match result {
+            Ok(Some(path)) => {
                 self.backup.path_text = path.to_string_lossy().into_owned();
                 self.backup.status = Some(if is_save {
                     format!("Destino selecionado: {}", path.display())
@@ -930,29 +1146,19 @@ impl FastTube {
                 });
                 ctx.request_repaint();
             }
-            Ok((_, Ok(None))) => {
-                self.settings.backup_picker_rx = None;
-            }
-            Ok((_, Err(error))) => {
-                self.settings.backup_picker_rx = None;
+            Ok(None) => {}
+            Err(error) => {
                 self.backup.status = Some(error);
-            }
-            Err(mpsc::TryRecvError::Empty) => {
-                ctx.request_repaint_after(Duration::from_millis(120));
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.settings.backup_picker_rx = None;
             }
         }
     }
 
     pub(crate) fn poll_oauth_picker(&mut self, ctx: &egui::Context) {
-        let Some(rx) = self.settings.oauth_picker_rx.as_ref() else {
+        let Some(result) = self.settings.oauth_picker_task.poll() else {
             return;
         };
-        match rx.try_recv() {
-            Ok(Ok(Some(source))) => {
-                self.settings.oauth_picker_rx = None;
+        match result {
+            Ok(Some(source)) => {
                 match settings::oauth_client_path() {
                     Ok(dest) => match settings::install_oauth_client_file(&source, &dest) {
                         Ok(()) => {
@@ -974,18 +1180,9 @@ impl FastTube {
                 }
                 ctx.request_repaint();
             }
-            Ok(Ok(None)) => {
-                self.settings.oauth_picker_rx = None;
-            }
-            Ok(Err(error)) => {
-                self.settings.oauth_picker_rx = None;
+            Ok(None) => {}
+            Err(error) => {
                 self.settings.oauth_import_status = Some((false, error));
-            }
-            Err(mpsc::TryRecvError::Empty) => {
-                ctx.request_repaint_after(Duration::from_millis(120));
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.settings.oauth_picker_rx = None;
             }
         }
     }
@@ -997,8 +1194,12 @@ impl FastTube {
                 self.apply_theme(Theme::default());
                 self.sync_theme_visuals(ctx);
                 let mut prefs = self.settings.prefs.value.clone();
-                let changed_feed = prefs.hide_shorts_in_home != defaults.hide_shorts_in_home;
+                let changed_feed = prefs.hide_shorts_in_home != defaults.hide_shorts_in_home
+                    || prefs.country_code != defaults.country_code;
                 prefs.language = defaults.language;
+                prefs.country_code = defaults.country_code;
+                prefs.mica_backdrop = defaults.mica_backdrop;
+                prefs.windows_toast_notifications = defaults.windows_toast_notifications;
                 prefs.compact_card_density = defaults.compact_card_density;
                 prefs.hide_shorts_in_home = defaults.hide_shorts_in_home;
                 prefs.auto_mini_player = defaults.auto_mini_player;
@@ -1029,12 +1230,22 @@ impl FastTube {
                 prefs.default_autoplay = defaults.default_autoplay;
                 prefs.default_loop = defaults.default_loop;
                 prefs.resume_enabled = defaults.resume_enabled;
+                prefs.ambient_mode = defaults.ambient_mode;
+                prefs.show_remaining_time = defaults.show_remaining_time;
                 prefs.remember_volume = defaults.remember_volume;
                 prefs.default_volume_percent = defaults.default_volume_percent;
                 prefs.audio_normalization = defaults.audio_normalization;
                 prefs.auto_subtitles = defaults.auto_subtitles;
                 prefs.preferred_subtitle_lang = defaults.preferred_subtitle_lang;
+                prefs.caption_style = defaults.caption_style;
+                prefs.ultrawide_zoom_mode = defaults.ultrawide_zoom_mode;
+                prefs.ultrawide_custom_zoom = defaults.ultrawide_custom_zoom;
                 prefs.hwdec_mode = defaults.hwdec_mode;
+                prefs.video_codec_preference = defaults.video_codec_preference;
+                prefs.remember_speed_per_channel = defaults.remember_speed_per_channel;
+                prefs.per_channel_speeds = defaults.per_channel_speeds;
+                prefs.auto_skip_chapters_enabled = defaults.auto_skip_chapters_enabled;
+                prefs.auto_skip_chapter_keywords = defaults.auto_skip_chapter_keywords;
                 self.apply_app_preferences(prefs);
                 if self.selected.is_none() {
                     self.playback.autoplay = defaults.default_autoplay;
@@ -1048,14 +1259,23 @@ impl FastTube {
             }
             SettingsTab::Privacy => {
                 let mut prefs = self.settings.prefs.value.clone();
+                let changed_feed = prefs.restricted_mode != defaults.restricted_mode;
+                prefs.restricted_mode = defaults.restricted_mode;
                 prefs.ryd_enabled = defaults.ryd_enabled;
                 prefs.dearrow_enabled = defaults.dearrow_enabled;
                 self.apply_app_preferences(prefs);
+                if changed_feed {
+                    self.invalidate_feed_cache();
+                }
             }
             SettingsTab::Storage => {
                 let mut prefs = self.settings.prefs.value.clone();
                 prefs.cache_dir_override = defaults.cache_dir_override;
                 prefs.download_dir_override = defaults.download_dir_override;
+                prefs.download_max_concurrent = defaults.download_max_concurrent;
+                prefs.download_embed_subs = defaults.download_embed_subs;
+                prefs.download_embed_chapters = defaults.download_embed_chapters;
+                prefs.download_embed_thumbnail = defaults.download_embed_thumbnail;
                 self.apply_app_preferences(prefs);
                 self.settings.cache_dir_input_synced = false;
                 self.settings.download_dir_input_synced = false;
@@ -1069,14 +1289,23 @@ impl FastTube {
         self.sync_theme_visuals(ctx);
         self.ensure_playback_settings_synchronized();
         self.settings.ensure_prefs_synchronized();
+        self.poll_storage_background_jobs(ctx);
+        if self.settings.active_tab != SettingsTab::Storage
+            || !self.settings.search_query.trim().is_empty()
+        {
+            reset_storage_tab_open_flag();
+        }
         let now = Instant::now();
         self.refresh_player_diagnostics(now);
-        if self.selected.is_some() {
+        if self.selected.is_some()
+            && self.settings.active_tab == SettingsTab::BackupDiagnostics
+            && self.settings.search_query.trim().is_empty()
+        {
             ctx.request_repaint_after(DIAGNOSTICS_REFRESH_INTERVAL);
         }
 
         let palette = self.palette();
-        let theme = self.settings.theme.value;
+        let theme = self.effective_theme();
         let avail_w = ui.available_width();
         let wide_layout = avail_w >= 760.0;
 
@@ -1125,6 +1354,7 @@ impl FastTube {
                     .show(ui, |ui| {
                         if crate::styled_pill_button(ui, "← Voltar", false, &palette).clicked() {
                             self.ui.settings_open = false;
+                            reset_storage_tab_open_flag();
                             self.sync_player_window_visibility();
                         }
 
@@ -1252,6 +1482,7 @@ impl FastTube {
                                         .clicked()
                                     {
                                         self.ui.settings_open = false;
+                                        reset_storage_tab_open_flag();
                                         self.sync_player_window_visibility();
                                     }
                                 });
@@ -1264,6 +1495,7 @@ impl FastTube {
         ui.horizontal_wrapped(|ui| {
             if crate::styled_pill_button(ui, "← Voltar", false, &palette).clicked() {
                 self.ui.settings_open = false;
+                reset_storage_tab_open_flag();
                 self.sync_player_window_visibility();
             }
             ui.add_space(6.0);
@@ -1323,6 +1555,7 @@ impl FastTube {
                                         .clicked()
                                         {
                                             self.ui.settings_open = false;
+                                            reset_storage_tab_open_flag();
                                             self.sync_player_window_visibility();
                                         }
                                     },
@@ -1572,36 +1805,52 @@ impl FastTube {
             None,
             None,
             |ui| {
-                settings_control_row(
-                    ui,
-                    palette,
-                    if pt {
-                        "Tema da interface"
-                    } else {
-                        "Interface theme"
-                    },
-                    if pt {
-                        "Aplicado imediatamente aos painéis e cartões; a superfície do vídeo permanece escura."
-                    } else {
-                        "Applied immediately to panels and cards; video surface stays dark."
-                    },
-                    275.0,
-                    |ui| {
-                        let mut selected_theme = self.settings.theme.value;
+                settings_row_frame(ui, |ui| {
+                    ui.label(
+                        RichText::new(if pt {
+                            "Tema da interface"
+                        } else {
+                            "Interface theme"
+                        })
+                        .size(13.5)
+                        .strong()
+                        .color(palette.channel_fg),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(if pt {
+                            "Siga automaticamente o tema do Windows ou escolha Escuro/Claro. A superfície do vídeo permanece escura."
+                        } else {
+                            "Follow the Windows system theme automatically or pick Dark/Light. The video stage stays dark."
+                        })
+                        .size(12.0)
+                        .color(palette.snippet_fg),
+                    );
+                    ui.add_space(10.0);
+                    let mut selected_theme = self.settings.theme.value;
+                    ui.horizontal_wrapped(|ui| {
+                        if theme_swatch_card(
+                            ui,
+                            palette,
+                            Theme::System,
+                            if pt {
+                                "Sistema (Windows)"
+                            } else {
+                                "System (Windows)"
+                            },
+                            selected_theme == Theme::System,
+                        ) {
+                            selected_theme = Theme::System;
+                        }
                         if theme_swatch_card(
                             ui,
                             palette,
                             Theme::Dark,
-                            if pt {
-                                "Escuro (padrão)"
-                            } else {
-                                "Dark (default)"
-                            },
+                            if pt { "Escuro" } else { "Dark" },
                             selected_theme == Theme::Dark,
                         ) {
                             selected_theme = Theme::Dark;
                         }
-                        ui.add_space(6.0);
                         if theme_swatch_card(
                             ui,
                             palette,
@@ -1611,17 +1860,43 @@ impl FastTube {
                         ) {
                             selected_theme = Theme::Light;
                         }
-                        if selected_theme != self.settings.theme.value {
-                            self.apply_theme(selected_theme);
-                            self.sync_theme_visuals(ctx);
-                        }
-                    },
-                );
+                    });
+                    if selected_theme != self.settings.theme.value {
+                        self.apply_theme(selected_theme);
+                        self.sync_theme_visuals(ctx);
+                    }
+                });
                 paint_row_divider(ui, palette);
 
                 let mut prefs = self.settings.prefs.value.clone();
                 let mut changed = false;
                 let mut invalidate = false;
+
+                if settings_toggle_row(
+                    ui,
+                    palette,
+                    theme,
+                    if pt {
+                        "Efeito Mica (Windows 11)"
+                    } else {
+                        "Mica backdrop (Windows 11)"
+                    },
+                    if pt {
+                        "Ativa transparência translúcida nativa do Windows 11 (DWM Mica) na moldura da janela. Requer Windows 11 22H2+ (opcional)."
+                    } else {
+                        "Enables native Windows 11 translucent backdrop (DWM Mica) on the main window frame. Requires Windows 11 22H2+ (opt-in)."
+                    },
+                    &mut prefs.mica_backdrop,
+                    None,
+                    Some((
+                        if pt { "Opcional" } else { "Opt-in" },
+                        palette.info_accent_fg,
+                        palette.queue_next_bg,
+                    )),
+                ) {
+                    changed = true;
+                }
+                paint_row_divider(ui, palette);
 
                 settings_control_row(
                     ui,
@@ -1646,6 +1921,66 @@ impl FastTube {
                                 prefs.language = lang;
                                 changed = true;
                             }
+                        }
+                    },
+                );
+                paint_row_divider(ui, palette);
+
+                let selected_country_label = match prefs.country_code.as_deref() {
+                    Some(code) => settings::COUNTRY_REGION_OPTIONS
+                        .iter()
+                        .find(|(c, _, _)| c.eq_ignore_ascii_case(code))
+                        .map(|(_, l_pt, l_en)| if pt { *l_pt } else { *l_en })
+                        .unwrap_or(code)
+                        .to_owned(),
+                    None => if pt {
+                        "Automático (Sistema)"
+                    } else {
+                        "Auto (System)"
+                    }
+                    .to_owned(),
+                };
+                settings_control_row(
+                    ui,
+                    palette,
+                    if pt {
+                        "País / Região de conteúdo (gl)"
+                    } else {
+                        "Country / Content region (gl)"
+                    },
+                    if pt {
+                        "Define o código de região (gl) enviado nas buscas e no feed inicial."
+                    } else {
+                        "Sets the YouTube region code (gl) used for search results and home feed."
+                    },
+                    240.0,
+                    |ui| {
+                        let prev_country = prefs.country_code.clone();
+                        egui::ComboBox::from_id_salt("settings_country_region_gl")
+                            .width(210.0)
+                            .selected_text(selected_country_label)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut prefs.country_code,
+                                    None,
+                                    if pt {
+                                        "Automático (Sistema)"
+                                    } else {
+                                        "Auto (System)"
+                                    },
+                                );
+                                for &(code, label_pt, label_en) in settings::COUNTRY_REGION_OPTIONS
+                                {
+                                    ui.selectable_value(
+                                        &mut prefs.country_code,
+                                        Some(code.to_owned()),
+                                        if pt { label_pt } else { label_en },
+                                    );
+                                }
+                            });
+                        if prefs.country_code != prev_country {
+                            changed = true;
+                            invalidate = true;
                         }
                     },
                 );
@@ -1953,11 +2288,201 @@ impl FastTube {
                         status_banner(ui, palette, err, true);
                     });
                 }
+                paint_row_divider(ui, palette);
+
+                let mut toast_prefs = self.settings.prefs.value.clone();
+                if settings_toggle_row(
+                    ui,
+                    palette,
+                    theme,
+                    if pt {
+                        "Notificações Toast do Windows para novos vídeos/lives (RSS)"
+                    } else {
+                        "Windows Toast notifications for new RSS uploads/lives"
+                    },
+                    if pt {
+                        "Exibe notificações nativas do Windows quando canais seguidos publicam novos vídeos ou entram ao vivo em segundo plano."
+                    } else {
+                        "Shows native Windows toast notifications when followed channels publish new videos or go live in the background."
+                    },
+                    &mut toast_prefs.windows_toast_notifications,
+                    None,
+                    None,
+                ) {
+                    self.apply_app_preferences(toast_prefs);
+                }
+                paint_row_divider(ui, palette);
+
+                let protocol_cache_id = egui::Id::new("settings_fasttube_protocol_hkcu_cache");
+                let protocol_status_id = egui::Id::new("settings_fasttube_protocol_hkcu_status");
+                let mut protocol_registered = ctx
+                    .data_mut(|d| d.get_temp::<bool>(protocol_cache_id))
+                    .unwrap_or_else(|| {
+                        let registered = crate::win11::is_fasttube_protocol_registered_hkcu();
+                        ctx.data_mut(|d| d.insert_temp(protocol_cache_id, registered));
+                        registered
+                    });
+                let mut protocol_status =
+                    ctx.data_mut(|d| d.get_temp::<(bool, String)>(protocol_status_id));
+
+                let mut trigger_register = false;
+                let mut trigger_unregister = false;
+                settings_row_frame(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(if pt {
+                                "Registro portátil do protocolo fasttube://"
+                            } else {
+                                "Portable fasttube:// protocol registration"
+                            })
+                            .size(13.5)
+                            .strong()
+                            .color(palette.channel_fg),
+                        );
+                        ui.add_space(6.0);
+                        if protocol_registered {
+                            settings_pill_badge(
+                                ui,
+                                if pt {
+                                    "Registrado (HKCU)"
+                                } else {
+                                    "Registered (HKCU)"
+                                },
+                                palette.notice_fg,
+                                palette.notice_bg,
+                            );
+                        } else {
+                            settings_pill_badge(
+                                ui,
+                                if pt {
+                                    "Não registrado"
+                                } else {
+                                    "Not registered"
+                                },
+                                palette.snippet_fg,
+                                palette.queue_next_bg,
+                            );
+                        }
+                    });
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(if pt {
+                            "Registra links fasttube:// apenas para o usuário atual (HKCU, sem privilégios de administrador) apontando para este executável."
+                        } else {
+                            "Registers fasttube:// links for the current user only (HKCU, no administrator privileges required) pointing to this executable."
+                        })
+                        .size(12.0)
+                        .color(palette.snippet_fg),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if pill_choice_button(
+                            ui,
+                            if pt {
+                                "Registrar fasttube://"
+                            } else {
+                                "Register fasttube://"
+                            },
+                            !protocol_registered,
+                            palette,
+                        )
+                        .clicked()
+                        {
+                            trigger_register = true;
+                        }
+                        ui.add_enabled_ui(protocol_registered, |ui| {
+                            if pill_choice_button(
+                                ui,
+                                if pt { "Remover registro" } else { "Unregister" },
+                                false,
+                                palette,
+                            )
+                            .clicked()
+                            {
+                                trigger_unregister = true;
+                            }
+                        });
+                    });
+                });
+
+                if trigger_register {
+                    let result = std::env::current_exe()
+                        .map_err(|err| err.to_string())
+                        .and_then(|exe| crate::win11::register_fasttube_protocol_hkcu(&exe));
+                    protocol_registered = crate::win11::is_fasttube_protocol_registered_hkcu();
+                    ctx.data_mut(|d| d.insert_temp(protocol_cache_id, protocol_registered));
+                    let (ok, msg) = match result {
+                        Ok(()) => (
+                            true,
+                            if pt {
+                                "Protocolo fasttube:// registrado com sucesso (HKCU).".to_owned()
+                            } else {
+                                "fasttube:// protocol registered successfully (HKCU).".to_owned()
+                            },
+                        ),
+                        Err(err) => (
+                            false,
+                            if pt {
+                                format!("Falha ao registrar fasttube://: {err}")
+                            } else {
+                                format!("Failed to register fasttube://: {err}")
+                            },
+                        ),
+                    };
+                    self.toasts.push(
+                        if ok {
+                            crate::toast::ToastKind::Success
+                        } else {
+                            crate::toast::ToastKind::Error
+                        },
+                        msg.clone(),
+                    );
+                    protocol_status = Some((ok, msg.clone()));
+                    ctx.data_mut(|d| d.insert_temp(protocol_status_id, (ok, msg)));
+                } else if trigger_unregister {
+                    let result = crate::win11::unregister_fasttube_protocol_hkcu();
+                    protocol_registered = crate::win11::is_fasttube_protocol_registered_hkcu();
+                    ctx.data_mut(|d| d.insert_temp(protocol_cache_id, protocol_registered));
+                    let (ok, msg) = match result {
+                        Ok(()) => (
+                            true,
+                            if pt {
+                                "Registro do protocolo fasttube:// removido (HKCU).".to_owned()
+                            } else {
+                                "fasttube:// protocol registration removed (HKCU).".to_owned()
+                            },
+                        ),
+                        Err(err) => (
+                            false,
+                            if pt {
+                                format!("Falha ao remover registro fasttube://: {err}")
+                            } else {
+                                format!("Failed to unregister fasttube://: {err}")
+                            },
+                        ),
+                    };
+                    self.toasts.push(
+                        if ok {
+                            crate::toast::ToastKind::Info
+                        } else {
+                            crate::toast::ToastKind::Error
+                        },
+                        msg.clone(),
+                    );
+                    protocol_status = Some((ok, msg.clone()));
+                    ctx.data_mut(|d| d.insert_temp(protocol_status_id, (ok, msg)));
+                }
+
+                if let Some((ok, msg)) = protocol_status {
+                    settings_row_frame(ui, |ui| {
+                        status_banner(ui, palette, &msg, !ok);
+                    });
+                }
             },
         );
 
         ui.add_space(16.0);
-        let app_update_busy = self.settings.app_update_rx.is_some();
+        let app_update_busy = self.settings.app_update_task.is_running();
         let app_badge = if let Some(check) = &self.settings.app_update_check {
             if check.update_available {
                 Some((
@@ -2205,30 +2730,26 @@ impl FastTube {
             if let Some(maybe_binding) = captured {
                 if let Some(binding) = maybe_binding {
                     let mut prefs = self.settings.prefs.value.clone();
-                    match slot_id {
-                        "play_pause" => prefs.keybindings.play_pause = binding,
-                        "seek_back" => prefs.keybindings.seek_back = binding,
-                        "seek_forward" => prefs.keybindings.seek_forward = binding,
-                        "mute" => prefs.keybindings.mute = binding,
-                        "theater" => prefs.keybindings.theater = binding,
-                        "fullscreen" => prefs.keybindings.fullscreen = binding,
-                        "mini_player" => prefs.keybindings.mini_player = binding,
-                        "audio_only" => prefs.keybindings.audio_only = binding,
-                        "screenshot" => prefs.keybindings.screenshot = binding,
-                        "ab_loop_a" => prefs.keybindings.ab_loop_a = binding,
-                        "ab_loop_b" => prefs.keybindings.ab_loop_b = binding,
-                        "ab_loop_clear" => prefs.keybindings.ab_loop_clear = binding,
-                        "command_palette" => prefs.keybindings.command_palette = binding,
-                        _ => {}
+                    if prefs.keybindings.set_slot(slot_id, binding) {
+                        self.apply_app_preferences(prefs);
                     }
-                    self.apply_app_preferences(prefs);
                 }
                 self.settings.capturing_keybinding = None;
             }
         }
 
         let kb = self.settings.prefs.value.keybindings.clone();
+        let conflicts = kb.detect_conflicts();
         let step_secs = self.seek_step_secs();
+        let conflict_badge_text = if conflicts.is_empty() {
+            None
+        } else {
+            Some(if pt {
+                format!("{} conflito(s)", conflicts.len())
+            } else {
+                format!("{} conflict(s)", conflicts.len())
+            })
+        };
         let shortcuts_open = settings_card(
             ui,
             palette,
@@ -2237,7 +2758,9 @@ impl FastTube {
             } else {
                 "Customizable keyboard shortcuts"
             },
-            None,
+            conflict_badge_text
+                .as_deref()
+                .map(|t| (t, palette.warning_fg, palette.error_bg)),
             Some(if pt {
                 "Guia completa (F1)"
             } else {
@@ -2245,103 +2768,93 @@ impl FastTube {
             }),
             |ui| {
                 settings_row_frame(ui, |ui| {
-                    let seek_back_desc = if pt {
-                        format!("Voltar {step_secs} segundos")
-                    } else {
-                        format!("Seek back {step_secs}s")
-                    };
-                    let seek_fwd_desc = if pt {
-                        format!("Avançar {step_secs} segundos")
-                    } else {
-                        format!("Seek forward {step_secs}s")
-                    };
-                    let rows: [(&'static str, &str, &str); 13] = [
-                        (
-                            "play_pause",
-                            if pt {
-                                "Reproduzir / pausar"
-                            } else {
-                                "Play / pause"
-                            },
-                            &kb.play_pause,
-                        ),
-                        ("seek_back", &seek_back_desc, &kb.seek_back),
-                        ("seek_forward", &seek_fwd_desc, &kb.seek_forward),
-                        (
-                            "mute",
-                            if pt { "Silenciar áudio" } else { "Mute audio" },
-                            &kb.mute,
-                        ),
-                        (
-                            "theater",
-                            if pt { "Modo teatro" } else { "Theater mode" },
-                            &kb.theater,
-                        ),
-                        (
-                            "fullscreen",
-                            if pt { "Tela cheia" } else { "Fullscreen" },
-                            &kb.fullscreen,
-                        ),
-                        ("mini_player", "Mini player", &kb.mini_player),
-                        (
-                            "audio_only",
-                            if pt {
-                                "Modo somente áudio"
-                            } else {
-                                "Audio-only mode"
-                            },
-                            &kb.audio_only,
-                        ),
-                        (
-                            "screenshot",
-                            if pt {
-                                "Capturar frame (PNG)"
-                            } else {
-                                "Screenshot frame (PNG)"
-                            },
-                            &kb.screenshot,
-                        ),
-                        (
-                            "ab_loop_a",
-                            if pt {
-                                "Marcar ponto A do loop"
-                            } else {
-                                "Set A-B loop start"
-                            },
-                            &kb.ab_loop_a,
-                        ),
-                        (
-                            "ab_loop_b",
-                            if pt {
-                                "Marcar ponto B do loop"
-                            } else {
-                                "Set A-B loop end"
-                            },
-                            &kb.ab_loop_b,
-                        ),
-                        (
-                            "ab_loop_clear",
-                            if pt {
-                                "Limpar loop A-B"
-                            } else {
-                                "Clear A-B loop"
-                            },
-                            &kb.ab_loop_clear,
-                        ),
-                        (
-                            "command_palette",
-                            if pt {
-                                "Paleta de comandos"
-                            } else {
-                                "Command palette"
-                            },
-                            &kb.command_palette,
-                        ),
-                    ];
-                    for (slot, label, current_val) in rows {
+                    if !conflicts.is_empty() {
+                        egui::Frame::new()
+                            .fill(palette.error_bg)
+                            .stroke(Stroke::new(1.0, palette.error_stroke))
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(egui::Margin::symmetric(12, 10))
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.label(
+                                    RichText::new(if pt {
+                                        "⚠ Conflitos de atalho detectados — duas ações estão usando a mesma tecla:"
+                                    } else {
+                                        "⚠ Keybinding conflicts detected — multiple actions share the same shortcut:"
+                                    })
+                                    .size(12.5)
+                                    .strong()
+                                    .color(palette.error_banner_fg),
+                                );
+                                ui.add_space(6.0);
+                                let mut resolve_pair: Option<(&'static str, &'static str)> = None;
+                                for conflict in &conflicts {
+                                    let label_a = settings::Keybindings::slot_label(
+                                        conflict.action_a,
+                                        pt,
+                                        step_secs,
+                                    );
+                                    let label_b = settings::Keybindings::slot_label(
+                                        conflict.action_b,
+                                        pt,
+                                        step_secs,
+                                    );
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "• [{}] {} ↔ {}",
+                                                conflict.binding, label_a, label_b
+                                            ))
+                                            .size(12.0)
+                                            .color(palette.error_banner_fg),
+                                        );
+                                        if pill_choice_button(
+                                            ui,
+                                            if pt {
+                                                "Resolver conflito"
+                                            } else {
+                                                "Clear duplicate"
+                                            },
+                                            false,
+                                            palette,
+                                        )
+                                        .clicked()
+                                        {
+                                            resolve_pair =
+                                                Some((conflict.action_a, conflict.action_b));
+                                        }
+                                    });
+                                }
+                                if let Some((a, b)) = resolve_pair {
+                                    let mut prefs = self.settings.prefs.value.clone();
+                                    if prefs.keybindings.resolve_conflict(a, b) {
+                                        self.apply_app_preferences(prefs);
+                                    }
+                                }
+                            });
+                        ui.add_space(10.0);
+                    }
+
+                    let mut reset_single_slot: Option<&'static str> = None;
+                    for (slot, current_val) in kb.entries() {
                         let capturing_this = self.settings.capturing_keybinding == Some(slot);
+                        let has_conflict = conflicts
+                            .iter()
+                            .any(|c| c.action_a == slot || c.action_b == slot);
+                        let is_modified = settings::Keybindings::default_for_slot(slot)
+                            .is_some_and(|def| !def.eq_ignore_ascii_case(current_val));
+                        let label = settings::Keybindings::slot_label(slot, pt, step_secs);
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(label).size(12.5).color(palette.channel_fg));
+                            if has_conflict {
+                                ui.add_space(4.0);
+                                settings_pill_badge(
+                                    ui,
+                                    if pt { "Conflito" } else { "Conflict" },
+                                    palette.warning_fg,
+                                    palette.error_bg,
+                                );
+                            }
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -2360,10 +2873,28 @@ impl FastTube {
                                         self.settings.capturing_keybinding =
                                             if capturing_this { None } else { Some(slot) };
                                     }
+                                    if is_modified
+                                        && !capturing_this
+                                        && pill_choice_button(
+                                            ui,
+                                            if pt { "Padrão" } else { "Reset" },
+                                            false,
+                                            palette,
+                                        )
+                                        .clicked()
+                                    {
+                                        reset_single_slot = Some(slot);
+                                    }
                                 },
                             );
                         });
                         ui.add_space(4.0);
+                    }
+                    if let Some(slot) = reset_single_slot {
+                        let mut prefs = self.settings.prefs.value.clone();
+                        if prefs.keybindings.reset_slot(slot) {
+                            self.apply_app_preferences(prefs);
+                        }
                     }
                     ui.add_space(6.0);
                     if pill_choice_button(
@@ -2392,6 +2923,7 @@ impl FastTube {
     }
 
     fn settings_tab_playback_ui(&mut self, ui: &mut egui::Ui, palette: ThemePalette, theme: Theme) {
+        let pt = self.ui_pt();
         let mut playback_prefs = self.settings.playback.value;
         let mut app_prefs = self.settings.prefs.value.clone();
         let mut app_prefs_changed = false;
@@ -2508,6 +3040,122 @@ impl FastTube {
                 );
                 paint_row_divider(ui, palette);
 
+                let saved_speed_count = app_prefs.per_channel_speeds.len();
+                let saved_speed_badge = (saved_speed_count > 0).then(|| {
+                    if pt {
+                        format!("{saved_speed_count} canal(is)")
+                    } else {
+                        format!("{saved_speed_count} channel(s)")
+                    }
+                });
+                let saved_speed_desc = if pt {
+                    format!(
+                        "Lembra automaticamente a velocidade de reprodução ajustada em cada canal ({saved_speed_count} canal(is) salvo(s))."
+                    )
+                } else {
+                    format!(
+                        "Automatically remembers the playback speed chosen for each channel ({saved_speed_count} channel(s) saved)."
+                    )
+                };
+                if settings_toggle_row(
+                    ui,
+                    palette,
+                    theme,
+                    if pt {
+                        "Lembrar velocidade por canal"
+                    } else {
+                        "Remember playback speed per channel"
+                    },
+                    &saved_speed_desc,
+                    &mut app_prefs.remember_speed_per_channel,
+                    None,
+                    saved_speed_badge
+                        .as_deref()
+                        .map(|label| (label, palette.info_accent_fg, palette.queue_next_bg)),
+                ) {
+                    app_prefs_changed = true;
+                }
+                if saved_speed_count > 0 {
+                    settings_row_frame(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new(if pt {
+                                    format!(
+                                        "{saved_speed_count} velocidade(s) personalizada(s) salva(s) por canal."
+                                    )
+                                } else {
+                                    format!(
+                                        "{saved_speed_count} custom per-channel speed(s) currently saved."
+                                    )
+                                })
+                                .size(12.0)
+                                .color(palette.snippet_fg),
+                            );
+                            if pill_choice_button(
+                                ui,
+                                if pt {
+                                    "Limpar velocidades salvas"
+                                } else {
+                                    "Clear saved speeds"
+                                },
+                                false,
+                                palette,
+                            )
+                            .clicked()
+                            {
+                                app_prefs.per_channel_speeds.clear();
+                                app_prefs_changed = true;
+                                self.toasts.push(
+                                    crate::toast::ToastKind::Info,
+                                    if pt {
+                                        "Velocidades salvas por canal limpas."
+                                    } else {
+                                        "Saved per-channel playback speeds cleared."
+                                    },
+                                );
+                            }
+                        });
+                    });
+                }
+                paint_row_divider(ui, palette);
+
+                let codec_title = if pt {
+                    "Preferência de codec de vídeo"
+                } else {
+                    "Preferred video codec"
+                };
+                let codec_desc = if pt {
+                    app_prefs.video_codec_preference.description_pt()
+                } else {
+                    app_prefs.video_codec_preference.description_en()
+                };
+                settings_control_row(ui, palette, codec_title, codec_desc, 260.0, |ui| {
+                    for codec in [
+                        VideoCodecPreference::Av1,
+                        VideoCodecPreference::H264,
+                        VideoCodecPreference::Vp9,
+                        VideoCodecPreference::Auto,
+                    ] {
+                        let label = if pt {
+                            codec.label_pt()
+                        } else {
+                            codec.label_en()
+                        };
+                        if pill_choice_button(
+                            ui,
+                            label,
+                            app_prefs.video_codec_preference == codec,
+                            palette,
+                        )
+                        .clicked()
+                        {
+                            app_prefs.video_codec_preference = codec;
+                            app_prefs_changed = true;
+                        }
+                    }
+                });
+                paint_row_divider(ui, palette);
+
                 settings_control_row(
                     ui,
                     palette,
@@ -2571,9 +3219,35 @@ impl FastTube {
                     ui,
                     palette,
                     theme,
-                    "Retomar reprodução de onde parou",
-                    "Usa o progresso salvo no histórico local para continuar vídeos já iniciados.",
+                    if pt {
+                        "Retomar reprodução de onde parou"
+                    } else {
+                        "Resume playback where you left off"
+                    },
+                    if pt {
+                        "Usa o progresso salvo no histórico local para continuar vídeos já iniciados."
+                    } else {
+                        "Uses local watch history progress to resume previously started videos."
+                    },
                     &mut app_prefs.resume_enabled,
+                    None,
+                    None,
+                ) {
+                    app_prefs_changed = true;
+                }
+                paint_row_divider(ui, palette);
+
+                if settings_toggle_row(
+                    ui,
+                    palette,
+                    theme,
+                    if pt { "Modo ambiente" } else { "Ambient mode" },
+                    if pt {
+                        "Adiciona um brilho sutil ao redor do player combinando com o conteúdo no tema escuro."
+                    } else {
+                        "Adds a subtle cinematic glow around the video stage in dark mode."
+                    },
+                    &mut app_prefs.ambient_mode,
                     None,
                     None,
                 ) {
@@ -2589,6 +3263,209 @@ impl FastTube {
             ui.add_space(8.0);
             status_banner(ui, palette, error, true);
         }
+
+        ui.add_space(16.0);
+        let chapter_kw_count = app_prefs.auto_skip_chapter_keywords.len();
+        let chapter_badge = (chapter_kw_count > 0).then(|| {
+            if pt {
+                format!("{chapter_kw_count} palavra(s)")
+            } else {
+                format!("{chapter_kw_count} keyword(s)")
+            }
+        });
+        settings_card(
+            ui,
+            palette,
+            if pt {
+                "Pular capítulos automaticamente por palavra-chave"
+            } else {
+                "Auto-skip chapters by keyword"
+            },
+            chapter_badge
+                .as_deref()
+                .map(|label| (label, palette.info_accent_fg, palette.queue_next_bg)),
+            None,
+            |ui| {
+                if settings_toggle_row(
+                    ui,
+                    palette,
+                    theme,
+                    if pt {
+                        "Pular capítulos automaticamente por palavra-chave"
+                    } else {
+                        "Auto-skip chapters by keyword"
+                    },
+                    if pt {
+                        "Avança automaticamente capítulos cujo título contenha qualquer uma das palavras-chave cadastradas (sem diferenciar maiúsculas)."
+                    } else {
+                        "Automatically skips video chapters whose title matches any configured keyword (case-insensitive)."
+                    },
+                    &mut app_prefs.auto_skip_chapters_enabled,
+                    None,
+                    None,
+                ) {
+                    app_prefs_changed = true;
+                }
+                paint_row_divider(ui, palette);
+
+                settings_row_frame(ui, |ui| {
+                    let input_id = egui::Id::new("settings_chapter_skip_keyword_input");
+                    let mut kw_input = ui
+                        .ctx()
+                        .data_mut(|d| d.get_temp::<String>(input_id))
+                        .unwrap_or_default();
+                    let at_limit = app_prefs.auto_skip_chapter_keywords.len()
+                        >= settings::MAX_AUTO_SKIP_CHAPTER_KEYWORDS;
+                    let add_keyword = |raw: &str, list: &mut Vec<String>| -> bool {
+                        let trimmed = raw.trim();
+                        if trimmed.is_empty()
+                            || trimmed.len() > 64
+                            || list.len() >= settings::MAX_AUTO_SKIP_CHAPTER_KEYWORDS
+                        {
+                            return false;
+                        }
+                        let lower = trimmed.to_lowercase();
+                        if list.iter().any(|existing| existing.to_lowercase() == lower) {
+                            return false;
+                        }
+                        list.push(trimmed.to_owned());
+                        true
+                    };
+
+                    ui.horizontal(|ui| {
+                        let edit_w = (ui.available_width() - 108.0).max(160.0);
+                        let resp = ui.add_sized(
+                            [edit_w, 28.0],
+                            egui::TextEdit::singleline(&mut kw_input)
+                                .char_limit(64)
+                                .hint_text(if pt {
+                                    "Adicionar palavra-chave (ex.: patrocinador, intro)..."
+                                } else {
+                                    "Add keyword (e.g. sponsor, intro)..."
+                                }),
+                        );
+                        let submit_enter =
+                            resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let can_add = !at_limit && !kw_input.trim().is_empty();
+                        let clicked_add = ui
+                            .add_enabled_ui(can_add, |ui| {
+                                pill_choice_button(
+                                    ui,
+                                    if pt { "Adicionar" } else { "Add" },
+                                    true,
+                                    palette,
+                                )
+                                .clicked()
+                            })
+                            .inner;
+                        if (clicked_add || submit_enter)
+                            && add_keyword(&kw_input, &mut app_prefs.auto_skip_chapter_keywords)
+                        {
+                            kw_input.clear();
+                            app_prefs_changed = true;
+                        }
+                    });
+                    ui.ctx().data_mut(|d| d.insert_temp(input_id, kw_input));
+
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(if pt {
+                                "Sugestões rápidas:"
+                            } else {
+                                "Quick presets:"
+                            })
+                            .size(12.0)
+                            .strong()
+                            .color(palette.snippet_fg),
+                        );
+                        for &preset in settings::DEFAULT_CHAPTER_SKIP_KEYWORD_PRESETS {
+                            let preset_lower = preset.to_lowercase();
+                            let already = app_prefs
+                                .auto_skip_chapter_keywords
+                                .iter()
+                                .any(|existing| existing.to_lowercase() == preset_lower);
+                            let btn_label = if already {
+                                format!("✓ {preset}")
+                            } else {
+                                format!("+ {preset}")
+                            };
+                            if ui
+                                .add_enabled_ui(!already && !at_limit, |ui| {
+                                    pill_choice_button(ui, &btn_label, already, palette).clicked()
+                                })
+                                .inner
+                                && add_keyword(preset, &mut app_prefs.auto_skip_chapter_keywords)
+                            {
+                                app_prefs_changed = true;
+                            }
+                        }
+                    });
+
+                    ui.add_space(10.0);
+                    if app_prefs.auto_skip_chapter_keywords.is_empty() {
+                        ui.label(
+                            RichText::new(if pt {
+                                "Nenhuma palavra-chave configurada. Use o campo acima ou as sugestões rápidas."
+                            } else {
+                                "No keywords configured yet. Use the field above or click a quick preset."
+                            })
+                            .size(12.0)
+                            .color(palette.snippet_fg),
+                        );
+                    } else {
+                        let mut remove_idx: Option<usize> = None;
+                        ui.horizontal_wrapped(|ui| {
+                            for (idx, kw) in app_prefs.auto_skip_chapter_keywords.iter().enumerate()
+                            {
+                                let btn = egui::Button::new(
+                                    RichText::new(format!("{kw}  ×"))
+                                        .size(11.5)
+                                        .strong()
+                                        .color(palette.info_accent_fg),
+                                )
+                                .fill(palette.queue_next_bg)
+                                .stroke(Stroke::new(
+                                    1.0,
+                                    palette.info_accent_fg.gamma_multiply(0.25),
+                                ))
+                                .corner_radius(CornerRadius::same(12))
+                                .min_size(Vec2::new(0.0, 24.0));
+                                if ui
+                                    .add(btn)
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .on_hover_text(if pt {
+                                        "Remover palavra-chave"
+                                    } else {
+                                        "Remove keyword"
+                                    })
+                                    .clicked()
+                                {
+                                    remove_idx = Some(idx);
+                                }
+                            }
+                            if pill_choice_button(
+                                ui,
+                                if pt { "Limpar todas" } else { "Clear all" },
+                                false,
+                                palette,
+                            )
+                            .clicked()
+                            {
+                                app_prefs.auto_skip_chapter_keywords.clear();
+                                app_prefs_changed = true;
+                            }
+                        });
+                        if let Some(idx) = remove_idx
+                            && idx < app_prefs.auto_skip_chapter_keywords.len()
+                        {
+                            app_prefs.auto_skip_chapter_keywords.remove(idx);
+                            app_prefs_changed = true;
+                        }
+                    }
+                });
+            },
+        );
 
         ui.add_space(16.0);
         settings_card(ui, palette, "Áudio e legendas", None, None, |ui| {
@@ -2653,12 +3530,21 @@ impl FastTube {
             }
             paint_row_divider(ui, palette);
 
+            let pt_cap = self.ui_pt();
             ui.add_enabled_ui(app_prefs.auto_subtitles, |ui| {
                 settings_control_row(
                     ui,
                     palette,
-                    "Idioma preferido das legendas",
-                    "Código ISO (ex.: pt, pt-BR, en, es). Legendas manuais têm prioridade sobre automáticas.",
+                    if pt_cap {
+                        "Idioma preferido das legendas"
+                    } else {
+                        "Preferred subtitle language"
+                    },
+                    if pt_cap {
+                        "Código ISO (ex.: pt, pt-BR, en, es). Legendas manuais têm prioridade sobre automáticas."
+                    } else {
+                        "ISO code (e.g. pt, pt-BR, en, es). Manual captions take priority over auto-generated ones."
+                    },
                     260.0,
                     |ui| {
                         ui.add_sized(
@@ -2683,6 +3569,134 @@ impl FastTube {
                     },
                 );
             });
+            paint_row_divider(ui, palette);
+
+            settings_control_row(
+                ui,
+                palette,
+                if pt_cap {
+                    "Tamanho da fonte das legendas"
+                } else {
+                    "Caption font size"
+                },
+                if pt_cap {
+                    "Escala aplicada no overlay e no libmpv (50% a 200%)."
+                } else {
+                    "Scale applied to both the overlay renderer and libmpv (50% to 200%)."
+                },
+                250.0,
+                |ui| {
+                    let mut scale_pct =
+                        (app_prefs.caption_style.font_scale.clamp(0.5, 2.0) * 100.0).round() as u32;
+                    if stepper_u32_controls(ui, &mut scale_pct, 50..=200, 10, "%", palette) {
+                        app_prefs.caption_style.font_scale =
+                            (scale_pct as f32 / 100.0).clamp(0.5, 2.0);
+                        app_prefs_changed = true;
+                    }
+                },
+            );
+            paint_row_divider(ui, palette);
+
+            settings_control_row(
+                ui,
+                palette,
+                if pt_cap {
+                    "Opacidade do fundo das legendas"
+                } else {
+                    "Caption background opacity"
+                },
+                if pt_cap {
+                    "Controla a transparência da faixa escura atrás do texto (0% a 100%)."
+                } else {
+                    "Controls transparency of the dark backdrop behind captions (0% to 100%)."
+                },
+                250.0,
+                |ui| {
+                    let mut bg_pct =
+                        (app_prefs.caption_style.bg_opacity.clamp(0.0, 1.0) * 100.0).round() as u32;
+                    if stepper_u32_controls(ui, &mut bg_pct, 0..=100, 10, "%", palette) {
+                        app_prefs.caption_style.bg_opacity =
+                            (bg_pct as f32 / 100.0).clamp(0.0, 1.0);
+                        app_prefs_changed = true;
+                    }
+                },
+            );
+            paint_row_divider(ui, palette);
+
+            settings_control_row(
+                ui,
+                palette,
+                if pt_cap {
+                    "Cor do texto das legendas"
+                } else {
+                    "Caption text color"
+                },
+                if pt_cap {
+                    "Cor principal renderizada para as legendas."
+                } else {
+                    "Primary foreground color rendered for captions."
+                },
+                260.0,
+                |ui| {
+                    for &(hex, label_pt, label_en) in settings::CAPTION_COLOR_PRESETS.iter().rev() {
+                        let active = app_prefs
+                            .caption_style
+                            .text_color_hex
+                            .eq_ignore_ascii_case(hex);
+                        if pill_choice_button(
+                            ui,
+                            if pt_cap { label_pt } else { label_en },
+                            active,
+                            palette,
+                        )
+                        .clicked()
+                        {
+                            app_prefs.caption_style.text_color_hex = hex.to_owned();
+                            app_prefs_changed = true;
+                        }
+                    }
+                },
+            );
+            paint_row_divider(ui, palette);
+
+            settings_control_row(
+                ui,
+                palette,
+                if pt_cap {
+                    "Tradução automática de legendas (tlang)"
+                } else {
+                    "Caption auto-translate (tlang)"
+                },
+                if pt_cap {
+                    "Traduz automaticamente legendas do YouTube para o idioma escolhido."
+                } else {
+                    "Automatically translates YouTube timedtext captions to the chosen language."
+                },
+                280.0,
+                |ui| {
+                    let cur_tlang = app_prefs.caption_style.translate_lang.clone();
+                    for &(code, label) in settings::CAPTION_TRANSLATE_LANGUAGES.iter().rev() {
+                        let active = cur_tlang
+                            .as_deref()
+                            .is_some_and(|c| c.eq_ignore_ascii_case(code));
+                        if pill_choice_button(ui, label, active, palette).clicked() {
+                            app_prefs.caption_style.translate_lang = Some(code.to_owned());
+                            app_prefs_changed = true;
+                        }
+                    }
+                    if pill_choice_button(
+                        ui,
+                        if pt_cap { "Desligado" } else { "Off" },
+                        cur_tlang.is_none(),
+                        palette,
+                    )
+                    .clicked()
+                    {
+                        app_prefs.caption_style.translate_lang = None;
+                        app_prefs_changed = true;
+                    }
+                },
+            );
         });
 
         ui.add_space(16.0);
@@ -3359,7 +4373,7 @@ impl FastTube {
                                 self.settings.oauth_import_status = Some((false, err));
                             }
                         }
-                        let picking = self.settings.oauth_picker_rx.is_some();
+                        let picking = self.settings.oauth_picker_task.is_running();
                         ui.add_enabled_ui(!picking, |ui| {
                             if pill_choice_button(
                                 ui,
@@ -3374,18 +4388,15 @@ impl FastTube {
                             .clicked()
                             {
                                 let initial = oauth_path.clone();
-                                let (tx, rx) = mpsc::channel();
-                                self.settings.oauth_picker_rx = Some(rx);
-                                let ctx_clone = ctx.clone();
-                                std::thread::spawn(move || {
-                                    let res = settings::pick_json_file_dialog(
-                                        false,
-                                        "Selecionar oauth-client.json",
-                                        initial.as_deref(),
-                                    );
-                                    let _ = tx.send(res);
-                                    ctx_clone.request_repaint();
-                                });
+                                self.settings
+                                    .oauth_picker_task
+                                    .spawn(ctx.clone(), move |_| {
+                                        settings::pick_json_file_dialog(
+                                            false,
+                                            "Selecionar oauth-client.json",
+                                            initial.as_deref(),
+                                        )
+                                    });
                             }
                         });
                     });
@@ -3410,12 +4421,44 @@ impl FastTube {
             None,
             None,
             |ui| {
+                let pt_priv = self.ui_pt();
                 if settings_toggle_row(
                     ui,
                     palette,
                     theme,
-                    "Pausar histórico de exibição",
-                    "Impede que novos vídeos assistidos ou progressos sejam registrados localmente.",
+                    if pt_priv {
+                        "Modo restrito"
+                    } else {
+                        "Restricted Mode"
+                    },
+                    if pt_priv {
+                        "Ajuda a filtrar vídeos potencialmente sensíveis ou inadequados nas buscas e recomendações."
+                    } else {
+                        "Helps filter potentially mature or sensitive videos from search results and recommendations."
+                    },
+                    &mut prefs.restricted_mode,
+                    None,
+                    None,
+                ) {
+                    changed = true;
+                    invalidate = true;
+                }
+                paint_row_divider(ui, palette);
+
+                if settings_toggle_row(
+                    ui,
+                    palette,
+                    theme,
+                    if pt_priv {
+                        "Pausar histórico de exibição"
+                    } else {
+                        "Pause watch history"
+                    },
+                    if pt_priv {
+                        "Impede que novos vídeos assistidos ou progressos sejam registrados localmente."
+                    } else {
+                        "Prevents newly watched videos or playback progress from being recorded locally."
+                    },
                     &mut prefs.pause_watch_history,
                     None,
                     None,
@@ -3634,7 +4677,6 @@ impl FastTube {
         } else {
             "Off"
         };
-        let theme = self.settings.theme.value;
         settings_card(
             ui,
             palette,
@@ -3764,7 +4806,7 @@ impl FastTube {
                                     "Absolute path to downloads folder"
                                 }),
                         );
-                        let picking = self.settings.download_picker_rx.is_some();
+                        let picking = self.settings.download_picker_task.is_running();
                         ui.add_enabled_ui(!picking, |ui| {
                             if pill_choice_button(
                                 ui,
@@ -3782,14 +4824,11 @@ impl FastTube {
                             {
                                 let initial =
                                     PathBuf::from(self.settings.download_dir_input.trim());
-                                let (tx, rx) = mpsc::channel();
-                                self.settings.download_picker_rx = Some(rx);
-                                let ctx_clone = ctx.clone();
-                                std::thread::spawn(move || {
-                                    let res = settings::pick_folder_dialog(Some(&initial));
-                                    let _ = tx.send(res);
-                                    ctx_clone.request_repaint();
-                                });
+                                self.settings
+                                    .download_picker_task
+                                    .spawn(ctx.clone(), move |_| {
+                                        settings::pick_folder_dialog(Some(&initial))
+                                    });
                             }
                         });
                     });
@@ -3877,11 +4916,118 @@ impl FastTube {
                         status_banner(ui, palette, notice, false);
                     }
                 });
+                paint_row_divider(ui, palette);
+
+                let theme = self.effective_theme();
+                let mut dl_prefs = self.settings.prefs.value.clone();
+                let mut dl_prefs_changed = false;
+
+                settings_control_row(
+                    ui,
+                    palette,
+                    if pt {
+                        "Downloads simultâneos"
+                    } else {
+                        "Concurrent downloads"
+                    },
+                    if pt {
+                        "Número máximo de vídeos baixados ao mesmo tempo (1 a 4)."
+                    } else {
+                        "Maximum number of videos downloaded in parallel (1 to 4)."
+                    },
+                    210.0,
+                    |ui| {
+                        for n in [4_usize, 3, 2, 1] {
+                            let label = format!("{n}");
+                            if pill_choice_button(
+                                ui,
+                                &label,
+                                dl_prefs.download_max_concurrent == n,
+                                palette,
+                            )
+                            .clicked()
+                            {
+                                dl_prefs.download_max_concurrent = n;
+                                dl_prefs_changed = true;
+                            }
+                        }
+                    },
+                );
+                paint_row_divider(ui, palette);
+
+                if settings_toggle_row(
+                    ui,
+                    palette,
+                    theme,
+                    if pt {
+                        "Embutir legendas nos downloads"
+                    } else {
+                        "Embed subtitles in downloads"
+                    },
+                    if pt {
+                        "Inclui as faixas de legenda disponíveis no arquivo baixado (--embed-subs)."
+                    } else {
+                        "Embeds available subtitle tracks into downloaded files (--embed-subs)."
+                    },
+                    &mut dl_prefs.download_embed_subs,
+                    None,
+                    None,
+                ) {
+                    dl_prefs_changed = true;
+                }
+                paint_row_divider(ui, palette);
+
+                if settings_toggle_row(
+                    ui,
+                    palette,
+                    theme,
+                    if pt {
+                        "Embutir capítulos nos downloads"
+                    } else {
+                        "Embed chapters in downloads"
+                    },
+                    if pt {
+                        "Grava marcadores de capítulo no arquivo de vídeo/áudio (--embed-chapters)."
+                    } else {
+                        "Writes chapter markers into downloaded video/audio files (--embed-chapters)."
+                    },
+                    &mut dl_prefs.download_embed_chapters,
+                    None,
+                    None,
+                ) {
+                    dl_prefs_changed = true;
+                }
+                paint_row_divider(ui, palette);
+
+                if settings_toggle_row(
+                    ui,
+                    palette,
+                    theme,
+                    if pt {
+                        "Embutir miniatura (capa) nos downloads"
+                    } else {
+                        "Embed thumbnail cover art in downloads"
+                    },
+                    if pt {
+                        "Adiciona a miniatura do vídeo como capa do arquivo (--embed-thumbnail)."
+                    } else {
+                        "Embeds the video thumbnail as file cover art (--embed-thumbnail)."
+                    },
+                    &mut dl_prefs.download_embed_thumbnail,
+                    None,
+                    None,
+                ) {
+                    dl_prefs_changed = true;
+                }
+
+                if dl_prefs_changed {
+                    self.apply_app_preferences(dl_prefs);
+                }
             },
         );
 
         ui.add_space(16.0);
-        let ytdlp_busy = self.settings.ytdlp_rx.is_some();
+        let ytdlp_busy = self.settings.ytdlp_task.is_running();
         let ytdlp_badge_info = self.settings.ytdlp_check.as_ref().map(|info| {
             let label = if info.update_available {
                 format!(
@@ -3999,17 +5145,23 @@ impl FastTube {
                 .ok();
         let ytdlp_subdir = effective_base.as_deref().map(settings::yt_dlp_cache_subdir);
 
-        if let Some(target_dir) = ytdlp_subdir.as_deref() {
-            let needs_measure = match &self.settings.cache_disk_usage {
-                Some((cached_dir, _, measured_at)) => {
-                    cached_dir != target_dir || measured_at.elapsed() > Duration::from_secs(15)
-                }
-                None => true,
+        let (just_opened_storage, is_measuring, is_clearing) =
+            if let Ok(mut state) = storage_async_state().lock() {
+                let opened = !state.was_storage_tab_open;
+                state.was_storage_tab_open = true;
+                (opened, state.measure_rx.is_some(), state.clear_rx.is_some())
+            } else {
+                (false, false, false)
             };
-            if needs_measure {
-                let usage = settings::measure_dir_usage(target_dir);
-                self.settings.cache_disk_usage =
-                    Some((target_dir.to_path_buf(), usage, Instant::now()));
+
+        if let Some(target_dir) = ytdlp_subdir.as_deref() {
+            let needs_measure = just_opened_storage
+                || match &self.settings.cache_disk_usage {
+                    Some((cached_dir, _, _)) => cached_dir != target_dir,
+                    None => true,
+                };
+            if needs_measure && !is_measuring {
+                self.start_async_cache_measure(target_dir.to_path_buf(), ctx);
             }
         }
 
@@ -4030,7 +5182,7 @@ impl FastTube {
                         egui::TextEdit::singleline(&mut self.settings.cache_dir_input)
                             .hint_text("Caminho absoluto da pasta de cache"),
                     );
-                    let picking = self.settings.cache_picker_rx.is_some();
+                    let picking = self.settings.cache_picker_task.is_running();
                     ui.add_enabled_ui(!picking, |ui| {
                         if pill_choice_button(
                             ui,
@@ -4041,14 +5193,11 @@ impl FastTube {
                         .clicked()
                         {
                             let initial = PathBuf::from(self.settings.cache_dir_input.trim());
-                            let (tx, rx) = mpsc::channel();
-                            self.settings.cache_picker_rx = Some(rx);
-                            let ctx_clone = ctx.clone();
-                            std::thread::spawn(move || {
-                                let res = settings::pick_folder_dialog(Some(&initial));
-                                let _ = tx.send(res);
-                                ctx_clone.request_repaint();
-                            });
+                            self.settings
+                                .cache_picker_task
+                                .spawn(ctx.clone(), move |_| {
+                                    settings::pick_folder_dialog(Some(&initial))
+                                });
                         }
                     });
                 });
@@ -4101,51 +5250,111 @@ impl FastTube {
         });
 
         ui.add_space(16.0);
-        let usage_text = self
-            .settings
-            .cache_disk_usage
-            .as_ref()
-            .map(|(_, u, _)| format!("{} ({} arquivos)", format_bytes_pt(u.bytes), u.files))
-            .unwrap_or_else(|| "Indisponível".into());
+        let is_measuring_now = storage_async_state()
+            .lock()
+            .map(|s| s.measure_rx.is_some())
+            .unwrap_or(false);
+        let usage_text = if is_measuring_now {
+            if pt {
+                "Calculando...".into()
+            } else {
+                "Calculating...".into()
+            }
+        } else {
+            self.settings
+                .cache_disk_usage
+                .as_ref()
+                .map(|(_, u, _)| {
+                    if pt {
+                        format!("{} ({} arquivos)", format_bytes_pt(u.bytes), u.files)
+                    } else {
+                        format!("{} ({} files)", format_bytes_pt(u.bytes), u.files)
+                    }
+                })
+                .unwrap_or_else(|| {
+                    if pt {
+                        "Indisponível".into()
+                    } else {
+                        "Unavailable".into()
+                    }
+                })
+        };
         settings_card(
             ui,
             palette,
-            "Uso de espaço e limpeza",
+            if pt {
+                "Uso de espaço e limpeza"
+            } else {
+                "Storage usage and cleanup"
+            },
             Some((&usage_text, palette.info_accent_fg, palette.queue_next_bg)),
             None,
             |ui| {
                 settings_control_row(
                     ui,
                     palette,
-                    "Cache em disco do yt-dlp",
-                    "Remove apenas os arquivos dentro da subpasta yt-dlp configurada.",
+                    if pt {
+                        "Cache em disco do yt-dlp"
+                    } else {
+                        "yt-dlp disk cache"
+                    },
+                    if pt {
+                        "Remove apenas os arquivos dentro da subpasta yt-dlp configurada."
+                    } else {
+                        "Removes only files inside the configured yt-dlp cache subfolder."
+                    },
                     190.0,
                     |ui| {
-                        if pill_choice_button(ui, "Recalcular", false, palette).clicked() {
-                            self.settings.cache_disk_usage = None;
-                        }
-                        if pill_choice_button(ui, "Limpar cache do yt-dlp", false, palette)
+                        ui.add_enabled_ui(!is_measuring_now && !is_clearing, |ui| {
+                            if pill_choice_button(
+                                ui,
+                                if is_measuring_now {
+                                    if pt {
+                                        "Calculando..."
+                                    } else {
+                                        "Calculating..."
+                                    }
+                                } else if pt {
+                                    "Recalcular"
+                                } else {
+                                    "Refresh"
+                                },
+                                false,
+                                palette,
+                            )
                             .clicked()
-                        {
-                            if let Some(base) = &effective_base {
-                                match settings::clear_yt_dlp_cache_dir(base) {
-                                    Ok(removed) => {
-                                        self.settings.cache_disk_usage = None;
-                                        self.settings.cache_status = Some(format!(
-                                            "Cache do yt-dlp limpo ({removed} arquivo(s) removido(s))."
-                                        ));
-                                    }
-                                    Err(err) => {
-                                        self.settings.cache_status =
-                                            Some(format!("Falha ao limpar cache do yt-dlp: {err}"));
-                                    }
+                            {
+                                self.settings.cache_disk_usage = None;
+                                if let Some(target_dir) = ytdlp_subdir.as_deref() {
+                                    self.start_async_cache_measure(target_dir.to_path_buf(), ctx);
                                 }
-                            } else {
-                                self.settings.cache_status = Some(
-                                    "Não foi possível determinar a pasta de cache efetiva.".into(),
-                                );
                             }
-                        }
+                            if pill_choice_button(
+                                ui,
+                                if is_clearing {
+                                    if pt { "Limpando..." } else { "Clearing..." }
+                                } else if pt {
+                                    "Limpar cache do yt-dlp"
+                                } else {
+                                    "Clear yt-dlp cache"
+                                },
+                                false,
+                                palette,
+                            )
+                            .clicked()
+                            {
+                                if let Some(base) = &effective_base {
+                                    self.start_async_yt_dlp_cache_clear(base.clone(), ctx);
+                                } else {
+                                    self.settings.cache_status = Some(if pt {
+                                        "Não foi possível determinar a pasta de cache efetiva."
+                                            .into()
+                                    } else {
+                                        "Could not determine the effective cache folder.".into()
+                                    });
+                                }
+                            }
+                        });
                     },
                 );
                 paint_row_divider(ui, palette);
@@ -4201,7 +5410,7 @@ impl FastTube {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Arquivo:").size(13.0));
-                    let picking = self.settings.backup_picker_rx.is_some();
+                    let picking = self.settings.backup_picker_task.is_running();
                     let edit_w = (ui.available_width() - 255.0).max(140.0);
                     ui.add_sized(
                         [edit_w, 30.0],
@@ -4211,33 +5420,33 @@ impl FastTube {
                     ui.add_enabled_ui(!picking, |ui| {
                         if pill_choice_button(ui, "Escolher...", false, palette).clicked() {
                             let initial = PathBuf::from(self.backup.path_text.trim());
-                            let (tx, rx) = mpsc::channel();
-                            self.settings.backup_picker_rx = Some(rx);
-                            let ctx_clone = ctx.clone();
-                            std::thread::spawn(move || {
-                                let res = settings::pick_json_file_dialog(
-                                    false,
-                                    "Selecionar arquivo de backup",
-                                    Some(&initial),
-                                );
-                                let _ = tx.send((false, res));
-                                ctx_clone.request_repaint();
-                            });
+                            self.settings
+                                .backup_picker_task
+                                .spawn(ctx.clone(), move |_| {
+                                    (
+                                        false,
+                                        settings::pick_json_file_dialog(
+                                            false,
+                                            "Selecionar arquivo de backup",
+                                            Some(&initial),
+                                        ),
+                                    )
+                                });
                         }
                         if pill_choice_button(ui, "Salvar em...", false, palette).clicked() {
                             let initial = PathBuf::from(self.backup.path_text.trim());
-                            let (tx, rx) = mpsc::channel();
-                            self.settings.backup_picker_rx = Some(rx);
-                            let ctx_clone = ctx.clone();
-                            std::thread::spawn(move || {
-                                let res = settings::pick_json_file_dialog(
-                                    true,
-                                    "Salvar backup do FastTube",
-                                    Some(&initial),
-                                );
-                                let _ = tx.send((true, res));
-                                ctx_clone.request_repaint();
-                            });
+                            self.settings
+                                .backup_picker_task
+                                .spawn(ctx.clone(), move |_| {
+                                    (
+                                        true,
+                                        settings::pick_json_file_dialog(
+                                            true,
+                                            "Salvar backup do FastTube",
+                                            Some(&initial),
+                                        ),
+                                    )
+                                });
                         }
                     });
                 });

@@ -1,18 +1,35 @@
 //! Local history. Positions and durations are milliseconds.
 //! Callers must serialize concurrent load/save operations.
-use serde_json::{Value, json};
-use std::collections::HashSet;
+use serde::Serialize;
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
-pub const MAX_ENTRIES: usize = 200;
-const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+pub const MAX_ENTRIES: usize = 5_000;
+const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TEXT_BYTES: usize = 4096;
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileFingerprint {
+    pub modified: Option<SystemTime>,
+    pub len: u64,
+}
+
+/// Captures `(mtime, len)` metadata for fast external-change detection before saving.
+pub fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
+    let meta = fs::metadata(path).ok()?;
+    Some(FileFingerprint {
+        modified: meta.modified().ok(),
+        len: meta.len(),
+    })
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Entry {
     pub video_id: String,
     pub title: String,
@@ -20,6 +37,22 @@ pub struct Entry {
     pub position_ms: u64,
     pub duration_ms: Option<u64>,
     pub watched_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_short: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_podcast: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_music: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub view_count_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published_time_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_verified: Option<bool>,
 }
 
 pub fn is_valid_video_id(video_id: &str) -> bool {
@@ -167,6 +200,10 @@ pub fn should_resume(position_ms: u64, duration_ms: Option<u64>) -> Option<u64> 
     }
 }
 
+fn optional_text_valid(opt: &Option<String>) -> bool {
+    opt.as_ref().is_none_or(|s| s.len() <= MAX_TEXT_BYTES)
+}
+
 impl Entry {
     fn valid(&self) -> bool {
         is_valid_video_id(&self.video_id)
@@ -176,6 +213,37 @@ impl Entry {
             && self
                 .duration_ms
                 .is_none_or(|duration| duration > 0 && self.position_ms <= duration)
+            && optional_text_valid(&self.date_label)
+            && optional_text_valid(&self.view_count_text)
+            && optional_text_valid(&self.published_time_text)
+            && optional_text_valid(&self.thumbnail_url)
+    }
+
+    pub fn merge_metadata_from(&mut self, older: &Entry) {
+        if self.is_short.is_none() {
+            self.is_short = older.is_short;
+        }
+        if self.is_podcast.is_none() {
+            self.is_podcast = older.is_podcast;
+        }
+        if self.is_music.is_none() {
+            self.is_music = older.is_music;
+        }
+        if self.date_label.is_none() {
+            self.date_label = older.date_label.clone();
+        }
+        if self.view_count_text.is_none() {
+            self.view_count_text = older.view_count_text.clone();
+        }
+        if self.published_time_text.is_none() {
+            self.published_time_text = older.published_time_text.clone();
+        }
+        if self.thumbnail_url.is_none() {
+            self.thumbnail_url = older.thumbnail_url.clone();
+        }
+        if self.channel_verified.is_none() {
+            self.channel_verified = older.channel_verified;
+        }
     }
 
     pub fn resume_position_ms(&self) -> Option<u64> {
@@ -187,6 +255,9 @@ impl Entry {
     }
 
     pub fn is_short(&self) -> bool {
+        if let Some(flag) = self.is_short {
+            return flag;
+        }
         if self.duration_ms.is_some_and(|d| d > 0 && d <= 62_000) {
             return true;
         }
@@ -194,13 +265,12 @@ impl Entry {
         let channel_lower = self.channel.to_lowercase();
         title_lower.contains("#shorts")
             || title_lower.contains("#short")
-            || title_lower.contains("shorts")
             || channel_lower.contains("shorts")
     }
 
     pub fn is_podcast(&self) -> bool {
-        if self.duration_ms.is_some_and(|d| d >= 1_500_000) {
-            return true;
+        if let Some(flag) = self.is_podcast {
+            return flag;
         }
         const KEYWORDS: &[&str] = &[
             "podcast",
@@ -208,19 +278,24 @@ impl Entry {
             "entrevista",
             "episódio",
             "episodio",
-            "papo",
-            "conversa",
             "achismos",
-            "flow",
+            "flow podcast",
+            "flow #",
             "inteligência ltda",
+            "inteligencia ltda",
             "podpah",
-            "monark",
-            "debate",
+            "à deriva",
+            "a deriva",
+            "joe rogan",
+            "lex fridman",
         ];
         entry_matches_keywords(&self.title, &self.channel, KEYWORDS)
     }
 
     pub fn is_music(&self) -> bool {
+        if let Some(flag) = self.is_music {
+            return flag;
+        }
         const KEYWORDS: &[&str] = &[
             "music",
             "música",
@@ -229,6 +304,8 @@ impl Entry {
             "clipe",
             "official video",
             "live from",
+            "live at",
+            "live @",
             "vevo",
             "acoustic",
             "acústico",
@@ -244,6 +321,14 @@ impl Entry {
             "banda",
             "remix",
             "soundtrack",
+            " - topic",
+            "concert",
+            "official audio",
+            "lyric video",
+            "music video",
+            "tiny desk",
+            "mellow version",
+            "sessions",
         ];
         if entry_matches_keywords(&self.title, &self.channel, &["asmr"]) {
             return false;
@@ -273,12 +358,29 @@ pub struct RecordTickOutcome {
     pub ranking_changed: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct History {
     entries: Vec<Entry>,
+    index: HashMap<String, usize>,
 }
 
+impl PartialEq for History {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
+
+impl Eq for History {}
+
 impl History {
+    fn rebuild_index(&mut self) {
+        self.index.clear();
+        self.index.reserve(self.entries.len());
+        for (idx, entry) in self.entries.iter().enumerate() {
+            self.index.insert(entry.video_id.clone(), idx);
+        }
+    }
+
     /// Adds missing videos and keeps the larger playback progress on conflicts.
     pub fn merged(&self, imported: &History) -> (History, MergeSummary) {
         let mut merged = self.clone();
@@ -314,13 +416,19 @@ impl History {
         &self.entries
     }
     pub fn get(&self, video_id: &str) -> Option<&Entry> {
-        self.entries.iter().find(|entry| entry.video_id == video_id)
+        self.index
+            .get(video_id)
+            .and_then(|&idx| self.entries.get(idx))
+    }
+    #[allow(dead_code)]
+    pub fn contains(&self, video_id: &str) -> bool {
+        self.index.contains_key(video_id)
     }
     pub fn resume_position_ms(&self, video_id: &str) -> Option<u64> {
         self.get(video_id).and_then(Entry::resume_position_ms)
     }
     /// Replaces an existing video and moves it to the front.
-    pub fn record(&mut self, entry: Entry) -> io::Result<()> {
+    pub fn record(&mut self, mut entry: Entry) -> io::Result<()> {
         if !entry.valid() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -330,18 +438,40 @@ impl History {
         if let Some(first) = self.entries.first_mut()
             && first.video_id == entry.video_id
         {
+            entry.merge_metadata_from(first);
             *first = entry;
             return Ok(());
         }
-        self.entries.retain(|old| old.video_id != entry.video_id);
+        if let Some(&old_idx) = self.index.get(&entry.video_id) {
+            entry.merge_metadata_from(&self.entries[old_idx]);
+            self.entries[..=old_idx].rotate_right(1);
+            self.entries[0] = entry;
+            for idx in self.index.values_mut() {
+                if *idx < old_idx {
+                    *idx += 1;
+                }
+            }
+            if let Some(slot) = self.index.get_mut(&self.entries[0].video_id) {
+                *slot = 0;
+            }
+            return Ok(());
+        }
         self.entries.insert(0, entry);
-        self.entries.truncate(MAX_ENTRIES);
+        for idx in self.index.values_mut() {
+            *idx += 1;
+        }
+        self.index.insert(self.entries[0].video_id.clone(), 0);
+        if self.entries.len() > MAX_ENTRIES {
+            for evicted in self.entries.drain(MAX_ENTRIES..) {
+                self.index.remove(&evicted.video_id);
+            }
+        }
         Ok(())
     }
     /// Fast path for active playback ticks: updates the front entry in-place when
     /// `video_id` already leads history, reporting whether recommendation-relevant
     /// state changed so callers do not rebuild feed rankings every video frame.
-    pub fn record_active_tick(&mut self, entry: Entry) -> io::Result<RecordTickOutcome> {
+    pub fn record_active_tick(&mut self, mut entry: Entry) -> io::Result<RecordTickOutcome> {
         if !entry.valid() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -351,6 +481,7 @@ impl History {
         if let Some(first) = self.entries.first_mut()
             && first.video_id == entry.video_id
         {
+            entry.merge_metadata_from(first);
             if *first == entry {
                 return Ok(RecordTickOutcome {
                     changed: false,
@@ -374,17 +505,202 @@ impl History {
             ranking_changed: true,
         })
     }
+
+    pub fn merge_remote_entries_ordered(
+        &mut self,
+        remote_entries: &[Entry],
+        prioritize_front: bool,
+    ) {
+        if remote_entries.is_empty() {
+            return;
+        }
+
+        let combine = |local: Option<&Entry>, remote: &Entry| -> Option<Entry> {
+            let mut combined = if let Some(local) = local {
+                let local_ts = local.watched_at_ms.unwrap_or(0);
+                let remote_ts = remote.watched_at_ms.unwrap_or(0);
+                let duration_ms = match (remote.duration_ms, local.duration_ms) {
+                    (Some(r), _) if r > 0 => Some(r),
+                    (None, Some(l)) if l > 0 => Some(l),
+                    _ => None,
+                };
+                let mut position_ms = if local_ts > remote_ts {
+                    local.position_ms
+                } else {
+                    local.position_ms.max(remote.position_ms)
+                };
+                if let Some(dur) = duration_ms {
+                    position_ms = position_ms.min(dur);
+                }
+                let title = if remote.title.trim().is_empty() {
+                    local.title.clone()
+                } else {
+                    remote.title.clone()
+                };
+                let channel = if remote.channel.trim().is_empty() {
+                    local.channel.clone()
+                } else {
+                    remote.channel.clone()
+                };
+                Entry {
+                    video_id: remote.video_id.clone(),
+                    title,
+                    channel,
+                    position_ms,
+                    duration_ms,
+                    watched_at_ms: match (local.watched_at_ms, remote.watched_at_ms) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (a, b) => a.or(b),
+                    },
+                    is_short: remote.is_short.or(local.is_short),
+                    is_podcast: remote.is_podcast.or(local.is_podcast),
+                    is_music: remote.is_music.or(local.is_music),
+                    date_label: remote
+                        .date_label
+                        .clone()
+                        .or_else(|| local.date_label.clone()),
+                    view_count_text: remote
+                        .view_count_text
+                        .clone()
+                        .or_else(|| local.view_count_text.clone()),
+                    published_time_text: remote
+                        .published_time_text
+                        .clone()
+                        .or_else(|| local.published_time_text.clone()),
+                    thumbnail_url: remote
+                        .thumbnail_url
+                        .clone()
+                        .or_else(|| local.thumbnail_url.clone()),
+                    channel_verified: remote.channel_verified.or(local.channel_verified),
+                }
+            } else {
+                remote.clone()
+            };
+            if let Some(dur) = combined.duration_ms
+                && combined.position_ms > dur
+            {
+                combined.position_ms = dur;
+            }
+            combined.valid().then_some(combined)
+        };
+
+        if !prioritize_front {
+            let mut new_tail = Vec::new();
+            let mut seen_new: HashSet<&str> = HashSet::new();
+            for remote in remote_entries {
+                if let Some(&idx) = self.index.get(&remote.video_id) {
+                    if let Some(updated) = combine(Some(&self.entries[idx]), remote) {
+                        self.entries[idx] = updated;
+                    }
+                } else if seen_new.insert(remote.video_id.as_str())
+                    && let Some(added) = combine(None, remote)
+                {
+                    new_tail.push(added);
+                }
+            }
+            for added in new_tail {
+                if self.entries.len() >= MAX_ENTRIES {
+                    break;
+                }
+                let idx = self.entries.len();
+                self.index.insert(added.video_id.clone(), idx);
+                self.entries.push(added);
+            }
+            return;
+        }
+
+        let remote_max_ts = remote_entries
+            .iter()
+            .filter_map(|e| e.watched_at_ms)
+            .max()
+            .unwrap_or(0);
+        let mut remote_merged = Vec::with_capacity(remote_entries.len());
+        let mut remote_ids: HashSet<&str> = HashSet::with_capacity(remote_entries.len());
+        for remote in remote_entries {
+            if !remote_ids.insert(remote.video_id.as_str()) {
+                continue;
+            }
+            let local = self
+                .index
+                .get(&remote.video_id)
+                .and_then(|&idx| self.entries.get(idx));
+            if let Some(combined) = combine(local, remote) {
+                remote_merged.push(combined);
+            }
+        }
+
+        let mut newer_locals = Vec::new();
+        let mut older_locals = Vec::new();
+        for existing in self.entries.drain(..) {
+            if remote_ids.contains(existing.video_id.as_str()) {
+                continue;
+            }
+            if existing.watched_at_ms.is_some_and(|ts| ts > remote_max_ts) {
+                newer_locals.push(existing);
+            } else {
+                older_locals.push(existing);
+            }
+        }
+        self.entries = newer_locals;
+        self.entries.extend(remote_merged);
+        self.entries.extend(older_locals);
+        self.entries.truncate(MAX_ENTRIES);
+        self.rebuild_index();
+    }
+
+    pub fn apply_remote_category_membership(
+        &mut self,
+        filter: HistoryFilter,
+        member_ids: &HashSet<String>,
+        complete: bool,
+    ) {
+        for entry in &mut self.entries {
+            let in_set = member_ids.contains(&entry.video_id);
+            match filter {
+                HistoryFilter::Shorts => {
+                    if in_set {
+                        entry.is_short = Some(true);
+                    } else if complete && entry.date_label.is_some() {
+                        entry.is_short = Some(false);
+                    }
+                }
+                HistoryFilter::Podcasts => {
+                    if in_set {
+                        entry.is_podcast = Some(true);
+                    } else if complete && entry.date_label.is_some() {
+                        entry.is_podcast = Some(false);
+                    }
+                }
+                HistoryFilter::Music => {
+                    if in_set {
+                        entry.is_music = Some(true);
+                    } else if complete && entry.date_label.is_some() {
+                        entry.is_music = Some(false);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     pub fn remove(&mut self, video_id: &str) -> bool {
-        let previous = self.entries.len();
-        self.entries.retain(|entry| entry.video_id != video_id);
-        previous != self.entries.len()
+        let Some(idx) = self.index.remove(video_id) else {
+            return false;
+        };
+        self.entries.remove(idx);
+        for slot in self.index.values_mut() {
+            if *slot > idx {
+                *slot -= 1;
+            }
+        }
+        true
     }
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.index.clear();
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum HistoryFilter {
     #[default]
     All,
@@ -609,7 +925,7 @@ pub fn load(path: &Path) -> io::Result<History> {
         return Err(invalid_data());
     }
     let mut entries = Vec::with_capacity(values.len());
-    let mut seen = HashSet::new();
+    let mut index = HashMap::with_capacity(values.len());
     for value in values {
         let text = |key| {
             value
@@ -617,6 +933,20 @@ pub fn load(path: &Path) -> io::Result<History> {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .ok_or_else(invalid_data)
+        };
+        let opt_text = |key| -> io::Result<Option<String>> {
+            match value.get(key) {
+                Some(Value::Null) | None => Ok(None),
+                Some(Value::String(s)) => Ok(Some(s.clone())),
+                Some(_) => Err(invalid_data()),
+            }
+        };
+        let opt_bool = |key| -> io::Result<Option<bool>> {
+            match value.get(key) {
+                Some(Value::Null) | None => Ok(None),
+                Some(Value::Bool(b)) => Ok(Some(*b)),
+                Some(_) => Err(invalid_data()),
+            }
         };
         let duration_ms = match value.get("duration_ms") {
             Some(Value::Null) => None,
@@ -637,40 +967,84 @@ pub fn load(path: &Path) -> io::Result<History> {
                 .ok_or_else(invalid_data)?,
             duration_ms,
             watched_at_ms,
+            is_short: opt_bool("is_short")?,
+            is_podcast: opt_bool("is_podcast")?,
+            is_music: opt_bool("is_music")?,
+            date_label: opt_text("date_label")?,
+            view_count_text: opt_text("view_count_text")?,
+            published_time_text: opt_text("published_time_text")?,
+            thumbnail_url: opt_text("thumbnail_url")?,
+            channel_verified: opt_bool("channel_verified")?,
         };
-        if !entry.valid() || !seen.insert(entry.video_id.clone()) {
+        let idx = entries.len();
+        if !entry.valid() || index.contains_key(&entry.video_id) {
             return Err(invalid_data());
         }
+        index.insert(entry.video_id.clone(), idx);
         entries.push(entry);
     }
-    Ok(History { entries })
+    Ok(History { entries, index })
+}
+
+#[allow(dead_code)]
+pub fn load_with_fingerprint(path: &Path) -> io::Result<(History, Option<FileFingerprint>)> {
+    let history = load(path)?;
+    Ok((history, file_fingerprint(path)))
+}
+
+/// Validates the on-disk history file only when its `(mtime, len)` fingerprint
+/// changed since the last known-good load/save, preserving corrupt files without
+/// full re-parsing on routine saves.
+#[allow(dead_code)]
+pub fn validate_disk_if_changed(path: &Path, expected: Option<FileFingerprint>) -> io::Result<()> {
+    let current = file_fingerprint(path);
+    if current == expected {
+        return Ok(());
+    }
+    if current.is_some() {
+        load(path)?;
+    }
+    Ok(())
 }
 
 fn invalid_data() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid local video history")
 }
 
-/// Syncs a temporary file alongside the destination before replacing it.
-pub fn save(path: &Path, history: &History) -> io::Result<()> {
-    let entries: Vec<Value> = history
-        .entries
-        .iter()
-        .map(|entry| {
-            json!({
-                "video_id": entry.video_id, "title": entry.title, "channel": entry.channel,
-                "position_ms": entry.position_ms, "duration_ms": entry.duration_ms,
-                "watched_at_ms": entry.watched_at_ms,
-            })
-        })
-        .collect();
-    let bytes = serde_json::to_vec(&json!({ "version": 1, "entries": entries }))?;
+/// Serializes history directly via `Entry`'s `Serialize` impl without an
+/// intermediate `serde_json::Value` DOM or per-entry string clones.
+pub fn serialize_bytes(history: &History) -> io::Result<Vec<u8>> {
+    #[derive(Serialize)]
+    struct HistoryFile<'a> {
+        version: u8,
+        entries: &'a [Entry],
+    }
+    let bytes = serde_json::to_vec(&HistoryFile {
+        version: 1,
+        entries: &history.entries,
+    })?;
     if bytes.len() as u64 > MAX_FILE_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "history exceeds file size limit",
         ));
     }
+    Ok(bytes)
+}
+
+/// Syncs a temporary file alongside the destination before replacing it.
+pub fn save(path: &Path, history: &History) -> io::Result<()> {
+    let bytes = serialize_bytes(history)?;
     write_atomic(path, &bytes)
+}
+
+#[allow(dead_code)]
+pub fn save_with_fingerprint(
+    path: &Path,
+    history: &History,
+) -> io::Result<Option<FileFingerprint>> {
+    save(path, history)?;
+    Ok(file_fingerprint(path))
 }
 
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -733,6 +1107,7 @@ fn replace(source: &Path, destination: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     fn entry(number: usize) -> Entry {
         Entry {
             video_id: format!("{number:011}"),
@@ -741,6 +1116,7 @@ mod tests {
             position_ms: 12,
             duration_ms: Some(100),
             watched_at_ms: None,
+            ..Default::default()
         }
     }
     fn test_path() -> PathBuf {
@@ -967,6 +1343,7 @@ mod tests {
                 position_ms: 98,
                 duration_ms: Some(100),
                 watched_at_ms: Some(now),
+                ..Default::default()
             },
             Entry {
                 video_id: "bbbbbbbbbbb".into(),
@@ -975,6 +1352,7 @@ mod tests {
                 position_ms: 40,
                 duration_ms: Some(100),
                 watched_at_ms: Some(now - DAY),
+                ..Default::default()
             },
             Entry {
                 video_id: "ccccccccccc".into(),
@@ -983,6 +1361,7 @@ mod tests {
                 position_ms: 99,
                 duration_ms: Some(100),
                 watched_at_ms: Some(now - 3 * DAY),
+                ..Default::default()
             },
             Entry {
                 video_id: "ddddddddddd".into(),
@@ -991,6 +1370,7 @@ mod tests {
                 position_ms: 10,
                 duration_ms: Some(100),
                 watched_at_ms: None,
+                ..Default::default()
             },
         ];
 
@@ -1020,6 +1400,7 @@ mod tests {
                 position_ms: 120_000,
                 duration_ms: Some(600_000),
                 watched_at_ms: Some(now),
+                ..Default::default()
             },
             Entry {
                 video_id: "22222222222".into(),
@@ -1028,6 +1409,7 @@ mod tests {
                 position_ms: 15_000,
                 duration_ms: Some(30_000),
                 watched_at_ms: Some(now),
+                ..Default::default()
             },
             Entry {
                 video_id: "33333333333".into(),
@@ -1036,6 +1418,7 @@ mod tests {
                 position_ms: 400_000,
                 duration_ms: Some(2_400_000),
                 watched_at_ms: Some(now),
+                ..Default::default()
             },
             Entry {
                 video_id: "44444444444".into(),
@@ -1044,6 +1427,7 @@ mod tests {
                 position_ms: 90_000,
                 duration_ms: Some(210_000),
                 watched_at_ms: Some(now),
+                ..Default::default()
             },
             Entry {
                 video_id: "55555555555".into(),
@@ -1052,6 +1436,7 @@ mod tests {
                 position_ms: 300_000,
                 duration_ms: Some(660_000),
                 watched_at_ms: Some(now),
+                ..Default::default()
             },
         ];
         assert_eq!(
@@ -1076,5 +1461,261 @@ mod tests {
         assert_eq!(stats.completed_count, 2);
         assert_eq!(stats.top_channels[0], ("Canal A".into(), 2));
         assert_eq!(stats.top_channels.len(), 3);
+    }
+
+    #[test]
+    fn long_gameplay_videos_are_not_misclassified_as_podcasts_and_explicit_flags_override() {
+        let gta_1 = Entry {
+            video_id: "gta00000001".into(),
+            title: "GTA 6 É INCRÍVEL".into(),
+            channel: "pescocofino".into(),
+            position_ms: 1_900_000,
+            duration_ms: Some(2_014_000), // 33:34
+            ..Default::default()
+        };
+        let gta_2 = Entry {
+            video_id: "gta00000002".into(),
+            title: "GTA 6 - #12: O Último Rolê".into(),
+            channel: "Funky Black Cat".into(),
+            position_ms: 300_000,
+            duration_ms: Some(2_813_000), // 46:53
+            ..Default::default()
+        };
+        let gta_3 = Entry {
+            video_id: "gta00000003".into(),
+            title: "GTA 6 - #11: Essa missão foi uma PORCARIA".into(),
+            channel: "Funky Black Cat".into(),
+            position_ms: 1_200_000,
+            duration_ms: Some(5_848_000), // 1:37:28
+            ..Default::default()
+        };
+        assert!(!gta_1.is_podcast());
+        assert!(!gta_2.is_podcast());
+        assert!(!gta_3.is_podcast());
+
+        let flow_podcast = Entry {
+            video_id: "flow0000001".into(),
+            title: "RAUL SENA [INVESTIDOR SARDINHA] - Flow #673".into(),
+            channel: "Flow Podcast".into(),
+            position_ms: 60_000,
+            duration_ms: Some(7_200_000),
+            ..Default::default()
+        };
+        assert!(flow_podcast.is_podcast());
+
+        let explicit_override = Entry {
+            video_id: "ovrd0000001".into(),
+            title: "Podcast title that is actually not a podcast".into(),
+            channel: "Music Channel".into(),
+            position_ms: 30_000,
+            duration_ms: Some(200_000),
+            is_short: Some(true),
+            is_podcast: Some(false),
+            is_music: Some(true),
+            ..Default::default()
+        };
+        assert!(explicit_override.is_short());
+        assert!(!explicit_override.is_podcast());
+        assert!(explicit_override.is_music());
+    }
+
+    #[test]
+    fn roundtrips_v1_metadata_and_merges_remote_categories() {
+        let path = test_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut history = History::default();
+        let mut rich = entry(1);
+        rich.is_short = Some(false);
+        rich.is_podcast = Some(true);
+        rich.is_music = Some(false);
+        rich.date_label = Some("Quinta-feira".into());
+        rich.view_count_text = Some("383 mil".into());
+        rich.thumbnail_url = Some("https://i.ytimg.com/vi/00000000001/hqdefault.jpg".into());
+        rich.channel_verified = Some(true);
+        history.record(rich.clone()).unwrap();
+        save(&path, &history).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.entries()[0], rich);
+
+        // Recording a playback tick preserves synced metadata.
+        let mut tick = entry(1);
+        tick.position_ms = 55;
+        let outcome = history.record_active_tick(tick).unwrap();
+        assert!(outcome.changed);
+        assert_eq!(history.entries()[0].is_podcast, Some(true));
+        assert_eq!(
+            history.entries()[0].view_count_text.as_deref(),
+            Some("383 mil")
+        );
+        assert_eq!(history.entries()[0].channel_verified, Some(true));
+
+        // Merge remote entries and apply category membership.
+        let mut remote_2 = entry(2);
+        remote_2.watched_at_ms = Some(100);
+        remote_2.date_label = Some("Hoje".into());
+        let mut remote_3 = entry(3);
+        remote_3.watched_at_ms = Some(90);
+        remote_3.date_label = Some("Ontem".into());
+        history.merge_remote_entries_ordered(&[remote_2.clone(), remote_3.clone()], true);
+        assert_eq!(history.entries()[0].video_id, remote_2.video_id);
+
+        let mut shorts = HashSet::new();
+        shorts.insert(remote_3.video_id.clone());
+        history.apply_remote_category_membership(HistoryFilter::Shorts, &shorts, true);
+        assert_eq!(
+            history.get(&remote_3.video_id).unwrap().is_short,
+            Some(true)
+        );
+        assert_eq!(
+            history.get(&remote_2.video_id).unwrap().is_short,
+            Some(false)
+        );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn history_index_stays_consistent_across_record_remove_clear_and_remote_merge() {
+        let mut history = History::default();
+        for i in 1..=5 {
+            let mut e = entry(i);
+            e.watched_at_ms = Some((i as u64) * 1_000);
+            history.record(e).unwrap();
+        }
+        assert_eq!(history.entries().len(), 5);
+        for (pos, item) in history.entries().iter().enumerate() {
+            assert_eq!(history.get(&item.video_id), Some(item));
+            assert!(history.contains(&item.video_id));
+            assert_eq!(history.index.get(&item.video_id), Some(&pos));
+        }
+
+        // Re-recording an existing middle entry rotates it to front and updates index slots.
+        let mut promoted = entry(2);
+        promoted.position_ms = 55;
+        promoted.watched_at_ms = Some(9_000);
+        history.record(promoted.clone()).unwrap();
+        assert_eq!(history.entries()[0].video_id, promoted.video_id);
+        assert_eq!(history.get(&promoted.video_id).unwrap().position_ms, 55);
+        for (pos, item) in history.entries().iter().enumerate() {
+            assert_eq!(history.index.get(&item.video_id), Some(&pos));
+        }
+
+        // Tail merge (!prioritize_front) updates existing entries in place and appends new ones.
+        let mut existing_update = entry(4);
+        existing_update.position_ms = 77;
+        existing_update.watched_at_ms = Some(8_000);
+        let mut tail_new = entry(6);
+        tail_new.watched_at_ms = Some(500);
+        history.merge_remote_entries_ordered(&[existing_update, tail_new.clone()], false);
+        assert_eq!(history.get(&entry(4).video_id).unwrap().position_ms, 77);
+        assert_eq!(
+            history.get(&tail_new.video_id).unwrap().video_id,
+            tail_new.video_id
+        );
+        for (pos, item) in history.entries().iter().enumerate() {
+            assert_eq!(history.index.get(&item.video_id), Some(&pos));
+        }
+
+        // Front merge (prioritize_front) rebuilds index accurately.
+        let mut front_new = entry(7);
+        front_new.watched_at_ms = Some(10_000);
+        history.merge_remote_entries_ordered(&[front_new.clone()], true);
+        assert_eq!(history.entries()[0].video_id, front_new.video_id);
+        for (pos, item) in history.entries().iter().enumerate() {
+            assert_eq!(history.index.get(&item.video_id), Some(&pos));
+        }
+
+        // Removing middle entry decrements trailing index entries accurately.
+        assert!(history.remove(&entry(3).video_id));
+        assert!(!history.contains(&entry(3).video_id));
+        assert!(history.get(&entry(3).video_id).is_none());
+        for (pos, item) in history.entries().iter().enumerate() {
+            assert_eq!(history.index.get(&item.video_id), Some(&pos));
+        }
+
+        history.clear();
+        assert!(history.index.is_empty());
+        assert!(history.get(&front_new.video_id).is_none());
+    }
+
+    #[test]
+    fn entry_direct_serialize_matches_v1_schema_and_omits_none_optional_fields() {
+        let mut history = History::default();
+        let plain = entry(1);
+        history.record(plain.clone()).unwrap();
+        let bytes = serialize_bytes(&history).unwrap();
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["version"], 1);
+        let first = &parsed["entries"][0];
+        assert_eq!(first["video_id"], plain.video_id);
+        assert_eq!(first["position_ms"], 12);
+        assert_eq!(first["duration_ms"], 100);
+        assert!(first.get("watched_at_ms").is_some());
+        assert!(first["watched_at_ms"].is_null());
+        for optional_key in [
+            "is_short",
+            "is_podcast",
+            "is_music",
+            "date_label",
+            "view_count_text",
+            "published_time_text",
+            "thumbnail_url",
+            "channel_verified",
+        ] {
+            assert!(
+                first.get(optional_key).is_none(),
+                "expected {optional_key} to be omitted when None"
+            );
+        }
+    }
+
+    #[test]
+    fn file_fingerprint_detects_external_corruption_and_skips_unchanged_files() {
+        let path = test_path();
+        assert_eq!(file_fingerprint(&path), None);
+        assert!(validate_disk_if_changed(&path, None).is_ok());
+
+        let mut history = History::default();
+        history.record(entry(1)).unwrap();
+        let fp = save_with_fingerprint(&path, &history).unwrap();
+        assert!(fp.is_some());
+
+        // Matching fingerprint passes fast-path without error.
+        assert!(validate_disk_if_changed(&path, fp).is_ok());
+
+        // External corruption changes fingerprint and triggers InvalidData.
+        fs::write(&path, b"corrupt-json").unwrap();
+        let err = validate_disk_if_changed(&path, fp).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&path).unwrap(), b"corrupt-json");
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn published_time_text_roundtrips_and_loads_legacy_entries() {
+        let path = test_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // Legacy JSON lacking `published_time_text` loads cleanly.
+        fs::write(
+            &path,
+            r#"{"version":1,"entries":[{"video_id":"00000000009","title":"Legacy","channel":"Chan","position_ms":10,"duration_ms":100}]}"#,
+        )
+        .unwrap();
+        let legacy = load(&path).unwrap();
+        assert_eq!(legacy.entries()[0].published_time_text, None);
+
+        let mut history = History::default();
+        let mut with_date = entry(10);
+        with_date.published_time_text = Some("há 3 dias".into());
+        history.record(with_date.clone()).unwrap();
+        save(&path, &history).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(
+            loaded.entries()[0].published_time_text.as_deref(),
+            Some("há 3 dias")
+        );
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }

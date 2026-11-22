@@ -1,22 +1,24 @@
 <#
 .SYNOPSIS
-    Mede de forma nao intrusiva um processo existente no Windows (memoria privada/residente, CPU e GPU).
+    Non-intrusively measures a running Windows process and its child process tree (RAM, CPU, and GPU).
 
 .DESCRIPTION
-    Coleta amostras periodicas de um processo em execucao (por padrao `fasttube`) sem interrompe-lo,
-    reinicia-lo ou modificar executaveis em disco.
+    Collects periodic samples from an existing process (default: `fasttube`) without interrupting,
+    restarting, or modifying executables on disk.
 
-    Metricas coletadas por amostra e resumidas (Min, Media, Mediana, P95, Max, Ultima):
-    - Memoria privada residente (WorkingSetPrivate via WMI/CIM PerfProc, equivalente ao Gerenciador de Tarefas)
-    - Memoria residente total (WorkingSet64) e Pico de Working Set (PeakWorkingSet64)
-    - Memoria privada comitada (PrivateMemorySize64 / Private Bytes)
-    - CPU (% total da maquina normalizado pelos nucleos logicos, % equivalente a 1 nucleo, User/Kernel, Threads, Handles)
-    - GPU quando disponivel via contadores WDDM (utilizacao total, 3D/Compute, Video Decode/Codec, Copy, VRAM dedicada e compartilhada)
-    - Subprocessos filhos ativos durante a amostra (ex.: `yt-dlp.exe`)
+    Metrics collected per sample and summarized (Min, Avg, Median, P95, Max, Last):
+    - Resident private memory (WorkingSetPrivate via WMI/CIM PerfProc, matching Task Manager)
+    - Total resident memory (WorkingSet64) and peak working set (PeakWorkingSet64)
+    - Committed private memory (PrivateMemorySize64 / Private Bytes)
+    - CPU (% total machine normalized by logical cores, % single-core equivalent, User/Kernel, Threads, Handles)
+    - GPU utilization when available via WDDM counters (total, 3D/Compute, Video Decode/Codec, Copy, Dedicated/Shared VRAM)
+    - Full recursive child process-tree aggregation (ChildProcessCount, TreeCpuPercent, TreeWorkingSetMB,
+      TreePrivateMB, TreeWorkingSetPrivateMB, TreeGpuPercent) covering helper processes such as
+      `yt-dlp.exe`, `ffmpeg.exe`, or multi-process browser workers.
 
-    Como o FastTube nao expoe telemetria externa do estado interno da UI/player, o cenario
-    (`ocioso`, `pausado`, `reproducao`, `pesquisa`, `nao-informado`, etc.) deve ser informado
-    manualmente pelo operador via `-Scenario` (ou `-PromptScenario`).
+    Dot-sourcing this script (`. .\scripts\measure-process.ps1`) loads the pure helper functions
+    (`Get-ProcessTreePids`, `Aggregate-ProcessTreeSample`, `Parse-GpuEngineUtilization`, `Get-MetricStats`)
+    without executing a live measurement.
 #>
 [CmdletBinding()]
 param(
@@ -47,6 +49,9 @@ param(
 
     [Parameter(Mandatory = $false)]
     [bool]$IncludeChildren = $true,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$IncludeChildProcesses,
 
     [Parameter(Mandatory = $false)]
     [switch]$AggregateMatchingProcesses,
@@ -88,12 +93,37 @@ function ConvertTo-MiB {
     return [math]::Round(([double]$Bytes / 1MB), 2)
 }
 
+function Get-ObjectPropertyValue {
+    param(
+        [Parameter(Mandatory = $true)]$Object,
+        [Parameter(Mandatory = $true)][string[]]$Names,
+        [Parameter(Mandatory = $false)]$DefaultValue = $null
+    )
+    if ($null -eq $Object) { return $DefaultValue }
+    if ($Object -is [System.Collections.IDictionary]) {
+        foreach ($name in $Names) {
+            if ($Object.Contains($name)) {
+                return $Object[$name]
+            }
+        }
+        return $DefaultValue
+    }
+    foreach ($name in $Names) {
+        $prop = $Object.PSObject.Properties[$name]
+        if ($null -ne $prop) {
+            return $prop.Value
+        }
+    }
+    return $DefaultValue
+}
+
 function Get-MetricStats {
     param(
         [Parameter(Mandatory = $false)]
+        [AllowNull()]
         [object[]]$Values
     )
-    $valid = @($Values | Where-Object { $null -ne $_ -and -not [double]::IsNaN($_) })
+    $valid = @($Values | Where-Object { $null -ne $_ -and -not [double]::IsNaN([double]$_) })
     if ($valid.Count -eq 0) {
         return [PSCustomObject]@{
             Count  = 0
@@ -105,7 +135,7 @@ function Get-MetricStats {
             Last   = $null
         }
     }
-    $sorted = @($valid | Sort-Object)
+    $sorted = @($valid | ForEach-Object { [double]$_ } | Sort-Object)
     $count = $sorted.Count
     $sum = ($sorted | Measure-Object -Sum).Sum
     $avg = $sum / $count
@@ -133,47 +163,374 @@ function Get-MetricStats {
     }
 }
 
+function Get-ProcessTreePids {
+    <#
+    .SYNOPSIS
+        Recursively resolves all PIDs in a process tree from a (ProcessId, ParentProcessId) table.
+    .DESCRIPTION
+        Uses breadth-first traversal with a visited set to prevent infinite loops caused by
+        Windows PID reuse or malformed parent cycles.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [int[]]$RootPids,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$ProcessTable,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$DescendantsOnly
+    )
+
+    $childrenByParent = [System.Collections.Generic.Dictionary[int, System.Collections.Generic.List[int]]]::new()
+    foreach ($entry in @($ProcessTable)) {
+        if ($null -eq $entry) { continue }
+        $rawPid = Get-ObjectPropertyValue -Object $entry -Names @('ProcessId', 'Id')
+        $rawParent = Get-ObjectPropertyValue -Object $entry -Names @('ParentProcessId')
+        if ($null -eq $rawPid -or $null -eq $rawParent) { continue }
+
+        $entryPid = [int]$rawPid
+        $parentPid = [int]$rawParent
+        if ($entryPid -le 0 -or $entryPid -eq $parentPid) { continue }
+
+        if (-not $childrenByParent.ContainsKey($parentPid)) {
+            $childrenByParent[$parentPid] = [System.Collections.Generic.List[int]]::new()
+        }
+        $childrenByParent[$parentPid].Add($entryPid)
+    }
+
+    $visited = [System.Collections.Generic.HashSet[int]]::new()
+    $queue = [System.Collections.Generic.Queue[int]]::new()
+    $result = [System.Collections.Generic.List[int]]::new()
+
+    foreach ($rootPid in $RootPids) {
+        if ($rootPid -le 0) { continue }
+        if ($visited.Add($rootPid)) {
+            $queue.Enqueue($rootPid)
+            if (-not $DescendantsOnly) {
+                $result.Add($rootPid)
+            }
+        }
+    }
+
+    while ($queue.Count -gt 0) {
+        $current = $queue.Dequeue()
+        if ($childrenByParent.ContainsKey($current)) {
+            foreach ($childPid in $childrenByParent[$current]) {
+                if ($visited.Add($childPid)) {
+                    $result.Add($childPid)
+                    $queue.Enqueue($childPid)
+                }
+            }
+        }
+    }
+
+    return @($result.ToArray())
+}
+
+function Aggregate-ProcessTreeSample {
+    <#
+    .SYNOPSIS
+        Aggregates CPU, memory, process counts, and child process names across root and descendant snapshots.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [int[]]$RootPids,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$ProcessSnapshots,
+
+        [Parameter(Mandatory = $false)]
+        [hashtable]$PreviousCpuSeconds = @{},
+
+        [Parameter(Mandatory = $false)]
+        [double]$DeltaWallSeconds = 1.0,
+
+        [Parameter(Mandatory = $false)]
+        [int]$LogicalProcessors = [Environment]::ProcessorCount
+    )
+
+    $safeWallSec = [math]::Max(0.001, $DeltaWallSeconds)
+    $safeCores = [math]::Max(1, $LogicalProcessors)
+
+    $rootSet = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($rootPid in $RootPids) {
+        [void]$rootSet.Add($rootPid)
+    }
+
+    $seenPids = [System.Collections.Generic.HashSet[int]]::new()
+    $nextCpuMap = @{}
+    if ($null -ne $PreviousCpuSeconds) {
+        foreach ($key in $PreviousCpuSeconds.Keys) {
+            $nextCpuMap[[int]$key] = [double]$PreviousCpuSeconds[$key]
+        }
+    }
+
+    $rootCount = 0
+    $childCount = 0
+    $childNames = [System.Collections.Generic.List[string]]::new()
+
+    $rootWsBytes = [int64]0
+    $rootPrivateBytes = [int64]0
+    $rootWspBytes = [int64]0
+    $rootWspSeen = $false
+    $rootCpuSec = 0.0
+    $rootDeltaCpuSec = 0.0
+
+    $childWsBytes = [int64]0
+    $childPrivateBytes = [int64]0
+    $childWspBytes = [int64]0
+    $childWspSeen = $false
+    $childCpuSec = 0.0
+    $childDeltaCpuSec = 0.0
+
+    foreach ($snap in @($ProcessSnapshots)) {
+        if ($null -eq $snap) { continue }
+        $rawPid = Get-ObjectPropertyValue -Object $snap -Names @('ProcessId', 'Id')
+        if ($null -eq $rawPid) { continue }
+        $procId = [int]$rawPid
+        if (-not $seenPids.Add($procId)) { continue }
+
+        $procName = [string](Get-ObjectPropertyValue -Object $snap -Names @('ProcessName', 'Name') -DefaultValue "pid_$procId")
+        $wsBytes = [int64](Get-ObjectPropertyValue -Object $snap -Names @('WorkingSetBytes', 'WorkingSet64') -DefaultValue 0)
+        $privBytes = [int64](Get-ObjectPropertyValue -Object $snap -Names @('PrivateBytes', 'PrivateMemorySize64') -DefaultValue 0)
+        $wspRaw = Get-ObjectPropertyValue -Object $snap -Names @('WorkingSetPrivateBytes', 'WorkingSetPrivate') -DefaultValue $null
+        $cpuSec = [double](Get-ObjectPropertyValue -Object $snap -Names @('TotalProcessorTimeSeconds', 'CpuSeconds') -DefaultValue 0.0)
+        $isNewChild = [bool](Get-ObjectPropertyValue -Object $snap -Names @('IsNewChild') -DefaultValue $false)
+
+        $deltaCpu = 0.0
+        if ($null -ne $PreviousCpuSeconds -and $PreviousCpuSeconds.ContainsKey($procId)) {
+            $deltaCpu = [math]::Max(0.0, ($cpuSec - [double]$PreviousCpuSeconds[$procId]))
+        } elseif ($isNewChild -and -not $rootSet.Contains($procId)) {
+            # Capture CPU burned by short-lived children spawned after the previous sample, bounded by wall interval.
+            $deltaCpu = [math]::Min([math]::Max(0.0, $cpuSec), ($safeWallSec * $safeCores))
+        }
+        $nextCpuMap[$procId] = $cpuSec
+
+        if ($rootSet.Contains($procId)) {
+            $rootCount++
+            $rootWsBytes += $wsBytes
+            $rootPrivateBytes += $privBytes
+            $rootCpuSec += $cpuSec
+            $rootDeltaCpuSec += $deltaCpu
+            if ($null -ne $wspRaw) {
+                $rootWspBytes += [int64]$wspRaw
+                $rootWspSeen = $true
+            }
+        } else {
+            $childCount++
+            $childNames.Add("$procName#$procId")
+            $childWsBytes += $wsBytes
+            $childPrivateBytes += $privBytes
+            $childCpuSec += $cpuSec
+            $childDeltaCpuSec += $deltaCpu
+            if ($null -ne $wspRaw) {
+                $childWspBytes += [int64]$wspRaw
+                $childWspSeen = $true
+            }
+        }
+    }
+
+    $treeWsBytes = $rootWsBytes + $childWsBytes
+    $treePrivateBytes = $rootPrivateBytes + $childPrivateBytes
+    $treeWspBytes = if ($rootWspSeen -or $childWspSeen) { $rootWspBytes + $childWspBytes } else { $null }
+    $treeCpuSec = $rootCpuSec + $childCpuSec
+    $treeDeltaCpuSec = $rootDeltaCpuSec + $childDeltaCpuSec
+
+    $treeCpuSingleCorePct = [math]::Round(($treeDeltaCpuSec / $safeWallSec) * 100.0, 2)
+    $treeCpuPct = [math]::Round((($treeDeltaCpuSec / $safeWallSec) / $safeCores) * 100.0, 2)
+    $childCpuPct = [math]::Round((($childDeltaCpuSec / $safeWallSec) / $safeCores) * 100.0, 2)
+
+    return [PSCustomObject]@{
+        RootProcessCount            = $rootCount
+        ChildProcessCount           = $childCount
+        TreeProcessCount            = $rootCount + $childCount
+        ChildProcessNames           = @($childNames.ToArray())
+        RootWorkingSetBytes         = $rootWsBytes
+        RootPrivateBytes            = $rootPrivateBytes
+        RootWorkingSetPrivateBytes  = if ($rootWspSeen) { $rootWspBytes } else { $null }
+        ChildWorkingSetBytes        = $childWsBytes
+        ChildPrivateBytes           = $childPrivateBytes
+        ChildWorkingSetPrivateBytes = $childWspBytes
+        TreeWorkingSetBytes         = $treeWsBytes
+        TreeWorkingSetMB            = ConvertTo-MiB $treeWsBytes
+        TreePrivateBytes            = $treePrivateBytes
+        TreePrivateMB               = ConvertTo-MiB $treePrivateBytes
+        TreeWorkingSetPrivateBytes  = $treeWspBytes
+        TreeWorkingSetPrivateMB     = ConvertTo-MiB $treeWspBytes
+        TreeCpuSeconds              = [math]::Round($treeCpuSec, 4)
+        TreeDeltaCpuSeconds         = [math]::Round($treeDeltaCpuSec, 4)
+        TreeCpuPercent              = $treeCpuPct
+        TreeCpuSingleCorePercent    = $treeCpuSingleCorePct
+        ChildDeltaCpuSeconds        = [math]::Round($childDeltaCpuSec, 4)
+        ChildCpuPercent             = $childCpuPct
+        NextCpuSeconds              = $nextCpuMap
+    }
+}
+
+function Parse-GpuEngineUtilization {
+    <#
+    .SYNOPSIS
+        Parses Windows GPU Engine utilization samples (Get-Counter or WMI PerfFormattedData) for a PID set.
+    .DESCRIPTION
+        Extracts PID and engine type from counter paths such as
+        `\GPU Engine(pid_1234_luid_..._engtype_3D)\Utilization Percentage` or WMI instance names
+        `pid_1234_luid_..._engtype_3D`. Returns Available=$false and TotalPercent=$null gracefully
+        when counters are unavailable or no matching PID samples are present.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$CounterSamples,
+
+        [Parameter(Mandatory = $true)]
+        [int[]]$TargetPids
+    )
+
+    $emptyResult = [PSCustomObject]@{
+        Available          = $false
+        TotalPercent       = $null
+        MaxEnginePercent   = $null
+        Engine3DPercent    = $null
+        VideoCodecPercent  = $null
+        CopyPercent        = $null
+        ActiveEngines      = [PSCustomObject]@{}
+        PerPidPercent      = @{}
+        MatchedSampleCount = 0
+    }
+
+    if ($null -eq $CounterSamples -or $null -eq $TargetPids) {
+        return $emptyResult
+    }
+    $samplesList = @($CounterSamples)
+    $targetPidList = @($TargetPids)
+    if ($samplesList.Count -eq 0 -or $targetPidList.Count -eq 0) {
+        return $emptyResult
+    }
+
+    $targetSet = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($targetPid in $TargetPids) {
+        [void]$targetSet.Add($targetPid)
+    }
+
+    $totalUtil = 0.0
+    $maxUtil = 0.0
+    $util3D = 0.0
+    $utilVideo = 0.0
+    $utilCopy = 0.0
+    $activeEngines = @{}
+    $perPid = @{}
+    $matchedCount = 0
+
+    foreach ($sample in $samplesList) {
+        if ($null -eq $sample) { continue }
+
+        $rawLabel = [string](Get-ObjectPropertyValue -Object $sample -Names @('Path', 'InstanceName', 'Name') -DefaultValue '')
+        if ([string]::IsNullOrWhiteSpace($rawLabel)) { continue }
+        if ($rawLabel -notmatch 'pid_(\d+)_') { continue }
+
+        $samplePid = [int]$Matches[1]
+        if (-not $targetSet.Contains($samplePid)) { continue }
+
+        $rawValue = Get-ObjectPropertyValue -Object $sample -Names @('CookedValue', 'UtilizationPercentage', 'Value') -DefaultValue $null
+        if ($null -eq $rawValue) { continue }
+        $u = [double]$rawValue
+        if ([double]::IsNaN($u) -or [double]::IsInfinity($u)) { continue }
+        if ($u -lt 0.0) { $u = 0.0 }
+
+        $matchedCount++
+        $totalUtil += $u
+        if ($u -gt $maxUtil) { $maxUtil = $u }
+
+        if (-not $perPid.ContainsKey($samplePid)) {
+            $perPid[$samplePid] = 0.0
+        }
+        $perPid[$samplePid] += $u
+
+        $engType = if ($rawLabel -match 'engtype_([^)\\]+)') { $Matches[1] } else { $rawLabel }
+
+        if ($u -gt 0.0) {
+            if (-not $activeEngines.ContainsKey($engType)) {
+                $activeEngines[$engType] = 0.0
+            }
+            $activeEngines[$engType] = [math]::Round(($activeEngines[$engType] + $u), 2)
+        }
+
+        if ($engType -match '^(3D|Compute|Graphics)') {
+            $util3D += $u
+        } elseif ($engType -match '(Video|Codec|Decode|Encode|VPE|JPEG)') {
+            $utilVideo += $u
+        } elseif ($engType -match 'Copy') {
+            $utilCopy += $u
+        }
+    }
+
+    if ($matchedCount -eq 0) {
+        return $emptyResult
+    }
+
+    $roundedPerPid = @{}
+    foreach ($k in $perPid.Keys) {
+        $roundedPerPid[$k] = [math]::Round($perPid[$k], 2)
+    }
+
+    return [PSCustomObject]@{
+        Available          = $true
+        TotalPercent       = [math]::Round($totalUtil, 2)
+        MaxEnginePercent   = [math]::Round($maxUtil, 2)
+        Engine3DPercent    = [math]::Round($util3D, 2)
+        VideoCodecPercent  = [math]::Round($utilVideo, 2)
+        CopyPercent        = [math]::Round($utilCopy, 2)
+        ActiveEngines      = [PSCustomObject]$activeEngines
+        PerPidPercent      = $roundedPerPid
+        MatchedSampleCount = $matchedCount
+    }
+}
+
 function Get-DescendantProcessIds {
     param(
         [Parameter(Mandatory = $true)]
         [int[]]$RootPids
     )
-    $rootSet = [System.Collections.Generic.HashSet[int]]::new()
-    $visited = [System.Collections.Generic.HashSet[int]]::new()
-    $frontier = [System.Collections.Generic.List[int]]::new()
-    foreach ($id in $RootPids) {
-        [void]$rootSet.Add($id)
-        [void]$visited.Add($id)
-        $frontier.Add($id)
+    $allProcs = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name -ErrorAction SilentlyContinue)
+    if ($allProcs.Count -eq 0) {
+        return @()
     }
-    $descendants = [System.Collections.Generic.List[object]]::new()
+    $descendantPids = @(Get-ProcessTreePids -RootPids $RootPids -ProcessTable $allProcs -DescendantsOnly)
+    if ($descendantPids.Count -eq 0) {
+        return @()
+    }
+    $descSet = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($dPid in $descendantPids) {
+        [void]$descSet.Add($dPid)
+    }
+    return @($allProcs | Where-Object { $descSet.Contains([int]$_.ProcessId) })
+}
 
-    while ($frontier.Count -gt 0) {
-        $parentFilter = ($frontier | ForEach-Object { "ParentProcessId = $_" }) -join ' OR '
-        $frontier.Clear()
-        $children = @(Get-CimInstance Win32_Process -Filter $parentFilter -Property ProcessId, ParentProcessId, Name -ErrorAction SilentlyContinue)
-        foreach ($proc in $children) {
-            $childPid = [int]$proc.ProcessId
-            if (-not $visited.Contains($childPid)) {
-                [void]$visited.Add($childPid)
-                if (-not $rootSet.Contains($childPid)) {
-                    $descendants.Add($proc)
-                }
-                $frontier.Add($childPid)
-            }
-        }
-    }
-    return @($descendants)
+# Allow unit tests and wrapper scripts to dot-source pure helpers without executing a live capture.
+if ($MyInvocation.InvocationName -eq '.') {
+    return
+}
+
+$includeTree = $IncludeChildren
+if ($PSBoundParameters.ContainsKey('IncludeChildProcesses')) {
+    $includeTree = [bool]$IncludeChildProcesses
 }
 
 if ($PromptScenario) {
-    Write-Host "Selecione o cenario atual do processo antes de iniciar a coleta:" -ForegroundColor Cyan
-    Write-Host "  [1] ocioso      (janela aberta, sem video carregado)"
-    Write-Host "  [2] pausado     (video carregado e pausado)"
-    Write-Host "  [3] reproducao  (video em reproducao ativa)"
-    Write-Host "  [4] pesquisa    (pesquisa ou consulta de resolucoes em andamento)"
+    Write-Host "Select the current process scenario before starting collection:" -ForegroundColor Cyan
+    Write-Host "  [1] ocioso      (window open, no video loaded)"
+    Write-Host "  [2] pausado     (video loaded and paused)"
+    Write-Host "  [3] reproducao  (active video playback)"
+    Write-Host "  [4] pesquisa    (search or metadata resolution in progress)"
     Write-Host "  [5] nao-informado / outro"
-    $choice = Read-Host "Opcao (1-5)"
+    $choice = Read-Host "Option (1-5)"
     switch ($choice.Trim()) {
         '1' { $Scenario = 'ocioso' }
         '2' { $Scenario = 'pausado' }
@@ -198,18 +555,18 @@ if ($null -ne $ProcessId -and $ProcessId.Count -gt 0) {
     foreach ($id in $ProcessId) {
         $p = Get-Process -Id $id -ErrorAction SilentlyContinue
         if ($null -eq $p) {
-            throw "Processo com PID $id nao encontrado em execucao."
+            throw "Process with PID $id is not currently running."
         }
         $targetProcesses += $p
     }
 } else {
     $found = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue | Sort-Object Id)
     if ($found.Count -eq 0) {
-        throw "Nenhum processo com nome '$ProcessName' esta em execucao no momento."
+        throw "No running process named '$ProcessName' was found."
     }
     if ($found.Count -gt 1 -and -not $AggregateMatchingProcesses) {
         $pidList = ($found | ForEach-Object { "$($_.Id) ($($_.ProcessName))" }) -join ', '
-        throw "Multiplos processos encontrados para '$ProcessName': $pidList. Especifique -ProcessId <PID> ou use -AggregateMatchingProcesses para agregar todos."
+        throw "Multiple processes found for '$ProcessName': $pidList. Pass -ProcessId <PID> or -AggregateMatchingProcesses to aggregate all."
     }
     $targetProcesses = $found
 }
@@ -250,31 +607,53 @@ $environmentMetadata = [PSCustomObject]@{
 }
 
 if (-not $Quiet -and -not $AsJson) {
-    Write-Host "Iniciando medicao nao intrusiva..." -ForegroundColor Cyan
-    Write-Host ("  Alvo       : {0} (PID: {1})" -f $primaryProc.ProcessName, ($targetPids -join ', '))
+    Write-Host "Starting non-intrusive process measurement..." -ForegroundColor Cyan
+    Write-Host ("  Target     : {0} (PID: {1})" -f $primaryProc.ProcessName, ($targetPids -join ', '))
     if ($executablePath) {
-        Write-Host ("  Executavel : {0}" -f $executablePath)
+        Write-Host ("  Executable : {0}" -f $executablePath)
     }
-    Write-Host ("  Cenario    : {0}" -f $effectiveScenario)
-    Write-Host ("  Amostras   : {0} (intervalo: {1}s)" -f $SampleCount, $IntervalSeconds)
+    Write-Host ("  Scenario   : {0}" -f $effectiveScenario)
+    Write-Host ("  Samples    : {0} (interval: {1}s, child-tree: {2})" -f $SampleCount, $IntervalSeconds, $includeTree)
 }
 
-# Baseline CPU times for first-sample delta
+# Baseline CPU times for root targets and any already-running descendants
+$baselineTimestamp = Get-Date
 $prevCpuMap = @{}
+$prevTreeCpuSeconds = @{}
 foreach ($p in $targetProcesses) {
     $p.Refresh()
-    $prevCpuMap[[int]$p.Id] = [PSCustomObject]@{
-        TotalSec  = $p.TotalProcessorTime.TotalSeconds
+    $pIdInt = [int]$p.Id
+    $totSec = $p.TotalProcessorTime.TotalSeconds
+    $prevCpuMap[$pIdInt] = [PSCustomObject]@{
+        TotalSec  = $totSec
         UserSec   = $p.UserProcessorTime.TotalSeconds
         KernelSec = $p.PrivilegedProcessorTime.TotalSeconds
     }
+    $prevTreeCpuSeconds[$pIdInt] = $totSec
 }
+
+if ($includeTree) {
+    $initialDescendants = @(Get-DescendantProcessIds -RootPids $targetPids)
+    foreach ($desc in $initialDescendants) {
+        $dPid = [int]$desc.ProcessId
+        $dp = Get-Process -Id $dPid -ErrorAction SilentlyContinue
+        if ($null -ne $dp) {
+            try {
+                $prevTreeCpuSeconds[$dPid] = $dp.TotalProcessorTime.TotalSeconds
+            } catch {
+                # Process may have exited or be protected; skip baseline for this child.
+            }
+        }
+    }
+}
+
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 $prevElapsedSec = $stopwatch.Elapsed.TotalSeconds
 $lastIterationEndSec = $prevElapsedSec
 
 $samples = [System.Collections.Generic.List[object]]::new()
 $anyGpuCounterSeen = $false
+$anyTreeGpuCounterSeen = $false
 
 for ($i = 1; $i -le $SampleCount; $i++) {
     if ($i -eq 1) {
@@ -301,10 +680,11 @@ for ($i = 1; $i -le $SampleCount; $i++) {
     }
 
     if ($aliveTargets.Count -eq 0) {
-        Write-Warning "O processo monitorado encerrou antes da amostra $i."
+        Write-Warning "Monitored process exited before sample $i."
         break
     }
 
+    $aliveRootPids = @($aliveTargets | ForEach-Object { [int]$_.Id })
     $workingSetBytes = [int64]0
     $peakWorkingSetBytes = [int64]0
     $privateBytes = [int64]0
@@ -349,115 +729,120 @@ for ($i = 1; $i -le $SampleCount; $i++) {
     $cpuUserPercent = [math]::Round((($deltaUserCpuSec / $deltaWallSec) / $logicalProcessors) * 100.0, 2)
     $cpuKernelPercent = [math]::Round((($deltaKernelCpuSec / $deltaWallSec) / $logicalProcessors) * 100.0, 2)
 
-    # Resident private memory (WorkingSetPrivate) via PerfProc
-    $pidFilter = ($aliveTargets | ForEach-Object { "IDProcess = $($_.Id)" }) -join ' OR '
-    $perfProcItems = @(Get-CimInstance Win32_PerfFormattedData_PerfProc_Process -Filter $pidFilter -ErrorAction SilentlyContinue)
-    $workingSetPrivateBytes = $null
-    if ($perfProcItems.Count -gt 0) {
-        $sumWsp = [int64]0
-        foreach ($item in $perfProcItems) {
-            if ($null -ne $item.WorkingSetPrivate) {
-                $sumWsp += [int64]$item.WorkingSetPrivate
-            }
-        }
-        $workingSetPrivateBytes = $sumWsp
-    }
-
-    $childCount = 0
-    $childNames = @()
-    $childWorkingSetBytes = [int64]0
-    $childPrivateBytes = [int64]0
-    $childWorkingSetPrivateBytes = [int64]0
-
-    if ($IncludeChildren) {
-        $descendants = @(Get-DescendantProcessIds -RootPids ($aliveTargets | ForEach-Object { [int]$_.Id }))
-        if ($descendants.Count -gt 0) {
-            foreach ($desc in $descendants) {
-                $cPid = [int]$desc.ProcessId
-                $cp = Get-Process -Id $cPid -ErrorAction SilentlyContinue
-                if ($null -ne $cp) {
-                    $childCount++
-                    $childNames += "$($cp.ProcessName)#$cPid"
-                    $childWorkingSetBytes += [int64]$cp.WorkingSet64
-                    $childPrivateBytes += [int64]$cp.PrivateMemorySize64
-                }
-            }
-            if ($childCount -gt 0) {
-                $childPidFilter = ($descendants | ForEach-Object { "IDProcess = $($_.ProcessId)" }) -join ' OR '
-                $childPerfItems = @(Get-CimInstance Win32_PerfFormattedData_PerfProc_Process -Filter $childPidFilter -ErrorAction SilentlyContinue)
-                foreach ($cItem in $childPerfItems) {
-                    if ($null -ne $cItem.WorkingSetPrivate) {
-                        $childWorkingSetPrivateBytes += [int64]$cItem.WorkingSetPrivate
-                    }
-                }
+    # Collect alive descendant processes when tree aggregation is enabled.
+    $aliveChildren = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
+    if ($includeTree) {
+        $descendants = @(Get-DescendantProcessIds -RootPids $aliveRootPids)
+        foreach ($desc in $descendants) {
+            $cPid = [int]$desc.ProcessId
+            $cp = Get-Process -Id $cPid -ErrorAction SilentlyContinue
+            if ($null -ne $cp) {
+                $cp.Refresh()
+                $aliveChildren.Add($cp)
             }
         }
     }
 
-    $gpuFilter = ($aliveTargets | ForEach-Object { "Name LIKE 'pid_$($_.Id)_%'" }) -join ' OR '
-    $gpuPidPattern = '^pid_(' + (($aliveTargets | ForEach-Object { [string]$_.Id }) -join '|') + ')_'
-    $gpuEngines = @(Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine -Filter $gpuFilter -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $gpuPidPattern })
-    $gpuMemItems = @(Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUProcessMemory -Filter $gpuFilter -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $gpuPidPattern })
+    $allTreePids = @($aliveRootPids)
+    foreach ($cp in $aliveChildren) {
+        $allTreePids += [int]$cp.Id
+    }
 
-    $gpuSampleAvailable = ($gpuEngines.Count -gt 0 -or $gpuMemItems.Count -gt 0)
+    # Fetch WorkingSetPrivate for all tree PIDs in a single CIM query.
+    $wspByPid = @{}
+    $allPidFilter = ($allTreePids | ForEach-Object { "IDProcess = $_" }) -join ' OR '
+    $perfProcItems = @(Get-CimInstance Win32_PerfFormattedData_PerfProc_Process -Filter $allPidFilter -ErrorAction SilentlyContinue)
+    foreach ($item in $perfProcItems) {
+        if ($null -ne $item.IDProcess -and $null -ne $item.WorkingSetPrivate) {
+            $itemPid = [int]$item.IDProcess
+            if (-not $wspByPid.ContainsKey($itemPid)) {
+                $wspByPid[$itemPid] = [int64]$item.WorkingSetPrivate
+            }
+        }
+    }
+
+    $treeSnapshots = [System.Collections.Generic.List[object]]::new()
+    foreach ($p in $aliveTargets) {
+        $pidInt = [int]$p.Id
+        $wspVal = if ($wspByPid.ContainsKey($pidInt)) { $wspByPid[$pidInt] } else { $null }
+        $treeSnapshots.Add([PSCustomObject]@{
+            ProcessId                 = $pidInt
+            ProcessName               = $p.ProcessName
+            WorkingSetBytes           = [int64]$p.WorkingSet64
+            PrivateBytes              = [int64]$p.PrivateMemorySize64
+            WorkingSetPrivateBytes    = $wspVal
+            TotalProcessorTimeSeconds = $p.TotalProcessorTime.TotalSeconds
+            IsNewChild                = $false
+        })
+    }
+    foreach ($cp in $aliveChildren) {
+        $cPidInt = [int]$cp.Id
+        $cWspVal = if ($wspByPid.ContainsKey($cPidInt)) { $wspByPid[$cPidInt] } else { $null }
+        $cCpuSec = 0.0
+        $isNewChild = $false
+        try {
+            $cCpuSec = $cp.TotalProcessorTime.TotalSeconds
+        } catch {
+            $cCpuSec = 0.0
+        }
+        try {
+            if ($null -ne $cp.StartTime -and $cp.StartTime -ge $baselineTimestamp) {
+                $isNewChild = $true
+            }
+        } catch {
+            $isNewChild = $false
+        }
+        $treeSnapshots.Add([PSCustomObject]@{
+            ProcessId                 = $cPidInt
+            ProcessName               = $cp.ProcessName
+            WorkingSetBytes           = [int64]$cp.WorkingSet64
+            PrivateBytes              = [int64]$cp.PrivateMemorySize64
+            WorkingSetPrivateBytes    = $cWspVal
+            TotalProcessorTimeSeconds = $cCpuSec
+            IsNewChild                = $isNewChild
+        })
+    }
+
+    $treeAgg = Aggregate-ProcessTreeSample `
+        -RootPids $aliveRootPids `
+        -ProcessSnapshots @($treeSnapshots.ToArray()) `
+        -PreviousCpuSeconds $prevTreeCpuSeconds `
+        -DeltaWallSeconds $deltaWallSec `
+        -LogicalProcessors $logicalProcessors
+    $prevTreeCpuSeconds = $treeAgg.NextCpuSeconds
+
+    $workingSetPrivateBytes = $treeAgg.RootWorkingSetPrivateBytes
+
+    # Fetch GPU counters across the full process tree in a single WMI pass per counter class.
+    $treeGpuFilter = ($allTreePids | ForEach-Object { "Name LIKE 'pid_${_}_%'" }) -join ' OR '
+    $treeGpuPidPattern = '^pid_(' + (($allTreePids | ForEach-Object { [string]$_ }) -join '|') + ')_'
+    $rootGpuPidPattern = '^pid_(' + (($aliveRootPids | ForEach-Object { [string]$_ }) -join '|') + ')_'
+
+    $allGpuEngines = @(Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine -Filter $treeGpuFilter -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $treeGpuPidPattern })
+    $allGpuMemItems = @(Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUProcessMemory -Filter $treeGpuFilter -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $treeGpuPidPattern })
+
+    $rootGpuParsed = Parse-GpuEngineUtilization -CounterSamples $allGpuEngines -TargetPids $aliveRootPids
+    $treeGpuParsed = Parse-GpuEngineUtilization -CounterSamples $allGpuEngines -TargetPids $allTreePids
+
+    $rootGpuMemItems = @($allGpuMemItems | Where-Object { $_.Name -match $rootGpuPidPattern })
+    $gpuSampleAvailable = ($rootGpuParsed.Available -or $rootGpuMemItems.Count -gt 0)
+    $treeGpuSampleAvailable = ($treeGpuParsed.Available -or $allGpuMemItems.Count -gt 0)
+
     if ($gpuSampleAvailable) {
         $anyGpuCounterSeen = $true
     }
-
-    $gpuEngineTotalPercent = $null
-    $gpuEngineMaxPercent = $null
-    $gpu3DPercent = $null
-    $gpuVideoCodecPercent = $null
-    $gpuCopyPercent = $null
-    $gpuActiveEngines = @{}
-
-    if ($gpuEngines.Count -gt 0) {
-        $totalUtil = 0.0
-        $maxUtil = 0.0
-        $util3D = 0.0
-        $utilVideo = 0.0
-        $utilCopy = 0.0
-
-        foreach ($eng in $gpuEngines) {
-            $u = [double]$eng.UtilizationPercentage
-            $totalUtil += $u
-            if ($u -gt $maxUtil) { $maxUtil = $u }
-
-            $engName = [string]$eng.Name
-            $engType = if ($engName -match 'engtype_(.+)$') { $Matches[1] } else { $engName }
-
-            if ($u -gt 0) {
-                if (-not $gpuActiveEngines.ContainsKey($engType)) {
-                    $gpuActiveEngines[$engType] = 0.0
-                }
-                $gpuActiveEngines[$engType] += $u
-            }
-
-            if ($engType -match '^(3D|Compute|Graphics)') {
-                $util3D += $u
-            } elseif ($engType -match '(Video|Codec|Decode|Encode|VPE|JPEG)') {
-                $utilVideo += $u
-            } elseif ($engType -match 'Copy') {
-                $utilCopy += $u
-            }
-        }
-
-        $gpuEngineTotalPercent = [math]::Round($totalUtil, 2)
-        $gpuEngineMaxPercent = [math]::Round($maxUtil, 2)
-        $gpu3DPercent = [math]::Round($util3D, 2)
-        $gpuVideoCodecPercent = [math]::Round($utilVideo, 2)
-        $gpuCopyPercent = [math]::Round($utilCopy, 2)
+    if ($treeGpuSampleAvailable) {
+        $anyTreeGpuCounterSeen = $true
     }
 
     $gpuDedicatedBytes = $null
     $gpuSharedBytes = $null
     $gpuLocalBytes = $null
-
-    if ($gpuMemItems.Count -gt 0) {
+    if ($rootGpuMemItems.Count -gt 0) {
         $dedSum = [int64]0
         $shrSum = [int64]0
         $locSum = [int64]0
-        foreach ($m in $gpuMemItems) {
+        foreach ($m in $rootGpuMemItems) {
             if ($null -ne $m.DedicatedUsage) { $dedSum += [int64]$m.DedicatedUsage }
             if ($null -ne $m.SharedUsage) { $shrSum += [int64]$m.SharedUsage }
             if ($null -ne $m.LocalUsage) { $locSum += [int64]$m.LocalUsage }
@@ -465,6 +850,19 @@ for ($i = 1; $i -le $SampleCount; $i++) {
         $gpuDedicatedBytes = $dedSum
         $gpuSharedBytes = $shrSum
         $gpuLocalBytes = $locSum
+    }
+
+    $treeGpuDedicatedBytes = $null
+    $treeGpuSharedBytes = $null
+    if ($allGpuMemItems.Count -gt 0) {
+        $tDedSum = [int64]0
+        $tShrSum = [int64]0
+        foreach ($m in $allGpuMemItems) {
+            if ($null -ne $m.DedicatedUsage) { $tDedSum += [int64]$m.DedicatedUsage }
+            if ($null -ne $m.SharedUsage) { $tShrSum += [int64]$m.SharedUsage }
+        }
+        $treeGpuDedicatedBytes = $tDedSum
+        $treeGpuSharedBytes = $tShrSum
     }
 
     $sampleObj = [PSCustomObject]@{
@@ -492,23 +890,36 @@ for ($i = 1; $i -le $SampleCount; $i++) {
         ThreadCount                = $threadCount
         HandleCount                = $handleCount
         GpuAvailable               = $gpuSampleAvailable
-        GpuEngineTotalPercent      = $gpuEngineTotalPercent
-        GpuEngineMaxPercent        = $gpuEngineMaxPercent
-        Gpu3DPercent               = $gpu3DPercent
-        GpuVideoCodecPercent       = $gpuVideoCodecPercent
-        GpuCopyPercent             = $gpuCopyPercent
-        GpuActiveEngines           = [PSCustomObject]$gpuActiveEngines
+        GpuEngineTotalPercent      = $rootGpuParsed.TotalPercent
+        GpuEngineMaxPercent        = $rootGpuParsed.MaxEnginePercent
+        Gpu3DPercent               = $rootGpuParsed.Engine3DPercent
+        GpuVideoCodecPercent       = $rootGpuParsed.VideoCodecPercent
+        GpuCopyPercent             = $rootGpuParsed.CopyPercent
+        GpuActiveEngines           = $rootGpuParsed.ActiveEngines
         GpuDedicatedBytes          = $gpuDedicatedBytes
         GpuDedicatedMiB            = ConvertTo-MiB $gpuDedicatedBytes
         GpuSharedBytes             = $gpuSharedBytes
         GpuSharedMiB               = ConvertTo-MiB $gpuSharedBytes
         GpuLocalBytes              = $gpuLocalBytes
         GpuLocalMiB                = ConvertTo-MiB $gpuLocalBytes
-        ChildProcessCount          = $childCount
-        ChildProcessNames          = ($childNames -join ', ')
-        ChildWorkingSetPrivateMiB  = ConvertTo-MiB $childWorkingSetPrivateBytes
-        ChildWorkingSetMiB         = ConvertTo-MiB $childWorkingSetBytes
-        ChildPrivateMiB            = ConvertTo-MiB $childPrivateBytes
+        ChildProcessCount          = $treeAgg.ChildProcessCount
+        ChildProcessNames          = ($treeAgg.ChildProcessNames -join ', ')
+        ChildCpuPercent            = $treeAgg.ChildCpuPercent
+        ChildWorkingSetPrivateMiB  = ConvertTo-MiB $treeAgg.ChildWorkingSetPrivateBytes
+        ChildWorkingSetMiB         = ConvertTo-MiB $treeAgg.ChildWorkingSetBytes
+        ChildPrivateMiB            = ConvertTo-MiB $treeAgg.ChildPrivateBytes
+        TreeProcessCount           = $treeAgg.TreeProcessCount
+        TreeCpuPercent             = $treeAgg.TreeCpuPercent
+        TreeCpuSingleCorePercent   = $treeAgg.TreeCpuSingleCorePercent
+        TreeWorkingSetMB           = $treeAgg.TreeWorkingSetMB
+        TreePrivateMB              = $treeAgg.TreePrivateMB
+        TreeWorkingSetPrivateMB    = $treeAgg.TreeWorkingSetPrivateMB
+        TreeGpuAvailable           = $treeGpuSampleAvailable
+        TreeGpuPercent             = $treeGpuParsed.TotalPercent
+        TreeGpu3DPercent           = $treeGpuParsed.Engine3DPercent
+        TreeGpuVideoCodecPercent   = $treeGpuParsed.VideoCodecPercent
+        TreeGpuDedicatedMiB        = ConvertTo-MiB $treeGpuDedicatedBytes
+        TreeGpuSharedMiB           = ConvertTo-MiB $treeGpuSharedBytes
     }
 
     $samples.Add($sampleObj)
@@ -516,52 +927,60 @@ for ($i = 1; $i -le $SampleCount; $i++) {
 }
 
 if ($samples.Count -eq 0) {
-    throw "Nenhuma amostra pode ser coletada."
+    throw "No samples could be collected."
 }
 
 $summary = [PSCustomObject]@{
-    WorkingSetPrivateMiB  = Get-MetricStats -Values @($samples | ForEach-Object { $_.WorkingSetPrivateMiB })
-    WorkingSetMiB         = Get-MetricStats -Values @($samples | ForEach-Object { $_.WorkingSetMiB })
-    PeakWorkingSetMiB     = Get-MetricStats -Values @($samples | ForEach-Object { $_.PeakWorkingSetMiB })
-    PrivateMiB            = Get-MetricStats -Values @($samples | ForEach-Object { $_.PrivateMiB })
-    CpuTotalPercent       = Get-MetricStats -Values @($samples | ForEach-Object { $_.CpuTotalPercent })
-    CpuSingleCorePercent  = Get-MetricStats -Values @($samples | ForEach-Object { $_.CpuSingleCorePercent })
-    ThreadCount           = Get-MetricStats -Values @($samples | ForEach-Object { [double]$_.ThreadCount })
-    HandleCount           = Get-MetricStats -Values @($samples | ForEach-Object { [double]$_.HandleCount })
-    GpuAvailable          = $anyGpuCounterSeen
-    GpuEngineTotalPercent = if ($anyGpuCounterSeen) { Get-MetricStats -Values @($samples | ForEach-Object { $_.GpuEngineTotalPercent }) } else { $null }
-    Gpu3DPercent          = if ($anyGpuCounterSeen) { Get-MetricStats -Values @($samples | ForEach-Object { $_.Gpu3DPercent }) } else { $null }
-    GpuVideoCodecPercent  = if ($anyGpuCounterSeen) { Get-MetricStats -Values @($samples | ForEach-Object { $_.GpuVideoCodecPercent }) } else { $null }
-    GpuDedicatedMiB       = if ($anyGpuCounterSeen) { Get-MetricStats -Values @($samples | ForEach-Object { $_.GpuDedicatedMiB }) } else { $null }
-    GpuSharedMiB          = if ($anyGpuCounterSeen) { Get-MetricStats -Values @($samples | ForEach-Object { $_.GpuSharedMiB }) } else { $null }
-    MaxChildProcessCount  = ($samples | Measure-Object -Property ChildProcessCount -Maximum).Maximum
+    WorkingSetPrivateMiB    = Get-MetricStats -Values @($samples | ForEach-Object { $_.WorkingSetPrivateMiB })
+    WorkingSetMiB           = Get-MetricStats -Values @($samples | ForEach-Object { $_.WorkingSetMiB })
+    PeakWorkingSetMiB       = Get-MetricStats -Values @($samples | ForEach-Object { $_.PeakWorkingSetMiB })
+    PrivateMiB              = Get-MetricStats -Values @($samples | ForEach-Object { $_.PrivateMiB })
+    CpuTotalPercent         = Get-MetricStats -Values @($samples | ForEach-Object { $_.CpuTotalPercent })
+    CpuSingleCorePercent    = Get-MetricStats -Values @($samples | ForEach-Object { $_.CpuSingleCorePercent })
+    ThreadCount             = Get-MetricStats -Values @($samples | ForEach-Object { [double]$_.ThreadCount })
+    HandleCount             = Get-MetricStats -Values @($samples | ForEach-Object { [double]$_.HandleCount })
+    GpuAvailable            = $anyGpuCounterSeen
+    GpuEngineTotalPercent   = if ($anyGpuCounterSeen) { Get-MetricStats -Values @($samples | ForEach-Object { $_.GpuEngineTotalPercent }) } else { $null }
+    Gpu3DPercent            = if ($anyGpuCounterSeen) { Get-MetricStats -Values @($samples | ForEach-Object { $_.Gpu3DPercent }) } else { $null }
+    GpuVideoCodecPercent    = if ($anyGpuCounterSeen) { Get-MetricStats -Values @($samples | ForEach-Object { $_.GpuVideoCodecPercent }) } else { $null }
+    GpuDedicatedMiB         = if ($anyGpuCounterSeen) { Get-MetricStats -Values @($samples | ForEach-Object { $_.GpuDedicatedMiB }) } else { $null }
+    GpuSharedMiB            = if ($anyGpuCounterSeen) { Get-MetricStats -Values @($samples | ForEach-Object { $_.GpuSharedMiB }) } else { $null }
+    MaxChildProcessCount    = ($samples | Measure-Object -Property ChildProcessCount -Maximum).Maximum
+    ChildProcessCount       = Get-MetricStats -Values @($samples | ForEach-Object { [double]$_.ChildProcessCount })
+    TreeProcessCount        = Get-MetricStats -Values @($samples | ForEach-Object { [double]$_.TreeProcessCount })
+    TreeCpuPercent          = Get-MetricStats -Values @($samples | ForEach-Object { $_.TreeCpuPercent })
+    TreeWorkingSetMB        = Get-MetricStats -Values @($samples | ForEach-Object { $_.TreeWorkingSetMB })
+    TreePrivateMB           = Get-MetricStats -Values @($samples | ForEach-Object { $_.TreePrivateMB })
+    TreeWorkingSetPrivateMB = Get-MetricStats -Values @($samples | ForEach-Object { $_.TreeWorkingSetPrivateMB })
+    TreeGpuAvailable        = $anyTreeGpuCounterSeen
+    TreeGpuPercent          = if ($anyTreeGpuCounterSeen) { Get-MetricStats -Values @($samples | ForEach-Object { $_.TreeGpuPercent }) } else { $null }
 }
 
 $report = [PSCustomObject]@{
-    SchemaVersion   = '1.0'
-    CollectedAt     = (Get-Date).ToString('o')
-    Scenario        = $effectiveScenario
-    ScenarioSource  = 'manual'
-    VideoUrl        = $VideoUrl
-    Resolution      = $Resolution
-    Notes           = $Notes
-    Target          = [PSCustomObject]@{
+    SchemaVersion  = '1.0'
+    CollectedAt    = (Get-Date).ToString('o')
+    Scenario       = $effectiveScenario
+    ScenarioSource = 'manual'
+    VideoUrl       = $VideoUrl
+    Resolution     = $Resolution
+    Notes          = $Notes
+    Target         = [PSCustomObject]@{
         ProcessName        = $primaryProc.ProcessName
         ProcessIds         = $targetPids
         ExecutablePath     = $executablePath
         ProcessStartTime   = $startTimeIso
         AggregatedMatching = [bool]$AggregateMatchingProcesses
-        IncludeChildren    = [bool]$IncludeChildren
+        IncludeChildren    = [bool]$includeTree
     }
-    Sampling        = [PSCustomObject]@{
+    Sampling       = [PSCustomObject]@{
         RequestedSamples = $SampleCount
         CollectedSamples = $samples.Count
         IntervalSeconds  = $IntervalSeconds
         TotalDurationSec = [math]::Round($stopwatch.Elapsed.TotalSeconds, 2)
     }
-    Environment     = $environmentMetadata
-    Summary         = $summary
-    Samples         = @($samples)
+    Environment    = $environmentMetadata
+    Summary        = $summary
+    Samples        = @($samples)
 }
 
 if (-not [string]::IsNullOrWhiteSpace($OutputJson)) {
@@ -609,13 +1028,18 @@ if (-not [string]::IsNullOrWhiteSpace($OutputMarkdown)) {
         "| Memoria Privada Residente (`WorkingSetPrivate`, MiB) | $($summary.WorkingSetPrivateMiB.Min) | $($summary.WorkingSetPrivateMiB.Avg) | $($summary.WorkingSetPrivateMiB.Median) | $($summary.WorkingSetPrivateMiB.P95) | $($summary.WorkingSetPrivateMiB.Max) |"
         "| Memoria Residente Total (`WorkingSet64`, MiB) | $($summary.WorkingSetMiB.Min) | $($summary.WorkingSetMiB.Avg) | $($summary.WorkingSetMiB.Median) | $($summary.WorkingSetMiB.P95) | $($summary.WorkingSetMiB.Max) |"
         "| Memoria Privada Comitada (`PrivateBytes`, MiB) | $($summary.PrivateMiB.Min) | $($summary.PrivateMiB.Avg) | $($summary.PrivateMiB.Median) | $($summary.PrivateMiB.P95) | $($summary.PrivateMiB.Max) |"
+        "| Tree Working Set (`TreeWorkingSetMB`, MiB) | $($summary.TreeWorkingSetMB.Min) | $($summary.TreeWorkingSetMB.Avg) | $($summary.TreeWorkingSetMB.Median) | $($summary.TreeWorkingSetMB.P95) | $($summary.TreeWorkingSetMB.Max) |"
+        "| Tree Private Memory (`TreePrivateMB`, MiB) | $($summary.TreePrivateMB.Min) | $($summary.TreePrivateMB.Avg) | $($summary.TreePrivateMB.Median) | $($summary.TreePrivateMB.P95) | $($summary.TreePrivateMB.Max) |"
         "| CPU Total da Maquina (%) | $($summary.CpuTotalPercent.Min) | $($summary.CpuTotalPercent.Avg) | $($summary.CpuTotalPercent.Median) | $($summary.CpuTotalPercent.P95) | $($summary.CpuTotalPercent.Max) |"
+        "| Tree CPU Total (%) | $($summary.TreeCpuPercent.Min) | $($summary.TreeCpuPercent.Avg) | $($summary.TreeCpuPercent.Median) | $($summary.TreeCpuPercent.P95) | $($summary.TreeCpuPercent.Max) |"
         "| CPU Equivalente 1 Nucleo (%) | $($summary.CpuSingleCorePercent.Min) | $($summary.CpuSingleCorePercent.Avg) | $($summary.CpuSingleCorePercent.Median) | $($summary.CpuSingleCorePercent.P95) | $($summary.CpuSingleCorePercent.Max) |"
         "| GPU Total Engines (%) | $(if ($summary.GpuAvailable) { $summary.GpuEngineTotalPercent.Min } else { 'N/D' }) | $(if ($summary.GpuAvailable) { $summary.GpuEngineTotalPercent.Avg } else { 'N/D' }) | $(if ($summary.GpuAvailable) { $summary.GpuEngineTotalPercent.Median } else { 'N/D' }) | $(if ($summary.GpuAvailable) { $summary.GpuEngineTotalPercent.P95 } else { 'N/D' }) | $(if ($summary.GpuAvailable) { $summary.GpuEngineTotalPercent.Max } else { 'N/D' }) |"
+        "| Tree GPU Total (%) | $(if ($summary.TreeGpuAvailable) { $summary.TreeGpuPercent.Min } else { 'N/D' }) | $(if ($summary.TreeGpuAvailable) { $summary.TreeGpuPercent.Avg } else { 'N/D' }) | $(if ($summary.TreeGpuAvailable) { $summary.TreeGpuPercent.Median } else { 'N/D' }) | $(if ($summary.TreeGpuAvailable) { $summary.TreeGpuPercent.P95 } else { 'N/D' }) | $(if ($summary.TreeGpuAvailable) { $summary.TreeGpuPercent.Max } else { 'N/D' }) |"
         "| GPU Video Codec/Decode (%) | $(if ($summary.GpuAvailable) { $summary.GpuVideoCodecPercent.Min } else { 'N/D' }) | $(if ($summary.GpuAvailable) { $summary.GpuVideoCodecPercent.Avg } else { 'N/D' }) | $(if ($summary.GpuAvailable) { $summary.GpuVideoCodecPercent.Median } else { 'N/D' }) | $(if ($summary.GpuAvailable) { $summary.GpuVideoCodecPercent.P95 } else { 'N/D' }) | $(if ($summary.GpuAvailable) { $summary.GpuVideoCodecPercent.Max } else { 'N/D' }) |"
         "| GPU 3D/Compute (%) | $(if ($summary.GpuAvailable) { $summary.Gpu3DPercent.Min } else { 'N/D' }) | $(if ($summary.GpuAvailable) { $summary.Gpu3DPercent.Avg } else { 'N/D' }) | $(if ($summary.GpuAvailable) { $summary.Gpu3DPercent.Median } else { 'N/D' }) | $(if ($summary.GpuAvailable) { $summary.Gpu3DPercent.P95 } else { 'N/D' }) | $(if ($summary.GpuAvailable) { $summary.Gpu3DPercent.Max } else { 'N/D' }) |"
         "| GPU VRAM Dedicada (MiB) | $(if ($summary.GpuAvailable) { $summary.GpuDedicatedMiB.Min } else { 'N/D' }) | $(if ($summary.GpuAvailable) { $summary.GpuDedicatedMiB.Avg } else { 'N/D' }) | $(if ($summary.GpuAvailable) { $summary.GpuDedicatedMiB.Median } else { 'N/D' }) | $(if ($summary.GpuAvailable) { $summary.GpuDedicatedMiB.P95 } else { 'N/D' }) | $(if ($summary.GpuAvailable) { $summary.GpuDedicatedMiB.Max } else { 'N/D' }) |"
         "| GPU VRAM Compartilhada (MiB) | $(if ($summary.GpuAvailable) { $summary.GpuSharedMiB.Min } else { 'N/D' }) | $(if ($summary.GpuAvailable) { $summary.GpuSharedMiB.Avg } else { 'N/D' }) | $(if ($summary.GpuAvailable) { $summary.GpuSharedMiB.Median } else { 'N/D' }) | $(if ($summary.GpuAvailable) { $summary.GpuSharedMiB.P95 } else { 'N/D' }) | $(if ($summary.GpuAvailable) { $summary.GpuSharedMiB.Max } else { 'N/D' }) |"
+        "| Child Processes (count) | $($summary.ChildProcessCount.Min) | $($summary.ChildProcessCount.Avg) | $($summary.ChildProcessCount.Median) | $($summary.ChildProcessCount.P95) | $($summary.ChildProcessCount.Max) |"
         ""
     )
     $mdContent = ($mdLines -join [Environment]::NewLine) + [Environment]::NewLine
@@ -631,16 +1055,16 @@ if ($AsJson) {
 } else {
     if (-not $Quiet) {
         Write-Host ""
-        Write-Host "Resumo da Coleta ($($report.Sampling.CollectedSamples) amostras, $($report.Sampling.TotalDurationSec)s):" -ForegroundColor Green
-        Write-Host ("  Memoria Privada Residente (WorkingSetPrivate) : media {0} MiB (min {1} / max {2} MiB)" -f $summary.WorkingSetPrivateMiB.Avg, $summary.WorkingSetPrivateMiB.Min, $summary.WorkingSetPrivateMiB.Max)
-        Write-Host ("  Memoria Residente Total (WorkingSet64)        : media {0} MiB (min {1} / max {2} MiB)" -f $summary.WorkingSetMiB.Avg, $summary.WorkingSetMiB.Min, $summary.WorkingSetMiB.Max)
-        Write-Host ("  Memoria Privada Comitada (PrivateBytes)       : media {0} MiB (min {1} / max {2} MiB)" -f $summary.PrivateMiB.Avg, $summary.PrivateMiB.Min, $summary.PrivateMiB.Max)
-        Write-Host ("  CPU Total ({0} nucleos logicos)               : media {1}% (min {2}% / max {3}%)" -f $logicalProcessors, $summary.CpuTotalPercent.Avg, $summary.CpuTotalPercent.Min, $summary.CpuTotalPercent.Max)
-        if ($summary.GpuAvailable) {
-            Write-Host ("  GPU Utilizacao Total / Video Codec            : media {0}% (max {1}%) / Video Codec media {2}% (max {3}%)" -f $summary.GpuEngineTotalPercent.Avg, $summary.GpuEngineTotalPercent.Max, $summary.GpuVideoCodecPercent.Avg, $summary.GpuVideoCodecPercent.Max)
-            Write-Host ("  GPU Memoria Dedicada / Compartilhada          : media {0} MiB / {1} MiB" -f $summary.GpuDedicatedMiB.Avg, $summary.GpuSharedMiB.Avg)
+        Write-Host "Collection Summary ($($report.Sampling.CollectedSamples) samples, $($report.Sampling.TotalDurationSec)s):" -ForegroundColor Green
+        Write-Host ("  WorkingSetPrivate (Root)          : avg {0} MiB (min {1} / max {2} MiB)" -f $summary.WorkingSetPrivateMiB.Avg, $summary.WorkingSetPrivateMiB.Min, $summary.WorkingSetPrivateMiB.Max)
+        Write-Host ("  WorkingSet64 (Root / Tree)        : root avg {0} MiB / tree avg {1} MiB" -f $summary.WorkingSetMiB.Avg, $summary.TreeWorkingSetMB.Avg)
+        Write-Host ("  PrivateBytes (Root / Tree)        : root avg {0} MiB / tree avg {1} MiB" -f $summary.PrivateMiB.Avg, $summary.TreePrivateMB.Avg)
+        Write-Host ("  CPU Total ({0} logical cores)      : root avg {1}% / tree avg {2}%" -f $logicalProcessors, $summary.CpuTotalPercent.Avg, $summary.TreeCpuPercent.Avg)
+        Write-Host ("  Child Processes                   : avg {0} (max {1})" -f $summary.ChildProcessCount.Avg, $summary.MaxChildProcessCount)
+        if ($summary.TreeGpuAvailable) {
+            Write-Host ("  GPU Tree Utilization              : avg {0}% (max {1}%)" -f $summary.TreeGpuPercent.Avg, $summary.TreeGpuPercent.Max)
         } else {
-            Write-Host "  GPU                                           : Contadores WDDM indisponiveis para o processo"
+            Write-Host "  GPU                               : WDDM counters unavailable for target process tree"
         }
     }
     return $report

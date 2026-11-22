@@ -329,42 +329,34 @@ impl RecommendationEngine {
         });
 
         // Diversify top slots so a single channel does not dominate consecutive entries.
-        let mut ranked = Vec::with_capacity(candidates.len());
-        let mut channel_appearances: HashMap<String, usize> = HashMap::new();
-        let mut last_channel = String::new();
-
-        while !candidates.is_empty() {
-            let mut best_pos = 0;
-            let mut best_effective_score = f64::NEG_INFINITY;
-
-            let search_window = candidates.len().min(24);
-            for (pos, (_, candidate)) in candidates.iter().enumerate().take(search_window) {
-                let ch_key = normalize_channel_key(&candidate.video.channel);
-                let count = if ch_key.is_empty() {
-                    0
+        let mut channel_interner: HashMap<String, usize> = HashMap::new();
+        let mut slots: Vec<Option<(ScoredVideo, Option<usize>)>> = candidates
+            .into_iter()
+            .map(|(_, scored)| {
+                let ch_key = normalize_channel_key(&scored.video.channel);
+                let ch_id = if ch_key.is_empty() {
+                    None
+                } else if let Some(&id) = channel_interner.get(&ch_key) {
+                    Some(id)
                 } else {
-                    *channel_appearances.get(&ch_key).unwrap_or(&0)
+                    let id = channel_interner.len();
+                    channel_interner.insert(ch_key, id);
+                    Some(id)
                 };
-                let repeat_penalty = (count as f64) * 6.5;
-                let consecutive_penalty = if !ch_key.is_empty() && ch_key == last_channel {
-                    14.0
-                } else {
-                    0.0
-                };
-                let effective = candidate.score - repeat_penalty - consecutive_penalty;
-                if effective > best_effective_score {
-                    best_effective_score = effective;
-                    best_pos = pos;
-                }
-            }
+                Some((scored, ch_id))
+            })
+            .collect();
 
-            let (_, mut chosen) = candidates.remove(best_pos);
-            chosen.score = best_effective_score;
-            let ch_key = normalize_channel_key(&chosen.video.channel);
-            if !ch_key.is_empty() {
-                *channel_appearances.entry(ch_key.clone()).or_insert(0) += 1;
-                last_channel = ch_key;
-            }
+        let order =
+            diversify_windowed_indices(slots.len(), channel_interner.len(), 6.5, 14.0, |idx| {
+                let (scored, ch_id) = slots[idx].as_ref().expect("unconsumed candidate slot");
+                (scored.score, *ch_id)
+            });
+
+        let mut ranked = Vec::with_capacity(order.len());
+        for (idx, effective_score) in order {
+            let (mut chosen, _) = slots[idx].take().expect("chosen candidate slot");
+            chosen.score = effective_score;
             ranked.push(chosen);
         }
 
@@ -1023,51 +1015,43 @@ impl RecommendationEngine {
                 .then_with(|| a.pos_idx.cmp(&b.pos_idx))
         });
 
-        let mut ranked = Vec::with_capacity(candidates.len());
-        let mut channel_appearances: HashMap<String, usize> = HashMap::new();
-        let mut last_channel = String::new();
         let repeat_weight = match tab {
             crate::watch_extras::SidebarTab::ForYou => 9.5,
             crate::watch_extras::SidebarTab::Related => 5.0,
             _ => 6.5,
         };
 
-        while !candidates.is_empty() {
-            let mut best_pos = 0;
-            let mut best_effective_score = f64::NEG_INFINITY;
-
-            let search_window = candidates.len().min(24);
-            for (pos, candidate) in candidates.iter().enumerate().take(search_window) {
-                let count = if candidate.ch_key.is_empty() {
-                    0
+        let mut channel_interner: HashMap<String, usize> = HashMap::new();
+        let candidate_ch_ids: Vec<Option<usize>> = candidates
+            .iter()
+            .map(|candidate| {
+                if candidate.ch_key.is_empty() {
+                    None
+                } else if let Some(&id) = channel_interner.get(&candidate.ch_key) {
+                    Some(id)
                 } else {
-                    *channel_appearances.get(&candidate.ch_key).unwrap_or(&0)
-                };
-                let repeat_penalty = (count as f64) * repeat_weight;
-                let consecutive_penalty =
-                    if !candidate.ch_key.is_empty() && candidate.ch_key == last_channel {
-                        14.0
-                    } else {
-                        0.0
-                    };
-                let effective = candidate.score - repeat_penalty - consecutive_penalty;
-                if effective > best_effective_score {
-                    best_effective_score = effective;
-                    best_pos = pos;
+                    let id = channel_interner.len();
+                    channel_interner.insert(candidate.ch_key.clone(), id);
+                    Some(id)
                 }
-            }
+            })
+            .collect();
 
-            let chosen = candidates.remove(best_pos);
-            if !chosen.ch_key.is_empty() {
-                *channel_appearances
-                    .entry(chosen.ch_key.clone())
-                    .or_insert(0) += 1;
-                last_channel = chosen.ch_key;
-            }
-            ranked.push((chosen.orig_idx, best_effective_score, chosen.is_short));
-        }
+        let order = diversify_windowed_indices(
+            candidates.len(),
+            channel_interner.len(),
+            repeat_weight,
+            14.0,
+            |idx| (candidates[idx].score, candidate_ch_ids[idx]),
+        );
 
-        ranked
+        order
+            .into_iter()
+            .map(|(idx, effective_score)| {
+                let chosen = &candidates[idx];
+                (chosen.orig_idx, effective_score, chosen.is_short)
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -1102,6 +1086,68 @@ impl RecommendationEngine {
         })
         .collect()
     }
+}
+
+/// O(N * W) windowed diversification (W = 24) using an active index window and
+/// interned channel IDs. Produces the exact same selection order and effective
+/// scores as removing `best_pos` from a sorted `Vec`, without O(N^2) shifts or
+/// per-iteration String allocations.
+fn diversify_windowed_indices<F>(
+    len: usize,
+    channel_count: usize,
+    repeat_weight: f64,
+    consecutive_penalty_val: f64,
+    mut score_and_channel: F,
+) -> Vec<(usize, f64)>
+where
+    F: FnMut(usize) -> (f64, Option<usize>),
+{
+    const WINDOW_SIZE: usize = 24;
+    let mut ranked = Vec::with_capacity(len);
+    if len == 0 {
+        return ranked;
+    }
+    let mut channel_appearances = vec![0usize; channel_count];
+    let mut last_channel: Option<usize> = None;
+    let initial_window = len.min(WINDOW_SIZE);
+    let mut window: Vec<usize> = (0..initial_window).collect();
+    let mut next_unwindowed = initial_window;
+
+    while !window.is_empty() {
+        let mut best_w_pos = 0usize;
+        let mut best_effective_score = f64::NEG_INFINITY;
+        let mut best_channel: Option<usize> = None;
+
+        for (w_pos, &cand_idx) in window.iter().enumerate() {
+            let (base_score, ch_id) = score_and_channel(cand_idx);
+            let repeat_penalty =
+                ch_id.map_or(0.0, |id| (channel_appearances[id] as f64) * repeat_weight);
+            let consecutive_penalty = if ch_id.is_some() && ch_id == last_channel {
+                consecutive_penalty_val
+            } else {
+                0.0
+            };
+            let effective = base_score - repeat_penalty - consecutive_penalty;
+            if effective > best_effective_score {
+                best_effective_score = effective;
+                best_w_pos = w_pos;
+                best_channel = ch_id;
+            }
+        }
+
+        let chosen_idx = window.remove(best_w_pos);
+        if next_unwindowed < len {
+            window.push(next_unwindowed);
+            next_unwindowed += 1;
+        }
+        if let Some(id) = best_channel {
+            channel_appearances[id] += 1;
+            last_channel = Some(id);
+        }
+        ranked.push((chosen_idx, best_effective_score));
+    }
+
+    ranked
 }
 
 pub fn is_recent_upload(metadata: Option<&VideoMetadata>, reference_epoch: Option<i64>) -> bool {
@@ -1170,6 +1216,9 @@ pub fn matches_filter(
 pub fn is_short_video(video: &Video, metadata: Option<&VideoMetadata>) -> bool {
     if contains_ignore_case(&video.url, "playlist?list=") {
         return false;
+    }
+    if metadata.is_some_and(|m| m.kind == crate::search::SearchResultKind::Short) {
+        return true;
     }
     if contains_ignore_case(&video.url, "/shorts/") {
         return true;
@@ -1279,6 +1328,9 @@ pub fn is_gaming_video(video: &Video, metadata: Option<&VideoMetadata>) -> bool 
 }
 
 pub fn is_live_video(video: &Video, metadata: Option<&VideoMetadata>) -> bool {
+    if metadata.is_some_and(|meta| meta.is_live) {
+        return true;
+    }
     let dur = video.duration.trim();
     if dur.eq_ignore_ascii_case("live") || dur.eq_ignore_ascii_case("ao vivo") {
         return true;
@@ -1664,6 +1716,7 @@ mod tests {
                 position_ms: 540_000,
                 duration_ms: Some(600_000),
                 watched_at_ms: None,
+                ..Default::default()
             })
             .unwrap();
         let mut queue = Queue::new(10);
@@ -1708,6 +1761,7 @@ mod tests {
                 position_ms: 595_000,
                 duration_ms: Some(600_000),
                 watched_at_ms: None,
+                ..Default::default()
             })
             .unwrap();
         let queue = Queue::new(10);
@@ -1791,6 +1845,19 @@ mod tests {
         );
         assert!(is_short_video(&short_by_tag, None));
         assert!(!is_short_video(&regular, None));
+
+        let short_by_meta = Video {
+            title: "Regular Looking Title".into(),
+            channel: "Creator".into(),
+            url: "https://www.youtube.com/watch?v=shortmeta01".into(),
+            thumbnail: String::new(),
+            duration: String::new(),
+        };
+        let short_meta = VideoMetadata {
+            kind: crate::search::SearchResultKind::Short,
+            ..Default::default()
+        };
+        assert!(is_short_video(&short_by_meta, Some(&short_meta)));
     }
 
     #[test]
@@ -1804,6 +1871,7 @@ mod tests {
                 position_ms: 400_000,
                 duration_ms: Some(500_000),
                 watched_at_ms: None,
+                ..Default::default()
             })
             .unwrap();
         let queue = Queue::new(10);
@@ -2033,5 +2101,114 @@ mod tests {
             .filter(|c| matches!(c, FeedFilter::Topic(t) if t.eq_ignore_ascii_case("rust")))
             .count();
         assert_eq!(rust_count, 1);
+    }
+
+    #[test]
+    fn windowed_diversification_matches_naive_order_and_scales_linearly_for_large_n() {
+        // Verify exact bit-for-bit parity against a naive O(N^2) Vec::remove reference.
+        let profile = UserProfile::default();
+        let channels = ["Alpha", "Beta", "Gamma", "Delta", "", "Alpha", "Beta"];
+        let small_videos: Vec<Video> = (0..64)
+            .map(|i| {
+                sample_video(
+                    &format!("vidrank{i:04}"),
+                    &format!("Rust video topic {i}"),
+                    channels[i % channels.len()],
+                    "10:00",
+                )
+            })
+            .collect();
+        let ranked = RecommendationEngine::rank_videos(
+            &small_videos,
+            &HashMap::new(),
+            &profile,
+            &FeedFilter::All,
+        );
+        assert_eq!(ranked.len(), small_videos.len());
+
+        // Independent reference check on the pre-diversified candidate scores.
+        let ref_epoch = current_unix_epoch().unwrap_or(1_762_728_000);
+        let mut ref_candidates: Vec<(usize, String, f64)> = small_videos
+            .iter()
+            .enumerate()
+            .map(|(idx, video)| {
+                let mut scored = RecommendationEngine::score_single(
+                    video,
+                    None,
+                    &profile,
+                    ref_epoch,
+                    &FeedFilter::All,
+                );
+                scored.score -= (idx as f64) * 0.04;
+                (idx, video.url.clone(), scored.score)
+            })
+            .collect();
+        ref_candidates.sort_by(|a, b| {
+            b.2.partial_cmp(&a.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let mut ref_appearances: HashMap<String, usize> = HashMap::new();
+        let mut ref_last = String::new();
+        let mut ref_order = Vec::with_capacity(ref_candidates.len());
+        while !ref_candidates.is_empty() {
+            let mut best_pos = 0;
+            let mut best_eff = f64::NEG_INFINITY;
+            for (pos, (orig_idx, _, score)) in ref_candidates
+                .iter()
+                .enumerate()
+                .take(ref_candidates.len().min(24))
+            {
+                let ch = normalize_channel_key(&small_videos[*orig_idx].channel);
+                let count = if ch.is_empty() {
+                    0
+                } else {
+                    *ref_appearances.get(&ch).unwrap_or(&0)
+                };
+                let eff = *score
+                    - (count as f64) * 6.5
+                    - if !ch.is_empty() && ch == ref_last {
+                        14.0
+                    } else {
+                        0.0
+                    };
+                if eff > best_eff {
+                    best_eff = eff;
+                    best_pos = pos;
+                }
+            }
+            let (orig_idx, url, _) = ref_candidates.remove(best_pos);
+            let ch = normalize_channel_key(&small_videos[orig_idx].channel);
+            if !ch.is_empty() {
+                *ref_appearances.entry(ch.clone()).or_insert(0) += 1;
+                ref_last = ch;
+            }
+            ref_order.push((url, best_eff));
+        }
+        let actual_order: Vec<(String, f64)> = ranked
+            .iter()
+            .map(|s| (s.video.url.clone(), s.score))
+            .collect();
+        assert_eq!(actual_order, ref_order);
+
+        // Large-N sanity: 1,500 items rank cleanly without quadratic blowup.
+        let large_videos: Vec<Video> = (0..1_500)
+            .map(|i| {
+                sample_video(
+                    &format!("bigvid{i:05}"),
+                    &format!("Large feed video {i}"),
+                    &format!("Channel {}", i % 30),
+                    "8:30",
+                )
+            })
+            .collect();
+        let large_ranked = RecommendationEngine::rank_videos(
+            &large_videos,
+            &HashMap::new(),
+            &profile,
+            &FeedFilter::All,
+        );
+        assert_eq!(large_ranked.len(), 1_500);
+        assert_ne!(large_ranked[0].video.channel, large_ranked[1].video.channel);
     }
 }

@@ -63,6 +63,7 @@ pub struct ImportRestorePoint {
 impl ImportRestorePoint {
     pub fn create(root: &Path, paths: &[(&str, &Path)]) -> io::Result<Self> {
         let directory = root.join(RECOVERY_DIR);
+        cleanup_incomplete_recovery_dir(&directory)?;
         if directory.exists() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -119,9 +120,31 @@ impl Drop for ImportRestorePoint {
     }
 }
 
+/// Removes an orphan recovery directory left behind by a crash before the
+/// completion marker was written. Safe because no target data files are
+/// modified until after the marker exists.
+fn cleanup_incomplete_recovery_dir(directory: &Path) -> io::Result<()> {
+    let meta = match fs::symlink_metadata(directory) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "caminho de recuperação inválido",
+        ));
+    }
+    if directory.join(RECOVERY_MARKER).is_file() {
+        return Ok(());
+    }
+    fs::remove_dir_all(directory)
+}
+
 /// Restores an interrupted import before normal application data is loaded.
 pub fn recover_pending_import(root: &Path, paths: &[(&str, &Path)]) -> io::Result<bool> {
     let directory = root.join(RECOVERY_DIR);
+    cleanup_incomplete_recovery_dir(&directory)?;
     if !directory.join(RECOVERY_MARKER).is_file() {
         return Ok(false);
     }
@@ -140,12 +163,11 @@ fn restore_from(root: &Path, paths: &[(String, PathBuf)]) -> io::Result<bool> {
     for (name, path) in paths {
         validate_data_file(root, path)?;
         let backup = directory.join(recovery_file(name));
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
         if backup.exists() {
             let bytes = fs::read(&backup)?;
             crate::history::write_atomic(path, &bytes)?;
+        } else if path.exists() {
+            fs::remove_file(path)?;
         }
     }
     fs::remove_dir_all(directory)?;
@@ -231,6 +253,86 @@ mod tests {
         assert!(recover_pending_import(&root, &refs).unwrap());
         assert_eq!(fs::read(&data).unwrap(), b"original");
         assert!(!recover_pending_import(&root, &refs).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn orphan_recovery_dir_without_marker_is_cleaned_up_on_recover_and_create() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "fasttube-orphan-recovery-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let data = root.join("library.json");
+        fs::write(&data, b"live-data").unwrap();
+        let refs = [("library", data.as_path())];
+
+        // Simulate crash mid-ImportRestorePoint::create before marker is written.
+        let orphan_dir = root.join(RECOVERY_DIR);
+        fs::create_dir_all(&orphan_dir).unwrap();
+        fs::write(orphan_dir.join(recovery_file("library")), b"stale-partial").unwrap();
+
+        // Startup recovery cleans up the orphan without modifying live files.
+        assert!(!recover_pending_import(&root, &refs).unwrap());
+        assert!(!orphan_dir.exists());
+        assert_eq!(fs::read(&data).unwrap(), b"live-data");
+
+        // Another orphan before create does not block future imports with AlreadyExists.
+        fs::create_dir_all(&orphan_dir).unwrap();
+        fs::write(
+            orphan_dir.join(recovery_file("library")),
+            b"stale-partial-2",
+        )
+        .unwrap();
+        let point = ImportRestorePoint::create(&root, &refs).unwrap();
+        assert!(orphan_dir.join(RECOVERY_MARKER).is_file());
+        point.commit().unwrap();
+        assert!(!orphan_dir.exists());
+        assert_eq!(fs::read(&data).unwrap(), b"live-data");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn valid_recovery_dir_with_marker_blocks_new_create_and_rolls_back_atomically() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "fasttube-marked-recovery-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let existing = root.join("library.json");
+        let created = root.join("history.json");
+        fs::write(&existing, b"before-import").unwrap();
+        let refs = [
+            ("library", existing.as_path()),
+            ("history", created.as_path()),
+        ];
+
+        let point = ImportRestorePoint::create(&root, &refs).unwrap();
+        std::mem::forget(point);
+        fs::write(&existing, b"partial-import").unwrap();
+        fs::write(&created, b"new-partial-file").unwrap();
+
+        // A committed restore point with marker must NOT be discarded by create().
+        let err = match ImportRestorePoint::create(&root, &refs) {
+            Ok(_) => panic!("expected AlreadyExists when recovery marker is present"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(root.join(RECOVERY_DIR).join(RECOVERY_MARKER).is_file());
+
+        // Full rollback remains intact: existing file is atomically restored and new file removed.
+        assert!(recover_pending_import(&root, &refs).unwrap());
+        assert_eq!(fs::read(&existing).unwrap(), b"before-import");
+        assert!(!created.exists());
+        assert!(!root.join(RECOVERY_DIR).exists());
+
         fs::remove_dir_all(root).unwrap();
     }
 }

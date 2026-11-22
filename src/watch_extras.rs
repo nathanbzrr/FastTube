@@ -8,6 +8,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 static SUBTITLE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 const SUBTITLE_VTT_CACHE_LIMIT: usize = 4;
+pub(crate) const MAX_WATCH_COMMENTS: usize = 500;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadySubtitle {
@@ -29,6 +30,19 @@ struct TranscriptPayload {
     url: String,
     vtt: String,
     cues: Vec<crate::transcript::Cue>,
+}
+
+#[derive(Default)]
+pub struct TranscriptDisplayCache {
+    pub valid: bool,
+    pub revision: u64,
+    pub raw_len: usize,
+    pub first_cue_sig: Option<(u64, u64, usize)>,
+    pub last_cue_sig: Option<(u64, u64, usize)>,
+    pub chapters_sig: u64,
+    pub segments: Vec<crate::transcript::Cue>,
+    pub items: Vec<crate::transcript::TranscriptDisplayItem>,
+    pub item_heights: Vec<Option<(i32, bool, f32)>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -101,15 +115,9 @@ fn translate_text_to_pt(text: &str, cancel: &process::Cancellation) -> Result<St
     if clipped.is_empty() {
         return Err("Coment\u{00e1}rio vazio.".into());
     }
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| {
-            "N\u{00e3}o foi poss\u{00ed}vel iniciar a tradu\u{00e7}\u{00e3}o.".to_owned()
-        })?;
-    let response = client
+    let response = crate::http_client::no_redirect()
         .get("https://translate.googleapis.com/translate_a/single")
+        .timeout(std::time::Duration::from_secs(10))
         .query(&[
             ("client", "gtx"),
             ("sl", "auto"),
@@ -247,6 +255,281 @@ pub fn parse_timestamp_lines(text: &str) -> Vec<CachedTimestampLine> {
         .map(|line| CachedTimestampLine {
             text: line.to_owned(),
             timestamps: extract_timestamps(line),
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DescriptionToken<'a> {
+    Text(&'a str),
+    Timestamp { raw: &'a str, secs: f64 },
+    Url(&'a str),
+    Mention(&'a str),
+    Hashtag(&'a str),
+}
+
+fn is_url_body_byte(b: u8) -> bool {
+    !b.is_ascii_whitespace() && !matches!(b, b'"' | b'\'' | b'<' | b'>')
+}
+
+fn trim_url_trailing_punctuation(raw: &str) -> &str {
+    let mut end = raw.len();
+    loop {
+        let slice = &raw[..end];
+        let Some(last) = slice.chars().next_back() else {
+            break;
+        };
+        let strip = match last {
+            '.' | ',' | ';' | '!' | '?' | ':' => true,
+            ')' => slice.matches(')').count() > slice.matches('(').count(),
+            ']' => slice.matches(']').count() > slice.matches('[').count(),
+            '}' => slice.matches('}').count() > slice.matches('{').count(),
+            _ => false,
+        };
+        if strip {
+            end -= last.len_utf8();
+        } else {
+            break;
+        }
+    }
+    &raw[..end]
+}
+
+fn parse_url_at(line: &str, start: usize) -> Option<usize> {
+    let rest = line.get(start..)?;
+    let scheme_len = if rest.starts_with("https://") {
+        8
+    } else if rest.starts_with("http://") {
+        7
+    } else {
+        return None;
+    };
+    let bytes = line.as_bytes();
+    let mut cursor = start + scheme_len;
+    while cursor < bytes.len() && is_url_body_byte(bytes[cursor]) {
+        cursor += 1;
+    }
+    let trimmed = trim_url_trailing_punctuation(&line[start..cursor]);
+    if trimmed.len() <= scheme_len {
+        return None;
+    }
+    Some(start + trimmed.len())
+}
+
+fn parse_mention_at(line: &str, start: usize) -> Option<usize> {
+    if line.as_bytes().get(start).copied() != Some(b'@') {
+        return None;
+    }
+    let prev_ok = start == 0
+        || line[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && !matches!(c, '_' | '.' | '-'));
+    if !prev_ok {
+        return None;
+    }
+    let rest = &line[start + 1..];
+    let mut len = 0usize;
+    for ch in rest.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-') {
+            len += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let mut end = start + 1 + len;
+    while end > start + 1 && matches!(line.as_bytes()[end - 1], b'.' | b'-') {
+        end -= 1;
+    }
+    (end > start + 1).then_some(end)
+}
+
+fn parse_hashtag_at(line: &str, start: usize) -> Option<usize> {
+    if line.as_bytes().get(start).copied() != Some(b'#') {
+        return None;
+    }
+    let prev_ok = start == 0
+        || line[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && !matches!(c, '_' | '/'));
+    if !prev_ok {
+        return None;
+    }
+    let rest = &line[start + 1..];
+    let mut len = 0usize;
+    let mut has_alpha_or_digit = false;
+    for ch in rest.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            if ch.is_alphanumeric() {
+                has_alpha_or_digit = true;
+            }
+            len += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    (len > 0 && has_alpha_or_digit).then_some(start + 1 + len)
+}
+
+fn parse_timestamp_at(line: &str, start: usize) -> Option<(usize, f64)> {
+    let bytes = line.as_bytes();
+    if !bytes.get(start).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    let prev_ok = start == 0
+        || line[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != ':');
+    if !prev_ok {
+        return None;
+    }
+    let mut parts = [0u64; 3];
+    let mut part_count = 0usize;
+    let mut cursor = start;
+    for slot in 0..3 {
+        let d_start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        let digit_len = cursor - d_start;
+        if digit_len == 0 || digit_len > 2 || (slot > 0 && digit_len != 2) {
+            return None;
+        }
+        parts[part_count] = line[d_start..cursor].parse::<u64>().ok()?;
+        part_count += 1;
+        if cursor < bytes.len() && bytes[cursor] == b':' {
+            if slot == 2 {
+                return None;
+            }
+            cursor += 1;
+        } else {
+            break;
+        }
+    }
+    let end_ok = cursor == bytes.len()
+        || line[cursor..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != ':');
+    if !end_ok {
+        return None;
+    }
+    let secs = match part_count {
+        2 if parts[1] < 60 => parts[0] * 60 + parts[1],
+        3 if parts[1] < 60 && parts[2] < 60 => parts[0] * 3600 + parts[1] * 60 + parts[2],
+        _ => return None,
+    };
+    Some((cursor, secs as f64))
+}
+
+/// Tokenizes a single description line into plain text, timestamps, `http(s)://` URLs,
+/// `@mentions`, and `#hashtags` while preserving exact lossless byte spans.
+pub fn tokenize_description_line(line: &str) -> Vec<DescriptionToken<'_>> {
+    if line.is_empty() {
+        return Vec::new();
+    }
+    let mut tokens = Vec::new();
+    let mut text_start = 0usize;
+    let mut i = 0usize;
+    let bytes = line.as_bytes();
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        let matched = if b == b'h' {
+            parse_url_at(line, i).map(|end| (end, DescriptionToken::Url(&line[i..end])))
+        } else if b == b'@' {
+            parse_mention_at(line, i).map(|end| (end, DescriptionToken::Mention(&line[i..end])))
+        } else if b == b'#' {
+            parse_hashtag_at(line, i).map(|end| (end, DescriptionToken::Hashtag(&line[i..end])))
+        } else if b.is_ascii_digit() {
+            parse_timestamp_at(line, i).map(|(end, secs)| {
+                (
+                    end,
+                    DescriptionToken::Timestamp {
+                        raw: &line[i..end],
+                        secs,
+                    },
+                )
+            })
+        } else {
+            None
+        };
+
+        if let Some((end, token)) = matched {
+            if i > text_start {
+                tokens.push(DescriptionToken::Text(&line[text_start..i]));
+            }
+            tokens.push(token);
+            i = end;
+            text_start = end;
+        } else {
+            let ch_len = line[i..].chars().next().map_or(1, char::len_utf8);
+            i += ch_len;
+        }
+    }
+
+    if text_start < bytes.len() {
+        tokens.push(DescriptionToken::Text(&line[text_start..]));
+    }
+    tokens
+}
+
+/// Returns the like ratio in `0.0..=1.0` for the compact RYD ratio bar, or `None` if total is 0.
+pub fn ryd_like_ratio(likes: u64, dislikes: u64) -> Option<f32> {
+    let total = likes.saturating_add(dislikes);
+    if total == 0 {
+        return None;
+    }
+    Some((likes as f64 / total as f64).clamp(0.0, 1.0) as f32)
+}
+
+fn normalize_comment_search_str(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars().flat_map(char::to_lowercase) {
+        let mapped = match ch {
+            'á' | 'à' | 'â' | 'ã' | 'ä' | 'å' => 'a',
+            'é' | 'è' | 'ê' | 'ë' => 'e',
+            'í' | 'ì' | 'î' | 'ï' => 'i',
+            'ó' | 'ò' | 'ô' | 'õ' | 'ö' | 'ø' => 'o',
+            'ú' | 'ù' | 'û' | 'ü' => 'u',
+            'ç' => 'c',
+            'ñ' => 'n',
+            'ý' | 'ÿ' => 'y',
+            '\u{0300}'..='\u{036f}' => continue,
+            other => other,
+        };
+        out.push(mapped);
+    }
+    out
+}
+
+/// Filters comments locally by query (case- and accent-insensitive across author and body).
+/// Multi-word queries require every term to match either the author or comment text.
+pub fn filter_comments_by_query(comments: &[oauth::Comment], query: &str) -> Vec<usize> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return (0..comments.len()).collect();
+    }
+    let terms: Vec<String> = trimmed
+        .split_whitespace()
+        .map(normalize_comment_search_str)
+        .filter(|t| !t.is_empty())
+        .collect();
+    if terms.is_empty() {
+        return (0..comments.len()).collect();
+    }
+    comments
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, comment)| {
+            let author_norm = normalize_comment_search_str(&comment.author);
+            let text_norm = normalize_comment_search_str(&comment.text);
+            let matches_all = terms.iter().all(|term| {
+                author_norm.contains(term.as_str()) || text_norm.contains(term.as_str())
+            });
+            matches_all.then_some(idx)
         })
         .collect()
 }
@@ -434,11 +717,52 @@ impl Drop for TempSubtitleFiles {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InnerTubeCommentMeta {
+    pub is_pinned: bool,
+    pub is_hearted: bool,
+    pub is_owner: bool,
+    pub is_member: bool,
+    pub like_count_text: Option<String>,
+    pub replies_continuation: Option<String>,
+}
+
+fn parse_compact_comment_count(raw: &str) -> Option<u64> {
+    if let Some(val) = search::parse_pt_br_compact_count(raw) {
+        return Some(val);
+    }
+    let digits: String = raw.chars().filter(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse::<u64>().ok()
+    }
+}
+
+#[allow(dead_code)]
+pub type WatchExtrasState = WatchExtras;
+
 pub struct WatchExtras {
     pub video_url: Option<String>,
+    pub like_count_text: Option<String>,
+    pub view_count_text: Option<String>,
+    pub published_date_text: Option<String>,
     pub tab: Tab,
     pub sidebar_tab: SidebarTab,
+    pub related_videos: Vec<crate::search::Video>,
+    pub related_metadata: Vec<crate::search::VideoMetadata>,
+    pub related_chips: Vec<crate::innertube::RelatedFilterChip>,
+    pub selected_related_chip: Option<usize>,
+    pub related_continuation: Option<String>,
+    pub innertube_comments_continuation: Option<String>,
+    pub innertube_comments_top_continuation: Option<String>,
+    pub innertube_comments_newest_continuation: Option<String>,
+    pub innertube_comments_loading: bool,
+    pub innertube_comment_meta: HashMap<String, InnerTubeCommentMeta>,
+    pub heatmap: Vec<crate::overlay::HeatmapPoint>,
+    pub(crate) cached_heatmap_key: Option<(u64, usize, bool)>,
+    pub(crate) cached_heatmap_points: Vec<crate::overlay::HeatmapPoint>,
+    pub(crate) cached_sidebar_related_key: Option<(usize, Option<String>, Option<usize>)>,
     pub comments: Vec<oauth::Comment>,
     pub comment_render_cache: Vec<CachedCommentMeta>,
     pub comments_next: Option<String>,
@@ -453,6 +777,12 @@ pub struct WatchExtras {
     pub comment_composer_active: bool,
     pub comment_emoji_picker_open: bool,
     pub reply_emoji_picker_for: Option<String>,
+    pub comment_search_query: String,
+    pub editing_comment_id: Option<String>,
+    pub editing_comment_draft: String,
+    pub report_modal_open: bool,
+    pub report_reason: String,
+    pub report_details: String,
     pub comment_post_error: Option<String>,
     comment_post_rx: Option<Receiver<Result<oauth::Comment, String>>>,
     comment_post_cancel: Option<process::Cancellation>,
@@ -480,16 +810,120 @@ pub struct WatchExtras {
     subtitle_apply_cancel: Option<process::Cancellation>,
     ready_subtitle: Option<ReadySubtitle>,
     pub transcript: Vec<crate::transcript::Cue>,
+    pub transcript_open: bool,
     pub transcript_query: String,
     pub transcript_error: Option<String>,
     pub transcript_loading: bool,
     pub transcript_follow: bool,
+    pub transcript_show_timestamps: bool,
     pub transcript_font_size: f32,
     pub transcript_high_contrast: bool,
-    transcript_rx: Option<Receiver<Result<TranscriptPayload, String>>>,
+    pub transcript_track_url: Option<String>,
+    pub transcript_auto_attempted: bool,
+    pub transcript_user_scrolled: bool,
+    pub transcript_last_scrolled_segment: Option<usize>,
+    pub transcript_last_scroll_offset: f32,
+    pub transcript_revision: u64,
+    transcript_request_id: u64,
+    transcript_rx: Option<Receiver<(u64, Result<TranscriptPayload, String>)>>,
     transcript_cancel: Option<process::Cancellation>,
+    pub transcript_display_cache: TranscriptDisplayCache,
     pub transcript_export_status: Option<(bool, String)>,
     transcript_export_rx: Option<Receiver<Result<Option<PathBuf>, String>>>,
+}
+
+impl Default for WatchExtras {
+    fn default() -> Self {
+        Self {
+            video_url: None,
+            like_count_text: None,
+            view_count_text: None,
+            published_date_text: None,
+            tab: Tab::default(),
+            sidebar_tab: SidebarTab::default(),
+            related_videos: Vec::new(),
+            related_metadata: Vec::new(),
+            related_chips: Vec::new(),
+            selected_related_chip: None,
+            related_continuation: None,
+            innertube_comments_continuation: None,
+            innertube_comments_top_continuation: None,
+            innertube_comments_newest_continuation: None,
+            innertube_comments_loading: false,
+            innertube_comment_meta: HashMap::new(),
+            heatmap: Vec::new(),
+            cached_heatmap_key: None,
+            cached_heatmap_points: Vec::new(),
+            cached_sidebar_related_key: None,
+            comments: Vec::new(),
+            comment_render_cache: Vec::new(),
+            comments_next: None,
+            comments_total: None,
+            comments_error: None,
+            comments_loaded: false,
+            comments_order: oauth::CommentOrder::default(),
+            comments_order_menu_open: false,
+            comments_loading: None,
+            comments_cancel: None,
+            comment_draft: String::new(),
+            comment_composer_active: false,
+            comment_emoji_picker_open: false,
+            reply_emoji_picker_for: None,
+            comment_search_query: String::new(),
+            editing_comment_id: None,
+            editing_comment_draft: String::new(),
+            report_modal_open: false,
+            report_reason: String::new(),
+            report_details: String::new(),
+            comment_post_error: None,
+            comment_post_rx: None,
+            comment_post_cancel: None,
+            comment_replies: HashMap::new(),
+            comment_ratings: HashMap::new(),
+            initial_comment_ratings: HashMap::new(),
+            user_modified_comment_ratings: HashSet::new(),
+            comment_rating_errors: HashMap::new(),
+            comment_action_tokens: None,
+            comment_rating_job: None,
+            comment_state_sync_rx: None,
+            comment_state_sync_cancel: None,
+            comment_state_sync_started: false,
+            comment_translations: HashMap::new(),
+            subtitles: Vec::new(),
+            subtitles_error: None,
+            subtitles_loaded: false,
+            subtitles_loading: None,
+            subtitles_cancel: None,
+            active_subtitle_url: None,
+            active_subtitle_cues: Vec::new(),
+            vtt_cache: HashMap::new(),
+            temp_subtitle_files: TempSubtitleFiles::default(),
+            subtitle_apply_rx: None,
+            subtitle_apply_cancel: None,
+            ready_subtitle: None,
+            transcript: Vec::new(),
+            transcript_open: false,
+            transcript_query: String::new(),
+            transcript_error: None,
+            transcript_loading: false,
+            transcript_follow: true,
+            transcript_show_timestamps: true,
+            transcript_font_size: 14.0,
+            transcript_high_contrast: false,
+            transcript_track_url: None,
+            transcript_auto_attempted: false,
+            transcript_user_scrolled: false,
+            transcript_last_scrolled_segment: None,
+            transcript_last_scroll_offset: 0.0,
+            transcript_revision: 0,
+            transcript_request_id: 0,
+            transcript_rx: None,
+            transcript_cancel: None,
+            transcript_display_cache: TranscriptDisplayCache::default(),
+            transcript_export_status: None,
+            transcript_export_rx: None,
+        }
+    }
 }
 
 impl WatchExtras {
@@ -692,6 +1126,7 @@ impl WatchExtras {
             }
         }
         let transcript_follow = self.transcript_follow;
+        let transcript_show_timestamps = self.transcript_show_timestamps;
         let transcript_font_size = self.transcript_font_size;
         let transcript_high_contrast = self.transcript_high_contrast;
         let comments_order = self.comments_order;
@@ -699,10 +1134,203 @@ impl WatchExtras {
             video_url: video_url.map(str::to_owned),
             comments_order,
             transcript_follow,
+            transcript_show_timestamps,
             transcript_font_size,
             transcript_high_contrast,
             ..Self::default()
         };
+    }
+
+    #[allow(dead_code)]
+    pub fn reset(&mut self) {
+        self.sync_video(None);
+    }
+
+    pub fn apply_watch_next(&mut self, next: crate::innertube::InnerTubeWatchNext) {
+        if next.like_count_text.is_some() {
+            self.like_count_text = next.like_count_text;
+        }
+        if next.view_count_text.is_some() {
+            self.view_count_text = next.view_count_text;
+        }
+        if next.published_date_text.is_some() {
+            self.published_date_text = next.published_date_text;
+        }
+        if !next.related_videos.is_empty() || self.related_videos.is_empty() {
+            self.related_videos = next.related_videos;
+            self.related_metadata = next.related_metadata;
+        }
+        if !next.related_chips.is_empty() || self.related_chips.is_empty() {
+            self.related_chips = next.related_chips;
+            self.selected_related_chip = self.related_chips.iter().position(|c| c.selected);
+        }
+        self.related_continuation = next.related_continuation;
+        if next.comments_continuation.is_some()
+            && (!self.comments_loaded || self.innertube_comments_continuation.is_none())
+        {
+            self.innertube_comments_continuation = next.comments_continuation;
+        }
+        if !next.heatmap.is_empty() || self.heatmap.is_empty() {
+            self.heatmap = next
+                .heatmap
+                .into_iter()
+                .filter(|b| b.duration_ms > 0 && b.intensity.is_finite())
+                .map(|b| crate::overlay::HeatmapPoint {
+                    start_secs: b.start_ms as f64 / 1000.0,
+                    duration_secs: b.duration_ms as f64 / 1000.0,
+                    intensity: b.intensity.clamp(0.0, 1.0),
+                })
+                .collect();
+            self.cached_heatmap_key = None;
+        }
+        self.cached_sidebar_related_key = None;
+    }
+
+    pub fn apply_innertube_comments_page(
+        &mut self,
+        page: crate::innertube::InnerTubeCommentsPage,
+        append: bool,
+    ) {
+        self.innertube_comments_loading = false;
+        self.comments_loaded = true;
+        self.comments_error = None;
+        if !append {
+            self.comments.clear();
+            self.comment_render_cache.clear();
+            self.innertube_comment_meta.clear();
+            self.comments_next = None;
+        }
+        if page.top_sort_continuation.is_some() {
+            self.innertube_comments_top_continuation = page.top_sort_continuation;
+        }
+        if page.newest_sort_continuation.is_some() {
+            self.innertube_comments_newest_continuation = page.newest_sort_continuation;
+        }
+        if let Some(total_raw) = page.total_count_text.as_deref()
+            && let Some(parsed_total) = parse_compact_comment_count(total_raw)
+        {
+            self.comments_total = Some(parsed_total);
+        }
+        let mut seen_ids: HashSet<String> = self.comments.iter().map(|c| c.id.clone()).collect();
+        for item in page.comments {
+            if self.comments.len() >= MAX_WATCH_COMMENTS {
+                break;
+            }
+            if item.id.trim().is_empty() || !seen_ids.insert(item.id.clone()) {
+                continue;
+            }
+            let likes = item
+                .like_count_text
+                .as_deref()
+                .and_then(parse_compact_comment_count)
+                .unwrap_or(0);
+            self.innertube_comment_meta.insert(
+                item.id.clone(),
+                InnerTubeCommentMeta {
+                    is_pinned: item.is_pinned,
+                    is_hearted: item.is_hearted,
+                    is_owner: item.is_owner,
+                    is_member: item.is_member,
+                    like_count_text: item.like_count_text,
+                    replies_continuation: item.replies_continuation,
+                },
+            );
+            self.comments.push(oauth::Comment {
+                id: item.id,
+                author: item.author,
+                author_avatar: item.author_avatar,
+                text: item.text,
+                published: item.published_text,
+                likes,
+                replies: item.reply_count,
+            });
+        }
+        if let Some(total) = self.comments_total {
+            self.comments_total = Some(total.max(self.comments.len() as u64));
+        }
+        self.innertube_comments_continuation = if self.comments.len() >= MAX_WATCH_COMMENTS {
+            None
+        } else {
+            page.continuation
+        };
+        sync_cached_comment_meta(&self.comments, &mut self.comment_render_cache);
+    }
+
+    pub fn apply_preloaded_manifest_extras(
+        &mut self,
+        manifest: &crate::stream_manifest::StreamManifest,
+    ) {
+        self.apply_preloaded_subtitles(manifest.to_subtitle_tracks());
+    }
+
+    pub fn is_transcript_open(&self) -> bool {
+        self.transcript_open || self.sidebar_tab == SidebarTab::Transcript
+    }
+
+    pub fn open_transcript(&mut self) {
+        self.transcript_open = true;
+        self.transcript_user_scrolled = false;
+        self.transcript_last_scrolled_segment = None;
+    }
+
+    pub fn close_transcript(&mut self) {
+        self.transcript_open = false;
+        if self.sidebar_tab == SidebarTab::Transcript {
+            self.sidebar_tab = SidebarTab::All;
+        }
+    }
+
+    pub fn preferred_transcript_track(&self, prefer_pt: bool) -> Option<&search::SubtitleTrack> {
+        let is_preferred_lang = |lang: &str| {
+            let lower = lang.trim().to_ascii_lowercase();
+            if prefer_pt {
+                lower == "pt" || lower.starts_with("pt-") || lower.starts_with("pt_")
+            } else {
+                lower == "en" || lower.starts_with("en-") || lower.starts_with("en_")
+            }
+        };
+        if let Some(selected_url) = self.transcript_track_url.as_deref()
+            && let Some(track) = self.subtitles.iter().find(|t| t.url == selected_url)
+        {
+            return Some(track);
+        }
+        if let Some(active_url) = self.active_subtitle_url.as_deref()
+            && let Some(track) = self.subtitles.iter().find(|t| t.url == active_url)
+        {
+            return Some(track);
+        }
+        self.subtitles
+            .iter()
+            .find(|t| !t.automatic && is_preferred_lang(&t.language))
+            .or_else(|| self.subtitles.iter().find(|t| !t.automatic))
+            .or_else(|| {
+                self.subtitles
+                    .iter()
+                    .find(|t| t.automatic && is_preferred_lang(&t.language))
+            })
+            .or_else(|| self.subtitles.first())
+    }
+
+    pub fn reload_transcript(&mut self, prefer_pt: bool, ctx: &egui::Context) {
+        if let Some(cancel) = self.transcript_cancel.take() {
+            cancel.cancel();
+        }
+        self.transcript_rx = None;
+        self.transcript_loading = false;
+        self.transcript_error = None;
+        self.transcript.clear();
+        self.transcript_user_scrolled = false;
+        self.transcript_last_scrolled_segment = None;
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        self.transcript_display_cache.valid = false;
+        if let Some(track) = self.preferred_transcript_track(prefer_pt).cloned() {
+            self.vtt_cache.remove(&track.url);
+            self.start_transcript(&track, ctx);
+        } else {
+            self.transcript_track_url = None;
+            self.transcript_auto_attempted = false;
+            self.refresh_subtitles(ctx);
+        }
     }
 
     pub fn reset_comments(&mut self) {
@@ -742,6 +1370,9 @@ impl WatchExtras {
         self.comment_composer_active = false;
         self.comment_emoji_picker_open = false;
         self.reply_emoji_picker_for = None;
+        self.comment_search_query.clear();
+        self.editing_comment_id = None;
+        self.editing_comment_draft.clear();
         self.comment_post_rx = None;
         self.comment_post_error = None;
         self.comment_replies.clear();
@@ -753,6 +1384,8 @@ impl WatchExtras {
         self.comment_state_sync_rx = None;
         self.comment_state_sync_started = false;
         self.comment_translations.clear();
+        self.innertube_comments_loading = false;
+        self.innertube_comment_meta.clear();
     }
 
     pub fn set_comments_order(
@@ -1163,18 +1796,28 @@ impl WatchExtras {
         });
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn start_transcript(&mut self, track: &search::SubtitleTrack, ctx: &egui::Context) {
-        if self.transcript_loading {
-            return;
+        if let Some(cancel) = self.transcript_cancel.take() {
+            cancel.cancel();
         }
+        self.transcript_rx = None;
+        self.transcript_loading = false;
+        self.transcript_request_id = self.transcript_request_id.wrapping_add(1);
+        let request_id = self.transcript_request_id;
+        self.transcript_track_url = Some(track.url.clone());
+        self.transcript_auto_attempted = true;
         self.transcript_error = None;
         self.transcript.clear();
         self.transcript_query.clear();
+        self.transcript_user_scrolled = false;
+        self.transcript_last_scrolled_segment = None;
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        self.transcript_display_cache.valid = false;
         if self.active_subtitle_url.as_deref() == Some(track.url.as_str())
             && !self.active_subtitle_cues.is_empty()
         {
             self.transcript = self.active_subtitle_cues.clone();
+            self.transcript_revision = self.transcript_revision.wrapping_add(1);
             return;
         }
         if let Some(vtt) = self.vtt_cache.get(&track.url) {
@@ -1183,7 +1826,10 @@ impl WatchExtras {
                     self.transcript_error =
                         Some("A faixa selecionada não contém trechos de legenda.".into());
                 }
-                Ok(cues) => self.transcript = cues,
+                Ok(cues) => {
+                    self.transcript = cues;
+                    self.transcript_revision = self.transcript_revision.wrapping_add(1);
+                }
                 Err(error) => self.transcript_error = Some(error),
             }
             return;
@@ -1213,7 +1859,7 @@ impl WatchExtras {
                         })
                     })
             };
-            let _ = tx.send(result);
+            let _ = tx.send((request_id, result));
             ctx.request_repaint();
         });
     }
@@ -1327,18 +1973,24 @@ impl WatchExtras {
         }
         let transcript_result = self.transcript_rx.as_ref().map(Receiver::try_recv);
         match transcript_result {
-            Some(Ok(Ok(payload))) => {
-                self.cache_vtt(&payload.url, payload.vtt);
-                self.transcript = payload.cues;
-                self.transcript_loading = false;
-                self.transcript_rx = None;
-                self.transcript_cancel = None;
+            Some(Ok((recv_id, Ok(payload)))) => {
+                if recv_id == self.transcript_request_id {
+                    self.cache_vtt(&payload.url, payload.vtt);
+                    self.transcript_track_url = Some(payload.url);
+                    self.transcript = payload.cues;
+                    self.transcript_revision = self.transcript_revision.wrapping_add(1);
+                    self.transcript_loading = false;
+                    self.transcript_rx = None;
+                    self.transcript_cancel = None;
+                }
             }
-            Some(Ok(Err(error))) => {
-                self.transcript_error = Some(error);
-                self.transcript_loading = false;
-                self.transcript_rx = None;
-                self.transcript_cancel = None;
+            Some(Ok((recv_id, Err(error)))) => {
+                if recv_id == self.transcript_request_id {
+                    self.transcript_error = Some(error);
+                    self.transcript_loading = false;
+                    self.transcript_rx = None;
+                    self.transcript_cancel = None;
+                }
             }
             Some(Err(TryRecvError::Disconnected)) => {
                 self.transcript_error = Some("Consulta de transcrição interrompida.".into());
@@ -1351,11 +2003,19 @@ impl WatchExtras {
         match self.comments_loading.as_ref().map(Receiver::try_recv) {
             Some(Ok(Ok(page))) => {
                 self.comments_loaded = true;
-                self.comments.extend(page.comments);
+                let remaining = MAX_WATCH_COMMENTS.saturating_sub(self.comments.len());
+                if remaining > 0 {
+                    self.comments
+                        .extend(page.comments.into_iter().take(remaining));
+                }
                 if let Some(total) = page.total_results {
                     self.comments_total = Some(total.max(self.comments.len() as u64));
                 }
-                self.comments_next = page.next_page;
+                self.comments_next = if self.comments.len() >= MAX_WATCH_COMMENTS {
+                    None
+                } else {
+                    page.next_page
+                };
                 self.comments_loading = None;
                 self.comments_cancel = None;
             }
@@ -1377,6 +2037,9 @@ impl WatchExtras {
             Some(Ok(Ok(comment))) => {
                 self.comments_loaded = true;
                 self.comments.insert(0, comment);
+                if self.comments.len() > MAX_WATCH_COMMENTS {
+                    self.comments.truncate(MAX_WATCH_COMMENTS);
+                }
                 if let Some(total) = &mut self.comments_total {
                     *total = total.saturating_add(1);
                 }
@@ -2368,5 +3031,429 @@ No vídeo anterior que gravamos lá pelas 12:30 falamos bastante sobre isso.
                 url: pt_url.into(),
             }]
         );
+    }
+
+    #[test]
+    fn preferred_transcript_track_follows_priority_order() {
+        let mut extras = WatchExtras {
+            subtitles: vec![
+                search::SubtitleTrack {
+                    language: "es".into(),
+                    automatic: true,
+                    url: "https://www.youtube.com/api/timedtext?v=1&lang=es&kind=asr".into(),
+                },
+                search::SubtitleTrack {
+                    language: "en".into(),
+                    automatic: true,
+                    url: "https://www.youtube.com/api/timedtext?v=1&lang=en&kind=asr".into(),
+                },
+                search::SubtitleTrack {
+                    language: "fr".into(),
+                    automatic: false,
+                    url: "https://www.youtube.com/api/timedtext?v=1&lang=fr".into(),
+                },
+                search::SubtitleTrack {
+                    language: "pt-BR".into(),
+                    automatic: false,
+                    url: "https://www.youtube.com/api/timedtext?v=1&lang=pt-BR".into(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            extras
+                .preferred_transcript_track(true)
+                .map(|t| t.language.as_str()),
+            Some("pt-BR")
+        );
+        // When UI is English, manual English isn't present so first manual track ('fr') wins over ASR.
+        assert_eq!(
+            extras
+                .preferred_transcript_track(false)
+                .map(|t| t.language.as_str()),
+            Some("fr")
+        );
+
+        extras.active_subtitle_url =
+            Some("https://www.youtube.com/api/timedtext?v=1&lang=en&kind=asr".into());
+        assert_eq!(
+            extras
+                .preferred_transcript_track(true)
+                .map(|t| t.language.as_str()),
+            Some("en")
+        );
+
+        extras.transcript_track_url =
+            Some("https://www.youtube.com/api/timedtext?v=1&lang=es&kind=asr".into());
+        assert_eq!(
+            extras
+                .preferred_transcript_track(true)
+                .map(|t| t.language.as_str()),
+            Some("es")
+        );
+    }
+
+    #[test]
+    fn poll_discards_stale_transcript_request_ids() {
+        let (tx, rx) = mpsc::channel();
+        let mut extras = WatchExtras {
+            transcript_request_id: 5,
+            transcript_loading: true,
+            transcript_rx: Some(rx),
+            ..Default::default()
+        };
+        tx.send((
+            4,
+            Ok(TranscriptPayload {
+                url: "https://www.youtube.com/api/timedtext?v=1&lang=en".into(),
+                vtt: "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nStale".into(),
+                cues: vec![crate::transcript::Cue {
+                    start_ms: 0,
+                    end_ms: 2_000,
+                    text: "Stale".into(),
+                }],
+            }),
+        ))
+        .unwrap();
+
+        extras.poll();
+        assert!(extras.transcript.is_empty());
+        assert!(extras.transcript_loading);
+        assert!(extras.transcript_rx.is_some());
+    }
+
+    #[test]
+    fn apply_watch_next_populates_related_videos_chips_heatmap_and_comments_continuation() {
+        let mut extras = WatchExtras::default();
+        extras.sync_video(Some("https://www.youtube.com/watch?v=video000001"));
+
+        let next = crate::innertube::InnerTubeWatchNext {
+            related_videos: vec![
+                search::Video {
+                    title: "Related 1".into(),
+                    channel: "Creator A".into(),
+                    url: "https://www.youtube.com/watch?v=rel00000001".into(),
+                    thumbnail: "https://i.ytimg.com/vi/rel00000001/hqdefault.jpg".into(),
+                    duration: "10:00".into(),
+                },
+                search::Video {
+                    title: "Related 2".into(),
+                    channel: "Creator B".into(),
+                    url: "https://www.youtube.com/watch?v=rel00000002".into(),
+                    thumbnail: String::new(),
+                    duration: "04:15".into(),
+                },
+            ],
+            related_metadata: vec![
+                search::VideoMetadata {
+                    channel_id: Some("UC1111111111111111111111".into()),
+                    channel_verified: true,
+                    ..Default::default()
+                },
+                search::VideoMetadata::default(),
+            ],
+            related_chips: vec![
+                crate::innertube::RelatedFilterChip {
+                    title: "All".into(),
+                    continuation: None,
+                    selected: false,
+                },
+                crate::innertube::RelatedFilterChip {
+                    title: "Rust".into(),
+                    continuation: Some("chip_cont_rust".into()),
+                    selected: true,
+                },
+            ],
+            related_continuation: Some("rel_next_token".into()),
+            comments_continuation: Some("comments_init_token".into()),
+            heatmap: vec![
+                crate::innertube::HeatmapBucket {
+                    start_ms: 0,
+                    duration_ms: 5_000,
+                    intensity: 0.25,
+                },
+                crate::innertube::HeatmapBucket {
+                    start_ms: 5_000,
+                    duration_ms: 5_000,
+                    intensity: 1.4,
+                },
+                crate::innertube::HeatmapBucket {
+                    start_ms: 10_000,
+                    duration_ms: 0,
+                    intensity: 0.5,
+                },
+            ],
+            channel_id: Some("UC1111111111111111111111".into()),
+            channel_verified: true,
+            like_count_text: Some("12 mil".into()),
+            subscriber_count_text: Some("500 mil inscritos".into()),
+            description_runs: Vec::new(),
+            ..Default::default()
+        };
+
+        extras.apply_watch_next(next);
+
+        assert_eq!(extras.related_videos.len(), 2);
+        assert_eq!(extras.related_videos[0].title, "Related 1");
+        assert_eq!(extras.related_chips.len(), 2);
+        assert_eq!(extras.selected_related_chip, Some(1));
+        assert_eq!(
+            extras.related_continuation.as_deref(),
+            Some("rel_next_token")
+        );
+        assert_eq!(
+            extras.innertube_comments_continuation.as_deref(),
+            Some("comments_init_token")
+        );
+        assert_eq!(extras.heatmap.len(), 2);
+        assert!((extras.heatmap[0].start_secs - 0.0).abs() < 1e-6);
+        assert!((extras.heatmap[0].duration_secs - 5.0).abs() < 1e-6);
+        assert!((extras.heatmap[0].intensity - 0.25).abs() < 1e-6);
+        assert!((extras.heatmap[1].start_secs - 5.0).abs() < 1e-6);
+        assert!((extras.heatmap[1].intensity - 1.0).abs() < 1e-6);
+
+        // Switching videos resets all watch-next state cleanly.
+        extras.sync_video(Some("https://www.youtube.com/watch?v=video000002"));
+        assert!(extras.related_videos.is_empty());
+        assert!(extras.related_chips.is_empty());
+        assert!(extras.selected_related_chip.is_none());
+        assert!(extras.related_continuation.is_none());
+        assert!(extras.innertube_comments_continuation.is_none());
+        assert!(extras.heatmap.is_empty());
+    }
+
+    #[test]
+    fn apply_innertube_comments_page_supports_oauth_free_append_and_enforces_max_cap() {
+        let mut extras = WatchExtras {
+            innertube_comments_loading: true,
+            ..Default::default()
+        };
+
+        let first_page = crate::innertube::InnerTubeCommentsPage {
+            comments: vec![crate::innertube::InnerTubeComment {
+                id: "it_c1".into(),
+                author: "@alice".into(),
+                author_avatar: Some("https://yt3.ggpht.com/a1.jpg".into()),
+                text: "Great video at 1:20".into(),
+                published_text: "há 3 horas".into(),
+                like_count_text: Some("1,5 mil".into()),
+                is_pinned: true,
+                is_hearted: true,
+                is_owner: true,
+                is_member: false,
+                reply_count: 4,
+                replies_continuation: Some("replies_c1".into()),
+            }],
+            continuation: Some("page2_token".into()),
+            top_sort_continuation: Some("sort_top_token".into()),
+            newest_sort_continuation: Some("sort_new_token".into()),
+            total_count_text: Some("842 comentários".into()),
+        };
+
+        extras.apply_innertube_comments_page(first_page, false);
+        assert!(!extras.innertube_comments_loading);
+        assert!(extras.comments_loaded);
+        assert_eq!(extras.comments.len(), 1);
+        assert_eq!(extras.comments[0].id, "it_c1");
+        assert_eq!(extras.comments[0].likes, 1_500);
+        assert_eq!(extras.comments[0].replies, 4);
+        assert_eq!(extras.comments_total, Some(842));
+        assert_eq!(
+            extras.innertube_comments_continuation.as_deref(),
+            Some("page2_token")
+        );
+        let meta = extras
+            .innertube_comment_meta
+            .get("it_c1")
+            .expect("metadata stored");
+        assert!(meta.is_pinned);
+        assert!(meta.is_hearted);
+        assert!(meta.is_owner);
+        assert!(!meta.is_member);
+        assert_eq!(meta.replies_continuation.as_deref(), Some("replies_c1"));
+
+        // Append up to MAX_WATCH_COMMENTS and verify cap + continuation clearing.
+        let mut many_comments = Vec::new();
+        for idx in 0..(MAX_WATCH_COMMENTS + 10) {
+            many_comments.push(crate::innertube::InnerTubeComment {
+                id: format!("it_bulk_{idx}"),
+                author: format!("@user_{idx}"),
+                author_avatar: None,
+                text: format!("Comment body {idx}"),
+                published_text: "há 1 dia".into(),
+                like_count_text: Some("3".into()),
+                is_pinned: false,
+                is_hearted: false,
+                is_owner: false,
+                is_member: idx % 2 == 0,
+                reply_count: 0,
+                replies_continuation: None,
+            });
+        }
+        extras.apply_innertube_comments_page(
+            crate::innertube::InnerTubeCommentsPage {
+                comments: many_comments,
+                continuation: Some("page3_should_clear_at_cap".into()),
+                top_sort_continuation: None,
+                newest_sort_continuation: None,
+                total_count_text: None,
+            },
+            true,
+        );
+        assert_eq!(extras.comments.len(), MAX_WATCH_COMMENTS);
+        assert!(extras.innertube_comments_continuation.is_none());
+    }
+
+    #[test]
+    fn apply_preloaded_manifest_extras_hydrates_subtitles_from_manifest() {
+        let mut extras = WatchExtras::default();
+        extras.sync_video(Some("https://www.youtube.com/watch?v=video000001"));
+
+        let manifest = crate::stream_manifest::StreamManifest {
+            video_id: "video000001".into(),
+            title: "Demo".into(),
+            channel: "Channel".into(),
+            channel_id: Some("UC1111111111111111111111".into()),
+            channel_verified: true,
+            duration_secs: Some(120.0),
+            is_live: false,
+            upload_date: None,
+            video_formats: Vec::new(),
+            audio_formats: Vec::new(),
+            muxed_formats: Vec::new(),
+            chapters: Vec::new(),
+            captions: vec![
+                crate::stream_manifest::ManifestCaptionTrack {
+                    language_code: "pt-BR".into(),
+                    label: "Português (Brasil)".into(),
+                    url: "https://www.youtube.com/api/timedtext?v=video000001&lang=pt-BR&fmt=vtt"
+                        .into(),
+                    is_auto_generated: false,
+                },
+                crate::stream_manifest::ManifestCaptionTrack {
+                    language_code: "en".into(),
+                    label: "English (auto)".into(),
+                    url: "https://www.youtube.com/api/timedtext?v=video000001&lang=en&kind=asr&fmt=vtt"
+                        .into(),
+                    is_auto_generated: true,
+                },
+            ],
+            storyboard: None,
+            fetched_at: std::time::Instant::now(),
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        };
+
+        extras.apply_preloaded_manifest_extras(&manifest);
+        assert!(extras.subtitles_loaded);
+        assert_eq!(extras.subtitles.len(), 2);
+        assert_eq!(extras.subtitles[0].language, "pt-BR");
+        assert!(!extras.subtitles[0].automatic);
+        assert!(extras.subtitles[0].url.contains("fmt=vtt"));
+        assert_eq!(extras.subtitles[1].language, "en");
+        assert!(extras.subtitles[1].automatic);
+    }
+
+    #[test]
+    fn tokenize_description_line_parses_urls_mentions_hashtags_and_timestamps() {
+        let line =
+            "Check 01:25 with @rustlang at https://rust-lang.org/learn, #programação and 1:02:03!";
+        let tokens = tokenize_description_line(line);
+        assert_eq!(
+            tokens,
+            vec![
+                DescriptionToken::Text("Check "),
+                DescriptionToken::Timestamp {
+                    raw: "01:25",
+                    secs: 85.0,
+                },
+                DescriptionToken::Text(" with "),
+                DescriptionToken::Mention("@rustlang"),
+                DescriptionToken::Text(" at "),
+                DescriptionToken::Url("https://rust-lang.org/learn"),
+                DescriptionToken::Text(", "),
+                DescriptionToken::Hashtag("#programação"),
+                DescriptionToken::Text(" and "),
+                DescriptionToken::Timestamp {
+                    raw: "1:02:03",
+                    secs: 3723.0,
+                },
+                DescriptionToken::Text("!"),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_description_line_ignores_emails_and_url_internal_tokens() {
+        let line = "Contact dev@example.com or visit http://example.com:8080/01:20#section (ok)";
+        let tokens = tokenize_description_line(line);
+        assert_eq!(
+            tokens,
+            vec![
+                DescriptionToken::Text("Contact dev@example.com or visit "),
+                DescriptionToken::Url("http://example.com:8080/01:20#section"),
+                DescriptionToken::Text(" (ok)"),
+            ]
+        );
+    }
+
+    #[test]
+    fn ryd_like_ratio_computes_bounds_and_handles_zero_total() {
+        assert_eq!(ryd_like_ratio(0, 0), None);
+        assert_eq!(ryd_like_ratio(100, 0), Some(1.0));
+        assert_eq!(ryd_like_ratio(0, 50), Some(0.0));
+        let half = ryd_like_ratio(75, 25).expect("non-zero total");
+        assert!((half - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn filter_comments_by_query_matches_author_and_text_case_and_accent_insensitively() {
+        let comments = vec![
+            oauth::Comment {
+                id: "1".into(),
+                author: "@JoãoSilva".into(),
+                author_avatar: None,
+                text: "Ótima explicação sobre programação em Rust!".into(),
+                published: "1d".into(),
+                likes: 12,
+                replies: 0,
+            },
+            oauth::Comment {
+                id: "2".into(),
+                author: "@Alice".into(),
+                author_avatar: None,
+                text: "Audio quality is crisp".into(),
+                published: "2h".into(),
+                likes: 3,
+                replies: 0,
+            },
+        ];
+
+        assert_eq!(filter_comments_by_query(&comments, "   "), vec![0, 1]);
+        assert_eq!(filter_comments_by_query(&comments, "programacao"), vec![0]);
+        assert_eq!(filter_comments_by_query(&comments, "joao rust"), vec![0]);
+        assert_eq!(filter_comments_by_query(&comments, "ALICE audio"), vec![1]);
+        assert!(filter_comments_by_query(&comments, "python").is_empty());
+    }
+
+    #[test]
+    fn watch_extras_reset_clears_comment_search_edit_and_report_modal_state() {
+        let mut extras = WatchExtras::default();
+        extras.sync_video(Some("https://www.youtube.com/watch?v=video000001"));
+        extras.comment_search_query = "rust".into();
+        extras.editing_comment_id = Some("c1".into());
+        extras.editing_comment_draft = "Updated body".into();
+        extras.report_modal_open = true;
+        extras.report_reason = "Spam".into();
+        extras.report_details = "Bot links".into();
+
+        extras.reset();
+
+        assert!(extras.comment_search_query.is_empty());
+        assert!(extras.editing_comment_id.is_none());
+        assert!(extras.editing_comment_draft.is_empty());
+        assert!(!extras.report_modal_open);
+        assert!(extras.report_reason.is_empty());
+        assert!(extras.report_details.is_empty());
     }
 }

@@ -9,6 +9,12 @@ on:
 permissions:
   contents: write
 
+env:
+  # Pinned shinchiro/mpv-winbuild-cmake x86_64 release artifact and SHA-256 digest.
+  MPV_WINBUILD_TAG: '20261111'
+  MPV_WINBUILD_ASSET: 'mpv-dev-x86_64-20261111-git-bcde6b93cc.7z'
+  MPV_WINBUILD_SHA256: '273c079b11ea5575822f972756f4c9a71149a5c10130353abeb8586738938452'
+
 jobs:
   release-windows-x64:
     runs-on: windows-latest
@@ -36,27 +42,68 @@ jobs:
             throw "Failed to parse version from Cargo.toml"
           }
 
-      - name: Fetch yt-dlp and libmpv runtime dependencies
+      - name: Fetch and verify yt-dlp and libmpv runtime dependencies
+        id: deps
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          New-Item -ItemType Directory -Path target\deps\mpv -Force | Out-Null
-          Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe' -OutFile target\deps\yt-dlp.exe
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
 
-          $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest'
-          $asset = $release.assets | Where-Object { $_.name -match '^mpv-dev-x86_64-.*\.7z$' } | Select-Object -First 1
-          if (-not $asset) {
-            throw "Could not find mpv-dev-x86_64 7z asset in shinchiro/mpv-winbuild-cmake latest release"
+          # Reuse verified SHA-256 parsing and assertion helpers from build-installer.ps1.
+          . ./scripts/build-installer.ps1
+
+          New-Item -ItemType Directory -Path target\deps\mpv -Force | Out-Null
+
+          $ghHeaders = @{ 'User-Agent' = 'FastTube-Release-Workflow' }
+          if (-not [string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+            $ghHeaders['Authorization'] = "Bearer $($env:GH_TOKEN)"
           }
-          $archive = Join-Path $env:RUNNER_TEMP $asset.name
-          Invoke-WebRequest -UseBasicParsing -Uri $asset.browser_download_url -OutFile $archive
+
+          # 1. Resolve immutable latest yt-dlp release tag and verify yt-dlp.exe against its sibling SHA2-256SUMS.
+          $ytRelease = Invoke-RestMethod -Uri 'https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest' -Headers $ghHeaders
+          if (-not $ytRelease -or [string]::IsNullOrWhiteSpace([string]$ytRelease.tag_name)) {
+            throw "Failed to resolve latest yt-dlp release tag."
+          }
+          $ytBaseUrl = "https://github.com/yt-dlp/yt-dlp/releases/download/$($ytRelease.tag_name)"
+          $ytExePath = 'target\deps\yt-dlp.exe'
+          $ytSumsPath = Join-Path $env:RUNNER_TEMP 'yt-dlp-SHA2-256SUMS.txt'
+
+          Invoke-WebRequest -UseBasicParsing -Uri "$ytBaseUrl/yt-dlp.exe" -OutFile $ytExePath
+          Invoke-WebRequest -UseBasicParsing -Uri "$ytBaseUrl/SHA2-256SUMS" -OutFile $ytSumsPath
+
+          $ytSumsContent = Get-Content -LiteralPath $ytSumsPath -Raw -Encoding UTF8
+          $expectedYtSha = Get-ExpectedSha256FromSums -ChecksumContent $ytSumsContent -FileName 'yt-dlp.exe'
+          $verifiedYtSha = Assert-FileSha256 -FilePath $ytExePath -ExpectedSha256 $expectedYtSha -Label "yt-dlp.exe ($($ytRelease.tag_name))"
+          Write-Host "Verified yt-dlp.exe ($($ytRelease.tag_name)) SHA-256: $verifiedYtSha"
+
+          # 2. Download pinned shinchiro/mpv-winbuild-cmake archive and verify its SHA-256 before extraction.
+          $mpvUrl = "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/$($env:MPV_WINBUILD_TAG)/$($env:MPV_WINBUILD_ASSET)"
+          $archive = Join-Path $env:RUNNER_TEMP $env:MPV_WINBUILD_ASSET
+          Invoke-WebRequest -UseBasicParsing -Uri $mpvUrl -OutFile $archive
+          $verifiedArchiveSha = Assert-FileSha256 -FilePath $archive -ExpectedSha256 $env:MPV_WINBUILD_SHA256 -Label $env:MPV_WINBUILD_ASSET
+          Write-Host "Verified $($env:MPV_WINBUILD_ASSET) SHA-256: $verifiedArchiveSha"
+
           7z x $archive -o"target\deps\mpv-extract" -y | Out-Null
-          $dlls = Get-ChildItem -Path target\deps\mpv-extract -Recurse -Filter '*mpv*.dll'
-          if (-not $dlls) {
+          if ($LASTEXITCODE -ne 0) {
+            throw "7z extraction failed with exit code $LASTEXITCODE"
+          }
+          $dlls = @(Get-ChildItem -Path target\deps\mpv-extract -Recurse -Filter '*mpv*.dll')
+          if ($dlls.Count -eq 0) {
             throw "No *mpv*.dll found inside extracted archive"
           }
           foreach ($dll in $dlls) {
             Copy-Item -LiteralPath $dll.FullName -Destination target\deps\mpv\ -Force
           }
+
+          $primaryMpv = @(Get-ChildItem -LiteralPath target\deps\mpv -File | Where-Object { $_.Name -ieq 'libmpv-2.dll' -or $_.Name -ieq 'mpv-2.dll' } | Select-Object -First 1)
+          if ($primaryMpv.Count -eq 0) {
+            throw "Neither libmpv-2.dll nor mpv-2.dll was extracted into target\deps\mpv"
+          }
+          $primaryMpvSha = (Get-FileHash -LiteralPath $primaryMpv[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "mpv_dll_sha256=$primaryMpvSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Extracted $($primaryMpv[0].Name) SHA-256: $primaryMpvSha"
 
       - name: Build portable zip bundle
         shell: pwsh
@@ -79,6 +126,7 @@ jobs:
           ./scripts/build-installer.ps1 `
             -LibMpvDirectory target\deps\mpv `
             -YtDlpPath target\deps\yt-dlp.exe `
+            -ExpectedMpvSha256 "${{ steps.deps.outputs.mpv_dll_sha256 }}" `
             -ExecutablePath target\portable-build\release\fasttube.exe `
             -OutputDirectory target\release-assets `
             -AppVersion $ver

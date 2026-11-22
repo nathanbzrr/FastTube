@@ -12,6 +12,8 @@ const SPONSORBLOCK_API_URL: &str = "https://sponsor.ajay.app/api/skipSegments";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const SKIP_TOAST_DURATION: Duration = Duration::from_secs(4);
+const SEGMENT_END_MARGIN_SECS: f64 = 0.15;
+const CONTIGUOUS_SKIP_GAP_SECS: f64 = 0.35;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -363,7 +365,9 @@ impl SponsorSegment {
     }
 
     pub fn contains(&self, pos_secs: f64) -> bool {
-        pos_secs.is_finite() && pos_secs >= self.start_secs && pos_secs < self.end_secs - 0.15
+        pos_secs.is_finite()
+            && pos_secs >= self.start_secs
+            && pos_secs < self.end_secs - SEGMENT_END_MARGIN_SECS
     }
 }
 
@@ -422,11 +426,20 @@ impl SponsorBlockRuntime {
         pos_secs: f64,
         settings: &SponsorBlockSettings,
     ) -> Option<&SponsorSegment> {
-        self.filtered_segments(settings)
-            .find(|segment| segment.contains(pos_secs))
+        let mut first_match = None;
+        for segment in self.filtered_segments(settings) {
+            if segment.contains(pos_secs) {
+                if !self.auto_skipped_uuids.contains(&segment.uuid) {
+                    return Some(segment);
+                }
+                if first_match.is_none() {
+                    first_match = Some(segment);
+                }
+            }
+        }
+        first_match
     }
 
-    #[allow(dead_code)]
     pub fn coalesced_skip_target(
         &self,
         pos_secs: f64,
@@ -441,14 +454,19 @@ impl SponsorBlockRuntime {
         loop {
             let mut extended = false;
             for seg in self.filtered_segments(settings) {
-                if !uuids.contains(&seg.uuid)
-                    && !self.auto_skipped_uuids.contains(&seg.uuid)
-                    && seg.start_secs <= target_end + 0.35
-                    && seg.end_secs > target_end
+                if self.auto_skipped_uuids.contains(&seg.uuid) {
+                    continue;
+                }
+                if seg.start_secs <= target_end + CONTIGUOUS_SKIP_GAP_SECS
+                    && seg.end_secs > pos_secs + SEGMENT_END_MARGIN_SECS
                 {
-                    target_end = seg.end_secs;
-                    uuids.push(seg.uuid.clone());
-                    extended = true;
+                    if !uuids.contains(&seg.uuid) {
+                        uuids.push(seg.uuid.clone());
+                    }
+                    if seg.end_secs > target_end {
+                        target_end = seg.end_secs;
+                        extended = true;
+                    }
                 }
             }
             if !extended {
@@ -456,6 +474,34 @@ impl SponsorBlockRuntime {
             }
         }
         Some((target_end, uuids, primary_category))
+    }
+
+    pub fn apply_auto_skip(
+        &mut self,
+        pos_secs: f64,
+        duration_secs: Option<f64>,
+        settings: &SponsorBlockSettings,
+        pt: bool,
+        now: Instant,
+    ) -> Option<f64> {
+        if !settings.enabled || settings.skip_mode != SponsorSkipMode::AutoSkip {
+            return None;
+        }
+        let (target_end, uuids, category) = self.coalesced_skip_target(pos_secs, settings)?;
+        self.auto_skipped_uuids.extend(uuids);
+        if settings.show_skip_toast {
+            let notice = if pt {
+                format!("Pulado: {}", category.label_pt())
+            } else {
+                format!("Skipped: {}", category.label_en())
+            };
+            self.last_skip_notice = Some((notice, now));
+        }
+        let target = duration_secs
+            .filter(|dur| dur.is_finite() && *dur > 0.0)
+            .map_or(target_end, |dur| target_end.min((dur - 0.1).max(0.0)))
+            .max(pos_secs);
+        Some(target)
     }
 
     pub fn active_skip_toast(&self, now: Instant) -> Option<&str> {
@@ -561,18 +607,16 @@ pub fn fetch_segments_with_cancel(
         return Ok(Vec::new());
     }
     let request_url = build_segments_url(video_id, categories)?;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .user_agent("FastTube/0.1 (SponsorBlock integration)")
-        .build()
-        .map_err(|error| {
-            format!("Não foi possível iniciar cliente HTTP do SponsorBlock: {error}")
-        })?;
     if cancel.cancelled() {
         return Err("Consulta ao SponsorBlock cancelada.".into());
     }
-    let response = client
+    let response = crate::http_client::shared()
         .get(&request_url)
+        .timeout(REQUEST_TIMEOUT)
+        .header(
+            reqwest::header::USER_AGENT,
+            "FastTube/0.1 (SponsorBlock integration)",
+        )
         .send()
         .map_err(|error| format!("Falha ao consultar SponsorBlock: {error}"))?;
     if cancel.cancelled() {
@@ -698,6 +742,144 @@ mod tests {
 
         runtime.auto_skipped_uuids.insert("intro".into());
         assert_eq!(runtime.coalesced_skip_target(6.0, &settings), None);
+    }
+
+    #[test]
+    fn coalesces_overlapping_nested_and_chained_segments_without_retriggering() {
+        let settings = SponsorBlockSettings::default();
+        let now = Instant::now();
+        let mut runtime = SponsorBlockRuntime {
+            segments: vec![
+                SponsorSegment {
+                    uuid: "past".into(),
+                    start_secs: 0.0,
+                    end_secs: 4.5,
+                    category: SponsorCategory::Intro,
+                },
+                SponsorSegment {
+                    uuid: "seg-1".into(),
+                    start_secs: 5.0,
+                    end_secs: 15.0,
+                    category: SponsorCategory::Intro,
+                },
+                SponsorSegment {
+                    uuid: "seg-2".into(),
+                    start_secs: 15.0,
+                    end_secs: 25.0,
+                    category: SponsorCategory::Sponsor,
+                },
+                SponsorSegment {
+                    uuid: "nested".into(),
+                    start_secs: 17.0,
+                    end_secs: 22.0,
+                    category: SponsorCategory::SelfPromo,
+                },
+                SponsorSegment {
+                    uuid: "seg-3".into(),
+                    start_secs: 25.3,
+                    end_secs: 40.0,
+                    category: SponsorCategory::Interaction,
+                },
+                SponsorSegment {
+                    uuid: "same-end".into(),
+                    start_secs: 30.0,
+                    end_secs: 40.0,
+                    category: SponsorCategory::Outro,
+                },
+                SponsorSegment {
+                    uuid: "distant".into(),
+                    start_secs: 41.0,
+                    end_secs: 50.0,
+                    category: SponsorCategory::Outro,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let (target_end, uuids, category) = runtime
+            .coalesced_skip_target(6.0, &settings)
+            .expect("coalesced target");
+        assert_eq!(target_end, 40.0);
+        assert_eq!(category, SponsorCategory::Intro);
+        assert_eq!(uuids, vec!["seg-1", "seg-2", "nested", "seg-3", "same-end"]);
+
+        let jumped = runtime.apply_auto_skip(6.0, Some(120.0), &settings, true, now);
+        assert_eq!(jumped, Some(40.0));
+        assert_eq!(
+            runtime.active_skip_toast(now),
+            Some("Pulado: Introdução / Vinheta")
+        );
+        assert!(!runtime.auto_skipped_uuids.contains("past"));
+        assert!(!runtime.auto_skipped_uuids.contains("distant"));
+
+        // Re-evaluating anywhere inside the skipped span must not loop or backwards-seek.
+        for pos in [6.5, 15.0, 18.0, 25.2, 32.0, 40.0] {
+            assert_eq!(
+                runtime.apply_auto_skip(pos, Some(120.0), &settings, true, now),
+                None,
+                "unexpected re-skip at {pos}"
+            );
+        }
+
+        // Separate downstream segment still auto-skips cleanly.
+        assert_eq!(
+            runtime.apply_auto_skip(41.5, Some(120.0), &settings, false, now),
+            Some(50.0)
+        );
+        assert_eq!(
+            runtime.active_skip_toast(now),
+            Some("Skipped: Outro / Credits")
+        );
+    }
+
+    #[test]
+    fn apply_auto_skip_clamps_duration_and_segment_at_prefers_unskipped_overlap() {
+        let mut settings = SponsorBlockSettings::default();
+        let now = Instant::now();
+        let mut runtime = SponsorBlockRuntime {
+            segments: vec![
+                SponsorSegment {
+                    uuid: "first-overlap".into(),
+                    start_secs: 10.0,
+                    end_secs: 20.0,
+                    category: SponsorCategory::Sponsor,
+                },
+                SponsorSegment {
+                    uuid: "second-overlap".into(),
+                    start_secs: 15.0,
+                    end_secs: 30.0,
+                    category: SponsorCategory::SelfPromo,
+                },
+                SponsorSegment {
+                    uuid: "near-end".into(),
+                    start_secs: 90.0,
+                    end_secs: 105.0,
+                    category: SponsorCategory::Outro,
+                },
+            ],
+            ..Default::default()
+        };
+
+        runtime.auto_skipped_uuids.insert("first-overlap".into());
+        assert_eq!(
+            runtime
+                .segment_at(16.0, &settings)
+                .map(|seg| seg.uuid.as_str()),
+            Some("second-overlap")
+        );
+
+        // Near-end segment clamps target cleanly inside video duration.
+        assert_eq!(
+            runtime.apply_auto_skip(91.0, Some(100.0), &settings, true, now),
+            Some(99.9)
+        );
+
+        // Non-AutoSkip modes never auto-skip.
+        settings.skip_mode = SponsorSkipMode::ManualButton;
+        assert_eq!(
+            runtime.apply_auto_skip(16.0, Some(100.0), &settings, true, now),
+            None
+        );
     }
 
     #[test]

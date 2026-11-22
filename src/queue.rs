@@ -1,6 +1,7 @@
 use crate::search::Video;
+use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read};
 use std::path::Path;
 
@@ -19,7 +20,8 @@ pub fn should_advance(ended: bool, handled: &mut bool, has_items: bool) -> bool 
     has_items
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RepeatMode {
     #[default]
     Off,
@@ -57,8 +59,13 @@ impl RepeatMode {
 pub struct Queue {
     videos: Vec<Video>,
     entry_ids: Vec<u64>,
+    queued_video_ids: HashSet<String>,
+    /// Tracks counts only for keys with 2+ occurrences so duplicate URLs
+    /// preserve `queued_video_ids` membership until the final copy is removed.
+    duplicate_key_counts: HashMap<String, usize>,
     limit: usize,
     next_entry_id: u64,
+    repeat_mode: RepeatMode,
 }
 
 impl Queue {
@@ -66,8 +73,49 @@ impl Queue {
         Self {
             videos: Vec::new(),
             entry_ids: Vec::new(),
+            queued_video_ids: HashSet::new(),
+            duplicate_key_counts: HashMap::new(),
             limit,
             next_entry_id: 1,
+            repeat_mode: RepeatMode::Off,
+        }
+    }
+
+    pub fn repeat_mode(&self) -> RepeatMode {
+        self.repeat_mode
+    }
+
+    pub fn set_repeat_mode(&mut self, repeat_mode: RepeatMode) {
+        self.repeat_mode = repeat_mode;
+    }
+
+    #[allow(dead_code)]
+    pub fn cycle_repeat_mode(&mut self) -> RepeatMode {
+        self.repeat_mode = self.repeat_mode.cycle();
+        self.repeat_mode
+    }
+
+    fn video_key(url: &str) -> String {
+        crate::history::youtube_video_id(url).unwrap_or_else(|| url.to_owned())
+    }
+
+    fn index_insert(&mut self, url: &str) {
+        let key = Self::video_key(url);
+        if !self.queued_video_ids.insert(key.clone()) {
+            *self.duplicate_key_counts.entry(key).or_insert(1) += 1;
+        }
+    }
+
+    fn index_remove(&mut self, url: &str) {
+        let key = Self::video_key(url);
+        if let Some(count) = self.duplicate_key_counts.get_mut(&key) {
+            if *count > 2 {
+                *count -= 1;
+            } else {
+                self.duplicate_key_counts.remove(&key);
+            }
+        } else {
+            self.queued_video_ids.remove(&key);
         }
     }
 
@@ -82,6 +130,32 @@ impl Queue {
     }
     pub fn videos(&self) -> &[Video] {
         &self.videos
+    }
+
+    #[allow(dead_code)]
+    pub fn queued_video_ids(&self) -> &HashSet<String> {
+        &self.queued_video_ids
+    }
+
+    /// O(1) membership check by validated YouTube video ID.
+    #[allow(dead_code)]
+    pub fn contains_video_id(&self, video_id: &str) -> bool {
+        self.queued_video_ids.contains(video_id)
+    }
+
+    /// O(1) membership check accepting either a raw video ID or a full URL.
+    #[allow(dead_code)]
+    pub fn contains_video(&self, video_id_or_url: &str) -> bool {
+        if self.queued_video_ids.contains(video_id_or_url) {
+            return true;
+        }
+        crate::history::youtube_video_id(video_id_or_url)
+            .is_some_and(|id| self.queued_video_ids.contains(&id))
+    }
+
+    #[allow(dead_code)]
+    pub fn is_queued(&self, video_id_or_url: &str) -> bool {
+        self.contains_video(video_id_or_url)
     }
 
     /// Stable identity for one queue occurrence. Duplicate URLs have different IDs.
@@ -109,6 +183,15 @@ impl Queue {
         Self::from_value_with_validator(root, limit, invalid)
     }
 
+    #[allow(dead_code)]
+    pub fn load_with_fingerprint(
+        path: &Path,
+        limit: usize,
+    ) -> io::Result<(Self, Option<crate::history::FileFingerprint>)> {
+        let queue = Self::load(path, limit)?;
+        Ok((queue, crate::history::file_fingerprint(path)))
+    }
+
     /// Decodes a queue value embedded in a user-data backup.
     pub fn from_backup_value(value: Value, limit: usize) -> io::Result<Self> {
         let invalid = || io::Error::new(io::ErrorKind::InvalidData, "fila inválida");
@@ -123,6 +206,16 @@ impl Queue {
         if !matches!(version, None | Some(1 | 2)) {
             return Err(invalid());
         }
+        let repeat_mode = match root.get("repeat_mode") {
+            None | Some(Value::Null) => RepeatMode::Off,
+            Some(Value::String(raw)) => match raw.trim().to_ascii_lowercase().as_str() {
+                "off" => RepeatMode::Off,
+                "all" => RepeatMode::All,
+                "one" => RepeatMode::One,
+                _ => return Err(invalid()),
+            },
+            Some(_) => return Err(invalid()),
+        };
         let entries = root
             .get("videos")
             .and_then(Value::as_array)
@@ -131,6 +224,7 @@ impl Queue {
             return Err(invalid());
         }
         let mut queue = Self::new(limit);
+        queue.repeat_mode = repeat_mode;
         let mut seen_ids = HashSet::with_capacity(entries.len());
         for entry in entries {
             let text = |key| -> io::Result<String> {
@@ -163,6 +257,7 @@ impl Queue {
             if !seen_ids.insert(entry_id) {
                 return Err(invalid());
             }
+            queue.index_insert(&video.url);
             queue.videos.push(video);
             queue.entry_ids.push(entry_id);
         }
@@ -177,21 +272,63 @@ impl Queue {
         Ok(queue)
     }
 
-    pub fn save(&self, path: &Path) -> io::Result<()> {
-        let bytes = serde_json::to_vec(&self.to_backup_value())?;
-        if bytes.len() as u64 > MAX_FILE_BYTES
-            || self.videos.iter().any(|v| {
-                [&v.title, &v.channel, &v.url, &v.thumbnail, &v.duration]
-                    .iter()
-                    .any(|s| s.len() > MAX_TEXT_BYTES)
-                    || v.url.is_empty()
-            })
-        {
+    pub fn serialize_bytes(&self) -> io::Result<Vec<u8>> {
+        if self.videos.iter().any(|v| {
+            [&v.title, &v.channel, &v.url, &v.thumbnail, &v.duration]
+                .iter()
+                .any(|s| s.len() > MAX_TEXT_BYTES)
+                || v.url.is_empty()
+        }) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "fila excede os limites de armazenamento",
             ));
         }
+        #[derive(Serialize)]
+        struct QueueEntryRef<'a> {
+            id: u64,
+            title: &'a str,
+            channel: &'a str,
+            url: &'a str,
+            thumbnail: &'a str,
+            duration: &'a str,
+        }
+        #[derive(Serialize)]
+        struct QueueFile<'a> {
+            version: u8,
+            #[serde(default)]
+            repeat_mode: RepeatMode,
+            videos: Vec<QueueEntryRef<'a>>,
+        }
+        let videos = self
+            .videos
+            .iter()
+            .zip(&self.entry_ids)
+            .map(|(video, &id)| QueueEntryRef {
+                id,
+                title: &video.title,
+                channel: &video.channel,
+                url: &video.url,
+                thumbnail: &video.thumbnail,
+                duration: &video.duration,
+            })
+            .collect();
+        let bytes = serde_json::to_vec(&QueueFile {
+            version: 2,
+            repeat_mode: self.repeat_mode,
+            videos,
+        })?;
+        if bytes.len() as u64 > MAX_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fila excede os limites de armazenamento",
+            ));
+        }
+        Ok(bytes)
+    }
+
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        let bytes = self.serialize_bytes()?;
         crate::history::write_atomic(path, &bytes)
     }
 
@@ -212,7 +349,11 @@ impl Queue {
                 })
             })
             .collect();
-        json!({"version": 2, "videos": videos})
+        json!({
+            "version": 2,
+            "repeat_mode": self.repeat_mode,
+            "videos": videos
+        })
     }
 
     pub fn add(&mut self, video: Video) -> Result<(), Video> {
@@ -220,6 +361,7 @@ impl Queue {
             return Err(video);
         }
         let entry_id = self.allocate_entry_id();
+        self.index_insert(&video.url);
         self.videos.push(video);
         self.entry_ids.push(entry_id);
         Ok(())
@@ -240,7 +382,9 @@ impl Queue {
             return None;
         }
         self.entry_ids.remove(index);
-        Some(self.videos.remove(index))
+        let removed = self.videos.remove(index);
+        self.index_remove(&removed.url);
+        Some(removed)
     }
 
     /// Removes the exact occurrence confirmed by a player load event.
@@ -262,8 +406,19 @@ impl Queue {
         true
     }
 
+    pub fn move_item(&mut self, from_index: usize, to_index: usize) -> bool {
+        self.reorder(from_index, to_index)
+    }
+
     pub fn move_to_top(&mut self, index: usize) -> bool {
         self.reorder(index, 0)
+    }
+
+    pub fn move_to_bottom(&mut self, index: usize) -> bool {
+        if self.videos.is_empty() {
+            return false;
+        }
+        self.reorder(index, self.videos.len() - 1)
     }
 
     pub fn index_of_entry(&self, entry_id: u64) -> Option<usize> {
@@ -316,8 +471,7 @@ impl Queue {
         let mut kept_ids = Vec::with_capacity(self.entry_ids.len());
         let original_len = self.videos.len();
         for (video, entry_id) in self.videos.drain(..).zip(self.entry_ids.drain(..)) {
-            let key =
-                crate::history::youtube_video_id(&video.url).unwrap_or_else(|| video.url.clone());
+            let key = Self::video_key(&video.url);
             if seen.insert(key) {
                 kept_videos.push(video);
                 kept_ids.push(entry_id);
@@ -325,13 +479,32 @@ impl Queue {
         }
         self.videos = kept_videos;
         self.entry_ids = kept_ids;
+        self.queued_video_ids = seen;
+        self.duplicate_key_counts.clear();
         original_len - self.videos.len()
+    }
+
+    /// Replaces the entire queue contents with fresh occurrence IDs while keeping
+    /// the video index synchronized and respecting `self.limit`.
+    #[allow(dead_code)]
+    pub fn replace_videos(&mut self, videos: impl IntoIterator<Item = Video>) -> usize {
+        self.clear();
+        let mut added = 0usize;
+        for video in videos {
+            if self.add(video).is_err() {
+                break;
+            }
+            added += 1;
+        }
+        added
     }
 
     pub fn clear(&mut self) -> usize {
         let count = self.videos.len();
         self.videos.clear();
         self.entry_ids.clear();
+        self.queued_video_ids.clear();
+        self.duplicate_key_counts.clear();
         count
     }
 
@@ -589,6 +762,149 @@ mod tests {
         assert!(queue.is_empty());
         assert!(!queue.shuffle_with_seed(1));
         assert_eq!(queue.format_duration_summary(), "0 vídeos");
+    }
+
+    #[test]
+    fn queued_video_index_stays_consistent_across_mutations_duplicates_and_load() {
+        let mut queue = Queue::new(10);
+        let yt_a = Video {
+            title: "A".into(),
+            channel: "Ch".into(),
+            url: "https://www.youtube.com/watch?v=abcdefghijk".into(),
+            thumbnail: String::new(),
+            duration: "3:00".into(),
+        };
+        let yt_a_short = Video {
+            title: "A dup".into(),
+            channel: "Ch".into(),
+            url: "https://youtu.be/abcdefghijk".into(),
+            thumbnail: String::new(),
+            duration: "3:00".into(),
+        };
+        let yt_b = Video {
+            title: "B".into(),
+            channel: "Ch".into(),
+            url: "https://www.youtube.com/watch?v=lmnopqrstuv".into(),
+            thumbnail: String::new(),
+            duration: "4:00".into(),
+        };
+
+        assert!(!queue.contains_video("abcdefghijk"));
+        assert!(!queue.is_queued(&yt_a.url));
+
+        queue.add(yt_a.clone()).unwrap();
+        queue.add(yt_a_short.clone()).unwrap();
+        queue.add(yt_b.clone()).unwrap();
+
+        let first_a_id = queue.entry_id(0).unwrap();
+        let second_a_id = queue.entry_id(1).unwrap();
+        assert_ne!(first_a_id, second_a_id);
+        assert!(queue.contains_video_id("abcdefghijk"));
+        assert!(queue.is_queued("https://youtu.be/abcdefghijk"));
+        assert!(queue.contains_video(&yt_b.url));
+
+        // Reorder preserves index membership and occurrence IDs.
+        assert!(queue.reorder(2, 0));
+        assert!(queue.contains_video_id("abcdefghijk"));
+        assert!(queue.contains_video_id("lmnopqrstuv"));
+
+        // Removing one duplicate occurrence keeps the video indexed until the last copy is removed.
+        assert!(queue.remove_entry(first_a_id).is_some());
+        assert!(queue.contains_video_id("abcdefghijk"));
+        assert!(queue.remove_entry(second_a_id).is_some());
+        assert!(!queue.contains_video_id("abcdefghijk"));
+        assert!(queue.contains_video_id("lmnopqrstuv"));
+
+        // Round-trip save & load rebuilds index and preserves occurrence IDs.
+        let path = std::env::temp_dir().join(format!(
+            "fasttube-queue-index-test-{}.json",
+            std::process::id()
+        ));
+        let b_id = queue.entry_id(0).unwrap();
+        queue.save(&path).unwrap();
+        let (mut loaded, fp) = Queue::load_with_fingerprint(&path, 10).unwrap();
+        assert!(fp.is_some());
+        assert_eq!(loaded.entry_id(0), Some(b_id));
+        assert!(loaded.contains_video_id("lmnopqrstuv"));
+        assert!(!loaded.contains_video_id("abcdefghijk"));
+        let _ = std::fs::remove_file(&path);
+
+        // replace_videos and clear keep index exact.
+        assert_eq!(loaded.replace_videos([yt_a.clone(), yt_a_short]), 2);
+        assert!(loaded.contains_video_id("abcdefghijk"));
+        assert!(!loaded.contains_video_id("lmnopqrstuv"));
+        assert_eq!(loaded.deduplicate(), 1);
+        assert!(loaded.contains_video_id("abcdefghijk"));
+        loaded.clear();
+        assert!(!loaded.contains_video_id("abcdefghijk"));
+        assert!(loaded.queued_video_ids().is_empty());
+    }
+
+    #[test]
+    fn repeat_mode_persists_in_queue_json_and_legacy_files_default_to_off() {
+        use super::RepeatMode;
+
+        let dir =
+            std::env::temp_dir().join(format!("fasttube-queue-repeat-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("queue.json");
+
+        let mut queue = Queue::new(4);
+        queue.add(video('a')).unwrap();
+        queue.set_repeat_mode(RepeatMode::All);
+        assert_eq!(queue.repeat_mode(), RepeatMode::All);
+        queue.save(&path).unwrap();
+
+        let loaded = Queue::load(&path, 4).unwrap();
+        assert_eq!(loaded.repeat_mode(), RepeatMode::All);
+        assert_eq!(titles(&loaded), ['a']);
+
+        let backup = loaded.to_backup_value();
+        assert_eq!(backup["repeat_mode"], "all");
+        let from_backup = Queue::from_backup_value(backup, 4).unwrap();
+        assert_eq!(from_backup.repeat_mode(), RepeatMode::All);
+
+        // Legacy v2 file without repeat_mode field loads with RepeatMode::Off.
+        let legacy_v2 = serde_json::json!({
+            "version": 2,
+            "videos": [
+                {"id": 1, "title": "a", "channel": "", "url": "a", "thumbnail": "", "duration": ""}
+            ]
+        });
+        std::fs::write(&path, serde_json::to_vec(&legacy_v2).unwrap()).unwrap();
+        let legacy_loaded = Queue::load(&path, 4).unwrap();
+        assert_eq!(legacy_loaded.repeat_mode(), RepeatMode::Off);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn move_item_and_move_to_bottom_preserve_occurrence_ids_and_video_index() {
+        let mut queue = Queue::new(6);
+        for ch in ['a', 'b', 'c', 'd'] {
+            let mut v = video(ch);
+            v.url = format!("https://www.youtube.com/watch?v={ch}bcdefghijk");
+            queue.add(v).unwrap();
+        }
+        let id_a = queue.entry_id(0).unwrap();
+        let id_b = queue.entry_id(1).unwrap();
+        let id_c = queue.entry_id(2).unwrap();
+        let id_d = queue.entry_id(3).unwrap();
+
+        assert!(queue.move_item(0, 2));
+        assert_eq!(titles(&queue), ['b', 'c', 'a', 'd']);
+        assert_eq!(queue.entry_id(0), Some(id_b));
+        assert_eq!(queue.entry_id(1), Some(id_c));
+        assert_eq!(queue.entry_id(2), Some(id_a));
+        assert_eq!(queue.entry_id(3), Some(id_d));
+
+        assert!(queue.move_to_bottom(0));
+        assert_eq!(titles(&queue), ['c', 'a', 'd', 'b']);
+        assert_eq!(queue.entry_id(3), Some(id_b));
+        assert!(queue.contains_video_id("abcdefghijk"));
+        assert!(queue.contains_video_id("bbcdefghijk"));
+        assert!(queue.contains_video_id("cbcdefghijk"));
+        assert!(queue.contains_video_id("dbcdefghijk"));
+        assert!(!queue.move_item(9, 0));
     }
 }
 

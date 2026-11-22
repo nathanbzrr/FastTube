@@ -11,12 +11,58 @@ use std::path::PathBuf;
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ITEMS: usize = 500;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(from = "LibraryWire")]
 pub struct Library {
     pub favorites: Vec<VideoRecord>,
     pub watch_later: Vec<VideoRecord>,
     pub collections: Vec<Collection>,
     pub bookmarks: Vec<Bookmark>,
+    #[serde(skip)]
+    watch_later_ids: HashSet<String>,
+    #[serde(skip)]
+    favorite_ids: HashSet<String>,
+    #[serde(skip)]
+    watch_later_revision: u64,
+    #[serde(skip)]
+    favorites_revision: u64,
+    #[serde(skip)]
+    collections_revision: u64,
+    #[serde(skip)]
+    bookmarks_revision: u64,
+}
+
+impl PartialEq for Library {
+    fn eq(&self, other: &Self) -> bool {
+        self.favorites == other.favorites
+            && self.watch_later == other.watch_later
+            && self.collections == other.collections
+            && self.bookmarks == other.bookmarks
+    }
+}
+
+impl Eq for Library {}
+
+#[derive(Deserialize)]
+struct LibraryWire {
+    favorites: Vec<VideoRecord>,
+    watch_later: Vec<VideoRecord>,
+    collections: Vec<Collection>,
+    bookmarks: Vec<Bookmark>,
+}
+
+impl From<LibraryWire> for Library {
+    fn from(wire: LibraryWire) -> Self {
+        let mut library = Self {
+            favorites: wire.favorites,
+            watch_later: wire.watch_later,
+            collections: wire.collections,
+            bookmarks: wire.bookmarks,
+            ..Self::default()
+        };
+        library.rebuild_indexes();
+        library
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -82,7 +128,80 @@ pub fn load(path: &Path) -> io::Result<Library> {
     Ok(library)
 }
 
+#[allow(dead_code)]
+pub fn load_with_fingerprint(
+    path: &Path,
+) -> io::Result<(Library, Option<crate::history::FileFingerprint>)> {
+    let library = load(path)?;
+    Ok((library, crate::history::file_fingerprint(path)))
+}
+
 impl Library {
+    pub fn rebuild_indexes(&mut self) {
+        self.watch_later_ids.clear();
+        self.watch_later_ids.reserve(self.watch_later.len());
+        for record in &self.watch_later {
+            if let Some(id) = crate::history::youtube_video_id(&record.video.url) {
+                self.watch_later_ids.insert(id);
+            }
+        }
+        self.favorite_ids.clear();
+        self.favorite_ids.reserve(self.favorites.len());
+        for record in &self.favorites {
+            if let Some(id) = crate::history::youtube_video_id(&record.video.url) {
+                self.favorite_ids.insert(id);
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn is_video_id_in_watch_later(&self, video_id: &str) -> bool {
+        self.watch_later_ids.contains(video_id)
+    }
+
+    #[allow(dead_code)]
+    pub fn is_in_watch_later(&self, video_id_or_url: &str) -> bool {
+        if crate::history::is_valid_video_id(video_id_or_url) {
+            return self.watch_later_ids.contains(video_id_or_url);
+        }
+        crate::history::youtube_video_id(video_id_or_url)
+            .is_some_and(|id| self.watch_later_ids.contains(&id))
+    }
+
+    #[allow(dead_code)]
+    pub fn is_video_id_in_favorites(&self, video_id: &str) -> bool {
+        self.favorite_ids.contains(video_id)
+    }
+
+    #[allow(dead_code)]
+    pub fn is_in_favorites(&self, video_id_or_url: &str) -> bool {
+        if crate::history::is_valid_video_id(video_id_or_url) {
+            return self.favorite_ids.contains(video_id_or_url);
+        }
+        crate::history::youtube_video_id(video_id_or_url)
+            .is_some_and(|id| self.favorite_ids.contains(&id))
+    }
+
+    #[allow(dead_code)]
+    pub fn watch_later_revision(&self) -> u64 {
+        self.watch_later_revision
+    }
+
+    #[allow(dead_code)]
+    pub fn favorites_revision(&self) -> u64 {
+        self.favorites_revision
+    }
+
+    #[allow(dead_code)]
+    pub fn collections_revision(&self) -> u64 {
+        self.collections_revision
+    }
+
+    #[allow(dead_code)]
+    pub fn bookmarks_revision(&self) -> u64 {
+        self.bookmarks_revision
+    }
+
     pub fn item_count(&self) -> usize {
         self.favorites.len()
             + self.watch_later.len()
@@ -97,25 +216,24 @@ impl Library {
     /// Adds imported records that are absent locally. Local records win conflicts.
     pub fn merged(&self, imported: &Library) -> (Library, MergeSummary) {
         let mut merged = self.clone();
+        merged.rebuild_indexes();
         let mut summary = MergeSummary::default();
-        let mut favorite_keys: HashSet<_> = merged
-            .favorites
-            .iter()
-            .filter_map(|record| crate::history::youtube_video_id(&record.video.url))
-            .collect();
-        let mut watch_later_keys: HashSet<_> = merged
-            .watch_later
-            .iter()
-            .filter_map(|record| crate::history::youtube_video_id(&record.video.url))
-            .collect();
+        let mut total_items = merged.item_count();
+        let mut favorites_changed = false;
+        let mut watch_later_changed = false;
+        let mut collections_changed = false;
+        let mut bookmarks_changed = false;
+
         for record in &imported.favorites {
             if let Some(id) = crate::history::youtube_video_id(&record.video.url) {
-                if favorite_keys.contains(&id) {
+                if merged.favorite_ids.contains(&id) {
                     summary.conflicts += 1;
-                } else if merged.item_count() < MAX_ITEMS {
-                    favorite_keys.insert(id);
+                } else if total_items < MAX_ITEMS {
+                    merged.favorite_ids.insert(id);
                     merged.favorites.push(record.clone());
+                    total_items += 1;
                     summary.added += 1;
+                    favorites_changed = true;
                 } else {
                     summary.skipped_for_limit += 1;
                 }
@@ -123,12 +241,14 @@ impl Library {
         }
         for record in &imported.watch_later {
             if let Some(id) = crate::history::youtube_video_id(&record.video.url) {
-                if watch_later_keys.contains(&id) {
+                if merged.watch_later_ids.contains(&id) {
                     summary.conflicts += 1;
-                } else if merged.item_count() < MAX_ITEMS {
-                    watch_later_keys.insert(id);
+                } else if total_items < MAX_ITEMS {
+                    merged.watch_later_ids.insert(id);
                     merged.watch_later.push(record.clone());
+                    total_items += 1;
                     summary.added += 1;
+                    watch_later_changed = true;
                 } else {
                     summary.skipped_for_limit += 1;
                 }
@@ -140,31 +260,33 @@ impl Library {
                 .iter()
                 .position(|collection| collection.name == imported_collection.name);
             if let Some(index) = target_index {
+                let mut existing_ids: HashSet<String> = merged.collections[index]
+                    .videos
+                    .iter()
+                    .filter_map(|existing| crate::history::youtube_video_id(&existing.video.url))
+                    .collect();
                 for record in &imported_collection.videos {
                     if let Some(id) = crate::history::youtube_video_id(&record.video.url) {
-                        let already_present =
-                            merged.collections[index].videos.iter().any(|existing| {
-                                crate::history::youtube_video_id(&existing.video.url).as_deref()
-                                    == Some(id.as_str())
-                            });
-                        if already_present {
+                        if existing_ids.contains(&id) {
                             summary.conflicts += 1;
-                        } else if merged.item_count() < MAX_ITEMS {
+                        } else if total_items < MAX_ITEMS {
+                            existing_ids.insert(id);
                             merged.collections[index].videos.push(record.clone());
+                            total_items += 1;
                             summary.added += 1;
+                            collections_changed = true;
                         } else {
                             summary.skipped_for_limit += 1;
                         }
                     }
                 }
             } else if merged.collections.len() < 100
-                && merged
-                    .item_count()
-                    .saturating_add(imported_collection.videos.len())
-                    <= MAX_ITEMS
+                && total_items.saturating_add(imported_collection.videos.len()) <= MAX_ITEMS
             {
+                total_items += imported_collection.videos.len();
                 summary.added += imported_collection.videos.len();
                 merged.collections.push(imported_collection.clone());
+                collections_changed = true;
             } else {
                 summary.skipped_for_limit += imported_collection.videos.len();
             }
@@ -188,13 +310,27 @@ impl Library {
             );
             if bookmark_keys.contains(&key) {
                 summary.conflicts += 1;
-            } else if merged.item_count() < MAX_ITEMS {
+            } else if total_items < MAX_ITEMS {
                 bookmark_keys.insert(key);
                 merged.bookmarks.push(bookmark.clone());
+                total_items += 1;
                 summary.added += 1;
+                bookmarks_changed = true;
             } else {
                 summary.skipped_for_limit += 1;
             }
+        }
+        if favorites_changed {
+            merged.favorites_revision = merged.favorites_revision.wrapping_add(1);
+        }
+        if watch_later_changed {
+            merged.watch_later_revision = merged.watch_later_revision.wrapping_add(1);
+        }
+        if collections_changed {
+            merged.collections_revision = merged.collections_revision.wrapping_add(1);
+        }
+        if bookmarks_changed {
+            merged.bookmarks_revision = merged.bookmarks_revision.wrapping_add(1);
         }
         (merged, summary)
     }
@@ -240,10 +376,115 @@ impl Library {
     }
     #[allow(dead_code)]
     pub fn toggle_favorite(&mut self, video: Video) {
-        toggle(&mut self.favorites, video);
+        if toggle_indexed(&mut self.favorites, &mut self.favorite_ids, video) {
+            self.favorites_revision = self.favorites_revision.wrapping_add(1);
+        }
     }
     pub fn toggle_watch_later(&mut self, video: Video) {
-        toggle(&mut self.watch_later, video);
+        if toggle_indexed(&mut self.watch_later, &mut self.watch_later_ids, video) {
+            self.watch_later_revision = self.watch_later_revision.wrapping_add(1);
+        }
+    }
+    #[allow(dead_code)]
+    pub fn add_to_watch_later(&mut self, video: Video) -> bool {
+        let Some(id) = crate::history::youtube_video_id(&video.url) else {
+            return false;
+        };
+        if self.watch_later_ids.contains(&id) || self.item_count() >= MAX_ITEMS {
+            return false;
+        }
+        self.watch_later_ids.insert(id);
+        self.watch_later.insert(0, VideoRecord { video });
+        self.watch_later_revision = self.watch_later_revision.wrapping_add(1);
+        true
+    }
+    #[allow(dead_code)]
+    pub fn add_to_favorites(&mut self, video: Video) -> bool {
+        let Some(id) = crate::history::youtube_video_id(&video.url) else {
+            return false;
+        };
+        if self.favorite_ids.contains(&id) || self.item_count() >= MAX_ITEMS {
+            return false;
+        }
+        self.favorite_ids.insert(id);
+        self.favorites.insert(0, VideoRecord { video });
+        self.favorites_revision = self.favorites_revision.wrapping_add(1);
+        true
+    }
+    #[allow(dead_code)]
+    pub fn clear_watch_later(&mut self) -> usize {
+        let removed = self.watch_later.len();
+        if removed > 0 {
+            self.watch_later.clear();
+            self.watch_later_ids.clear();
+            self.watch_later_revision = self.watch_later_revision.wrapping_add(1);
+        }
+        removed
+    }
+    #[allow(dead_code)]
+    pub fn clear_favorites(&mut self) -> usize {
+        let removed = self.favorites.len();
+        if removed > 0 {
+            self.favorites.clear();
+            self.favorite_ids.clear();
+            self.favorites_revision = self.favorites_revision.wrapping_add(1);
+        }
+        removed
+    }
+    #[allow(dead_code)]
+    pub fn clear_collections(&mut self) -> usize {
+        let removed = self.collections.len();
+        if removed > 0 {
+            self.collections.clear();
+            self.collections_revision = self.collections_revision.wrapping_add(1);
+        }
+        removed
+    }
+    #[allow(dead_code)]
+    pub fn clear_bookmarks(&mut self) -> usize {
+        let removed = self.bookmarks.len();
+        if removed > 0 {
+            self.bookmarks.clear();
+            self.bookmarks_revision = self.bookmarks_revision.wrapping_add(1);
+        }
+        removed
+    }
+    #[allow(dead_code)]
+    pub fn toggle_video_in_collection(&mut self, collection_name: &str, video: Video) -> bool {
+        let trimmed = collection_name.trim();
+        if trimmed.is_empty() || trimmed.len() > 128 {
+            return false;
+        }
+        let Some(vid) = crate::history::youtube_video_id(&video.url) else {
+            return false;
+        };
+        let total_items = self.item_count();
+        let mut changed = false;
+        if let Some(collection) = self
+            .collections
+            .iter_mut()
+            .find(|c| c.name.eq_ignore_ascii_case(trimmed))
+        {
+            if let Some(pos) = collection.videos.iter().position(|v| {
+                crate::history::youtube_video_id(&v.video.url).as_deref() == Some(&vid)
+            }) {
+                collection.videos.remove(pos);
+                changed = true;
+            } else if total_items < MAX_ITEMS {
+                collection.videos.insert(0, VideoRecord { video });
+                changed = true;
+            }
+        } else if self.collections.len() < 100 && total_items < MAX_ITEMS {
+            self.collections.push(Collection {
+                name: trimmed.to_owned(),
+                videos: vec![VideoRecord { video }],
+            });
+            changed = true;
+        }
+        if changed {
+            self.collections_revision = self.collections_revision.wrapping_add(1);
+        }
+        changed
     }
     pub fn add_bookmark(&mut self, bookmark: Bookmark) -> io::Result<()> {
         if self.item_count() >= MAX_ITEMS
@@ -254,6 +495,7 @@ impl Library {
             return Err(invalid());
         }
         self.bookmarks.push(bookmark);
+        self.bookmarks_revision = self.bookmarks_revision.wrapping_add(1);
         Ok(())
     }
 
@@ -265,12 +507,19 @@ impl Library {
         if trimmed.len() > 4096 {
             return Err("A nota do marcador excede o limite de 4096 bytes.");
         }
-        mark.note = trimmed.to_owned();
+        if mark.note != trimmed {
+            mark.note = trimmed.to_owned();
+            self.bookmarks_revision = self.bookmarks_revision.wrapping_add(1);
+        }
         Ok(())
     }
 
     pub fn remove_bookmark(&mut self, index: usize) -> Option<Bookmark> {
-        (index < self.bookmarks.len()).then(|| self.bookmarks.remove(index))
+        let removed = (index < self.bookmarks.len()).then(|| self.bookmarks.remove(index));
+        if removed.is_some() {
+            self.bookmarks_revision = self.bookmarks_revision.wrapping_add(1);
+        }
+        removed
     }
 
     pub fn create_collection(&mut self, name: &str) -> Result<usize, &'static str> {
@@ -295,6 +544,7 @@ impl Library {
             name: trimmed.to_owned(),
             videos: Vec::new(),
         });
+        self.collections_revision = self.collections_revision.wrapping_add(1);
         Ok(self.collections.len() - 1)
     }
 
@@ -347,15 +597,17 @@ impl Library {
         }
         let col_idx = self.create_collection(name)?;
         let mut seen_ids = HashSet::new();
+        let mut total_items = self.item_count();
         let mut added = 0usize;
         for video in valid_videos {
-            if self.item_count() >= MAX_ITEMS {
+            if total_items >= MAX_ITEMS {
                 break;
             }
             if let Some(id) = crate::history::youtube_video_id(&video.url)
                 && seen_ids.insert(id)
             {
                 self.collections[col_idx].videos.push(VideoRecord { video });
+                total_items += 1;
                 added += 1;
             }
         }
@@ -381,26 +633,47 @@ impl Library {
         {
             return Err("Já existe outra coleção com esse nome.");
         }
-        self.collections[index].name = trimmed.to_owned();
+        if self.collections[index].name != trimmed {
+            self.collections[index].name = trimmed.to_owned();
+            self.collections_revision = self.collections_revision.wrapping_add(1);
+        }
         Ok(())
     }
 
     pub fn delete_collection(&mut self, index: usize) -> Option<Collection> {
-        (index < self.collections.len()).then(|| self.collections.remove(index))
+        let removed = (index < self.collections.len()).then(|| self.collections.remove(index));
+        if removed.is_some() {
+            self.collections_revision = self.collections_revision.wrapping_add(1);
+        }
+        removed
     }
 
     pub fn remove_from_watch_later(&mut self, video_url: &str) -> bool {
-        remove_video(&mut self.watch_later, video_url)
+        let removed =
+            remove_video_indexed(&mut self.watch_later, &mut self.watch_later_ids, video_url);
+        if removed {
+            self.watch_later_revision = self.watch_later_revision.wrapping_add(1);
+        }
+        removed
     }
 
     pub fn remove_from_favorites(&mut self, video_url: &str) -> bool {
-        remove_video(&mut self.favorites, video_url)
+        let removed = remove_video_indexed(&mut self.favorites, &mut self.favorite_ids, video_url);
+        if removed {
+            self.favorites_revision = self.favorites_revision.wrapping_add(1);
+        }
+        removed
     }
 
     pub fn remove_from_collection(&mut self, collection_index: usize, video_url: &str) -> bool {
-        self.collections
+        let removed = self
+            .collections
             .get_mut(collection_index)
-            .is_some_and(|collection| remove_video(&mut collection.videos, video_url))
+            .is_some_and(|collection| remove_video(&mut collection.videos, video_url));
+        if removed {
+            self.collections_revision = self.collections_revision.wrapping_add(1);
+        }
+        removed
     }
 }
 
@@ -455,34 +728,91 @@ fn remove_video(records: &mut Vec<VideoRecord>, video_url: &str) -> bool {
     previous != records.len()
 }
 
-fn toggle(records: &mut Vec<VideoRecord>, video: Video) {
-    if let Some(id) = crate::history::youtube_video_id(&video.url) {
-        if let Some(index) = records.iter().position(|r| {
-            crate::history::youtube_video_id(&r.video.url).as_deref() == Some(id.as_str())
-        }) {
-            records.remove(index);
-        } else if records.len() < MAX_ITEMS {
-            records.insert(0, VideoRecord { video });
+fn remove_video_indexed(
+    records: &mut Vec<VideoRecord>,
+    index: &mut HashSet<String>,
+    video_url: &str,
+) -> bool {
+    let target_id = crate::history::youtube_video_id(video_url);
+    let previous = records.len();
+    records.retain(|record| {
+        if let Some(target_id) = target_id.as_deref() {
+            crate::history::youtube_video_id(&record.video.url).as_deref() != Some(target_id)
+        } else {
+            record.video.url != video_url
+        }
+    });
+    let removed = previous != records.len();
+    if removed {
+        if let Some(id) = target_id {
+            index.remove(&id);
+        } else {
+            index.clear();
+            for record in records.iter() {
+                if let Some(id) = crate::history::youtube_video_id(&record.video.url) {
+                    index.insert(id);
+                }
+            }
         }
     }
+    removed
+}
+
+fn toggle_indexed(
+    records: &mut Vec<VideoRecord>,
+    index: &mut HashSet<String>,
+    video: Video,
+) -> bool {
+    let Some(id) = crate::history::youtube_video_id(&video.url) else {
+        return false;
+    };
+    if index.contains(&id) {
+        if let Some(pos) = records.iter().position(|r| {
+            crate::history::youtube_video_id(&r.video.url).as_deref() == Some(id.as_str())
+        }) {
+            records.remove(pos);
+        }
+        index.remove(&id);
+        return true;
+    }
+    if records.len() < MAX_ITEMS {
+        index.insert(id);
+        records.insert(0, VideoRecord { video });
+        return true;
+    }
+    false
 }
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid local library")
 }
-pub fn save(path: &Path, library: &Library) -> io::Result<()> {
+
+pub fn serialize_bytes(library: &Library) -> io::Result<Vec<u8>> {
     library.validate().map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "library exceeds limits or contains invalid entries",
         )
     })?;
-    let bytes = serde_json::to_vec(&serde_json::json!({"version":1,"library":library}))?;
+    #[derive(Serialize)]
+    struct LibraryFile<'a> {
+        version: u8,
+        library: &'a Library,
+    }
+    let bytes = serde_json::to_vec(&LibraryFile {
+        version: 1,
+        library,
+    })?;
     if bytes.len() as u64 > MAX_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "library exceeds file size limit",
         ));
     }
+    Ok(bytes)
+}
+
+pub fn save(path: &Path, library: &Library) -> io::Result<()> {
+    let bytes = serialize_bytes(library)?;
     crate::history::write_atomic(path, &bytes)
 }
 
@@ -621,5 +951,93 @@ mod tests {
 
         assert!(lib.remove_bookmark(1).is_some());
         assert_eq!(lib.bookmarks.len(), 1);
+    }
+
+    #[test]
+    fn indexed_watch_later_favorites_and_per_bucket_revisions_stay_synchronized() {
+        let v1 = Video {
+            title: "Video 1".into(),
+            channel: "Channel A".into(),
+            url: "https://www.youtube.com/watch?v=abcdefghijk".into(),
+            thumbnail: String::new(),
+            duration: "3:15".into(),
+        };
+        let v2 = Video {
+            title: "Video 2".into(),
+            channel: "Channel B".into(),
+            url: "https://youtu.be/lmnopqrstuv".into(),
+            thumbnail: String::new(),
+            duration: "4:20".into(),
+        };
+
+        let mut lib = Library::default();
+        assert_eq!(lib.watch_later_revision(), 0);
+        assert_eq!(lib.favorites_revision(), 0);
+        assert_eq!(lib.collections_revision(), 0);
+        assert_eq!(lib.bookmarks_revision(), 0);
+
+        // Watch Later mutation only bumps watch_later_revision and updates O(1) index.
+        lib.toggle_watch_later(v1.clone());
+        assert!(lib.is_in_watch_later("abcdefghijk"));
+        assert!(lib.is_in_watch_later("https://youtu.be/abcdefghijk"));
+        assert!(!lib.is_in_favorites("abcdefghijk"));
+        assert_eq!(lib.watch_later_revision(), 1);
+        assert_eq!(lib.favorites_revision(), 0);
+        assert_eq!(lib.collections_revision(), 0);
+        assert_eq!(lib.bookmarks_revision(), 0);
+
+        // Favorites mutation only bumps favorites_revision.
+        assert!(lib.add_to_favorites(v2.clone()));
+        assert!(!lib.add_to_favorites(v2.clone())); // duplicate no-op
+        assert!(lib.is_in_favorites("lmnopqrstuv"));
+        assert_eq!(lib.watch_later_revision(), 1);
+        assert_eq!(lib.favorites_revision(), 1);
+
+        // Bookmark mutation only bumps bookmarks_revision.
+        lib.add_bookmark(Bookmark {
+            video_id: "abcdefghijk".into(),
+            title: "Video 1".into(),
+            time_ms: 15_000,
+            note: "Note".into(),
+        })
+        .unwrap();
+        assert_eq!(lib.bookmarks_revision(), 1);
+        assert_eq!(lib.watch_later_revision(), 1);
+        assert_eq!(lib.collections_revision(), 0);
+
+        // Collection mutation only bumps collections_revision.
+        assert!(lib.toggle_video_in_collection("Study", v1.clone()));
+        assert_eq!(lib.collections_revision(), 1);
+        assert_eq!(lib.watch_later_revision(), 1);
+
+        // Save & load rebuilds HashSet indexes automatically.
+        let path = std::env::temp_dir().join(format!(
+            "fasttube-library-index-test-{}.json",
+            std::process::id()
+        ));
+        save(&path, &lib).unwrap();
+        let (loaded, fp) = load_with_fingerprint(&path).unwrap();
+        assert!(fp.is_some());
+        assert!(loaded.is_in_watch_later("abcdefghijk"));
+        assert!(loaded.is_in_favorites("lmnopqrstuv"));
+        let _ = fs::remove_file(&path);
+
+        // Merge updates indexes and bumps only mutated bucket revisions.
+        let mut imported = Library::default();
+        imported.toggle_watch_later(v2.clone());
+        let (mut merged, summary) = lib.merged(&imported);
+        assert_eq!(summary.added, 1);
+        assert!(merged.is_in_watch_later("abcdefghijk"));
+        assert!(merged.is_in_watch_later("lmnopqrstuv"));
+        assert_eq!(
+            merged.watch_later_revision(),
+            lib.watch_later_revision() + 1
+        );
+        assert_eq!(merged.favorites_revision(), lib.favorites_revision());
+
+        // Clear empties indexes and bumps revision.
+        assert_eq!(merged.clear_watch_later(), 2);
+        assert!(!merged.is_in_watch_later("abcdefghijk"));
+        assert!(!merged.is_in_watch_later("lmnopqrstuv"));
     }
 }

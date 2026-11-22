@@ -7,15 +7,17 @@ use fastframe_now_playing::{
 };
 use fastframe_power::{Conditions as PowerConditions, Event as PowerEvent, KeepAwake, Power};
 use fastframe_tray::{Config as TrayConfig, Event as TrayEvent, MenuItem as TrayMenuItem, Tray};
-use std::fs;
-use std::io::Read;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const MAX_ARTWORK_BYTES: usize = 4 * 1024 * 1024;
 const ARTWORK_TIMEOUT: Duration = Duration::from_secs(8);
+static ARTWORK_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn fasttube_icon_rgba(size: usize) -> Vec<u8> {
     let size = size.max(8);
@@ -120,6 +122,7 @@ where
 pub(crate) enum InstanceCommand {
     Show,
     OpenUrl(String),
+    OpenSection(String),
 }
 
 pub(crate) enum SingleInstanceOutcome {
@@ -173,19 +176,43 @@ pub(crate) fn is_supported_youtube_url(raw: &str) -> bool {
     )
 }
 
+fn strip_prefix_ignore_ascii_case<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = input.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
+        input.get(prefix.len()..)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn parse_fasttube_section_uri(raw: &str) -> Option<&'static str> {
+    let trimmed = raw.trim();
+    let rest = strip_prefix_ignore_ascii_case(trimmed, "fasttube://")?.trim_start_matches('/');
+    let section_raw = strip_prefix_ignore_ascii_case(rest, "section/")?;
+    let section = section_raw.trim_matches('/').to_ascii_lowercase();
+    match section.as_str() {
+        "home" => Some("home"),
+        "subscriptions" => Some("subscriptions"),
+        "history" => Some("history"),
+        "downloads" => Some("downloads"),
+        "watch_later" | "watch-later" => Some("watch_later"),
+        _ => None,
+    }
+}
+
 pub(crate) fn normalize_fasttube_protocol_url(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if is_supported_youtube_url(trimmed) {
         return Some(trimmed.to_owned());
     }
+    if let Some(section) = parse_fasttube_section_uri(trimmed) {
+        return Some(format!("fasttube://section/{section}"));
+    }
     let parsed = url::Url::parse(trimmed).ok()?;
     if !parsed.scheme().eq_ignore_ascii_case("fasttube") {
         return None;
     }
-    let rest = trimmed
-        .strip_prefix("fasttube://")
-        .or_else(|| trimmed.strip_prefix("FASTTUBE://"))?
-        .trim_start_matches('/');
+    let rest = strip_prefix_ignore_ascii_case(trimmed, "fasttube://")?.trim_start_matches('/');
     if rest.is_empty() {
         return None;
     }
@@ -205,6 +232,9 @@ where
         if is_hidden_launch_flag(trimmed) {
             continue;
         }
+        if let Some(section) = parse_fasttube_section_uri(trimmed) {
+            return format!("section {section}");
+        }
         if let Some(url) = normalize_fasttube_protocol_url(trimmed) {
             return format!("open {url}");
         }
@@ -217,13 +247,127 @@ pub(crate) fn parse_instance_request(line: &str) -> Option<InstanceCommand> {
     if trimmed.eq_ignore_ascii_case("show") {
         return Some(InstanceCommand::Show);
     }
-    if let Some(rest) = trimmed
-        .strip_prefix("open ")
-        .or_else(|| trimmed.strip_prefix("OPEN "))
-    {
+    if let Some(rest) = strip_prefix_ignore_ascii_case(trimmed, "section ") {
+        let section = rest.trim().to_ascii_lowercase();
+        let canonical = match section.as_str() {
+            "home" => Some("home"),
+            "subscriptions" => Some("subscriptions"),
+            "history" => Some("history"),
+            "downloads" => Some("downloads"),
+            "watch_later" | "watch-later" => Some("watch_later"),
+            _ => None,
+        }?;
+        return Some(InstanceCommand::OpenSection(canonical.to_owned()));
+    }
+    if let Some(rest) = strip_prefix_ignore_ascii_case(trimmed, "open ") {
         let url = rest.trim();
+        if let Some(section) = parse_fasttube_section_uri(url) {
+            return Some(InstanceCommand::OpenSection(section.to_owned()));
+        }
         if let Some(normalized) = normalize_fasttube_protocol_url(url) {
             return Some(InstanceCommand::OpenUrl(normalized));
+        }
+    }
+    None
+}
+
+const MAX_INTERNET_SHORTCUT_BYTES: u64 = 64 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DroppedInput {
+    YouTubeUrl(String),
+    LocalMediaFile(PathBuf),
+}
+
+pub fn is_supported_local_media_ext(ext: &str) -> bool {
+    let clean = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+    matches!(
+        clean.as_str(),
+        "mp4"
+            | "mkv"
+            | "webm"
+            | "mov"
+            | "avi"
+            | "m4v"
+            | "mp3"
+            | "m4a"
+            | "opus"
+            | "ogg"
+            | "wav"
+            | "flac"
+            | "aac"
+    )
+}
+
+pub fn parse_internet_shortcut_url(contents: &str) -> Option<String> {
+    let mut in_internet_shortcut = false;
+    let mut saw_any_section = false;
+    let mut fallback_url: Option<String> = None;
+
+    for raw_line in contents.lines() {
+        let line = raw_line.trim().trim_start_matches('\u{FEFF}');
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            saw_any_section = true;
+            let section = line[1..line.len() - 1].trim();
+            in_internet_shortcut = section.eq_ignore_ascii_case("InternetShortcut");
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=')
+            && key.trim().eq_ignore_ascii_case("URL")
+        {
+            let cleaned = value.trim().trim_matches('"').trim();
+            if cleaned.is_empty() {
+                continue;
+            }
+            if in_internet_shortcut {
+                return Some(cleaned.to_owned());
+            }
+            if !saw_any_section && fallback_url.is_none() {
+                fallback_url = Some(cleaned.to_owned());
+            }
+        }
+    }
+
+    fallback_url
+}
+
+pub fn classify_dropped_path(path: &Path) -> Option<DroppedInput> {
+    let ext = path.extension()?.to_str()?;
+    if ext.eq_ignore_ascii_case("url") {
+        let file = fs::File::open(path).ok()?;
+        let mut bytes = Vec::new();
+        file.take(MAX_INTERNET_SHORTCUT_BYTES)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        let contents = String::from_utf8_lossy(&bytes);
+        let raw_url = parse_internet_shortcut_url(&contents)?;
+        let normalized = normalize_fasttube_protocol_url(&raw_url)?;
+        return is_supported_youtube_url(&normalized)
+            .then_some(DroppedInput::YouTubeUrl(normalized));
+    }
+    if is_supported_local_media_ext(ext) {
+        return Some(DroppedInput::LocalMediaFile(path.to_path_buf()));
+    }
+    None
+}
+
+pub fn classify_dropped_text(text: &str) -> Option<DroppedInput> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    for candidate in std::iter::once(trimmed)
+        .chain(trimmed.lines().map(str::trim))
+        .chain(trimmed.split_whitespace())
+    {
+        let stripped = candidate.trim_matches(|c| matches!(c, '<' | '>' | '"' | '\'' | '(' | ')'));
+        if let Some(normalized) = normalize_fasttube_protocol_url(stripped)
+            && is_supported_youtube_url(&normalized)
+        {
+            return Some(DroppedInput::YouTubeUrl(normalized));
         }
     }
     None
@@ -254,8 +398,10 @@ where
         Some("ok".to_owned())
     }) {
         Claim::First(guard) => {
-            if let Some(InstanceCommand::OpenUrl(url)) = parse_instance_request(&request) {
-                let _ = tx.send(InstanceCommand::OpenUrl(url));
+            if let Some(cmd @ (InstanceCommand::OpenUrl(_) | InstanceCommand::OpenSection(_))) =
+                parse_instance_request(&request)
+            {
+                let _ = tx.send(cmd);
             }
             SingleInstanceOutcome::Primary(InstanceHandle {
                 _guard: guard,
@@ -364,12 +510,50 @@ impl ArtworkCache {
     }
 }
 
-fn download_artwork_to(url: &str, dest: &PathBuf) -> Option<PathBuf> {
-    let client = reqwest::blocking::Client::builder()
+fn write_artwork_atomically(dest: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = dest
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "artwork path has no parent directory",
+            )
+        })?;
+    fs::create_dir_all(parent)?;
+    let (temp_path, mut file) = loop {
+        let id = ARTWORK_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".fasttube-now-playing-art-{}-{id}.tmp",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    let result = (|| {
+        file.write_all(bytes)?;
+        drop(file);
+        fs::rename(&temp_path, dest)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn download_artwork_to(url: &str, dest: &Path) -> Option<PathBuf> {
+    let response = crate::http_client::shared()
+        .get(url)
         .timeout(ARTWORK_TIMEOUT)
-        .build()
+        .send()
         .ok()?;
-    let response = client.get(url).send().ok()?;
     if !response.status().is_success() {
         return None;
     }
@@ -381,8 +565,8 @@ fn download_artwork_to(url: &str, dest: &PathBuf) -> Option<PathBuf> {
     if bytes.is_empty() || bytes.len() > MAX_ARTWORK_BYTES {
         return None;
     }
-    fs::write(dest, &bytes).ok()?;
-    Some(dest.clone())
+    write_artwork_atomically(dest, &bytes).ok()?;
+    Some(dest.to_path_buf())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -539,11 +723,29 @@ struct TrayMenuSnapshot {
     video_title: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NowPlayingDiffKey {
+    pub(crate) video_id: String,
+    pub(crate) title: String,
+    pub(crate) channel: String,
+    pub(crate) artwork_url: String,
+    pub(crate) art_file: Option<PathBuf>,
+    pub(crate) is_playing: bool,
+    pub(crate) ended: bool,
+    pub(crate) timeline_secs_bucket: i64,
+    pub(crate) duration_secs_bucket: Option<i64>,
+    pub(crate) volume_pct: Option<u8>,
+    pub(crate) can_next: bool,
+    pub(crate) can_previous: bool,
+}
+
 #[derive(Default)]
 pub(crate) struct DesktopIntegrations {
     instance: Option<InstanceHandle>,
     now_playing: Option<NowPlaying>,
     artwork: ArtworkCache,
+    last_now_playing_key: Option<Option<NowPlayingDiffKey>>,
+    now_playing_push_count: u64,
     power: Option<Power>,
     keep_awake: Option<KeepAwake>,
     tray: Option<Tray>,
@@ -691,7 +893,10 @@ impl DesktopIntegrations {
             let truncated: String = title.chars().take(64).collect();
             tooltip.push_str(&truncated);
         } else if let Some(ver) = update_version {
-            tooltip.push_str(&format!("\nv{ver} disponível"));
+            tooltip.push_str(&format!(
+                "\nv{ver} {}",
+                if pt { "disponível" } else { "available" }
+            ));
         }
         tray.set_tooltip(tooltip);
     }
@@ -729,12 +934,52 @@ impl DesktopIntegrations {
     }
 
     pub(crate) fn notify_seeked(&mut self, position_secs: f64) {
+        self.last_now_playing_key = None;
         if let Some(controls) = &mut self.now_playing
             && position_secs.is_finite()
             && position_secs >= 0.0
         {
             controls.seeked(Duration::from_secs_f64(position_secs));
         }
+    }
+
+    pub(crate) fn now_playing_diff_key(
+        snapshot: Option<&NowPlayingSnapshot>,
+        art_file: Option<&PathBuf>,
+    ) -> Option<NowPlayingDiffKey> {
+        let snap = snapshot?;
+        let timeline_secs_bucket = if snap.position_secs.is_finite() && snap.position_secs >= 0.0 {
+            snap.position_secs.floor() as i64
+        } else {
+            0
+        };
+        let duration_secs_bucket = snap
+            .duration_secs
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .map(|d| d.round() as i64);
+        let volume_pct = snap
+            .volume_fraction
+            .filter(|v| v.is_finite())
+            .map(|v| (v.clamp(0.0, 1.0) * 100.0).round() as u8);
+        Some(NowPlayingDiffKey {
+            video_id: snap.video_id.clone(),
+            title: snap.title.clone(),
+            channel: snap.channel.clone(),
+            artwork_url: snap.thumbnail_url.clone(),
+            art_file: art_file.cloned(),
+            is_playing: snap.playing,
+            ended: snap.ended,
+            timeline_secs_bucket,
+            duration_secs_bucket,
+            volume_pct,
+            can_next: snap.can_next,
+            can_previous: snap.can_previous,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn now_playing_push_count(&self) -> u64 {
+        self.now_playing_push_count
     }
 
     pub(crate) fn sync_now_playing(
@@ -746,6 +991,12 @@ impl DesktopIntegrations {
             snapshot.as_ref().map(|snap| snap.thumbnail_url.as_str()),
             ctx,
         );
+        let key = Self::now_playing_diff_key(snapshot.as_ref(), art_file.as_ref());
+        if self.last_now_playing_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.last_now_playing_key = Some(key);
+        self.now_playing_push_count = self.now_playing_push_count.saturating_add(1);
         let Some(controls) = &mut self.now_playing else {
             return;
         };
@@ -915,5 +1166,203 @@ mod tests {
             panic!("expected suspending event");
         }
         assert!(ack.is_done());
+    }
+
+    #[test]
+    fn normalizes_fasttube_protocol_urls_case_insensitively() {
+        let expected_watch = Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_owned());
+        assert_eq!(
+            normalize_fasttube_protocol_url("fasttube://watch?v=dQw4w9WgXcQ"),
+            expected_watch
+        );
+        assert_eq!(
+            normalize_fasttube_protocol_url("FASTTUBE://watch?v=dQw4w9WgXcQ"),
+            expected_watch
+        );
+        assert_eq!(
+            normalize_fasttube_protocol_url("FastTube://watch?v=dQw4w9WgXcQ"),
+            expected_watch
+        );
+        assert_eq!(
+            normalize_fasttube_protocol_url("FaStTuBe:///watch?v=dQw4w9WgXcQ"),
+            expected_watch
+        );
+        assert_eq!(
+            normalize_fasttube_protocol_url("FastTube://https://youtu.be/dQw4w9WgXcQ"),
+            Some("https://youtu.be/dQw4w9WgXcQ".to_owned())
+        );
+        assert_eq!(
+            parse_instance_request("Open FastTube://watch?v=dQw4w9WgXcQ"),
+            Some(InstanceCommand::OpenUrl(
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into()
+            ))
+        );
+        assert_eq!(normalize_fasttube_protocol_url("FastTube://"), None);
+        assert_eq!(
+            normalize_fasttube_protocol_url("FastTube:watch?v=dQw4w9WgXcQ"),
+            None
+        );
+    }
+
+    #[test]
+    fn writes_smtc_artwork_atomically_and_leaves_no_temp_files() {
+        struct TempArtDir(PathBuf);
+        impl Drop for TempArtDir {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let dir = TempArtDir(std::env::temp_dir().join(format!(
+            "fasttube-desktop-art-test-{}-{}",
+            std::process::id(),
+            ARTWORK_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        )));
+        let _ = fs::remove_dir_all(&dir.0);
+        fs::create_dir_all(&dir.0).expect("create temp artwork dir");
+        let dest = dir.0.join("now-playing-art.img");
+
+        let first = b"first-artwork-payload";
+        write_artwork_atomically(&dest, first).expect("initial atomic artwork write");
+        assert_eq!(fs::read(&dest).expect("read initial artwork"), first);
+
+        let second = b"second-artwork-payload-replacing-first";
+        write_artwork_atomically(&dest, second).expect("atomic artwork replace");
+        assert_eq!(fs::read(&dest).expect("read replaced artwork"), second);
+
+        let leftovers: Vec<String> = fs::read_dir(&dir.0)
+            .expect("list temp artwork dir")
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "unexpected temp artwork files left behind: {leftovers:?}"
+        );
+        assert!(write_artwork_atomically(Path::new("orphan.img"), first).is_err());
+    }
+
+    #[test]
+    fn parses_fasttube_section_uris_for_jump_lists() {
+        for section in [
+            "home",
+            "subscriptions",
+            "history",
+            "downloads",
+            "watch_later",
+        ] {
+            let uri = format!("fasttube://section/{section}");
+            assert_eq!(parse_fasttube_section_uri(&uri), Some(section));
+            assert_eq!(normalize_fasttube_protocol_url(&uri), Some(uri.clone()));
+            assert_eq!(
+                launch_argument_request(["fasttube.exe".into(), uri.clone()]),
+                format!("section {section}")
+            );
+            assert_eq!(
+                parse_instance_request(&format!("section {section}")),
+                Some(InstanceCommand::OpenSection(section.to_owned()))
+            );
+            assert_eq!(
+                parse_instance_request(&format!("open {uri}")),
+                Some(InstanceCommand::OpenSection(section.to_owned()))
+            );
+        }
+
+        assert_eq!(
+            parse_fasttube_section_uri("FastTube://Section/Watch-Later/"),
+            Some("watch_later")
+        );
+        assert_eq!(
+            normalize_fasttube_protocol_url("FASTTUBE:///section/Downloads"),
+            Some("fasttube://section/downloads".to_owned())
+        );
+        assert_eq!(
+            parse_fasttube_section_uri("fasttube://section/unknown"),
+            None
+        );
+        assert_eq!(parse_instance_request("section unknown"), None);
+    }
+
+    #[test]
+    fn classifies_dropped_paths_internet_shortcuts_and_text() {
+        for ext in [
+            "mp4", "MKV", ".webm", "mov", "avi", "m4v", "mp3", "m4a", "opus", "ogg", "wav", "flac",
+            "aac",
+        ] {
+            assert!(
+                is_supported_local_media_ext(ext),
+                "expected {ext} supported"
+            );
+        }
+        assert!(!is_supported_local_media_ext("exe"));
+        assert!(!is_supported_local_media_ext("txt"));
+        assert!(!is_supported_local_media_ext(""));
+
+        let shortcut_body = "[DEFAULT]\r\nBASEURL=https://example.com\r\n[InternetShortcut]\r\nURL=https://www.youtube.com/watch?v=dQw4w9WgXcQ\r\nIconIndex=0\r\n";
+        assert_eq!(
+            parse_internet_shortcut_url(shortcut_body),
+            Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_owned())
+        );
+        assert_eq!(
+            parse_internet_shortcut_url("URL=https://youtu.be/abc123\n"),
+            Some("https://youtu.be/abc123".to_owned())
+        );
+        assert_eq!(
+            parse_internet_shortcut_url("[Other]\nURL=https://youtu.be/abc"),
+            None
+        );
+
+        assert_eq!(
+            classify_dropped_path(Path::new(r"C:\Videos\demo.mkv")),
+            Some(DroppedInput::LocalMediaFile(PathBuf::from(
+                r"C:\Videos\demo.mkv"
+            )))
+        );
+        assert_eq!(classify_dropped_path(Path::new(r"C:\notes.txt")), None);
+
+        struct TempDropDir(PathBuf);
+        impl Drop for TempDropDir {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = TempDropDir(std::env::temp_dir().join(format!(
+            "fasttube-drop-test-{}-{}",
+            std::process::id(),
+            ARTWORK_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        )));
+        fs::create_dir_all(&dir.0).expect("create temp drop dir");
+        let yt_shortcut = dir.0.join("clip.url");
+        fs::write(&yt_shortcut, shortcut_body).expect("write yt shortcut");
+        assert_eq!(
+            classify_dropped_path(&yt_shortcut),
+            Some(DroppedInput::YouTubeUrl(
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_owned()
+            ))
+        );
+
+        let other_shortcut = dir.0.join("other.url");
+        fs::write(
+            &other_shortcut,
+            "[InternetShortcut]\nURL=https://example.com\n",
+        )
+        .expect("write non-yt shortcut");
+        assert_eq!(classify_dropped_path(&other_shortcut), None);
+
+        assert_eq!(
+            classify_dropped_text("  <https://youtu.be/dQw4w9WgXcQ>  "),
+            Some(DroppedInput::YouTubeUrl(
+                "https://youtu.be/dQw4w9WgXcQ".to_owned()
+            ))
+        );
+        assert_eq!(
+            classify_dropped_text("FastTube://watch?v=dQw4w9WgXcQ"),
+            Some(DroppedInput::YouTubeUrl(
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_owned()
+            ))
+        );
+        assert_eq!(classify_dropped_text("https://example.com/video"), None);
+        assert_eq!(classify_dropped_text("fasttube://section/home"), None);
     }
 }

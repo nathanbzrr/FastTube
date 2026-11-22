@@ -36,6 +36,8 @@ pub(crate) enum YtSidebarIcon {
     Mic,
     Bell,
     Keyboard,
+    Explore,
+    Incognito,
 }
 
 pub(crate) fn paint_arc_points(
@@ -763,6 +765,332 @@ pub(crate) fn paint_yt_icon(
                 painter.add(egui::Shape::closed_line(flag, stroke));
             }
         }
+        YtSidebarIcon::Explore => {
+            paint_explore_icon(painter, center, color);
+        }
+        YtSidebarIcon::Incognito => {
+            paint_incognito_icon(painter, center, color);
+        }
+    }
+}
+
+pub(crate) fn paint_settings_gear_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    color: Color32,
+) {
+    let stroke = egui::Stroke::new(1.5, color);
+    let thin = egui::Stroke::new(1.3, color);
+    painter.circle_stroke(center, 2.8, stroke);
+    painter.circle_stroke(center, 6.2, thin);
+    for i in 0..8 {
+        let a = (i as f32 * 45.0).to_radians();
+        let dx = a.cos();
+        let dy = a.sin();
+        painter.line_segment(
+            [
+                egui::pos2(center.x + dx * 6.0, center.y + dy * 6.0),
+                egui::pos2(center.x + dx * 8.2, center.y + dy * 8.2),
+            ],
+            stroke,
+        );
+    }
+}
+
+pub(crate) fn paint_notifications_bell_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    color: Color32,
+    unread_count: usize,
+) {
+    paint_yt_icon(painter, center, YtSidebarIcon::Bell, color, false);
+    if unread_count > 0 {
+        let badge_label = if unread_count > 9 {
+            "9+".to_owned()
+        } else {
+            unread_count.to_string()
+        };
+        let badge_w = if unread_count > 9 { 18.0 } else { 14.0 };
+        let badge_h = 14.0;
+        let badge_center = egui::pos2(center.x + 6.0, center.y - 5.5);
+        let badge_rect = egui::Rect::from_center_size(badge_center, egui::vec2(badge_w, badge_h));
+        painter.rect_filled(badge_rect, 7.0, Color32::from_rgb(204, 0, 0));
+        painter.text(
+            badge_center,
+            egui::Align2::CENTER_CENTER,
+            badge_label,
+            egui::FontId::proportional(9.5),
+            Color32::WHITE,
+        );
+    }
+}
+
+pub(crate) fn paint_grid_view_icon(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
+    let stroke = egui::Stroke::new(1.4, color);
+    for (dx, dy) in [(-3.6_f32, -3.6_f32), (3.6, -3.6), (-3.6, 3.6), (3.6, 3.6)] {
+        let cell = egui::Rect::from_center_size(
+            egui::pos2(center.x + dx, center.y + dy),
+            egui::vec2(5.4, 5.4),
+        );
+        painter.rect_stroke(cell, 1.2, stroke, egui::StrokeKind::Inside);
+    }
+}
+
+pub(crate) fn paint_list_view_icon(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
+    let stroke = egui::Stroke::new(1.5, color);
+    for dy in [-4.6_f32, 0.0, 4.6] {
+        painter.circle_filled(egui::pos2(center.x - 6.0, center.y + dy), 1.35, color);
+        painter.line_segment(
+            [
+                egui::pos2(center.x - 2.6, center.y + dy),
+                egui::pos2(center.x + 6.8, center.y + dy),
+            ],
+            stroke,
+        );
+    }
+}
+
+pub(crate) fn paint_incognito_icon(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
+    let stroke = egui::Stroke::new(1.45, color);
+    let crown = vec![
+        egui::pos2(center.x - 5.2, center.y - 1.2),
+        egui::pos2(center.x - 3.4, center.y - 6.8),
+        egui::pos2(center.x, center.y - 5.6),
+        egui::pos2(center.x + 3.4, center.y - 6.8),
+        egui::pos2(center.x + 5.2, center.y - 1.2),
+    ];
+    painter.add(egui::Shape::closed_line(crown, stroke));
+    painter.line_segment(
+        [
+            egui::pos2(center.x - 8.2, center.y - 1.0),
+            egui::pos2(center.x + 8.2, center.y - 1.0),
+        ],
+        egui::Stroke::new(1.7, color),
+    );
+    let left_lens = egui::pos2(center.x - 3.6, center.y + 4.0);
+    let right_lens = egui::pos2(center.x + 3.6, center.y + 4.0);
+    painter.circle_stroke(left_lens, 2.5, stroke);
+    painter.circle_stroke(right_lens, 2.5, stroke);
+    painter.line_segment(
+        [
+            egui::pos2(left_lens.x + 2.5, left_lens.y - 0.3),
+            egui::pos2(right_lens.x - 2.5, right_lens.y - 0.3),
+        ],
+        stroke,
+    );
+}
+
+pub(crate) fn paint_explore_icon(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
+    let stroke = egui::Stroke::new(1.45, color);
+    painter.circle_stroke(center, 7.6, stroke);
+    let needle = vec![
+        egui::pos2(center.x + 3.8, center.y - 3.8),
+        egui::pos2(center.x + 1.4, center.y + 1.4),
+        egui::pos2(center.x - 3.8, center.y + 3.8),
+        egui::pos2(center.x - 1.4, center.y - 1.4),
+    ];
+    painter.add(egui::Shape::closed_line(needle, stroke));
+    painter.circle_filled(center, 1.1, color);
+}
+
+pub(crate) fn paint_channel_bell_all_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    color: Color32,
+) {
+    let stroke = egui::Stroke::new(1.5, color);
+    let thin = egui::Stroke::new(1.25, color);
+    let bell = vec![
+        egui::pos2(center.x - 5.6, center.y + 3.2),
+        egui::pos2(center.x - 4.2, center.y + 1.0),
+        egui::pos2(center.x - 4.0, center.y - 2.6),
+        egui::pos2(center.x - 2.4, center.y - 5.6),
+        egui::pos2(center.x, center.y - 6.6),
+        egui::pos2(center.x + 2.4, center.y - 5.6),
+        egui::pos2(center.x + 4.0, center.y - 2.6),
+        egui::pos2(center.x + 4.2, center.y + 1.0),
+        egui::pos2(center.x + 5.6, center.y + 3.2),
+    ];
+    painter.add(egui::Shape::convex_polygon(bell, color, egui::Stroke::NONE));
+    let clapper = paint_arc_points(egui::pos2(center.x, center.y + 3.8), 2.1, 10.0, 170.0, 8);
+    painter.add(egui::Shape::line(clapper, stroke));
+    let left_wave = paint_arc_points(
+        egui::pos2(center.x - 2.2, center.y - 2.0),
+        5.8,
+        145.0,
+        225.0,
+        7,
+    );
+    let right_wave = paint_arc_points(
+        egui::pos2(center.x + 2.2, center.y - 2.0),
+        5.8,
+        -45.0,
+        35.0,
+        7,
+    );
+    painter.add(egui::Shape::line(left_wave, thin));
+    painter.add(egui::Shape::line(right_wave, thin));
+}
+
+pub(crate) fn paint_channel_bell_personalized_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    color: Color32,
+) {
+    paint_yt_icon(painter, center, YtSidebarIcon::Bell, color, false);
+}
+
+pub(crate) fn paint_channel_bell_none_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    color: Color32,
+) {
+    paint_yt_icon(painter, center, YtSidebarIcon::Bell, color, false);
+    painter.line_segment(
+        [
+            egui::pos2(center.x - 6.6, center.y - 6.2),
+            egui::pos2(center.x + 6.6, center.y + 6.2),
+        ],
+        egui::Stroke::new(1.6, color),
+    );
+}
+
+pub(crate) fn paint_channel_notify_bell_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    color: Color32,
+    level: settings::ChannelNotifyLevel,
+) {
+    match level {
+        settings::ChannelNotifyLevel::All => paint_channel_bell_all_icon(painter, center, color),
+        settings::ChannelNotifyLevel::Personalized => {
+            paint_channel_bell_personalized_icon(painter, center, color);
+        }
+        settings::ChannelNotifyLevel::None => paint_channel_bell_none_icon(painter, center, color),
+    }
+}
+
+pub(crate) fn paint_focus_ring_if_focused(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    rounding: impl Into<egui::CornerRadius>,
+) {
+    if !response.has_focus() {
+        return;
+    }
+    let corner_radius: egui::CornerRadius = rounding.into();
+    let ring_color = if ui.visuals().dark_mode {
+        Color32::from_rgb(62, 166, 255)
+    } else {
+        Color32::from_rgb(6, 95, 212)
+    };
+    ui.painter().rect_stroke(
+        response.rect.expand(1.5),
+        corner_radius,
+        egui::Stroke::new(2.0, ring_color),
+        egui::StrokeKind::Outside,
+    );
+}
+
+pub(crate) fn layout_clamped_galley(
+    ui: &egui::Ui,
+    text: &str,
+    max_width: f32,
+    font_id: egui::FontId,
+    color: egui::Color32,
+    max_lines: usize,
+) -> std::sync::Arc<egui::Galley> {
+    let max_lines = max_lines.max(1);
+    let wrap_w = max_width.max(24.0);
+    let normalized: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let layout_with = |candidate: String, break_anywhere: bool| {
+        let mut job = egui::text::LayoutJob::simple(candidate, font_id.clone(), color, wrap_w);
+        job.wrap.max_width = wrap_w;
+        job.wrap.max_rows = usize::MAX;
+        job.wrap.break_anywhere = break_anywhere;
+        egui::WidgetText::from(job).into_galley(
+            ui,
+            Some(egui::TextWrapMode::Wrap),
+            wrap_w,
+            egui::FontSelection::Default,
+        )
+    };
+
+    let full = layout_with(normalized.clone(), false);
+    if full.rows.len() <= max_lines && full.size().x <= wrap_w + 2.0 {
+        return full;
+    }
+
+    let chars: Vec<char> = normalized.chars().collect();
+    let break_anywhere = full.size().x > wrap_w + 2.0;
+    let mut lo = 1usize;
+    let mut hi = chars.len();
+    let mut best_text = String::from("…");
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let prefix: String = chars[..mid].iter().collect();
+        let candidate = format!("{}…", prefix.trim_end());
+        let galley = layout_with(candidate.clone(), break_anywhere);
+        if galley.rows.len() <= max_lines && galley.size().x <= wrap_w + 2.0 {
+            best_text = candidate;
+            lo = mid + 1;
+        } else {
+            if mid == 0 {
+                break;
+            }
+            hi = mid - 1;
+        }
+    }
+    layout_with(best_text, break_anywhere)
+}
+
+pub(crate) fn layout_two_line_clamped_galley(
+    ui: &egui::Ui,
+    text: &str,
+    max_width: f32,
+    font_id: egui::FontId,
+    color: egui::Color32,
+) -> std::sync::Arc<egui::Galley> {
+    layout_clamped_galley(ui, text, max_width, font_id, color, 2)
+}
+
+pub(crate) fn card_hover_wash_shapes(
+    rect: egui::Rect,
+    corner_radius: f32,
+    hover_t: f32,
+    palette: &ThemePalette,
+) -> (egui::Shape, egui::Shape) {
+    let t = hover_t.clamp(0.0, 1.0);
+    if t <= 0.01 {
+        return (egui::Shape::Noop, egui::Shape::Noop);
+    }
+    let wash_rect = rect.expand(6.0 * t);
+    let wash_fill = palette.card_alt_bg.gamma_multiply(0.72 * t);
+    let wash_stroke = palette.card_alt_stroke.gamma_multiply(0.75 * t);
+    let cr = egui::CornerRadius::from(corner_radius + 4.0);
+    (
+        egui::Shape::rect_filled(wash_rect, cr, wash_fill),
+        egui::Shape::rect_stroke(
+            wash_rect,
+            cr,
+            egui::Stroke::new(1.0, wash_stroke),
+            egui::StrokeKind::Inside,
+        ),
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn paint_card_hover_wash(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    corner_radius: f32,
+    hover_t: f32,
+    palette: &ThemePalette,
+) {
+    let (fill_shape, stroke_shape) = card_hover_wash_shapes(rect, corner_radius, hover_t, palette);
+    if !matches!(fill_shape, egui::Shape::Noop) {
+        ui.painter().add(fill_shape);
+        ui.painter().add(stroke_shape);
     }
 }
 
@@ -856,6 +1184,7 @@ pub(crate) fn paint_channel_search_icon_btn(
         ],
         stroke,
     );
+    paint_focus_ring_if_focused(ui, &response, 8.0);
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -949,7 +1278,167 @@ pub(crate) fn paint_more_dots_button(ui: &mut egui::Ui, palette: &ThemePalette) 
         ui.painter()
             .circle_filled(egui::pos2(c.x, c.y + dy), 1.45, dot_color);
     }
+    paint_focus_ring_if_focused(ui, &response, 13.0);
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+pub(crate) fn paint_filter_sliders_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    color: Color32,
+) {
+    let stroke = egui::Stroke::new(1.5, color);
+    for (dy, knob_dx) in [(-4.2_f32, -2.6_f32), (0.0, 2.8), (4.2, -1.6)] {
+        let y = center.y + dy;
+        painter.line_segment(
+            [egui::pos2(center.x - 6.5, y), egui::pos2(center.x + 6.5, y)],
+            stroke,
+        );
+        painter.circle_filled(egui::pos2(center.x + knob_dx, y), 1.9, color);
+    }
+}
+
+pub(crate) fn paint_shorts_heart_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    color: Color32,
+    filled: bool,
+) {
+    let left_lobe = egui::pos2(center.x - 4.1, center.y - 2.3);
+    let right_lobe = egui::pos2(center.x + 4.1, center.y - 2.3);
+    let lobe_r = 4.55;
+    if filled {
+        painter.circle_filled(left_lobe, lobe_r, color);
+        painter.circle_filled(right_lobe, lobe_r, color);
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                egui::pos2(center.x - 8.4, center.y - 1.1),
+                egui::pos2(center.x - 3.6, center.y - 5.2),
+                egui::pos2(center.x, center.y - 2.6),
+                egui::pos2(center.x + 3.6, center.y - 5.2),
+                egui::pos2(center.x + 8.4, center.y - 1.1),
+                egui::pos2(center.x, center.y + 8.0),
+            ],
+            color,
+            egui::Stroke::NONE,
+        ));
+    } else {
+        let mut pts = Vec::with_capacity(28);
+        pts.push(egui::pos2(center.x, center.y - 3.8));
+        // Left upper arch counter-clockwise toward outer cheek
+        for step in 1..=8 {
+            let t = step as f32 / 8.0;
+            let angle = std::f32::consts::PI * (0.12 + t * 0.96);
+            pts.push(egui::pos2(
+                left_lobe.x + lobe_r * angle.cos(),
+                left_lobe.y - lobe_r * angle.sin(),
+            ));
+        }
+        pts.push(egui::pos2(center.x - 7.8, center.y + 0.6));
+        pts.push(egui::pos2(center.x, center.y + 7.9));
+        pts.push(egui::pos2(center.x + 7.8, center.y + 0.6));
+        // Right upper arch back to center cleft
+        for step in (1..=8).rev() {
+            let t = step as f32 / 8.0;
+            let angle = std::f32::consts::PI * (0.12 + t * 0.96);
+            pts.push(egui::pos2(
+                right_lobe.x - lobe_r * angle.cos(),
+                right_lobe.y - lobe_r * angle.sin(),
+            ));
+        }
+        painter.add(egui::Shape::closed_line(
+            pts,
+            egui::Stroke::new(1.85, color),
+        ));
+    }
+}
+
+pub(crate) fn paint_shorts_comment_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    color: Color32,
+) {
+    let stroke = egui::Stroke::new(1.75, color);
+    let bubble = vec![
+        egui::pos2(center.x - 6.8, center.y - 7.0),
+        egui::pos2(center.x + 6.8, center.y - 7.0),
+        egui::pos2(center.x + 8.0, center.y - 5.8),
+        egui::pos2(center.x + 8.0, center.y + 3.2),
+        egui::pos2(center.x + 6.8, center.y + 4.4),
+        egui::pos2(center.x - 2.2, center.y + 4.4),
+        egui::pos2(center.x - 6.2, center.y + 8.0),
+        egui::pos2(center.x - 6.2, center.y + 4.4),
+        egui::pos2(center.x - 6.8, center.y + 4.4),
+        egui::pos2(center.x - 8.0, center.y + 3.2),
+        egui::pos2(center.x - 8.0, center.y - 5.8),
+    ];
+    painter.add(egui::Shape::closed_line(bubble, stroke));
+    painter.line_segment(
+        [
+            egui::pos2(center.x - 4.2, center.y - 2.6),
+            egui::pos2(center.x + 4.2, center.y - 2.6),
+        ],
+        egui::Stroke::new(1.5, color),
+    );
+    painter.line_segment(
+        [
+            egui::pos2(center.x - 4.2, center.y + 0.8),
+            egui::pos2(center.x + 1.8, center.y + 0.8),
+        ],
+        egui::Stroke::new(1.5, color),
+    );
+}
+
+pub(crate) fn paint_shorts_share_icon(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
+    // Forward curved arrow pointing right
+    let curve = vec![
+        egui::pos2(center.x - 7.2, center.y + 6.8),
+        egui::pos2(center.x - 6.2, center.y + 2.2),
+        egui::pos2(center.x - 3.6, center.y - 0.6),
+        egui::pos2(center.x + 0.4, center.y - 1.6),
+        egui::pos2(center.x + 2.6, center.y - 1.6),
+        egui::pos2(center.x + 2.6, center.y - 6.4),
+        egui::pos2(center.x + 8.6, center.y - 0.2),
+        egui::pos2(center.x + 2.6, center.y + 5.8),
+        egui::pos2(center.x + 2.6, center.y + 1.4),
+        egui::pos2(center.x - 0.8, center.y + 1.4),
+        egui::pos2(center.x - 4.2, center.y + 2.8),
+    ];
+    painter.add(egui::Shape::closed_line(
+        curve,
+        egui::Stroke::new(1.65, color),
+    ));
+}
+
+pub(crate) fn paint_shorts_arrow_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    color: Color32,
+    up: bool,
+) {
+    let dir = if up { -1.0 } else { 1.0 };
+    let stroke = egui::Stroke::new(1.85, color);
+    let tip = egui::pos2(center.x, center.y + dir * 6.5);
+    let tail = egui::pos2(center.x, center.y - dir * 6.5);
+    painter.line_segment([tail, tip], stroke);
+    painter.line_segment(
+        [egui::pos2(center.x - 4.8, center.y + dir * 1.4), tip],
+        stroke,
+    );
+    painter.line_segment(
+        [egui::pos2(center.x + 4.8, center.y + dir * 1.4), tip],
+        stroke,
+    );
+}
+
+pub(crate) fn paint_shorts_more_dots_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    color: Color32,
+) {
+    for dy in [-4.5_f32, 0.0, 4.5] {
+        painter.circle_filled(egui::pos2(center.x, center.y + dy), 1.55, color);
+    }
 }
 
 pub(crate) fn paint_short_novo_badge(ui: &egui::Ui, rect: egui::Rect) {
@@ -1160,6 +1649,7 @@ pub(crate) fn paint_window_control_button(
         .on_hover_text(tooltip)
 }
 
+#[allow(dead_code)]
 pub(crate) fn paint_channel_avatar(
     ui: &mut egui::Ui,
     channel_name: &str,
@@ -1214,6 +1704,7 @@ pub(crate) fn sidebar_section_header_item(
         egui::FontId::proportional(15.5),
         palette.header_button_fg,
     );
+    paint_focus_ring_if_focused(ui, &response, 10.0);
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -1265,6 +1756,7 @@ pub(crate) fn sidebar_pill_item(
             Color32::from_rgb(62, 166, 255),
         );
     }
+    paint_focus_ring_if_focused(ui, &response, 10.0);
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -1302,9 +1794,31 @@ pub(crate) fn compact_sidebar_item(
         egui::FontId::proportional(10.0),
         label_color,
     );
+    paint_focus_ring_if_focused(ui, &response, 10.0);
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SidebarChannelIndicator {
+    None,
+    Unseen,
+    Live,
+}
+
+pub(crate) fn resolve_sidebar_channel_indicator(
+    has_unseen: bool,
+    is_live: bool,
+) -> SidebarChannelIndicator {
+    if is_live {
+        SidebarChannelIndicator::Live
+    } else if has_unseen {
+        SidebarChannelIndicator::Unseen
+    } else {
+        SidebarChannelIndicator::None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sidebar_channel_item(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -1312,6 +1826,8 @@ pub(crate) fn sidebar_channel_item(
     avatar_url: Option<&str>,
     channel_name: &str,
     active: bool,
+    has_unseen: bool,
+    is_live: bool,
     palette: &ThemePalette,
 ) -> egui::Response {
     let desired = egui::vec2(ui.available_width().max(110.0), 40.0);
@@ -1355,11 +1871,28 @@ pub(crate) fn sidebar_channel_item(
         egui::FontId::proportional(14.0),
         palette.channel_fg,
     );
-    ui.painter().circle_filled(
-        egui::pos2(pill_rect.right() - 12.0, pill_rect.center().y),
-        2.5,
-        Color32::from_rgb(62, 166, 255),
-    );
+    let indicator_center = egui::pos2(pill_rect.right() - 12.0, pill_rect.center().y);
+    match resolve_sidebar_channel_indicator(has_unseen, is_live) {
+        SidebarChannelIndicator::None => {}
+        SidebarChannelIndicator::Unseen => {
+            ui.painter()
+                .circle_filled(indicator_center, 2.5, Color32::from_rgb(62, 166, 255));
+        }
+        SidebarChannelIndicator::Live => {
+            let live_red = Color32::from_rgb(255, 0, 51);
+            let arc_stroke = egui::Stroke::new(1.2, live_red);
+            ui.painter().circle_filled(indicator_center, 2.2, live_red);
+            ui.painter().add(egui::Shape::line(
+                paint_arc_points(indicator_center, 4.8, -45.0, 45.0, 6),
+                arc_stroke,
+            ));
+            ui.painter().add(egui::Shape::line(
+                paint_arc_points(indicator_center, 4.8, 135.0, 225.0, 6),
+                arc_stroke,
+            ));
+        }
+    }
+    paint_focus_ring_if_focused(ui, &response, 10.0);
     response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text(channel_name)
@@ -1423,10 +1956,47 @@ pub(crate) fn paint_thumbnail_overlays(
     }
 }
 
+pub(crate) fn paint_playlist_stack_tab(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    stack_color: Option<Color32>,
+    dark_theme: bool,
+) {
+    let tab_color = stack_color.unwrap_or_else(|| {
+        if dark_theme {
+            Color32::from_rgb(76, 76, 80)
+        } else {
+            Color32::from_rgb(196, 196, 202)
+        }
+    });
+    let tab_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 8.0, rect.top()),
+        egui::pos2(
+            (rect.right() - 8.0).max(rect.left() + 10.0),
+            (rect.bottom() - 1.5).max(rect.top() + 2.0),
+        ),
+    );
+    ui.painter().rect_filled(
+        tab_rect,
+        egui::CornerRadius {
+            nw: 8,
+            ne: 8,
+            sw: 0,
+            se: 0,
+        },
+        tab_color,
+    );
+}
+
 pub(crate) fn paint_playlist_badge_overlay(ui: &egui::Ui, rect: egui::Rect, label: &str) {
-    let text_w = (label.chars().count() as f32) * 6.8;
-    let badge_w = (text_w + 30.0).max(52.0);
-    let badge_h = 21.0;
+    let fg = Color32::from_rgb(241, 241, 241);
+    let font = egui::FontId::proportional(11.5);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font.clone(), fg);
+    let text_w = galley.size().x;
+    let badge_w = (text_w + 26.0).max(46.0);
+    let badge_h = 20.0;
     let badge_rect = egui::Rect::from_min_size(
         egui::pos2(
             (rect.right() - badge_w - 8.0).max(rect.left() + 4.0),
@@ -1437,10 +2007,9 @@ pub(crate) fn paint_playlist_badge_overlay(ui: &egui::Ui, rect: egui::Rect, labe
     ui.painter().rect_filled(
         badge_rect,
         4.0,
-        Color32::from_rgba_unmultiplied(15, 15, 15, 224),
+        Color32::from_rgba_unmultiplied(15, 15, 15, 212),
     );
-    let fg = Color32::from_rgb(241, 241, 241);
-    let icon_x = badge_rect.left() + 8.0;
+    let icon_x = badge_rect.left() + 7.0;
     let cy = badge_rect.center().y;
     for (idx, dy) in [-3.2_f32, 0.0, 3.2].into_iter().enumerate() {
         let len = if idx == 2 { 5.2 } else { 8.5 };
@@ -1459,12 +2028,278 @@ pub(crate) fn paint_playlist_badge_overlay(ui: &egui::Ui, rect: egui::Rect, labe
     ];
     ui.painter()
         .add(egui::Shape::convex_polygon(tri, fg, egui::Stroke::NONE));
-    ui.painter().text(
-        egui::pos2(icon_x + 14.0, cy),
-        egui::Align2::LEFT_CENTER,
-        label,
-        egui::FontId::proportional(11.5),
+    ui.painter().galley(
+        egui::pos2(icon_x + 13.0, cy - galley.size().y * 0.5),
+        galley,
         fg,
+    );
+}
+
+pub(crate) fn paint_mix_badge_overlay(ui: &egui::Ui, rect: egui::Rect, label: &str) {
+    let fg = Color32::from_rgb(241, 241, 241);
+    let font = egui::FontId::proportional(11.5);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font.clone(), fg);
+    let text_w = galley.size().x;
+    let badge_w = (text_w + 26.0).max(46.0);
+    let badge_h = 20.0;
+    let badge_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            (rect.right() - badge_w - 8.0).max(rect.left() + 4.0),
+            (rect.bottom() - badge_h - 8.0).max(rect.top() + 4.0),
+        ),
+        egui::vec2(badge_w, badge_h),
+    );
+    ui.painter().rect_filled(
+        badge_rect,
+        4.0,
+        Color32::from_rgba_unmultiplied(15, 15, 15, 212),
+    );
+    let icon_x = badge_rect.left() + 7.0;
+    let cy = badge_rect.center().y;
+    let tri = vec![
+        egui::pos2(icon_x, cy - 3.6),
+        egui::pos2(icon_x, cy + 3.6),
+        egui::pos2(icon_x + 5.4, cy),
+    ];
+    ui.painter()
+        .add(egui::Shape::convex_polygon(tri, fg, egui::Stroke::NONE));
+    ui.painter().line_segment(
+        [
+            egui::pos2(icon_x + 7.2, cy - 3.2),
+            egui::pos2(icon_x + 7.2, cy + 3.2),
+        ],
+        egui::Stroke::new(1.3, fg),
+    );
+    ui.painter().line_segment(
+        [
+            egui::pos2(icon_x + 9.8, cy - 4.2),
+            egui::pos2(icon_x + 9.8, cy + 4.2),
+        ],
+        egui::Stroke::new(1.3, fg),
+    );
+    ui.painter().galley(
+        egui::pos2(icon_x + 13.0, cy - galley.size().y * 0.5),
+        galley,
+        fg,
+    );
+}
+
+pub(crate) fn paint_playlist_loop_icon(ui: &egui::Ui, rect: egui::Rect, fg: Color32) {
+    let p = ui.painter();
+    let c = rect.center();
+    let s = (rect.width().min(rect.height()) * 0.42).max(5.0);
+    let stroke = egui::Stroke::new(1.7, fg);
+    p.line_segment(
+        [
+            egui::pos2(c.x - s * 0.75, c.y - s * 0.45),
+            egui::pos2(c.x + s * 0.65, c.y - s * 0.45),
+        ],
+        stroke,
+    );
+    p.line_segment(
+        [
+            egui::pos2(c.x - s * 0.75, c.y - s * 0.45),
+            egui::pos2(c.x - s * 0.75, c.y - s * 0.05),
+        ],
+        stroke,
+    );
+    let top_arrow = vec![
+        egui::pos2(c.x + s * 0.45, c.y - s * 0.85),
+        egui::pos2(c.x + s * 0.45, c.y - s * 0.05),
+        egui::pos2(c.x + s * 0.92, c.y - s * 0.45),
+    ];
+    p.add(egui::Shape::convex_polygon(
+        top_arrow,
+        fg,
+        egui::Stroke::NONE,
+    ));
+
+    p.line_segment(
+        [
+            egui::pos2(c.x - s * 0.65, c.y + s * 0.45),
+            egui::pos2(c.x + s * 0.75, c.y + s * 0.45),
+        ],
+        stroke,
+    );
+    p.line_segment(
+        [
+            egui::pos2(c.x + s * 0.75, c.y + s * 0.05),
+            egui::pos2(c.x + s * 0.75, c.y + s * 0.45),
+        ],
+        stroke,
+    );
+    let bot_arrow = vec![
+        egui::pos2(c.x - s * 0.45, c.y + s * 0.05),
+        egui::pos2(c.x - s * 0.45, c.y + s * 0.85),
+        egui::pos2(c.x - s * 0.92, c.y + s * 0.45),
+    ];
+    p.add(egui::Shape::convex_polygon(
+        bot_arrow,
+        fg,
+        egui::Stroke::NONE,
+    ));
+}
+
+pub(crate) fn paint_playlist_shuffle_icon(ui: &egui::Ui, rect: egui::Rect, fg: Color32) {
+    let p = ui.painter();
+    let c = rect.center();
+    let s = (rect.width().min(rect.height()) * 0.42).max(5.0);
+    let stroke = egui::Stroke::new(1.7, fg);
+    // Upper path crossing to lower-right
+    p.line_segment(
+        [
+            egui::pos2(c.x - s * 0.9, c.y - s * 0.45),
+            egui::pos2(c.x - s * 0.3, c.y - s * 0.45),
+        ],
+        stroke,
+    );
+    p.line_segment(
+        [
+            egui::pos2(c.x - s * 0.3, c.y - s * 0.45),
+            egui::pos2(c.x + s * 0.3, c.y + s * 0.45),
+        ],
+        stroke,
+    );
+    p.line_segment(
+        [
+            egui::pos2(c.x + s * 0.3, c.y + s * 0.45),
+            egui::pos2(c.x + s * 0.7, c.y + s * 0.45),
+        ],
+        stroke,
+    );
+    // Lower path crossing to upper-right
+    p.line_segment(
+        [
+            egui::pos2(c.x - s * 0.9, c.y + s * 0.45),
+            egui::pos2(c.x - s * 0.3, c.y + s * 0.45),
+        ],
+        stroke,
+    );
+    p.line_segment(
+        [
+            egui::pos2(c.x - s * 0.3, c.y + s * 0.45),
+            egui::pos2(c.x + s * 0.3, c.y - s * 0.45),
+        ],
+        stroke,
+    );
+    p.line_segment(
+        [
+            egui::pos2(c.x + s * 0.3, c.y - s * 0.45),
+            egui::pos2(c.x + s * 0.7, c.y - s * 0.45),
+        ],
+        stroke,
+    );
+    let upper_arrow = vec![
+        egui::pos2(c.x + s * 0.5, c.y - s * 0.8),
+        egui::pos2(c.x + s * 0.5, c.y - s * 0.1),
+        egui::pos2(c.x + s * 0.95, c.y - s * 0.45),
+    ];
+    let lower_arrow = vec![
+        egui::pos2(c.x + s * 0.5, c.y + s * 0.1),
+        egui::pos2(c.x + s * 0.5, c.y + s * 0.8),
+        egui::pos2(c.x + s * 0.95, c.y + s * 0.45),
+    ];
+    p.add(egui::Shape::convex_polygon(
+        upper_arrow,
+        fg,
+        egui::Stroke::NONE,
+    ));
+    p.add(egui::Shape::convex_polygon(
+        lower_arrow,
+        fg,
+        egui::Stroke::NONE,
+    ));
+}
+
+pub(crate) fn paint_lock_icon(ui: &egui::Ui, rect: egui::Rect, fg: Color32) {
+    let p = ui.painter();
+    let c = rect.center();
+    let s = (rect.width().min(rect.height()) * 0.42).max(4.5);
+    let body = egui::Rect::from_center_size(
+        egui::pos2(c.x, c.y + s * 0.25),
+        egui::vec2(s * 1.35, s * 1.05),
+    );
+    p.rect_stroke(
+        body,
+        2.0,
+        egui::Stroke::new(1.3, fg),
+        egui::StrokeKind::Middle,
+    );
+    let shackle_w = s * 0.75;
+    let shackle_top = c.y - s * 0.75;
+    let shackle_bot = body.top();
+    let pts = [
+        egui::pos2(c.x - shackle_w * 0.5, shackle_bot),
+        egui::pos2(c.x - shackle_w * 0.5, shackle_top + s * 0.2),
+        egui::pos2(c.x, shackle_top),
+        egui::pos2(c.x + shackle_w * 0.5, shackle_top + s * 0.2),
+        egui::pos2(c.x + shackle_w * 0.5, shackle_bot),
+    ];
+    for pair in pts.windows(2) {
+        p.line_segment([pair[0], pair[1]], egui::Stroke::new(1.3, fg));
+    }
+}
+
+pub(crate) fn paint_unlisted_link_icon(ui: &egui::Ui, rect: egui::Rect, fg: Color32) {
+    let p = ui.painter();
+    let c = rect.center();
+    let s = (rect.width().min(rect.height()) * 0.44).max(4.5);
+    let stroke = egui::Stroke::new(1.3, fg);
+    let left_ring = egui::Rect::from_center_size(
+        egui::pos2(c.x - s * 0.35, c.y),
+        egui::vec2(s * 0.9, s * 0.65),
+    );
+    let right_ring = egui::Rect::from_center_size(
+        egui::pos2(c.x + s * 0.35, c.y),
+        egui::vec2(s * 0.9, s * 0.65),
+    );
+    p.rect_stroke(left_ring, 3.0, stroke, egui::StrokeKind::Middle);
+    p.rect_stroke(right_ring, 3.0, stroke, egui::StrokeKind::Middle);
+}
+
+pub(crate) fn paint_small_play_triangle(
+    ui: &egui::Ui,
+    center: egui::Pos2,
+    radius: f32,
+    fg: Color32,
+) {
+    let tri = vec![
+        egui::pos2(center.x - radius * 0.65, center.y - radius * 0.9),
+        egui::pos2(center.x - radius * 0.65, center.y + radius * 0.9),
+        egui::pos2(center.x + radius * 0.95, center.y),
+    ];
+    ui.painter()
+        .add(egui::Shape::convex_polygon(tri, fg, egui::Stroke::NONE));
+}
+
+pub(crate) fn paint_close_x_icon(ui: &egui::Ui, rect: egui::Rect, fg: Color32) {
+    let c = rect.center();
+    let r = (rect.width().min(rect.height()) * 0.30).max(4.0);
+    let stroke = egui::Stroke::new(1.7, fg);
+    ui.painter().line_segment(
+        [egui::pos2(c.x - r, c.y - r), egui::pos2(c.x + r, c.y + r)],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [egui::pos2(c.x - r, c.y + r), egui::pos2(c.x + r, c.y - r)],
+        stroke,
+    );
+}
+
+pub(crate) fn paint_chevron_down_icon(ui: &egui::Ui, rect: egui::Rect, fg: Color32, up: bool) {
+    let c = rect.center();
+    let r = (rect.width().min(rect.height()) * 0.28).max(3.5);
+    let dy = if up { -r * 0.55 } else { r * 0.55 };
+    let stroke = egui::Stroke::new(1.7, fg);
+    ui.painter().line_segment(
+        [egui::pos2(c.x - r, c.y - dy), egui::pos2(c.x, c.y + dy)],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [egui::pos2(c.x, c.y + dy), egui::pos2(c.x + r, c.y - dy)],
+        stroke,
     );
 }
 
@@ -1548,9 +2383,12 @@ pub(crate) struct SearchCardAction {
     pub(crate) filter_channel: Option<String>,
 }
 
+#[allow(dead_code)]
 type FeatureFilterToggle = fn(&mut search::SearchFeatureFilters);
+#[allow(dead_code)]
 type FeatureFilterSpec = (&'static str, bool, FeatureFilterToggle);
 
+#[allow(dead_code)]
 pub(crate) fn feature_filter_items(f: &search::SearchFeatureFilters) -> [FeatureFilterSpec; 11] {
     [
         ("Ao vivo", f.live, |s| s.live = !s.live),
@@ -1868,6 +2706,7 @@ pub(crate) fn paint_report_history_hero_illustration(ui: &mut egui::Ui, size: eg
     );
 }
 
+#[allow(dead_code)]
 pub(crate) fn paint_search_filters_button(
     ui: &mut egui::Ui,
     open: bool,
@@ -2026,8 +2865,10 @@ pub(crate) fn format_search_card_subline(
     (!parts.is_empty()).then(|| parts.join(" \u{2022} "))
 }
 
-pub(crate) fn paint_live_now_badge(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(76.0, 20.0), egui::Sense::hover());
+pub(crate) fn paint_live_now_badge_localized(ui: &mut egui::Ui, pt: bool) {
+    let label = if pt { "AO VIVO" } else { "LIVE" };
+    let width = if pt { 76.0 } else { 58.0 };
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 20.0), egui::Sense::hover());
     let red = Color32::from_rgb(204, 0, 0);
     ui.painter().rect_filled(rect, 4.0, red);
     let c = egui::pos2(rect.left() + 13.0, rect.center().y);
@@ -2046,10 +2887,14 @@ pub(crate) fn paint_live_now_badge(ui: &mut egui::Ui) {
     ui.painter().text(
         egui::pos2(rect.left() + 24.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
-        "AO VIVO",
+        label,
         egui::FontId::proportional(10.5),
         fg,
     );
+}
+
+pub(crate) fn paint_live_now_badge(ui: &mut egui::Ui) {
+    paint_live_now_badge_localized(ui, true);
 }
 
 pub(crate) fn paint_search_metadata_badge(ui: &mut egui::Ui, label: &str, palette: &ThemePalette) {
@@ -2106,6 +2951,55 @@ pub(crate) fn format_time(seconds: f64) -> String {
     }
 }
 
+pub(crate) fn youtube_chip_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    active: bool,
+    with_chevron: bool,
+    _palette: &ThemePalette,
+    dark_theme: bool,
+) -> egui::Response {
+    let fg = match (active, dark_theme) {
+        (true, true) => Color32::from_rgb(15, 15, 15),
+        (true, false) => Color32::WHITE,
+        (false, true) => Color32::from_rgb(241, 241, 241),
+        (false, false) => Color32::from_rgb(15, 15, 15),
+    };
+    let font = egui::FontId::proportional(13.5);
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, fg);
+    let pad_l = 12.0;
+    let pad_r = if with_chevron { 10.0 } else { 12.0 };
+    let chevron_extra = if with_chevron { 16.0 } else { 0.0 };
+    let chip_w = (pad_l + galley.size().x + chevron_extra + pad_r).ceil();
+    let chip_h = 32.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(chip_w, chip_h), egui::Sense::click());
+    let bg = match (active, dark_theme, response.hovered()) {
+        (true, true, _) => Color32::from_rgb(241, 241, 241),
+        (true, false, _) => Color32::from_rgb(15, 15, 15),
+        (false, true, true) => Color32::from_rgb(63, 63, 63),
+        (false, true, false) => Color32::from_rgb(39, 39, 39),
+        (false, false, true) => Color32::from_rgb(229, 229, 229),
+        (false, false, false) => Color32::from_rgb(242, 242, 242),
+    };
+    ui.painter().rect_filled(rect, 8.0, bg);
+    let text_pos = egui::pos2(rect.left() + pad_l, rect.center().y - galley.size().y * 0.5);
+    ui.painter().galley(text_pos, galley, fg);
+    if with_chevron {
+        let cx = rect.right() - pad_r - 5.0;
+        let cy = rect.center().y + 1.0;
+        ui.painter().add(egui::Shape::line(
+            vec![
+                egui::pos2(cx - 4.0, cy - 2.2),
+                egui::pos2(cx, cy + 2.0),
+                egui::pos2(cx + 4.0, cy - 2.2),
+            ],
+            egui::Stroke::new(1.5, fg),
+        ));
+    }
+    paint_focus_ring_if_focused(ui, &response, 8.0);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 pub(crate) fn styled_pill_button(
     ui: &mut egui::Ui,
     label: &str,
@@ -2130,7 +3024,9 @@ pub(crate) fn styled_pill_button(
         .stroke(egui::Stroke::new(1.0, stroke_col))
         .corner_radius(16)
         .min_size(egui::vec2(0.0, 30.0));
-    ui.add(btn).on_hover_cursor(egui::CursorIcon::PointingHand)
+    let resp = ui.add(btn).on_hover_cursor(egui::CursorIcon::PointingHand);
+    paint_focus_ring_if_focused(ui, &resp, 16.0);
+    resp
 }
 
 pub(crate) fn styled_compact_button(
@@ -2157,7 +3053,9 @@ pub(crate) fn styled_compact_button(
         .stroke(egui::Stroke::new(1.0, stroke_col))
         .corner_radius(13)
         .min_size(egui::vec2(0.0, 25.0));
-    ui.add(btn).on_hover_cursor(egui::CursorIcon::PointingHand)
+    let resp = ui.add(btn).on_hover_cursor(egui::CursorIcon::PointingHand);
+    paint_focus_ring_if_focused(ui, &resp, 13.0);
+    resp
 }
 
 pub(crate) fn styled_compact_button_enabled(
@@ -2191,6 +3089,7 @@ pub(crate) fn styled_compact_button_enabled(
         .corner_radius(13)
         .min_size(egui::vec2(0.0, 25.0));
     let resp = ui.add_enabled(enabled, btn);
+    paint_focus_ring_if_focused(ui, &resp, 13.0);
     if enabled {
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     } else {
@@ -2213,7 +3112,9 @@ pub(crate) fn styled_danger_button(
     .stroke(egui::Stroke::new(1.0, palette.error_stroke))
     .corner_radius(14)
     .min_size(egui::vec2(0.0, 26.0));
-    ui.add(btn).on_hover_cursor(egui::CursorIcon::PointingHand)
+    let resp = ui.add(btn).on_hover_cursor(egui::CursorIcon::PointingHand);
+    paint_focus_ring_if_focused(ui, &resp, 14.0);
+    resp
 }
 
 pub(crate) fn styled_ghost_button(
@@ -2231,7 +3132,9 @@ pub(crate) fn styled_ghost_button(
     .stroke(egui::Stroke::new(1.0, palette.card_alt_stroke))
     .corner_radius(13)
     .min_size(egui::vec2(0.0, 25.0));
-    ui.add(btn).on_hover_cursor(egui::CursorIcon::PointingHand)
+    let resp = ui.add(btn).on_hover_cursor(egui::CursorIcon::PointingHand);
+    paint_focus_ring_if_focused(ui, &resp, 13.0);
+    resp
 }
 
 pub(crate) fn styled_icon_chip_button(
@@ -2251,6 +3154,7 @@ pub(crate) fn styled_icon_chip_button(
         .corner_radius(8)
         .min_size(egui::vec2(26.0, 24.0));
     let resp = ui.add_enabled(enabled, btn);
+    paint_focus_ring_if_focused(ui, &resp, 8.0);
     if enabled {
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     } else {
@@ -2469,22 +3373,25 @@ pub(crate) fn empty_state_ui(
 
 pub(crate) fn app_modal_window(
     ctx: &egui::Context,
-    id_salt: &str,
+    id: egui::Id,
     title: &str,
-    max_width: f32,
-    palette: &ThemePalette,
-    add_body: impl FnOnce(&mut egui::Ui),
-) -> bool {
+    open: &mut bool,
+    default_width: f32,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
     let screen = ctx.content_rect();
-    let scrim_id = egui::Id::new((id_salt, "modal_scrim_fade"));
-    let fade_t = ctx.animate_bool_with_time(scrim_id, true, 0.16);
-    let scrim_alpha = (135.0 * fade_t).round().clamp(0.0, 255.0) as u8;
+    let scrim_id = id.with("modal_scrim_fade");
+    let fade_t = ctx.animate_bool_responsive(scrim_id, *open);
+    if !*open && fade_t <= 0.01 {
+        return;
+    }
 
+    let scrim_alpha = (140.0 * fade_t).round().clamp(0.0, 255.0) as u8;
     let mut backdrop_clicked = false;
-    egui::Area::new(egui::Id::new((id_salt, "modal_backdrop")))
+    egui::Area::new(id.with("modal_backdrop"))
         .order(egui::Order::Foreground)
         .fixed_pos(screen.min)
-        .interactable(true)
+        .interactable(*open)
         .show(ctx, |ui| {
             let (rect, resp) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
             ui.painter().rect_filled(
@@ -2492,17 +3399,28 @@ pub(crate) fn app_modal_window(
                 0.0,
                 Color32::from_rgba_unmultiplied(0, 0, 0, scrim_alpha),
             );
-            if resp.clicked() {
+            if *open && resp.clicked() {
                 backdrop_clicked = true;
             }
         });
 
-    let modal_w = max_width.min((screen.width() - 48.0).max(240.0)).max(240.0);
+    if !*open {
+        return;
+    }
+
+    let dark_mode = ctx.global_style().visuals.dark_mode;
+    let palette = ThemePalette::for_theme(if dark_mode { Theme::Dark } else { Theme::Light });
+
+    let modal_w = default_width
+        .min((screen.width() - 48.0).max(240.0))
+        .max(240.0);
     let inner_w = (modal_w - 40.0).max(180.0);
     let mut close_clicked = false;
+    let close_btn_id = id.with("modal_close_btn");
+    let any_popup_open = egui::Popup::is_any_open(ctx);
 
     let win_resp = egui::Window::new(title)
-        .id(egui::Id::new(id_salt))
+        .id(id)
         .title_bar(false)
         .collapsible(false)
         .resizable(false)
@@ -2520,7 +3438,7 @@ pub(crate) fn app_modal_window(
                     offset: [0, 8],
                     blur: 24,
                     spread: 0,
-                    color: Color32::from_rgba_unmultiplied(0, 0, 0, 110),
+                    color: Color32::from_rgba_unmultiplied(0, 0, 0, 115),
                 }),
         )
         .show(ctx, |ui| {
@@ -2543,9 +3461,11 @@ pub(crate) fn app_modal_window(
                     },
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if styled_icon_chip_button(ui, true, "✕", palette).clicked() {
-                        close_clicked = true;
-                    }
+                    ui.push_id(close_btn_id, |ui| {
+                        if styled_icon_chip_button(ui, true, "✕", &palette).clicked() {
+                            close_clicked = true;
+                        }
+                    });
                 });
             });
             ui.add_space(10.0);
@@ -2554,19 +3474,20 @@ pub(crate) fn app_modal_window(
             ui.painter()
                 .rect_filled(div_rect, 0.0, palette.card_alt_stroke.gamma_multiply(0.7));
             ui.add_space(12.0);
-            add_body(ui);
+            add_contents(ui);
         });
 
-    if backdrop_clicked && let Some(inner) = win_resp {
-        ctx.move_to_top(inner.response.layer_id);
+    if let Some(inner) = win_resp {
+        let modal_layer = inner.response.layer_id;
+        ctx.move_to_top(modal_layer);
+        // Trap keyboard focus & input within the active modal layer.
+        ctx.memory_mut(|mem| mem.set_modal_layer(modal_layer));
     }
 
-    let esc_pressed = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-    let closed = close_clicked || backdrop_clicked || esc_pressed;
-    if closed {
-        let _ = ctx.animate_bool_with_time(scrim_id, false, 0.0);
+    let esc_pressed = !any_popup_open && ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    if close_clicked || backdrop_clicked || esc_pressed {
+        *open = false;
     }
-    closed
 }
 
 pub(crate) fn styled_menu_item_button(
@@ -2608,7 +3529,9 @@ pub(crate) fn styled_menu_item_button(
             btn = btn.stroke(egui::Stroke::NONE);
         }
         ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| {
-            ui.add(btn).on_hover_cursor(egui::CursorIcon::PointingHand)
+            let resp = ui.add(btn).on_hover_cursor(egui::CursorIcon::PointingHand);
+            paint_focus_ring_if_focused(ui, &resp, 8.0);
+            resp
         })
         .inner
     })
@@ -2625,7 +3548,29 @@ pub(crate) fn paint_subtle_avatar_ring(ui: &egui::Ui, center: egui::Pos2, radius
 
 #[cfg(test)]
 mod tests {
-    use super::is_actionable_inline_message;
+    use super::{
+        SidebarChannelIndicator, is_actionable_inline_message, resolve_sidebar_channel_indicator,
+    };
+
+    #[test]
+    fn sidebar_channel_indicator_distinguishes_none_unseen_and_live() {
+        assert_eq!(
+            resolve_sidebar_channel_indicator(false, false),
+            SidebarChannelIndicator::None
+        );
+        assert_eq!(
+            resolve_sidebar_channel_indicator(true, false),
+            SidebarChannelIndicator::Unseen
+        );
+        assert_eq!(
+            resolve_sidebar_channel_indicator(false, true),
+            SidebarChannelIndicator::Live
+        );
+        assert_eq!(
+            resolve_sidebar_channel_indicator(true, true),
+            SidebarChannelIndicator::Live
+        );
+    }
 
     #[test]
     fn suppresses_empty_and_progress_status_strings() {
@@ -2662,5 +3607,135 @@ mod tests {
             "Loop A-B indisponível em transmissões ao vivo."
         ));
         assert!(is_actionable_inline_message("Failed to open video stream"));
+    }
+
+    #[test]
+    fn two_line_clamped_galley_never_exceeds_two_lines_and_appends_ellipsis_on_overflow() {
+        let ctx = super::egui::Context::default();
+        let mut short_rows = 0usize;
+        let mut short_text = String::new();
+        let mut long_rows = 0usize;
+        let mut long_text = String::new();
+
+        let mut out = ctx.run_ui(super::egui::RawInput::default(), |ui| {
+            super::egui::CentralPanel::default().show(ui, |ui| {
+                let font = super::egui::FontId::proportional(15.0);
+                let short = super::layout_two_line_clamped_galley(
+                    ui,
+                    "Short video title",
+                    220.0,
+                    font.clone(),
+                    super::Color32::WHITE,
+                );
+                short_rows = short.rows.len();
+                short_text = short.job.text.clone();
+
+                let long = super::layout_two_line_clamped_galley(
+                    ui,
+                    "This is an extraordinarily long YouTube video title that will definitely wrap past two full lines inside a narrow video grid card width",
+                    160.0,
+                    font,
+                    super::Color32::WHITE,
+                );
+                long_rows = long.rows.len();
+                long_text = long.job.text.clone();
+            });
+        });
+        out.textures_delta.clear();
+
+        assert!(short_rows <= 2);
+        assert_eq!(short_text, "Short video title");
+        assert!(!short_text.ends_with('…'));
+
+        assert_eq!(long_rows, 2);
+        assert!(long_text.ends_with('…'));
+    }
+
+    #[test]
+    fn app_modal_window_renders_headlessly_and_closes_on_escape() {
+        let ctx = super::egui::Context::default();
+        let modal_id = super::egui::Id::new("test_modal_window");
+        let mut open = true;
+        let mut body_rendered = false;
+
+        let mut out = ctx.run_ui(super::egui::RawInput::default(), |ui| {
+            let ctx = ui.ctx().clone();
+            super::app_modal_window(&ctx, modal_id, "Test Modal", &mut open, 420.0, |ui| {
+                body_rendered = true;
+                ui.label("Modal contents");
+            });
+        });
+        out.textures_delta.clear();
+        assert!(body_rendered);
+        assert!(open);
+
+        let mut esc_input = super::egui::RawInput::default();
+        esc_input.events.push(super::egui::Event::Key {
+            key: super::egui::Key::Escape,
+            physical_key: Some(super::egui::Key::Escape),
+            pressed: true,
+            repeat: false,
+            modifiers: super::egui::Modifiers::NONE,
+        });
+        let mut esc_out = ctx.run_ui(esc_input, |ui| {
+            let ctx = ui.ctx().clone();
+            super::app_modal_window(&ctx, modal_id, "Test Modal", &mut open, 420.0, |ui| {
+                ui.label("Modal contents");
+            });
+        });
+        esc_out.textures_delta.clear();
+        assert!(!open);
+    }
+
+    #[test]
+    fn focus_ring_and_wave3_vector_icons_paint_headlessly_without_panicking() {
+        let ctx = super::egui::Context::default();
+        let mut out = ctx.run_ui(super::egui::RawInput::default(), |ui| {
+            super::egui::CentralPanel::default().show(ui, |ui| {
+                let (rect, resp) = ui.allocate_exact_size(
+                    super::egui::vec2(24.0, 24.0),
+                    super::egui::Sense::click(),
+                );
+                resp.request_focus();
+                super::paint_focus_ring_if_focused(ui, &resp, 8.0);
+                let c = rect.center();
+                let fg = super::Color32::WHITE;
+                super::paint_settings_gear_icon(ui.painter(), c, fg);
+                super::paint_notifications_bell_icon(ui.painter(), c, fg, 0);
+                super::paint_notifications_bell_icon(ui.painter(), c, fg, 4);
+                super::paint_notifications_bell_icon(ui.painter(), c, fg, 15);
+                super::paint_grid_view_icon(ui.painter(), c, fg);
+                super::paint_list_view_icon(ui.painter(), c, fg);
+                super::paint_incognito_icon(ui.painter(), c, fg);
+                super::paint_explore_icon(ui.painter(), c, fg);
+                super::paint_channel_notify_bell_icon(
+                    ui.painter(),
+                    c,
+                    fg,
+                    crate::settings::ChannelNotifyLevel::All,
+                );
+                super::paint_channel_notify_bell_icon(
+                    ui.painter(),
+                    c,
+                    fg,
+                    crate::settings::ChannelNotifyLevel::Personalized,
+                );
+                super::paint_channel_notify_bell_icon(
+                    ui.painter(),
+                    c,
+                    fg,
+                    crate::settings::ChannelNotifyLevel::None,
+                );
+                super::paint_filter_sliders_icon(ui.painter(), c, fg);
+                super::paint_shorts_heart_icon(ui.painter(), c, fg, false);
+                super::paint_shorts_heart_icon(ui.painter(), c, fg, true);
+                super::paint_shorts_comment_icon(ui.painter(), c, fg);
+                super::paint_shorts_share_icon(ui.painter(), c, fg);
+                super::paint_shorts_arrow_icon(ui.painter(), c, fg, true);
+                super::paint_shorts_arrow_icon(ui.painter(), c, fg, false);
+                super::paint_shorts_more_dots_icon(ui.painter(), c, fg);
+            });
+        });
+        out.textures_delta.clear();
     }
 }

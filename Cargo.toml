@@ -1,6 +1,6 @@
 [package]
 name = 'fasttube'
-version = '0.3.6'
+version = '0.4.0'
 edition = '2024'
 rust-version = '1.98'
 description = 'A native, local-first Windows desktop client for browsing and watching YouTube.'
@@ -34,6 +34,13 @@ base64 = '0.22'
 getrandom = '0.3'
 sha2 = '0.10'
 url = '2'
-reqwest = { version = '0.12', default-features = false, features = ['blocking', 'json', 'rustls-tls'] }
+reqwest = { version = '0.12', default-features = false, features = ['blocking', 'json', 'rustls-tls', 'gzip', 'brotli', 'http2'] }
 tungstenite = '0.29'
 windows-sys = { version = '0.61', features = ['Win32_Foundation', 'Win32_Security_Cryptography', 'Win32_Storage_FileSystem', 'Win32_System_DataExchange', 'Win32_System_Memory', 'Win32_System_Ole', 'Win32_UI_WindowsAndMessaging'] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.dev.package."*"]
+opt-level = 2

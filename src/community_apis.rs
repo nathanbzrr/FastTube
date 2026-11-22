@@ -155,7 +155,7 @@ fn fetch_limited_body(
     if cancel.cancelled() {
         return None;
     }
-    let resp = client.get(url).send().ok()?;
+    let resp = client.get(url).timeout(API_TIMEOUT).send().ok()?;
     if cancel.cancelled() || !resp.status().is_success() {
         return None;
     }
@@ -203,26 +203,20 @@ pub fn fetch_community_extras(
     if (!ryd_enabled && !dearrow_enabled) || !valid_video_id(video_id) || cancel.cancelled() {
         return outcome;
     }
-    let Ok(client) = reqwest::blocking::Client::builder()
-        .timeout(API_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    else {
-        return outcome;
-    };
+    let client = crate::http_client::no_redirect();
 
     match (ryd_enabled, dearrow_enabled) {
         (true, true) => {
             let (ryd, dearrow) = std::thread::scope(|s| {
-                let ryd_handle = s.spawn(|| fetch_ryd(&client, video_id, cancel));
-                let dearrow = fetch_dearrow(&client, video_id, cancel);
+                let ryd_handle = s.spawn(|| fetch_ryd(client, video_id, cancel));
+                let dearrow = fetch_dearrow(client, video_id, cancel);
                 (ryd_handle.join().ok().flatten(), dearrow)
             });
             outcome.ryd = ryd;
             outcome.dearrow = dearrow;
         }
-        (true, false) => outcome.ryd = fetch_ryd(&client, video_id, cancel),
-        (false, true) => outcome.dearrow = fetch_dearrow(&client, video_id, cancel),
+        (true, false) => outcome.ryd = fetch_ryd(client, video_id, cancel),
+        (false, true) => outcome.dearrow = fetch_dearrow(client, video_id, cancel),
         (false, false) => {}
     }
 

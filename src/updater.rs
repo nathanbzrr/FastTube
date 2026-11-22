@@ -5,24 +5,40 @@ use crate::search;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 const GITHUB_LATEST_URL: &str = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest";
 const API_TIMEOUT: Duration = Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_REDIRECT_HOPS: usize = 5;
+const MAX_CHECKSUMS_BYTES: u64 = 256 * 1024;
 const MIN_EXE_BYTES: usize = 1024 * 1024;
 const MAX_EXE_BYTES: usize = 96 * 1024 * 1024;
 
 static UPDATE_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+static UPDATER_HTTP_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct YtDlpUpdateCheck {
     pub current_version: Option<String>,
     pub latest_version: String,
     pub download_url: String,
+    pub checksums_url: String,
     pub update_available: bool,
     pub install_path: PathBuf,
+}
+
+fn yt_dlp_binary_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "yt-dlp.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "yt-dlp"
+    }
 }
 
 pub fn local_bin_yt_dlp_path() -> Option<PathBuf> {
@@ -31,27 +47,66 @@ pub fn local_bin_yt_dlp_path() -> Option<PathBuf> {
     if !root.is_absolute() {
         return None;
     }
-    #[cfg(windows)]
-    let name = "yt-dlp.exe";
-    #[cfg(not(windows))]
-    let name = "yt-dlp";
-    Some(root.join("FastTube").join("bin").join(name))
+    Some(root.join("FastTube").join("bin").join(yt_dlp_binary_name()))
 }
 
-pub fn preferred_install_path() -> Result<PathBuf, String> {
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(parent) = exe.parent()
+fn bundled_yt_dlp_path_for(executable: &Path) -> Option<PathBuf> {
+    let candidate = executable.parent()?.join(yt_dlp_binary_name());
+    candidate.is_file().then_some(candidate)
+}
+
+fn resolve_managed_yt_dlp_path(
+    local_bin: Option<&Path>,
+    current_exe: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(local) = local_bin
+        && local.is_file()
     {
-        #[cfg(windows)]
-        let bundled = parent.join("yt-dlp.exe");
-        #[cfg(not(windows))]
-        let bundled = parent.join("yt-dlp");
-        if bundled.exists() && is_directory_writable(parent) {
-            return Ok(bundled);
-        }
+        return Some(local.to_path_buf());
     }
-    local_bin_yt_dlp_path()
+    current_exe.and_then(bundled_yt_dlp_path_for)
+}
+
+fn resolve_yt_dlp_install_path_with(
+    local_bin: Option<&Path>,
+    current_exe: Option<&Path>,
+    dir_writable: impl FnOnce(&Path) -> bool,
+) -> Result<PathBuf, String> {
+    // Keep install destination aligned with execution precedence: if a managed copy
+    // already exists in LOCALAPPDATA, update it in place so it cannot shadow a bundled update.
+    if let Some(local) = local_bin
+        && local.is_file()
+    {
+        return Ok(local.to_path_buf());
+    }
+    if let Some(bundled) = current_exe.and_then(bundled_yt_dlp_path_for)
+        && let Some(parent) = bundled.parent()
+        && dir_writable(parent)
+    {
+        return Ok(bundled);
+    }
+    local_bin
+        .map(Path::to_path_buf)
         .ok_or_else(|| "Diretório LOCALAPPDATA indisponível para atualizar o yt-dlp.".to_owned())
+}
+
+/// Resolves the managed `yt-dlp` binary path for execution using the same precedence
+/// as `resolve_yt_dlp_install_path()`.
+pub(crate) fn managed_yt_dlp_path() -> Option<PathBuf> {
+    let local_bin = local_bin_yt_dlp_path();
+    let current_exe = std::env::current_exe().ok();
+    resolve_managed_yt_dlp_path(local_bin.as_deref(), current_exe.as_deref())
+}
+
+/// Resolves the `yt-dlp` install destination aligned with `managed_yt_dlp_path()`.
+pub(crate) fn resolve_yt_dlp_install_path() -> Result<PathBuf, String> {
+    let local_bin = local_bin_yt_dlp_path();
+    let current_exe = std::env::current_exe().ok();
+    resolve_yt_dlp_install_path_with(
+        local_bin.as_deref(),
+        current_exe.as_deref(),
+        is_directory_writable,
+    )
 }
 
 fn is_directory_writable(dir: &Path) -> bool {
@@ -76,22 +131,84 @@ pub fn installed_version(cancel: &Cancellation) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-fn is_allowed_github_download(url: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(url) else {
-        return false;
-    };
+fn is_allowed_github_url(parsed: &url::Url) -> bool {
     if parsed.scheme() != "https" {
+        return false;
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
+    if parsed.port_or_known_default() != Some(443) {
         return false;
     }
     let Some(host) = parsed.host_str() else {
         return false;
     };
-    let lower = host.to_ascii_lowercase();
-    lower == "github.com"
-        || lower.ends_with(".githubusercontent.com")
-        || lower == "release-assets.githubusercontent.com"
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "github.com"
+            | "api.github.com"
+            | "objects.githubusercontent.com"
+            | "release-assets.githubusercontent.com"
+    )
 }
 
+fn is_allowed_github_download(url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|parsed| is_allowed_github_url(&parsed))
+}
+
+fn should_follow_redirect(next: &url::Url, previous_count: usize) -> Result<(), &'static str> {
+    if previous_count > MAX_REDIRECT_HOPS {
+        return Err("too many redirects");
+    }
+    if !is_allowed_github_url(next) {
+        return Err("redirect target is not an allowed GitHub HTTPS host");
+    }
+    Ok(())
+}
+
+fn github_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        match should_follow_redirect(attempt.url(), attempt.previous().len()) {
+            Ok(()) => attempt.follow(),
+            Err(reason) => attempt.error(reason),
+        }
+    })
+}
+
+fn updater_http_client() -> Result<&'static reqwest::blocking::Client, String> {
+    if let Some(client) = UPDATER_HTTP_CLIENT.get() {
+        return Ok(client);
+    }
+    let built = reqwest::blocking::Client::builder()
+        .https_only(true)
+        .redirect(github_redirect_policy())
+        .user_agent(format!("FastTube-Updater/{CURRENT_APP_VERSION}"))
+        .build()
+        .map_err(|_| "Não foi possível iniciar o cliente HTTP.".to_owned())?;
+    let _ = UPDATER_HTTP_CLIENT.set(built);
+    UPDATER_HTTP_CLIENT
+        .get()
+        .ok_or_else(|| "Não foi possível iniciar o cliente HTTP.".to_owned())
+}
+
+fn find_release_asset_url(assets: &[serde_json::Value], wanted_name: &str) -> Option<String> {
+    assets.iter().find_map(|asset| {
+        let name = asset.get("name").and_then(serde_json::Value::as_str)?;
+        if name.eq_ignore_ascii_case(wanted_name) {
+            asset
+                .get("browser_download_url")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|u| is_allowed_github_download(u))
+                .map(str::to_owned)
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(test)]
 pub fn parse_github_release_json(bytes: &[u8]) -> Result<(String, String), String> {
     let json: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|_| "Resposta inválida da API do GitHub.".to_owned())?;
@@ -103,31 +220,130 @@ pub fn parse_github_release_json(bytes: &[u8]) -> Result<(String, String), Strin
         .ok_or_else(|| "Versão não informada pela API do GitHub.".to_owned())?
         .to_owned();
 
-    #[cfg(windows)]
-    let wanted_asset = "yt-dlp.exe";
-    #[cfg(not(windows))]
-    let wanted_asset = "yt-dlp";
-
-    let download_url = json
+    let assets = json
         .get("assets")
         .and_then(serde_json::Value::as_array)
-        .and_then(|assets| {
-            assets.iter().find_map(|asset| {
-                let name = asset.get("name").and_then(serde_json::Value::as_str)?;
-                if name.eq_ignore_ascii_case(wanted_asset) {
-                    asset
-                        .get("browser_download_url")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                } else {
-                    None
-                }
-            })
-        })
-        .filter(|u| is_allowed_github_download(u))
+        .ok_or_else(|| "Binário yt-dlp.exe não encontrado na release mais recente.".to_owned())?;
+
+    let download_url = find_release_asset_url(assets, yt_dlp_binary_name())
         .ok_or_else(|| "Binário yt-dlp.exe não encontrado na release mais recente.".to_owned())?;
 
     Ok((tag, download_url))
+}
+
+fn parse_ytdlp_release_json(bytes: &[u8]) -> Result<(String, String, String), String> {
+    let json: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|_| "Resposta inválida da API do GitHub.".to_owned())?;
+    let tag = json
+        .get("tag_name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "Versão não informada pela API do GitHub.".to_owned())?
+        .to_owned();
+
+    let assets = json
+        .get("assets")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "Binário yt-dlp.exe não encontrado na release mais recente.".to_owned())?;
+
+    let download_url = find_release_asset_url(assets, yt_dlp_binary_name())
+        .ok_or_else(|| "Binário yt-dlp.exe não encontrado na release mais recente.".to_owned())?;
+
+    let checksums_url = find_release_asset_url(assets, "SHA2-256SUMS").ok_or_else(|| {
+        "Arquivo SHA2-256SUMS não encontrado na release do yt-dlp. Atualização recusada por segurança."
+            .to_owned()
+    })?;
+
+    Ok((tag, download_url, checksums_url))
+}
+
+fn derive_ytdlp_checksums_url(download_url: &str) -> Result<String, String> {
+    let mut parsed = url::Url::parse(download_url)
+        .map_err(|_| "URL de download do yt-dlp inválida.".to_owned())?;
+    if !is_allowed_github_url(&parsed) {
+        return Err("URL de download não permitida.".to_owned());
+    }
+    let Some(host) = parsed.host_str() else {
+        return Err("URL de download do yt-dlp inválida.".to_owned());
+    };
+    if !host.eq_ignore_ascii_case("github.com") {
+        return Err("Não foi possível localizar SHA2-256SUMS para a release do yt-dlp.".to_owned());
+    }
+    let has_valid_release_path = parsed.path_segments().is_some_and(|segments| {
+        let parts: Vec<&str> = segments.collect();
+        parts.len() == 6
+            && !parts[0].is_empty()
+            && !parts[1].is_empty()
+            && parts[2] == "releases"
+            && parts[3] == "download"
+            && !parts[4].is_empty()
+            && parts[5].eq_ignore_ascii_case(yt_dlp_binary_name())
+    });
+    if !has_valid_release_path {
+        return Err("Não foi possível localizar SHA2-256SUMS para a release do yt-dlp.".to_owned());
+    }
+    {
+        let mut segments = parsed
+            .path_segments_mut()
+            .map_err(|_| "URL de download do yt-dlp inválida.".to_owned())?;
+        segments.pop();
+        segments.push("SHA2-256SUMS");
+    }
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Ok(parsed.into())
+}
+
+fn verify_release_sha256(
+    bytes: &[u8],
+    sums_text: &str,
+    asset_name: &str,
+    sums_label: &str,
+) -> Result<(), String> {
+    let expected_hash = parse_sha256sums(sums_text, asset_name).ok_or_else(|| {
+        format!("Hash SHA-256 para '{asset_name}' não encontrado em {sums_label}.")
+    })?;
+    if !verify_sha256_bytes(bytes, &expected_hash) {
+        return Err(format!(
+            "Falha na verificação de integridade SHA-256 ({sums_label}) para '{asset_name}'. Abortado."
+        ));
+    }
+    Ok(())
+}
+
+fn fetch_checksums_text(
+    client: &reqwest::blocking::Client,
+    sums_url: &str,
+    sums_label: &str,
+    cancel: &Cancellation,
+) -> Result<String, String> {
+    if cancel.cancelled() {
+        return Err("Atualização cancelada.".to_owned());
+    }
+    if !is_allowed_github_download(sums_url) {
+        return Err(format!("URL do arquivo {sums_label} não permitida."));
+    }
+    let sums_resp = client
+        .get(sums_url)
+        .timeout(API_TIMEOUT)
+        .send()
+        .map_err(|_| format!("Não foi possível baixar {sums_label} para verificação."))?;
+    if !sums_resp.status().is_success() {
+        return Err(format!(
+            "{sums_label} retornou HTTP {}.",
+            sums_resp.status().as_u16()
+        ));
+    }
+    let mut sums_bytes = Vec::new();
+    sums_resp
+        .take(MAX_CHECKSUMS_BYTES)
+        .read_to_end(&mut sums_bytes)
+        .map_err(|_| format!("Falha ao ler {sums_label}."))?;
+    if cancel.cancelled() {
+        return Err("Atualização cancelada.".to_owned());
+    }
+    Ok(String::from_utf8_lossy(&sums_bytes).into_owned())
 }
 
 pub fn check_for_update(cancel: &Cancellation) -> Result<YtDlpUpdateCheck, String> {
@@ -135,13 +351,10 @@ pub fn check_for_update(cancel: &Cancellation) -> Result<YtDlpUpdateCheck, Strin
         return Err("Verificação cancelada.".to_owned());
     }
     let current_version = installed_version(cancel);
-    let client = reqwest::blocking::Client::builder()
-        .timeout(API_TIMEOUT)
-        .user_agent("FastTube-Updater/0.3")
-        .build()
-        .map_err(|_| "Não foi possível iniciar o cliente HTTP.".to_owned())?;
+    let client = updater_http_client()?;
     let resp = client
         .get(GITHUB_LATEST_URL)
+        .timeout(API_TIMEOUT)
         .send()
         .map_err(|_| "Não foi possível consultar atualizações do yt-dlp no GitHub.".to_owned())?;
     if !resp.status().is_success() {
@@ -151,8 +364,8 @@ pub fn check_for_update(cancel: &Cancellation) -> Result<YtDlpUpdateCheck, Strin
     resp.take(512 * 1024)
         .read_to_end(&mut body)
         .map_err(|_| "Falha ao ler resposta do GitHub.".to_owned())?;
-    let (latest_version, download_url) = parse_github_release_json(&body)?;
-    let install_path = preferred_install_path()?;
+    let (latest_version, download_url, checksums_url) = parse_ytdlp_release_json(&body)?;
+    let install_path = resolve_yt_dlp_install_path()?;
     let update_available = current_version
         .as_deref()
         .is_none_or(|cur| cur.trim() != latest_version.trim());
@@ -160,6 +373,7 @@ pub fn check_for_update(cancel: &Cancellation) -> Result<YtDlpUpdateCheck, Strin
         current_version,
         latest_version,
         download_url,
+        checksums_url,
         update_available,
         install_path,
     })
@@ -173,22 +387,41 @@ pub fn download_and_install(
     if cancel.cancelled() {
         return Err("Atualização cancelada.".to_owned());
     }
+    let checksums_url = derive_ytdlp_checksums_url(download_url)?;
+    download_and_install_with_checksums(download_url, &checksums_url, install_path, cancel)
+}
+
+pub fn download_and_install_with_checksums(
+    download_url: &str,
+    checksums_url: &str,
+    install_path: &Path,
+    cancel: &Cancellation,
+) -> Result<PathBuf, String> {
+    if cancel.cancelled() {
+        return Err("Atualização cancelada.".to_owned());
+    }
     if !is_allowed_github_download(download_url) {
         return Err("URL de download não permitida.".to_owned());
+    }
+    if !is_allowed_github_download(checksums_url) {
+        return Err("URL do arquivo SHA2-256SUMS não permitida.".to_owned());
     }
     let parent = install_path
         .parent()
         .ok_or_else(|| "Caminho de instalação inválido.".to_owned())?;
-    fs::create_dir_all(parent)
-        .map_err(|e| format!("Não foi possível criar diretório de destino: {e}"))?;
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(DOWNLOAD_TIMEOUT)
-        .user_agent("FastTube-Updater/0.3")
-        .build()
-        .map_err(|_| "Não foi possível iniciar o download.".to_owned())?;
+    let client = updater_http_client()?;
+    let asset_name = yt_dlp_binary_name();
+    let sums_text = fetch_checksums_text(client, checksums_url, "SHA2-256SUMS", cancel)?;
+    if parse_sha256sums(&sums_text, asset_name).is_none() {
+        return Err(format!(
+            "Hash SHA-256 para '{asset_name}' não encontrado em SHA2-256SUMS."
+        ));
+    }
+
     let resp = client
         .get(download_url)
+        .timeout(DOWNLOAD_TIMEOUT)
         .send()
         .map_err(|_| "Falha de conexão ao baixar yt-dlp.".to_owned())?;
     if !resp.status().is_success() {
@@ -211,6 +444,10 @@ pub fn download_and_install(
     if !bytes.starts_with(b"MZ") {
         return Err("Arquivo baixado não é um executável Windows válido.".to_owned());
     }
+    verify_release_sha256(&bytes, &sums_text, asset_name, "SHA2-256SUMS")?;
+
+    fs::create_dir_all(parent)
+        .map_err(|e| format!("Não foi possível criar diretório de destino: {e}"))?;
 
     let (temp_path, mut temp_file) = loop {
         let seq = UPDATE_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -547,14 +784,24 @@ pub fn parse_fasttube_release_json(
 
 pub fn parse_sha256sums(text: &str, asset_name: &str) -> Option<String> {
     let target = asset_name.trim();
+    if target.is_empty() {
+        return None;
+    }
     for line in text.lines() {
-        let trimmed = line.trim();
+        let trimmed = line.trim().trim_start_matches('\u{feff}');
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
         let mut parts = trimmed.splitn(2, char::is_whitespace);
-        let hash = parts.next()?.trim();
-        let file = parts.next()?.trim().trim_start_matches('*').trim();
+        let Some(hash) = parts.next().map(str::trim) else {
+            continue;
+        };
+        let Some(file) = parts
+            .next()
+            .map(|rest| rest.trim().trim_start_matches('*').trim())
+        else {
+            continue;
+        };
         let file_base = Path::new(file)
             .file_name()
             .and_then(|s| s.to_str())
@@ -584,13 +831,10 @@ pub fn check_fasttube_update(cancel: &Cancellation) -> Result<AppUpdateCheck, St
     if cancel.cancelled() {
         return Err("Verificação de atualização cancelada.".to_owned());
     }
-    let client = reqwest::blocking::Client::builder()
-        .timeout(API_TIMEOUT)
-        .user_agent(format!("FastTube-Updater/{CURRENT_APP_VERSION}"))
-        .build()
-        .map_err(|_| "Não foi possível iniciar o cliente HTTP.".to_owned())?;
+    let client = updater_http_client()?;
     let resp = client
         .get(FASTTUBE_GITHUB_LATEST_URL)
+        .timeout(API_TIMEOUT)
         .header("Accept", "application/vnd.github+json")
         .send()
         .map_err(|_| "Não foi possível consultar a release mais recente no GitHub.".to_owned())?;
@@ -648,6 +892,18 @@ pub fn download_and_prepare_app_update(
     }
     let asset_name = sanitize_asset_filename(&check.asset_name)
         .ok_or_else(|| "Nome de arquivo da release inválido.".to_owned())?;
+    let sums_url = check
+        .checksums_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| {
+            "Arquivo SHA256SUMS.txt ausente na release. Atualização recusada por segurança."
+                .to_owned()
+        })?;
+    if !is_allowed_github_download(sums_url) {
+        return Err("URL do arquivo SHA256SUMS.txt não permitida.".to_owned());
+    }
 
     let target_exe = std::env::current_exe()
         .map_err(|e| format!("Não foi possível localizar o executável atual: {e}"))?;
@@ -663,6 +919,14 @@ pub fn download_and_prepare_app_update(
         ));
     }
 
+    let client = updater_http_client()?;
+    let sums_text = fetch_checksums_text(client, sums_url, "SHA256SUMS.txt", cancel)?;
+    if parse_sha256sums(&sums_text, &asset_name).is_none() {
+        return Err(format!(
+            "Hash SHA-256 para '{asset_name}' não encontrado em SHA256SUMS.txt."
+        ));
+    }
+
     let seq = UPDATE_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let work_dir = app_updates_root_dir()?.join(format!(
         "v{}-{}-{}",
@@ -673,16 +937,14 @@ pub fn download_and_prepare_app_update(
     fs::create_dir_all(&work_dir)
         .map_err(|e| format!("Não foi possível criar pasta de atualização: {e}"))?;
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(APP_DOWNLOAD_TIMEOUT)
-        .user_agent(format!("FastTube-Updater/{CURRENT_APP_VERSION}"))
-        .build()
-        .map_err(|_| "Não foi possível iniciar o cliente HTTP de download.".to_owned())?;
-
     let resp = client
         .get(&check.download_url)
+        .timeout(APP_DOWNLOAD_TIMEOUT)
         .send()
-        .map_err(|_| "Falha de rede ao baixar a atualização do FastTube.".to_owned())?;
+        .map_err(|_| {
+            let _ = fs::remove_dir_all(&work_dir);
+            "Falha de rede ao baixar a atualização do FastTube.".to_owned()
+        })?;
     if !resp.status().is_success() {
         let _ = fs::remove_dir_all(&work_dir);
         return Err(format!(
@@ -692,9 +954,14 @@ pub fn download_and_prepare_app_update(
     }
 
     let mut bytes = Vec::new();
-    resp.take((MAX_APP_ARTIFACT_BYTES + 1) as u64)
+    if resp
+        .take((MAX_APP_ARTIFACT_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
-        .map_err(|_| "Falha durante a leitura do arquivo de atualização.".to_owned())?;
+        .is_err()
+    {
+        let _ = fs::remove_dir_all(&work_dir);
+        return Err("Falha durante a leitura do arquivo de atualização.".to_owned());
+    }
     if cancel.cancelled() {
         let _ = fs::remove_dir_all(&work_dir);
         return Err("Atualização cancelada.".to_owned());
@@ -716,38 +983,9 @@ pub fn download_and_prepare_app_update(
         _ => {}
     }
 
-    if let Some(sums_url) = check.checksums_url.as_deref() {
-        if !is_allowed_github_download(sums_url) {
-            let _ = fs::remove_dir_all(&work_dir);
-            return Err("URL do arquivo SHA256SUMS.txt não permitida.".to_owned());
-        }
-        let sums_resp = client
-            .get(sums_url)
-            .send()
-            .map_err(|_| "Não foi possível baixar SHA256SUMS.txt para verificação.".to_owned())?;
-        if !sums_resp.status().is_success() {
-            let _ = fs::remove_dir_all(&work_dir);
-            return Err(format!(
-                "SHA256SUMS.txt retornou HTTP {}.",
-                sums_resp.status().as_u16()
-            ));
-        }
-        let mut sums_bytes = Vec::new();
-        sums_resp
-            .take(256 * 1024)
-            .read_to_end(&mut sums_bytes)
-            .map_err(|_| "Falha ao ler SHA256SUMS.txt.".to_owned())?;
-        let sums_text = String::from_utf8_lossy(&sums_bytes);
-        let expected_hash = parse_sha256sums(&sums_text, &asset_name).ok_or_else(|| {
-            let _ = fs::remove_dir_all(&work_dir);
-            format!("Hash SHA-256 para '{asset_name}' não encontrado em SHA256SUMS.txt.")
-        })?;
-        if !verify_sha256_bytes(&bytes, &expected_hash) {
-            let _ = fs::remove_dir_all(&work_dir);
-            return Err(
-                "Falha na verificação de integridade SHA-256 da atualização. Abortado.".to_owned(),
-            );
-        }
+    if let Err(err) = verify_release_sha256(&bytes, &sums_text, &asset_name, "SHA256SUMS.txt") {
+        let _ = fs::remove_dir_all(&work_dir);
+        return Err(err);
     }
 
     let artifact_path = work_dir.join(&asset_name);
@@ -1010,5 +1248,234 @@ mod tests {
         assert_eq!(parsed, expected);
         assert!(verify_sha256_bytes(payload, &parsed));
         assert!(!verify_sha256_bytes(b"tampered", &parsed));
+    }
+
+    #[test]
+    fn parses_ytdlp_release_requires_sha2_256sums_asset() {
+        let asset_name = yt_dlp_binary_name();
+        let valid_json = format!(
+            r#"{{
+                "tag_name": "2026.11.10",
+                "assets": [
+                    {{"name": "{asset_name}", "browser_download_url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.11.10/{asset_name}"}},
+                    {{"name": "SHA2-256SUMS", "browser_download_url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.11.10/SHA2-256SUMS"}}
+                ]
+            }}"#
+        );
+        let (tag, bin_url, sums_url) = parse_ytdlp_release_json(valid_json.as_bytes()).unwrap();
+        assert_eq!(tag, "2026.11.10");
+        assert!(bin_url.ends_with(asset_name));
+        assert!(sums_url.ends_with("/SHA2-256SUMS"));
+
+        let missing_sums = format!(
+            r#"{{
+                "tag_name": "2026.11.10",
+                "assets": [
+                    {{"name": "{asset_name}", "browser_download_url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.11.10/{asset_name}"}}
+                ]
+            }}"#
+        );
+        assert!(parse_ytdlp_release_json(missing_sums.as_bytes()).is_err());
+
+        let untrusted_sums_host = format!(
+            r#"{{
+                "tag_name": "2026.11.10",
+                "assets": [
+                    {{"name": "{asset_name}", "browser_download_url": "https://github.com/yt-dlp/yt-dlp/releases/download/2026.11.10/{asset_name}"}},
+                    {{"name": "SHA2-256SUMS", "browser_download_url": "https://raw.githubusercontent.com/yt-dlp/yt-dlp/master/SHA2-256SUMS"}}
+                ]
+            }}"#
+        );
+        assert!(parse_ytdlp_release_json(untrusted_sums_host.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn derives_ytdlp_checksums_url_from_release_download_url() {
+        let asset_name = yt_dlp_binary_name();
+        let download_url = format!(
+            "https://github.com/yt-dlp/yt-dlp/releases/download/2026.11.10/{asset_name}?foo=1#frag"
+        );
+        let derived = derive_ytdlp_checksums_url(&download_url).unwrap();
+        assert_eq!(
+            derived,
+            "https://github.com/yt-dlp/yt-dlp/releases/download/2026.11.10/SHA2-256SUMS"
+        );
+
+        assert!(
+            derive_ytdlp_checksums_url(
+                "http://github.com/yt-dlp/yt-dlp/releases/download/2026.11.10/yt-dlp.exe"
+            )
+            .is_err()
+        );
+        assert!(
+            derive_ytdlp_checksums_url("https://objects.githubusercontent.com/release/yt-dlp.exe")
+                .is_err()
+        );
+        assert!(
+            derive_ytdlp_checksums_url(
+                "https://github.com/yt-dlp/yt-dlp/releases/download/2026.11.10/other.exe"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn verifies_ytdlp_sha2_256sums_success_mismatch_and_missing() {
+        use sha2::Digest;
+        let payload = b"MZfake-yt-dlp-binary-payload-for-sha256-check";
+        let expected: String = sha2::Sha256::digest(payload)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let sums = format!(
+            "\u{feff}# yt-dlp release checksums\nmalformed-line-without-whitespace\n0000000000000000000000000000000000000000000000000000000000000000  yt-dlp_x86.exe\n{expected} *./yt-dlp.exe\n"
+        );
+
+        assert!(verify_release_sha256(payload, &sums, "yt-dlp.exe", "SHA2-256SUMS").is_ok());
+        assert!(
+            verify_release_sha256(b"MZtampered-payload", &sums, "yt-dlp.exe", "SHA2-256SUMS")
+                .is_err()
+        );
+        assert!(verify_release_sha256(payload, &sums, "yt-dlp_arm64.exe", "SHA2-256SUMS").is_err());
+        assert!(
+            verify_release_sha256(
+                payload,
+                "not-a-valid-hex  yt-dlp.exe\n",
+                "yt-dlp.exe",
+                "SHA2-256SUMS"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn app_self_update_refuses_missing_or_disallowed_checksums_url() {
+        let base_check = AppUpdateCheck {
+            current_version: "0.3.5".into(),
+            latest_version: "0.3.6".into(),
+            tag_name: "v0.3.6".into(),
+            release_url: "https://github.com/nathanbzrr/FastTube/releases/tag/v0.3.6".into(),
+            release_notes: String::new(),
+            asset_name: "FastTube-v0.3.6-x64-portable.zip".into(),
+            download_url: "https://github.com/nathanbzrr/FastTube/releases/download/v0.3.6/FastTube-v0.3.6-x64-portable.zip".into(),
+            checksums_url: None,
+            install_kind: AppInstallKind::Portable,
+            update_available: true,
+        };
+        let cancel = Cancellation::default();
+
+        let err_missing = download_and_prepare_app_update(&base_check, &cancel).unwrap_err();
+        assert!(err_missing.contains("SHA256SUMS.txt"));
+
+        let mut blank_sums = base_check.clone();
+        blank_sums.checksums_url = Some("   ".into());
+        assert!(download_and_prepare_app_update(&blank_sums, &cancel).is_err());
+
+        let mut disallowed_sums = base_check;
+        disallowed_sums.checksums_url = Some(
+            "https://raw.githubusercontent.com/nathanbzrr/FastTube/main/SHA256SUMS.txt".into(),
+        );
+        assert!(download_and_prepare_app_update(&disallowed_sums, &cancel).is_err());
+    }
+
+    #[test]
+    fn redirect_policy_enforces_strict_github_https_hosts_and_hop_limit() {
+        for allowed in [
+            "https://github.com/yt-dlp/yt-dlp/releases/download/2026.11.10/yt-dlp.exe",
+            "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest",
+            "https://objects.githubusercontent.com/github-production-release-asset-123/asset",
+            "https://release-assets.githubusercontent.com/github-production-release-asset-123/asset",
+            "https://GITHUB.COM/nathanbzrr/FastTube/releases/download/v0.3.6/SHA256SUMS.txt",
+        ] {
+            assert!(
+                is_allowed_github_download(allowed),
+                "should allow {allowed}"
+            );
+            let parsed = url::Url::parse(allowed).unwrap();
+            assert!(should_follow_redirect(&parsed, 1).is_ok());
+            assert!(should_follow_redirect(&parsed, MAX_REDIRECT_HOPS).is_ok());
+            assert!(should_follow_redirect(&parsed, MAX_REDIRECT_HOPS + 1).is_err());
+        }
+
+        for disallowed in [
+            "http://github.com/yt-dlp/yt-dlp/releases/download/2026.11.10/yt-dlp.exe",
+            "http://objects.githubusercontent.com/asset",
+            "https://raw.githubusercontent.com/attacker/repo/main/yt-dlp.exe",
+            "https://user-images.githubusercontent.com/123/evil.exe",
+            "https://gist.githubusercontent.com/user/id/raw/yt-dlp.exe",
+            "https://evil.githubusercontent.com/yt-dlp.exe",
+            "https://github.com.evil.example/yt-dlp.exe",
+            "https://github.com:8443/yt-dlp/yt-dlp/releases/download/2026.11.10/yt-dlp.exe",
+            "https://user@github.com/yt-dlp/yt-dlp/releases/download/2026.11.10/yt-dlp.exe",
+        ] {
+            assert!(
+                !is_allowed_github_download(disallowed),
+                "should reject {disallowed}"
+            );
+            let parsed = url::Url::parse(disallowed).unwrap();
+            assert!(should_follow_redirect(&parsed, 1).is_err());
+        }
+
+        let c1 = updater_http_client().unwrap();
+        let c2 = updater_http_client().unwrap();
+        assert!(std::ptr::eq(c1, c2));
+    }
+
+    #[test]
+    fn unifies_ytdlp_install_and_execution_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "fasttube-ytdlp-paths-{}-{}",
+            std::process::id(),
+            UPDATE_TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let local_bin_dir = root.join("localappdata").join("FastTube").join("bin");
+        let app_dir = root.join("portable");
+        fs::create_dir_all(&local_bin_dir).unwrap();
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let local_bin = local_bin_dir.join(yt_dlp_binary_name());
+        let bundled = app_dir.join(yt_dlp_binary_name());
+        let fake_exe = app_dir.join("fasttube.exe");
+        fs::write(&fake_exe, b"exe").unwrap();
+
+        // Neither binary exists: execution falls back to PATH (None); install targets local_bin.
+        assert_eq!(
+            resolve_managed_yt_dlp_path(Some(&local_bin), Some(&fake_exe)),
+            None
+        );
+        assert_eq!(
+            resolve_yt_dlp_install_path_with(Some(&local_bin), Some(&fake_exe), |_| true).unwrap(),
+            local_bin
+        );
+
+        // Bundled exists only: writable portable folder uses bundled for both exec and install.
+        fs::write(&bundled, b"bundled").unwrap();
+        assert_eq!(
+            resolve_managed_yt_dlp_path(Some(&local_bin), Some(&fake_exe)),
+            Some(bundled.clone())
+        );
+        assert_eq!(
+            resolve_yt_dlp_install_path_with(Some(&local_bin), Some(&fake_exe), |_| true).unwrap(),
+            bundled
+        );
+        // Unwritable Program Files folder installs into local_bin.
+        assert_eq!(
+            resolve_yt_dlp_install_path_with(Some(&local_bin), Some(&fake_exe), |_| false).unwrap(),
+            local_bin
+        );
+
+        // Both local_bin and writable bundled exist: BOTH exec and install pick local_bin so
+        // an existing managed copy can never shadow an updated bundled copy.
+        fs::write(&local_bin, b"managed").unwrap();
+        assert_eq!(
+            resolve_managed_yt_dlp_path(Some(&local_bin), Some(&fake_exe)),
+            Some(local_bin.clone())
+        );
+        assert_eq!(
+            resolve_yt_dlp_install_path_with(Some(&local_bin), Some(&fake_exe), |_| true).unwrap(),
+            local_bin
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

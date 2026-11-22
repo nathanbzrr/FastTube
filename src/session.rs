@@ -5,7 +5,15 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+static BROWSER_PROFILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static WEB_SESSION_ACQUIRE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub(crate) fn web_session_acquire_lock() -> &'static Mutex<()> {
+    WEB_SESSION_ACQUIRE_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 pub fn profile_dir() -> Result<PathBuf, String> {
     let base = crate::settings::settings_path().map_err(|e| e.to_string())?;
@@ -15,6 +23,7 @@ pub fn profile_dir() -> Result<PathBuf, String> {
         .join("browser-profile"))
 }
 
+#[cfg_attr(test, allow(dead_code))]
 pub fn has_saved_profile() -> bool {
     profile_dir().is_ok_and(|p| p.join("Default").exists())
 }
@@ -190,6 +199,16 @@ fn signed_in(cookies: &[Value]) -> bool {
 }
 
 pub fn youtube_cookies(interactive: bool, cancel: &Cancellation) -> Result<Vec<Value>, String> {
+    if cancel.cancelled() {
+        return Err("Login cancelado.".into());
+    }
+    let _profile_guard = BROWSER_PROFILE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cancel.cancelled() {
+        return Err("Login cancelado.".into());
+    }
     let profile = profile_dir()?;
     if !interactive && !profile.join("Default").exists() {
         return Err("Entre na sua conta Google para continuar.".into());

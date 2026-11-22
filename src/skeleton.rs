@@ -1,7 +1,31 @@
 use eframe::egui::{self, Color32};
 use std::time::Duration;
 
-const REPAINT_INTERVAL: Duration = Duration::from_millis(28);
+const REPAINT_INTERVAL: Duration = Duration::from_millis(40);
+const SPINNER_REPAINT_INTERVAL: Duration = Duration::from_millis(33);
+const SHIMMER_CACHE_ID: &str = "fasttube_skeleton_shimmer_frame_cache";
+const SPINNER_REPAINT_PASS_ID: &str = "fasttube_visible_spinner_repaint_pass";
+
+#[derive(Clone, Copy)]
+struct ShimmerFrameCache {
+    pass_nr: u64,
+    time: f64,
+}
+
+#[derive(Clone, Copy)]
+struct SpinnerRepaintPass(u64);
+
+fn is_window_minimized(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.viewport().minimized.unwrap_or(false))
+}
+
+fn rect_intersects_clip(ui: &egui::Ui, rect: egui::Rect) -> bool {
+    rect.is_positive() && ui.clip_rect().is_positive() && rect.intersects(ui.clip_rect())
+}
+
+fn is_rect_visible_and_active(ui: &egui::Ui, rect: egui::Rect) -> bool {
+    rect_intersects_clip(ui, rect) && !is_window_minimized(ui.ctx())
+}
 
 fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     let t = t.clamp(0.0, 1.0);
@@ -38,9 +62,27 @@ pub(crate) fn shimmer_factor(time_secs: f64, rect: egui::Rect) -> f32 {
 }
 
 pub(crate) fn shimmer_color_for_rect(ui: &egui::Ui, rect: egui::Rect, dark_theme: bool) -> Color32 {
-    let time = ui.input(|i| i.time);
-    ui.ctx().request_repaint_after(REPAINT_INTERVAL);
     let (base, highlight) = skeleton_palette(dark_theme);
+    if !is_rect_visible_and_active(ui, rect) {
+        return base;
+    }
+
+    let ctx = ui.ctx();
+    let pass_nr = ctx.cumulative_pass_nr();
+    let cache_id = egui::Id::new(SHIMMER_CACHE_ID);
+    let cached = ctx.data_mut(|data| data.get_temp::<ShimmerFrameCache>(cache_id));
+    let time = match cached {
+        Some(entry) if entry.pass_nr == pass_nr => entry.time,
+        _ => {
+            let time = ui.input(|i| i.time);
+            // Coalesce shimmer animation repaints to once per composite frame pass.
+            ctx.request_repaint_after(REPAINT_INTERVAL);
+            ctx.data_mut(|data| {
+                data.insert_temp(cache_id, ShimmerFrameCache { pass_nr, time });
+            });
+            time
+        }
+    };
     lerp_color(base, highlight, shimmer_factor(time, rect))
 }
 
@@ -50,6 +92,9 @@ pub(crate) fn paint_skeleton_rect(
     corner_radius: f32,
     dark_theme: bool,
 ) {
+    if !rect_intersects_clip(ui, rect) {
+        return;
+    }
     let color = shimmer_color_for_rect(ui, rect, dark_theme);
     ui.painter().rect_filled(rect, corner_radius, color);
 }
@@ -67,9 +112,60 @@ pub(crate) fn skeleton_box(
 
 pub(crate) fn skeleton_circle(ui: &mut egui::Ui, diameter: f32, dark_theme: bool) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::hover());
+    if !rect_intersects_clip(ui, rect) {
+        return;
+    }
     let color = shimmer_color_for_rect(ui, rect, dark_theme);
     ui.painter()
         .circle_filled(rect.center(), diameter * 0.5, color);
+}
+
+pub(crate) fn visible_spinner_sized(ui: &mut egui::Ui, size: f32) -> egui::Response {
+    let size = size.max(0.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    response.widget_info(|| egui::WidgetInfo::new(egui::WidgetType::ProgressIndicator));
+
+    if !is_rect_visible_and_active(ui, rect) {
+        return response;
+    }
+
+    let ctx = ui.ctx();
+    let pass_nr = ctx.cumulative_pass_nr();
+    let repaint_id = egui::Id::new(SPINNER_REPAINT_PASS_ID);
+    let already_scheduled = ctx.data_mut(|data| {
+        data.get_temp::<SpinnerRepaintPass>(repaint_id)
+            .is_some_and(|last| last.0 == pass_nr)
+    });
+    if !already_scheduled {
+        ctx.request_repaint_after(SPINNER_REPAINT_INTERVAL);
+        ctx.data_mut(|data| {
+            data.insert_temp(repaint_id, SpinnerRepaintPass(pass_nr));
+        });
+    }
+
+    let color = ui.visuals().strong_text_color();
+    let radius = ((rect.height().min(rect.width()) * 0.5) - 2.0).max(1.0);
+    let n_points = (radius.round() as u32).clamp(8, 128);
+    let time = ui.input(|i| i.time);
+    let start_angle = time * std::f64::consts::TAU;
+    let end_angle = start_angle + 240_f64.to_radians() * time.sin();
+    let points: Vec<egui::Pos2> = (0..n_points)
+        .map(|i| {
+            let t = i as f64 / n_points as f64;
+            let angle = start_angle + (end_angle - start_angle) * t;
+            let (sin, cos) = angle.sin_cos();
+            rect.center() + radius * egui::vec2(cos as f32, sin as f32)
+        })
+        .collect();
+    ui.painter()
+        .add(egui::Shape::line(points, egui::Stroke::new(3.0, color)));
+
+    response
+}
+
+pub(crate) fn visible_spinner(ui: &mut egui::Ui) -> egui::Response {
+    let size = ui.style().spacing.interact_size.y;
+    visible_spinner_sized(ui, size)
 }
 
 pub(crate) fn skeleton_text_line(ui: &mut egui::Ui, width: f32, height: f32, dark_theme: bool) {
@@ -401,5 +497,229 @@ mod tests {
         assert_eq!(lerp_color(a, b, 1.0), b);
         let mid = lerp_color(a, b, 0.5);
         assert!(mid.r() > a.r() && mid.r() < b.r());
+    }
+
+    fn warm_context(screen: egui::Rect) -> egui::Context {
+        let ctx = egui::Context::default();
+        for step in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(step as f64 * 0.1),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |_| {});
+            out.textures_delta.clear();
+        }
+        ctx
+    }
+
+    fn input_with_minimized(screen: egui::Rect, time: f64, minimized: bool) -> egui::RawInput {
+        let mut input = egui::RawInput {
+            screen_rect: Some(screen),
+            time: Some(time),
+            ..Default::default()
+        };
+        input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .minimized = Some(minimized);
+        input
+    }
+
+    #[test]
+    fn offscreen_and_zero_sized_shimmer_produces_zero_repaints_and_returns_base_color() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let ctx = warm_context(screen);
+        let repaint_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&repaint_calls);
+        ctx.set_request_repaint_callback(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let (base_dark, _) = skeleton_palette(true);
+        let mut offscreen_color = Color32::TRANSPARENT;
+        let mut zero_color = Color32::TRANSPARENT;
+
+        let mut output = ctx.run_ui(input_with_minimized(screen, 1.25, false), |ui| {
+            ui.set_clip_rect(screen);
+            let offscreen =
+                egui::Rect::from_min_size(egui::pos2(20.0, 1200.0), egui::vec2(200.0, 100.0));
+            let zero = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(0.0, 40.0));
+            offscreen_color = shimmer_color_for_rect(ui, offscreen, true);
+            zero_color = shimmer_color_for_rect(ui, zero, true);
+        });
+        output.textures_delta.clear();
+
+        assert_eq!(offscreen_color, base_dark);
+        assert_eq!(zero_color, base_dark);
+        assert_eq!(
+            repaint_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "offscreen and zero-sized skeletons must not request repaints"
+        );
+        assert_eq!(
+            output
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .map(|v| v.repaint_delay),
+            Some(Duration::MAX)
+        );
+    }
+
+    #[test]
+    fn minimized_window_shimmer_produces_zero_repaints_and_returns_base_color() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let ctx = warm_context(screen);
+        let repaint_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&repaint_calls);
+        ctx.set_request_repaint_callback(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let (base_light, _) = skeleton_palette(false);
+        let mut color = Color32::TRANSPARENT;
+
+        let mut output = ctx.run_ui(input_with_minimized(screen, 2.5, true), |ui| {
+            ui.set_clip_rect(screen);
+            let visible_rect =
+                egui::Rect::from_min_size(egui::pos2(40.0, 40.0), egui::vec2(240.0, 135.0));
+            color = shimmer_color_for_rect(ui, visible_rect, false);
+        });
+        output.textures_delta.clear();
+
+        assert_eq!(color, base_light);
+        assert_eq!(
+            repaint_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "minimized windows must not schedule skeleton shimmer repaints"
+        );
+        assert_eq!(
+            output
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .map(|v| v.repaint_delay),
+            Some(Duration::MAX)
+        );
+    }
+
+    #[test]
+    fn visible_shimmer_animates_and_coalesces_repaint_request() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let ctx = warm_context(screen);
+        let repaint_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&repaint_calls);
+        ctx.set_request_repaint_callback(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let mut colors_t0 = Vec::new();
+        let mut output_t0 = ctx.run_ui(input_with_minimized(screen, 0.5, false), |ui| {
+            ui.set_clip_rect(screen);
+            for row in 0..8 {
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(16.0, 16.0 + row as f32 * 40.0),
+                    egui::vec2(220.0, 24.0),
+                );
+                colors_t0.push(shimmer_color_for_rect(ui, rect, true));
+            }
+        });
+        output_t0.textures_delta.clear();
+
+        assert_eq!(
+            repaint_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "multiple visible skeleton rects in one frame must coalesce into a single repaint request"
+        );
+        let repaint_delay = output_t0
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.repaint_delay)
+            .expect("root viewport output");
+        assert!(
+            repaint_delay > Duration::ZERO && repaint_delay <= REPAINT_INTERVAL,
+            "expected bounded shimmer repaint delay <= {REPAINT_INTERVAL:?}, got {repaint_delay:?}"
+        );
+
+        let mut color_t1 = Color32::TRANSPARENT;
+        let mut output_t1 = ctx.run_ui(input_with_minimized(screen, 1.35, false), |ui| {
+            ui.set_clip_rect(screen);
+            let rect = egui::Rect::from_min_size(egui::pos2(16.0, 16.0), egui::vec2(220.0, 24.0));
+            color_t1 = shimmer_color_for_rect(ui, rect, true);
+        });
+        output_t1.textures_delta.clear();
+
+        assert_ne!(
+            colors_t0[0], color_t1,
+            "visible shimmer color should animate across time"
+        );
+    }
+
+    #[test]
+    fn visible_spinner_gates_painting_and_repaints_on_visibility_and_minimized() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let ctx = warm_context(screen);
+        let repaint_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&repaint_calls);
+        ctx.set_request_repaint_callback(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        // 1. Offscreen spinner allocates layout rect but requests zero repaints.
+        let mut offscreen_rect = egui::Rect::NOTHING;
+        let mut offscreen_out = ctx.run_ui(input_with_minimized(screen, 1.0, false), |ui| {
+            ui.set_clip_rect(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(800.0, 100.0),
+            ));
+            ui.add_space(300.0);
+            offscreen_rect = visible_spinner(ui).rect;
+        });
+        offscreen_out.textures_delta.clear();
+        assert!(offscreen_rect.is_positive());
+        assert_eq!(repaint_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            offscreen_out
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .map(|v| v.repaint_delay),
+            Some(Duration::MAX)
+        );
+
+        // 2. Minimized window spinner requests zero repaints even inside clip rect.
+        let mut minimized_out = ctx.run_ui(input_with_minimized(screen, 1.2, true), |ui| {
+            ui.set_clip_rect(screen);
+            let _ = visible_spinner_sized(ui, 18.0);
+        });
+        minimized_out.textures_delta.clear();
+        assert_eq!(repaint_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            minimized_out
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .map(|v| v.repaint_delay),
+            Some(Duration::MAX)
+        );
+
+        // 3. Visible active spinners request one bounded repaint per frame pass.
+        let mut visible_out = ctx.run_ui(input_with_minimized(screen, 1.4, false), |ui| {
+            ui.set_clip_rect(screen);
+            let r1 = visible_spinner(ui).rect;
+            let r2 = visible_spinner_sized(ui, 24.0).rect;
+            assert!(r1.is_positive());
+            assert!((r2.width() - 24.0).abs() < 0.01);
+            assert!((r2.height() - 24.0).abs() < 0.01);
+        });
+        visible_out.textures_delta.clear();
+        assert_eq!(repaint_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let spinner_delay = visible_out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.repaint_delay)
+            .expect("root viewport output");
+        assert!(
+            spinner_delay > Duration::ZERO && spinner_delay <= SPINNER_REPAINT_INTERVAL,
+            "expected bounded spinner repaint delay <= {SPINNER_REPAINT_INTERVAL:?}, got {spinner_delay:?}"
+        );
     }
 }
